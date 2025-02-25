@@ -3,8 +3,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from vllm.logger import init_logger
 from vllm.utils import cdiv
-from vllm.v1.core.kv_cache_utils import (BlockHashType, FreeKVCacheBlockQueue,
-                                         KVCacheBlock,
+from vllm.v1.core.kv_cache_memory_pool import KVCacheBlockPool
+from vllm.v1.core.kv_cache_utils import (BlockHashType, KVCacheBlock,
                                          generate_block_hash_extra_keys,
                                          hash_block_tokens,
                                          hash_request_tokens)
@@ -43,14 +43,7 @@ class KVCacheManager:
         self.num_preallocate_tokens = num_preallocate_tokens
         self.num_preallocate_blocks = cdiv(num_preallocate_tokens, block_size)
 
-        # A Block pool of all kv-cache blocks.
-        self.block_pool: List[KVCacheBlock] = [
-            KVCacheBlock(idx) for idx in range(num_gpu_blocks)
-        ]
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.block_pool)
+        self.kv_block_pool = KVCacheBlockPool(num_gpu_blocks)
 
         # {block_hash: {block ID: block}}. A cached block is
         # a full block with a block hash that can be used for prefix caching.
@@ -132,7 +125,7 @@ class KVCacheManager:
         req_blocks = self.req_to_blocks[request.request_id]
 
         num_new_blocks = num_required_blocks - len(req_blocks)
-        if num_new_blocks > self.free_block_queue.num_free_blocks:
+        if num_new_blocks > self.kv_block_pool.num_free_blocks:
             # Need to allocate new blocks due to insufficient pre-allocated
             # slots, but we cannot allocate new blocks due to the limit.
             return None
@@ -145,7 +138,7 @@ class KVCacheManager:
             # preallocated blocks.
             num_new_blocks = min(
                 num_new_blocks + self.num_preallocate_blocks,
-                self.free_block_queue.num_free_blocks,
+                self.kv_block_pool.num_free_blocks,
                 # Should not exceed the maximum number of blocks per request.
                 # This is especially because the block table has the shape
                 # [..., max_num_blocks_per_req].
@@ -214,7 +207,7 @@ class KVCacheManager:
                                             if blk.ref_cnt == 0)
 
         num_required_blocks = cdiv(num_tokens, self.block_size)
-        if (num_required_blocks > self.free_block_queue.num_free_blocks -
+        if (num_required_blocks > self.kv_block_pool.num_free_blocks -
                 num_evictable_computed_blocks):
             # Cannot allocate new blocks.
             return None
@@ -231,7 +224,7 @@ class KVCacheManager:
         # preallocated blocks.
         num_new_blocks = min(
             num_required_blocks + self.num_preallocate_blocks,
-            self.free_block_queue.num_free_blocks,
+            self.kv_block_pool.num_free_blocks,
             # Should not exceed the maximum number of blocks per request.
             # This is especially because the block table has the shape
             # [..., max_num_blocks_per_req].
@@ -283,7 +276,7 @@ class KVCacheManager:
         for block in ordered_blocks:
             block.decr_ref()
             if block.ref_cnt == 0:
-                self.free_block_queue.append(block)
+                self.kv_block_pool.free(block)
 
     def uncache_blocks(self, request: Request) -> int:
         """Uncache the blocks that are no longer full based on the
@@ -318,7 +311,7 @@ class KVCacheManager:
             False otherwise.
         """
         num_used_blocks = (self.num_gpu_blocks -
-                           self.free_block_queue.num_free_blocks)
+                           self.kv_block_pool.num_free_blocks)
         if num_used_blocks > 0:
             logger.warning(
                 "Failed to reset prefix cache because some "
@@ -329,8 +322,7 @@ class KVCacheManager:
         self.cached_block_hash_to_block = defaultdict(dict)
 
         # Remove all hashes from all blocks.
-        for block in self.block_pool:
-            block.reset_hash()
+        self.kv_block_pool.reset_hash()
 
         logger.info("Successfully reset prefix cache")
         return True
@@ -396,7 +388,7 @@ class KVCacheManager:
         Returns:
             A list of new block.
         """
-        if num_blocks > self.free_block_queue.num_free_blocks:
+        if num_blocks > self.kv_block_pool.num_free_blocks:
             raise ValueError(
                 f"Cannot get {num_blocks} free blocks from the pool")
 
@@ -404,7 +396,7 @@ class KVCacheManager:
         idx = 0
         while idx < num_blocks:
             # First allocate blocks.
-            curr_block = self.free_block_queue.popleft()
+            curr_block = self.kv_block_pool.allocate(1)[0]
             assert curr_block.ref_cnt == 0
 
             # If the block is cached, evict it.
@@ -468,7 +460,7 @@ class KVCacheManager:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0:
-                self.free_block_queue.remove(block)
+                self.kv_block_pool.remove(block)
             block.incr_ref()
 
     def _cache_full_blocks(
