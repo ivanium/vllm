@@ -45,18 +45,6 @@ class KVCacheManager:
 
         self.kv_block_pool = KVCacheBlockPool(num_gpu_blocks)
 
-        # {block_hash: {block ID: block}}. A cached block is
-        # a full block with a block hash that can be used for prefix caching.
-        # The cached block may be used by running requests or in the
-        # free_block_queue that could potentially be evicted.
-        # NOTE: We currently don't de-duplicate the blocks in the cache,
-        # meaning that if a block becomes full and is cached, we don't check
-        # if there is already an identical block in the cache. This is because
-        # we want to make sure the allocated block IDs won't change so that
-        # block tables are append-only.
-        self.cached_block_hash_to_block: Dict[BlockHashType, Dict[
-            int, KVCacheBlock]] = defaultdict(dict)
-
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request
         # is finished.
@@ -92,7 +80,7 @@ class KVCacheManager:
             # block_hashes is a chain of block hashes. If a block hash is not
             # in the cached_block_hash_to_id, the following block hashes are
             # not computed yet for sure.
-            if cached_block := self._get_cached_block(block_hash):
+            if cached_block := self.kv_block_pool.get_cached_block(block_hash):
                 computed_blocks.append(cached_block)
             else:
                 break
@@ -296,7 +284,7 @@ class KVCacheManager:
         num_uncached_blocks = 0
         for block in blocks[num_full_blocks:]:
             # If the block is not cached, the following blocks are not cached.
-            if not self._maybe_evict_cached_block(block):
+            if not self.kv_block_pool.maybe_evict_cached_block(block):
                 break
             num_uncached_blocks += 1
         return num_uncached_blocks
@@ -318,11 +306,9 @@ class KVCacheManager:
                 "blocks (%d) are not freed yet", num_used_blocks)
             return False
 
-        # Remove all hashes so that no new blocks will hit.
-        self.cached_block_hash_to_block = defaultdict(dict)
-
-        # Remove all hashes from all blocks.
-        self.kv_block_pool.reset_hash()
+        # Remove all hashes so that no new blocks will hit and remove all hashes
+        # from all blocks.
+        self.kv_block_pool.reset_prefix_cache()
 
         logger.info("Successfully reset prefix cache")
         return True
@@ -401,52 +387,13 @@ class KVCacheManager:
 
             # If the block is cached, evict it.
             if self.enable_caching:
-                self._maybe_evict_cached_block(curr_block)
+                self.kv_block_pool.maybe_evict_cached_block(curr_block)
 
             curr_block.incr_ref()
             ret.append(curr_block)
             idx += 1
 
         return ret
-
-    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
-        """
-        If a block is cached in `cached_block_hash_to_block`, we reset its hash
-        metadata and evict it from the cache.
-
-        Args:
-            block: The block to evict.
-
-        Returns:
-            True if the block is evicted, False otherwise.
-        """
-        block_hash = block.block_hash
-        if block_hash and block_hash in self.cached_block_hash_to_block:
-            block.reset_hash()
-            del self.cached_block_hash_to_block[block_hash][block.block_id]
-
-            if len(self.cached_block_hash_to_block[block_hash]) == 0:
-                del self.cached_block_hash_to_block[block_hash]
-
-            return True
-        return False
-
-    def _get_cached_block(self,
-                          block_hash: BlockHashType) -> Optional[KVCacheBlock]:
-        """Get a cached block by the block hash, or None if cache miss.
-        If there are duplicated blocks, we return the first block in the cache.
-
-        Args:
-            block_hash: The hash value of the block.
-
-        Returns:
-            The cached block if it exists, or None.
-        """
-        if block_hash in self.cached_block_hash_to_block:
-            first_block_id = list(
-                self.cached_block_hash_to_block[block_hash].keys())[0]
-            return self.cached_block_hash_to_block[block_hash][first_block_id]
-        return None
 
     def _touch(self, blocks: List[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
@@ -476,7 +423,7 @@ class KVCacheManager:
         metadata to be updated and cached. Given a request, it computes the
         block hashes for the blocks starting from `blk_start_idx` to the end
         of the request's full blocks, updating the metadata for each block
-        and caching them in the `cached_block_hash_to_block`.
+        and caching them in the `kv_block_pool.cached_block_hash_to_block`.
 
         Args:
             request: The request to cache the blocks.
@@ -530,5 +477,5 @@ class KVCacheManager:
 
             # Update and added the full block to the cache.
             blk.block_hash = block_hash
-            self.cached_block_hash_to_block[block_hash][blk.block_id] = blk
+            self.kv_block_pool.add_to_prefix_cache(blk)
             prev_block_hash_value = block_hash.hash_value
