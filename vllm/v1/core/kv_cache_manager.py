@@ -3,7 +3,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from vllm.logger import init_logger
 from vllm.utils import cdiv
-from vllm.v1.core.kv_cache_memory_pool import KVCacheBlockPool
+from vllm.v1.core.kv_cache_memory_pool import KVCacheMemPool
 from vllm.v1.core.kv_cache_utils import (BlockHashType, KVCacheBlock,
                                          generate_block_hash_extra_keys,
                                          hash_block_tokens,
@@ -43,7 +43,7 @@ class KVCacheManager:
         self.num_preallocate_tokens = num_preallocate_tokens
         self.num_preallocate_blocks = cdiv(num_preallocate_tokens, block_size)
 
-        self.kv_block_pool = KVCacheBlockPool(num_gpu_blocks)
+        self.kv_block_pool = KVCacheMemPool(num_gpu_blocks)
 
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request

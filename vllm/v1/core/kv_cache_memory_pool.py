@@ -10,7 +10,7 @@ from vllm.v1.core.kv_cache_utils import (BlockHashType, FreeKVCacheBlockQueue,
 logger = init_logger(__name__)
 
 
-class KVCacheBlockPoolBase(ABC):
+class KVCacheMemPoolBase(ABC):
 
     @abstractmethod
     def __init__(self, num_gpu_blocks: int):
@@ -69,7 +69,7 @@ class KVCacheBlockPoolBase(ABC):
         return None
 
 
-class KVCacheBlockPool(KVCacheBlockPoolBase):
+class KVCacheMemPool(KVCacheMemPoolBase):
 
     def __init__(self, num_gpu_blocks: int):
         super().__init__(num_gpu_blocks)
