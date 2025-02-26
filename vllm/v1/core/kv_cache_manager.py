@@ -43,7 +43,7 @@ class KVCacheManager:
         self.num_preallocate_tokens = num_preallocate_tokens
         self.num_preallocate_blocks = cdiv(num_preallocate_tokens, block_size)
 
-        self.kv_block_pool = KVCacheMemPool(num_gpu_blocks)
+        self.kv_block_pool = KVCacheMemPool(num_gpu_blocks, enable_caching)
 
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request
@@ -136,7 +136,7 @@ class KVCacheManager:
             )
             assert num_new_blocks > 0
 
-            new_blocks = self._get_new_blocks(num_new_blocks)
+            new_blocks = self.kv_block_pool.allocate(num_new_blocks)
             req_blocks.extend(new_blocks)
 
         if not self.enable_caching:
@@ -202,7 +202,7 @@ class KVCacheManager:
 
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
-            self._touch(computed_blocks)
+            self.kv_block_pool.touch(computed_blocks)
         else:
             assert not computed_blocks, (
                 "Computed blocks should be empty when "
@@ -223,7 +223,7 @@ class KVCacheManager:
         assert num_new_blocks > 0
 
         # Concatenate the computed block IDs and the new block IDs.
-        new_blocks = self._get_new_blocks(num_new_blocks)
+        new_blocks = self.kv_block_pool.allocate(num_new_blocks)
         self.req_to_blocks[request.request_id] = computed_blocks + new_blocks
 
         if not self.enable_caching:
@@ -362,53 +362,6 @@ class KVCacheManager:
             else:
                 break
         return num_common_blocks
-
-    def _get_new_blocks(self, num_blocks: int) -> List[KVCacheBlock]:
-        """Get new blocks from the free block pool.
-
-        Note that we do not check block cache in this function.
-
-        Args:
-            num_blocks: The number of blocks to allocate.
-
-        Returns:
-            A list of new block.
-        """
-        if num_blocks > self.kv_block_pool.num_free_blocks:
-            raise ValueError(
-                f"Cannot get {num_blocks} free blocks from the pool")
-
-        ret: List[KVCacheBlock] = []
-        idx = 0
-        while idx < num_blocks:
-            # First allocate blocks.
-            curr_block = self.kv_block_pool.allocate(1)[0]
-            assert curr_block.ref_cnt == 0
-
-            # If the block is cached, evict it.
-            if self.enable_caching:
-                self.kv_block_pool.maybe_evict_cached_block(curr_block)
-
-            curr_block.incr_ref()
-            ret.append(curr_block)
-            idx += 1
-
-        return ret
-
-    def _touch(self, blocks: List[KVCacheBlock]) -> None:
-        """Touch a block increases its reference count by 1, and may remove
-        the block from the free queue. This is used when a block is hit by
-        another request with the same prefix.
-
-        Args:
-            blocks: A list of blocks to touch.
-        """
-        for block in blocks:
-            # ref_cnt=0 means this block is in the free list (i.e. eviction
-            # candidate), so remove it.
-            if block.ref_cnt == 0:
-                self.kv_block_pool.remove(block)
-            block.incr_ref()
 
     def _cache_full_blocks(
         self,

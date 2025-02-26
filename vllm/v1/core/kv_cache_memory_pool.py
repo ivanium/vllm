@@ -13,8 +13,14 @@ logger = init_logger(__name__)
 class KVCacheMemPoolBase(ABC):
 
     @abstractmethod
-    def __init__(self, num_gpu_blocks: int):
-        self.num_gpu_blocks = num_gpu_blocks
+    def __init__(self, num_gpu_blocks: int, enable_caching: bool, *args,
+                 **kwargs):
+        """Initialize the KV cache memory pool.
+        Args:
+            num_gpu_blocks: The number of KVCacheBlocks in the pool.
+            enable_caching: Whether to enable prefix caching.
+        """
+        raise NotImplementedError
 
     @property
     @abstractmethod
@@ -24,7 +30,7 @@ class KVCacheMemPoolBase(ABC):
 
     @abstractmethod
     def allocate(self, num_blocks: int) -> List[KVCacheBlock]:
-        """Allocate a specified number of KVCacheBlocks."""
+        """Allocate new KVCacheBlocks."""
         raise NotImplementedError
 
     @abstractmethod
@@ -36,6 +42,17 @@ class KVCacheMemPoolBase(ABC):
     def reset_prefix_cache(self):
         """Reset prefix cache for all KVCacheBlocks."""
         return
+
+    @abstractmethod
+    def touch(self, blocks: List[KVCacheBlock]) -> None:
+        """Touch a block increases its reference count by 1, and may remove
+        the block from the free queue. This is used when a block is hit by
+        another request with the same prefix.
+
+        Args:
+            blocks: A list of blocks to touch.
+        """
+        raise NotImplementedError
 
     def maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """Maybe evict a cached block from the prefix cache.
@@ -71,8 +88,9 @@ class KVCacheMemPoolBase(ABC):
 
 class KVCacheMemPool(KVCacheMemPoolBase):
 
-    def __init__(self, num_gpu_blocks: int):
-        super().__init__(num_gpu_blocks)
+    def __init__(self, num_gpu_blocks: int, enable_caching: bool = True):
+        self.num_gpu_blocks = num_gpu_blocks
+        self.enable_caching = enable_caching
 
         # A Block pool of all kv-cache blocks.
         self.block_pool: List[KVCacheBlock] = [
@@ -95,9 +113,43 @@ class KVCacheMemPool(KVCacheMemPoolBase):
             int, KVCacheBlock]] = defaultdict(dict)
 
     def allocate(self, num_blocks: int) -> List[KVCacheBlock]:
-        return [self.free_block_queue.popleft() for _ in range(num_blocks)]
+        """Get new blocks from the free block pool.
+
+        Note that we do not check block cache in this function.
+
+        Args:
+            num_blocks: The number of blocks to allocate.
+
+        Returns:
+            A list of new block.
+        """
+        if num_blocks > self.num_free_blocks:
+            raise ValueError(
+                f"Cannot get {num_blocks} free blocks from the pool")
+
+        ret: List[KVCacheBlock] = []
+        idx = 0
+        while idx < num_blocks:
+            # First allocate blocks.
+            curr_block = self.free_block_queue.popleft()
+            assert curr_block.ref_cnt == 0
+
+            # If the block is cached, evict it.
+            if self.enable_caching:
+                self.maybe_evict_cached_block(curr_block)
+
+            curr_block.incr_ref()
+            ret.append(curr_block)
+            idx += 1
+
+        return ret
 
     def free(self, blocks: Union[KVCacheBlock, List[KVCacheBlock]]) -> None:
+        """Free the specified blocks and add them to the free block queue.
+        If a block is cached, we remove it from the prefix cache.
+        Args:
+            blocks: A list of blocks to free.
+        """
         if isinstance(blocks, KVCacheBlock):
             blocks = [blocks]
         for block in blocks:
@@ -113,6 +165,21 @@ class KVCacheMemPool(KVCacheMemPoolBase):
         # Remove all hashes from all blocks.
         for block in self.block_pool:
             block.reset_hash()
+
+    def touch(self, blocks: List[KVCacheBlock]) -> None:
+        """Touch a block increases its reference count by 1, and may remove
+        the block from the free queue. This is used when a block is hit by
+        another request with the same prefix.
+
+        Args:
+            blocks: A list of blocks to touch.
+        """
+        for block in blocks:
+            # ref_cnt=0 means this block is in the free list (i.e. eviction
+            # candidate), so remove it.
+            if block.ref_cnt == 0:
+                self.free_block_queue.remove(block)
+            block.incr_ref()
 
     def maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
