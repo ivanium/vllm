@@ -45,12 +45,18 @@ class Scheduler:
         num_gpu_blocks = cache_config.num_gpu_blocks
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         # Create the KV cache manager.
+        kv_hidden_size = (model_config.hf_config.hidden_size //
+                          model_config.hf_config.num_attention_heads *
+                          model_config.hf_config.num_key_value_heads)
         self.kv_cache_manager = KVCacheManager(
             block_size=self.cache_config.block_size,
             num_gpu_blocks=num_gpu_blocks,
             max_model_len=self.max_model_len,
             sliding_window=self.cache_config.sliding_window,
-            enable_caching=self.cache_config.enable_prefix_caching)
+            enable_caching=self.cache_config.enable_prefix_caching,
+            kv_hidden_size=kv_hidden_size,
+            cache_config=self.cache_config,
+            model_config=model_config)
         self.block_size = self.cache_config.block_size
 
         # req_id -> Request

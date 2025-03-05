@@ -3,6 +3,7 @@ from collections import defaultdict
 
 from typing import Dict, List, Union, Optional
 
+from vllm.config import CacheConfig, ModelConfig
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import (BlockHashType, FreeKVCacheBlockQueue,
                                          KVCacheBlock)
@@ -11,16 +12,6 @@ logger = init_logger(__name__)
 
 
 class KVCacheMemPoolBase(ABC):
-
-    @abstractmethod
-    def __init__(self, num_gpu_blocks: int, enable_caching: bool, *args,
-                 **kwargs):
-        """Initialize the KV cache memory pool.
-        Args:
-            num_gpu_blocks: The number of KVCacheBlocks in the pool.
-            enable_caching: Whether to enable prefix caching.
-        """
-        raise NotImplementedError
 
     @property
     @abstractmethod
@@ -231,3 +222,132 @@ class KVCacheMemPool(KVCacheMemPoolBase):
             return
 
         self.cached_block_hash_to_block[block_hash][block.block_id] = block
+
+
+class KVCacheElasticMemPool(KVCacheMemPoolBase):
+
+    def __init__(self, num_gpu_blocks: int, enable_caching: bool,
+                 block_size: int, token_bytes: int,
+                 cache_config: Optional[CacheConfig],
+                 model_config: Optional[ModelConfig]):
+        self.block_size = block_size
+        self.token_bytes = token_bytes
+        self.block_bytes = self.block_size * self.token_bytes
+        # assert block_bytes == (2 ** 21), "Only support 2MB block size for now."
+        assert cache_config is not None and model_config is not None
+        self.cache_config = cache_config
+        self.model_config = model_config
+
+        self.num_gpu_blocks = num_gpu_blocks
+        self.enable_caching = enable_caching
+
+        # A Block pool of all kv-cache blocks.
+        self.block_pool: List[KVCacheBlock] = [
+            KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+        ]
+
+        # kvcached
+        from kvcached.slab_allocator import PageAllocator, Page  # noqa: F401
+
+        assert not self.enable_caching, "Caching is not supported in ElasticMemPool"
+        PAGE_SIZE = 2 << 20  # 2MB
+        assert PAGE_SIZE % self.block_bytes == 0
+        assert self.num_gpu_blocks % (PAGE_SIZE // self.block_bytes) == 0
+        GMEM_SIZE = (self.block_bytes * self.num_gpu_blocks + PAGE_SIZE -
+                     1) // PAGE_SIZE * PAGE_SIZE
+        self.page_allocator = PageAllocator(GMEM_SIZE, PAGE_SIZE)
+        self.avail_pages: Dict[int, Page] = {}
+        self.full_pages: Dict[int, Page] = {}
+
+    def allocate(self, num_blocks: int) -> List[KVCacheBlock]:
+        """Get new blocks from the free block pool.
+
+        Note that we do not check block cache in this function.
+
+        Args:
+            num_blocks: The number of blocks to allocate.
+
+        Returns:
+            A list of new block.
+        """
+        if num_blocks > self.num_free_blocks:
+            raise ValueError(
+                f"Cannot get {num_blocks} free blocks from the pool")
+
+        ret: List[KVCacheBlock] = []
+        idx = 0
+        while idx < num_blocks:
+            page: Optional["Page"] = None
+            if not self.avail_pages:
+                page = self.page_allocator.alloc_page()
+                page.init(self.block_bytes)
+            else:
+                _, page = self.avail_pages.popitem()
+            assert page is not None
+            block_id = page.alloc()
+            if page.full():
+                self.full_pages[page.page_id] = page
+            else:
+                self.avail_pages[page.page_id] = page
+            # First allocate blocks.
+            curr_block = self.block_pool[block_id]
+            assert curr_block.ref_cnt == 0
+
+            # # If the block is cached, evict it.
+            # if self.enable_caching:
+            #     self.maybe_evict_cached_block(curr_block)
+
+            curr_block.incr_ref()
+            ret.append(curr_block)
+            idx += 1
+
+        return ret
+
+    def free(self, blocks: Union[KVCacheBlock, List[KVCacheBlock]]) -> None:
+        """Free the specified blocks and add them to the free block queue.
+        If a block is cached, we remove it from the prefix cache.
+        Args:
+            blocks: A list of blocks to free.
+        """
+        if isinstance(blocks, KVCacheBlock):
+            blocks = [blocks]
+        for block in blocks:
+            page_id = self.page_allocator.get_page_id(block.block_id,
+                                                      self.block_bytes)
+            if page_id in self.full_pages:
+                assert page_id not in self.avail_pages
+                page = self.full_pages.pop(page_id)
+                page.free(block.block_id)
+                self.avail_pages[page_id] = page
+            elif page_id in self.avail_pages:
+                page = self.avail_pages[page_id]
+                page.free(block.block_id)
+                if page.empty():
+                    del self.avail_pages[page_id]
+                    self.page_allocator.free_page(page)
+            else:
+                raise ValueError("Block not found in any page")
+
+    @property
+    def num_free_blocks(self) -> int:
+        num_free_blocks = sum(p.num_free_blocks()
+                              for p in self.avail_pages.values())
+        num_free_blocks += self.page_allocator.get_num_free_blocks(
+            self.block_bytes)
+        return num_free_blocks
+
+    def reset_prefix_cache(self):
+        raise NotImplementedError
+
+    def touch(self, blocks: List[KVCacheBlock]) -> None:
+        raise NotImplementedError
+
+    def maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+        raise NotImplementedError
+
+    def get_cached_block(self,
+                         block_hash: BlockHashType) -> Optional[KVCacheBlock]:
+        raise NotImplementedError
+
+    def add_to_prefix_cache(self, block: KVCacheBlock) -> None:
+        raise NotImplementedError

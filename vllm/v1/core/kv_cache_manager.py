@@ -1,9 +1,10 @@
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from vllm.config import CacheConfig, ModelConfig
 from vllm.logger import init_logger
 from vllm.utils import cdiv
-from vllm.v1.core.kv_cache_memory_pool import KVCacheMemPool
+from vllm.v1.core.kv_cache_memory_pool import KVCacheMemPool, KVCacheElasticMemPool
 from vllm.v1.core.kv_cache_utils import (KVCacheBlock,
                                          generate_block_hash_extra_keys,
                                          hash_block_tokens,
@@ -11,7 +12,7 @@ from vllm.v1.core.kv_cache_utils import (KVCacheBlock,
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
-
+USE_ELASTIC_POOL = True
 
 class KVCacheManager:
 
@@ -23,6 +24,9 @@ class KVCacheManager:
         sliding_window: Optional[int] = None,
         enable_caching: bool = True,
         num_preallocate_tokens: int = 64,
+        kv_hidden_size: Optional[int] = None,
+        cache_config: Optional[CacheConfig] = None,
+        model_config: Optional[ModelConfig] = None,
     ) -> None:
         self.block_size = block_size
         self.num_gpu_blocks = num_gpu_blocks
@@ -43,7 +47,23 @@ class KVCacheManager:
         self.num_preallocate_tokens = num_preallocate_tokens
         self.num_preallocate_blocks = cdiv(num_preallocate_tokens, block_size)
 
-        self.kv_block_pool = KVCacheMemPool(num_gpu_blocks, enable_caching)
+        assert not self.enable_caching, "prefix caching is not supported yet"
+        assert (kv_hidden_size is not None and cache_config is not None
+                and model_config is not None)
+        # token_bytes: multiply by 2 for K and V
+        if cache_config.cache_dtype == "auto":
+            cache_dtype = model_config.dtype
+        else:
+            from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
+            cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+        token_bytes = cache_dtype.itemsize * kv_hidden_size * 2
+        if USE_ELASTIC_POOL:
+            self.kv_block_pool = KVCacheElasticMemPool(num_gpu_blocks,
+                                                    enable_caching, block_size,
+                                                    token_bytes, cache_config,
+                                                    model_config)
+        else:
+            self.kv_block_pool = KVCacheMemPool(num_gpu_blocks, enable_caching)
 
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request

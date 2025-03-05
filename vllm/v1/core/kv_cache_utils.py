@@ -381,7 +381,12 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     assert len(page_sizes) == 1
     page_size = page_sizes.pop()
 
-    num_blocks = int(available_memory // page_size // len(kv_cache_spec))
+    PAGE_SIZE = 2 << 20  # 2 MB
+    assert PAGE_SIZE % page_size == 0, (
+        "The page size of the KV cache must be a fraction of 2 MB.")
+
+    num_blocks = int(available_memory // len(kv_cache_spec) //
+                     PAGE_SIZE) * (PAGE_SIZE // page_size)
     num_blocks = max(num_blocks, 0)
 
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
