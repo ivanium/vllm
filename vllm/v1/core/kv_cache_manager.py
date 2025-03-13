@@ -1,4 +1,4 @@
-from collections import defaultdict
+import os
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from vllm.config import CacheConfig, ModelConfig
@@ -12,7 +12,7 @@ from vllm.v1.core.kv_cache_utils import (KVCacheBlock,
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
-USE_ELASTIC_POOL = True
+
 
 class KVCacheManager:
 
@@ -57,11 +57,15 @@ class KVCacheManager:
             from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
             cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
         token_bytes = cache_dtype.itemsize * kv_hidden_size * 2
-        if USE_ELASTIC_POOL:
+
+        use_elastic_pool = os.environ.get("USE_ELASTIC_POOL", "0") == "1"
+        if use_elastic_pool:
+            logger.info("Using elastic memory pool")
             self.kv_block_pool = KVCacheElasticMemPool(num_gpu_blocks,
-                                                    enable_caching, block_size,
-                                                    token_bytes, cache_config,
-                                                    model_config)
+                                                       enable_caching,
+                                                       block_size, token_bytes,
+                                                       cache_config,
+                                                       model_config)
         else:
             self.kv_block_pool = KVCacheMemPool(num_gpu_blocks, enable_caching)
 

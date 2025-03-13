@@ -1,4 +1,5 @@
 import gc
+import os
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, cast
 
@@ -1023,7 +1024,7 @@ class GPUModelRunner:
         """
         Initialize KV cache based on `kv_cache_config`.
         Args:
-            kv_cache_config: Configuration for the KV cache, including the KV 
+            kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
         if len(kv_cache_config.groups) > 1:
@@ -1032,21 +1033,49 @@ class GPUModelRunner:
                 "supported yet.")
 
         kv_caches: Dict[str, torch.Tensor] = {}
+        use_elastic_pool = os.environ.get("USE_ELASTIC_POOL", "0") == "1"
+        if use_elastic_pool:
+            # kvcached
+            from kvcached.ops import init_kvcached, vllm_alloc_kv_cache  # noqa: F401
 
-        for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items():
+            logger.info("Using kvcached for KV cache.")
+            init_kvcached()
+
+            layer_name, layer_spec = next(
+                iter(kv_cache_config.kv_cache_spec.items()))
             tensor_config = kv_cache_config.tensors[layer_name]
             assert tensor_config.size % layer_spec.page_size_bytes == 0
             num_blocks = tensor_config.size // layer_spec.page_size_bytes
-            if isinstance(layer_spec, FullAttentionSpec):
-                kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
-                    num_blocks, layer_spec.block_size, layer_spec.num_kv_heads,
-                    layer_spec.head_size)
-                dtype = layer_spec.dtype
-                kv_caches[layer_name] = torch.zeros(kv_cache_shape,
-                                                    dtype=dtype,
-                                                    device=self.device)
-            else:
-                raise NotImplementedError
+
+            kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
+                num_blocks, layer_spec.block_size, layer_spec.num_kv_heads,
+                layer_spec.head_size)
+            block_size = layer_spec.block_size
+            device = "cuda"
+            num_layers = len(kv_cache_config.kv_cache_spec)
+            kv_tensors = vllm_alloc_kv_cache(kv_cache_shape, block_size,
+                                             self.dtype, device, num_layers)
+        else:
+            kv_tensors = []
+            for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items(
+            ):
+                tensor_config = kv_cache_config.tensors[layer_name]
+                assert tensor_config.size % layer_spec.page_size_bytes == 0
+                num_blocks = tensor_config.size // layer_spec.page_size_bytes
+                if isinstance(layer_spec, FullAttentionSpec):
+                    kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
+                        num_blocks, layer_spec.block_size,
+                        layer_spec.num_kv_heads, layer_spec.head_size)
+                    dtype = layer_spec.dtype
+                    kv_tensors.append(
+                        torch.zeros(kv_cache_shape,
+                                    dtype=dtype,
+                                    device=self.device))
+                else:
+                    raise NotImplementedError
+
+        for idx, layer_name in enumerate(kv_cache_config.kv_cache_spec.keys()):
+            kv_caches[layer_name] = kv_tensors[idx]
 
         bind_kv_cache(
             kv_caches,
@@ -1055,10 +1084,10 @@ class GPUModelRunner:
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         """
-        Generates the KVCacheSpec by parsing the kv cache format from each 
+        Generates the KVCacheSpec by parsing the kv cache format from each
         Attention module in the static forward context.
         Returns:
-            KVCacheSpec: A dictionary mapping layer names to their KV cache 
+            KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
 

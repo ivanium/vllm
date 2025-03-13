@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
+import os
 
 from typing import Dict, List, Union, Optional
 
@@ -9,6 +10,8 @@ from vllm.v1.core.kv_cache_utils import (BlockHashType, FreeKVCacheBlockQueue,
                                          KVCacheBlock)
 
 logger = init_logger(__name__)
+
+MEM_PRESSURE_SIMU = True
 
 
 class KVCacheMemPoolBase(ABC):
@@ -259,6 +262,9 @@ class KVCacheElasticMemPool(KVCacheMemPoolBase):
         self.avail_pages: Dict[int, Page] = {}
         self.full_pages: Dict[int, Page] = {}
 
+        # Adapt to available GPU memory.
+        self.mem_file = "/tmp/kvcached_mem" if MEM_PRESSURE_SIMU else None
+
     def allocate(self, num_blocks: int) -> List[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
@@ -334,7 +340,9 @@ class KVCacheElasticMemPool(KVCacheMemPoolBase):
                               for p in self.avail_pages.values())
         num_free_blocks += self.page_allocator.get_num_free_blocks(
             self.block_bytes)
-        return num_free_blocks
+        num_avail_blocks = self._get_avail_gpu_mem()  # available GPU memory
+
+        return min(num_free_blocks, num_avail_blocks)
 
     def reset_prefix_cache(self):
         raise NotImplementedError
@@ -351,3 +359,38 @@ class KVCacheElasticMemPool(KVCacheMemPoolBase):
 
     def add_to_prefix_cache(self, block: KVCacheBlock) -> None:
         raise NotImplementedError
+
+    def _get_avail_gpu_mem(self):
+        PAGE_SIZE = 2 << 20  # 2MB
+        occupied_mem = self._read_mem_file()
+        num_layers = int(getattr(self.model_config.hf_text_config,
+                             "num_hidden_layers", 0))
+        num_occupied_pages = (occupied_mem // num_layers + PAGE_SIZE - 1) // PAGE_SIZE
+        num_occupied_blocks = num_occupied_pages * PAGE_SIZE // self.block_bytes
+        if num_occupied_blocks > self.num_gpu_blocks:
+            logger.warning(
+                f"Occupied blocks {num_occupied_blocks} exceeds total GPU blocks {self.num_gpu_blocks}"
+            )
+            num_occupied_blocks = self.num_gpu_blocks
+        num_avail_blocks = max(self.num_gpu_blocks - num_occupied_blocks, 0)
+        return num_avail_blocks
+
+    def _read_mem_file(self):
+        if self.mem_file is None or not os.path.exists(self.mem_file):
+            return 0
+
+        try:
+            with open(self.mem_file, 'r') as file:
+                content = file.read().strip()
+
+                try:
+                    return int(content)
+                except ValueError:
+                    logger.error("Error: File does not contain a valid number.")
+                    return 0
+        except FileNotFoundError:
+            logger.error(f"Error: File {self.mem_file} not found.")
+            return 0
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
+            return 0
