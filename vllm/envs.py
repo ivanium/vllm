@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     VLLM_USE_CUDNN_PREFILL: bool = False
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
+    VLLM_ENABLE_KVCACHED: bool = False
 
 
 def get_default_cache_root():
@@ -991,6 +992,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The default value is "VLLM".
     "VLLM_PROCESS_NAME_PREFIX":
     lambda: os.getenv("VLLM_PROCESS_NAME_PREFIX", "VLLM"),
+
+    # Whether to use elastic KV cache.
+    # This is useful for releasing unused KV cache space to the system so that
+    # other applications (perhaps another LLM serving engine) can use it.
+    "VLLM_ENABLE_KVCACHED":
+    lambda: os.getenv("VLLM_ENABLE_KVCACHED", "False").lower() in
+    ("true", "1"),
 }
 
 # --8<-- [end:env-vars-definition]
