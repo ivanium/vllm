@@ -29,8 +29,38 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
-                                    enable_kv_cache_events)
+        import os  # noqa: E501
+
+        self.enable_kvcached = os.getenv("ENABLE_KVCACHED",
+                                         "false").lower() == "true"
+
+        self.block_pool: BlockPool
+        if self.enable_kvcached:
+            if self.enable_caching:
+                raise ValueError("Caching is not supported for kvcached")
+
+            if len(self.kv_cache_config.kv_cache_groups) != 1:
+                raise ValueError(
+                    "Only one kv cache group is supported for kvcached")
+
+            kv_cache_group = self.kv_cache_config.kv_cache_groups[0]
+            block_size = kv_cache_group.kv_cache_spec.block_size
+            num_gpu_blocks = self.kv_cache_config.num_blocks
+
+            # cell_size is the size (in bytes) of the per-token K/V cache
+            cell_size = (kv_cache_group.kv_cache_spec.page_size_bytes //
+                         block_size // 2)
+
+            from vllm.v1.core.block_pool import ElasticBlockPool  # noqa: E501
+            self.block_pool = ElasticBlockPool(
+                num_gpu_blocks,
+                block_size,
+                cell_size=cell_size,
+                num_layers=len(self.kv_cache_config.kv_cache_tensors),
+                enable_caching=enable_caching)
+        else:
+            self.block_pool = BlockPool(kv_cache_config.num_blocks,
+                                        enable_caching, enable_kv_cache_events)
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle

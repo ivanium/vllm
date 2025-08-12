@@ -92,6 +92,16 @@ class EngineCore:
         self.collective_rpc("initialize_cache",
                             args=(num_gpu_blocks, num_cpu_blocks))
 
+        enable_kvcached = os.getenv("ENABLE_KVCACHED",
+                                    "false").lower() == "true"
+        if enable_kvcached:
+            from kvcached.integration.vllm.interfaces import init_kvcached
+            init_kvcached(
+                tp_rank=0,
+                tp_size=vllm_config.parallel_config.tensor_parallel_size,
+                is_worker=False,
+            )
+
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
