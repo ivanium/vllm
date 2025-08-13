@@ -24,6 +24,13 @@ To add signal handler support, please refer to `csrc/inc/ftensor.hpp:25-29`:
   bool swapout(void *addr, size_t size);
 ```
 
+Install vLLM (if not installed):
+
+```shell
+# Clone this repo and check out this branch
+VLLM_USE_PRECOMPILED=1 pip install --editable .
+```
+
 To run vLLM with kvcached:
 
 ```shell
