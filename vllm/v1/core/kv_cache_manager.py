@@ -340,6 +340,7 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
+        # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
             self.block_pool.touch(new_computed_block_list)
         else:
