@@ -13,7 +13,7 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -254,6 +254,46 @@ class KVCacheManager:
         if num_new_tokens == 0:
             raise ValueError("num_new_tokens must be greater than 0")
 
+        # Fast path for the Scheduler RUNNING loop (hot path): RUNNING requests
+        # are allocated incrementally and never have prefix-cache hits or delayed
+        # caching. Keep this dispatch extremely strict to avoid behavior changes.
+        if (
+            request.status == RequestStatus.RUNNING
+            and num_new_computed_tokens == 0
+            and new_computed_blocks is None
+            and not delay_cache_blocks
+            and num_encoder_tokens == 0
+        ):
+            return self._allocate_slots_running_fast(
+                request=request,
+                num_new_tokens=num_new_tokens,
+                num_lookahead_tokens=num_lookahead_tokens,
+            )
+
+        return self._allocate_slots_general(
+            request=request,
+            num_new_tokens=num_new_tokens,
+            num_new_computed_tokens=num_new_computed_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_lookahead_tokens=num_lookahead_tokens,
+            delay_cache_blocks=delay_cache_blocks,
+            num_encoder_tokens=num_encoder_tokens,
+        )
+
+    def _allocate_slots_general(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_computed_tokens: int,
+        new_computed_blocks: KVCacheBlocks | None,
+        num_lookahead_tokens: int,
+        delay_cache_blocks: bool,
+        num_encoder_tokens: int,
+    ) -> KVCacheBlocks | None:
+        """General allocation path covering WAITING/prefix-cache/async transfer.
+
+        This method preserves the pre-refactor behavior of allocate_slots().
+        """
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
         else:
@@ -321,6 +361,56 @@ class KVCacheManager:
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
+        return self.create_kv_cache_blocks(new_blocks)
+
+    def _allocate_slots_running_fast(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_lookahead_tokens: int,
+    ) -> KVCacheBlocks | None:
+        """Fast path for RUNNING requests.
+
+        Assumptions (enforced by caller):
+        - No new computed blocks from prefix caching
+        - No delayed caching
+        - No cross-attention static allocation (num_encoder_tokens == 0)
+        """
+        # Equivalent to the general path's "skipped blocks" cleanup, but
+        # avoid per-manager calls for the common case (full attention).
+        self.coordinator.remove_skipped_blocks_if_needed(
+            request.request_id, request.num_computed_tokens
+        )
+
+        num_computed_tokens = request.num_computed_tokens
+        num_tokens_need_slot = min(
+            num_computed_tokens + num_new_tokens + num_lookahead_tokens,
+            self.max_model_len,
+        )
+
+        num_blocks_to_allocate = (
+            self.coordinator.get_num_blocks_to_allocate_running_fast(
+                request_id=request.request_id,
+                num_tokens=num_tokens_need_slot,
+                num_encoder_tokens=0,
+            )
+        )
+        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            return None
+
+        new_blocks = self.coordinator.allocate_new_blocks_running_fast(
+            request_id=request.request_id,
+            num_tokens=num_tokens_need_slot,
+            num_encoder_tokens=0,
+        )
+
+        if not self.enable_caching:
+            return self.create_kv_cache_blocks(new_blocks)
+
+        num_tokens_to_cache = min(
+            num_computed_tokens + num_new_tokens, request.num_tokens
+        )
+        self.coordinator.cache_blocks(request, num_tokens_to_cache)
         return self.create_kv_cache_blocks(new_blocks)
 
     def free(self, request: Request) -> None:

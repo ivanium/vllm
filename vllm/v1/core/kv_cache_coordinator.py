@@ -15,12 +15,14 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     FullAttentionManager,
+    SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
 )
 from vllm.v1.request import Request
 
@@ -66,6 +68,108 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+
+        # Precompute small bits of metadata for the RUNNING fast path to avoid
+        # repeated isinstance()/attribute lookups in the hot loop.
+        self._manager_block_sizes: list[int] = [
+            m.block_size for m in self.single_type_managers
+        ]
+        self._manager_is_cross_attention: list[bool] = [
+            isinstance(m, CrossAttentionManager) for m in self.single_type_managers
+        ]
+        self._has_cross_attention = any(self._manager_is_cross_attention)
+        self._manager_mamba_extra_tokens: list[int] = []
+        for m in self.single_type_managers:
+            spec = m.kv_cache_spec
+            if isinstance(spec, MambaSpec) and spec.num_speculative_blocks > 0:
+                # IMPORTANT: Match MambaManager.get_num_blocks_to_allocate() which
+                # adds extra tokens using kv_cache_spec.block_size (not the
+                # cp-scaled manager.block_size).
+                self._manager_mamba_extra_tokens.append(
+                    spec.block_size * spec.num_speculative_blocks
+                )
+            else:
+                self._manager_mamba_extra_tokens.append(0)
+
+        default_get_num_skipped_tokens = SingleTypeKVCacheManager.get_num_skipped_tokens
+        self._remove_skipped_manager_indices: list[int] = [
+            i
+            for i, m in enumerate(self.single_type_managers)
+            if type(m).get_num_skipped_tokens is not default_get_num_skipped_tokens
+        ]
+
+    @property
+    def has_cross_attention(self) -> bool:
+        return self._has_cross_attention
+
+    def remove_skipped_blocks_if_needed(
+        self, request_id: str, num_computed_tokens: int
+    ) -> None:
+        """RUNNING fast path helper: skip remove_skipped_blocks for common cases."""
+        for i in self._remove_skipped_manager_indices:
+            self.single_type_managers[i].remove_skipped_blocks(
+                request_id, num_computed_tokens
+            )
+
+    def get_num_blocks_to_allocate_running_fast(
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_encoder_tokens: int = 0,
+    ) -> int:
+        """RUNNING fast path helper.
+
+        Computes the total number of *new* blocks that would be allocated across
+        all KV cache groups to ensure capacity for `num_tokens` decoder tokens
+        (and `num_encoder_tokens` cross-attention tokens when applicable).
+        """
+        total = 0
+        managers = self.single_type_managers
+        block_sizes = self._manager_block_sizes
+        is_cross = self._manager_is_cross_attention
+        mamba_extra = self._manager_mamba_extra_tokens
+
+        for i, manager in enumerate(managers):
+            tokens_i = num_encoder_tokens if is_cross[i] else num_tokens
+            tokens_i += mamba_extra[i]
+            block_size_i = block_sizes[i]
+            # ceil_div(tokens_i, block_size_i)
+            required_blocks = (tokens_i + block_size_i - 1) // block_size_i
+            total += required_blocks - len(manager.req_to_blocks[request_id])
+
+        return total
+
+    def allocate_new_blocks_running_fast(
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_encoder_tokens: int = 0,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        """RUNNING fast path helper.
+
+        Allocates and appends new blocks (if needed) for each KV cache group.
+        """
+        managers = self.single_type_managers
+        block_sizes = self._manager_block_sizes
+        is_cross = self._manager_is_cross_attention
+        mamba_extra = self._manager_mamba_extra_tokens
+
+        new_blocks_per_group: list[list[KVCacheBlock]] = []
+        for i, manager in enumerate(managers):
+            tokens_i = num_encoder_tokens if is_cross[i] else num_tokens
+            tokens_i += mamba_extra[i]
+            block_size_i = block_sizes[i]
+            required_blocks = (tokens_i + block_size_i - 1) // block_size_i
+            req_blocks = manager.req_to_blocks[request_id]
+            num_new_blocks = required_blocks - len(req_blocks)
+            if num_new_blocks <= 0:
+                new_blocks: list[KVCacheBlock] = []
+            else:
+                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                req_blocks.extend(new_blocks)
+            new_blocks_per_group.append(new_blocks)
+
+        return tuple(new_blocks_per_group)
 
     def get_num_blocks_to_allocate(
         self,
