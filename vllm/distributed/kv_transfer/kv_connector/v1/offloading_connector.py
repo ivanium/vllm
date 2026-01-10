@@ -94,7 +94,7 @@ class OffloadingConnector(KVConnectorBase_V1):
                 spec, self.num_kv_cache_groups
             )
         elif role == KVConnectorRole.WORKER:
-            self.connector_worker = OffloadingConnectorWorker(spec)
+            self.connector_worker = OffloadingConnectorWorker(spec, kv_cache_config)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
@@ -219,7 +219,10 @@ class OffloadingConnectorScheduler:
         self.gpu_block_size = spec.gpu_block_size
         self.offloaded_block_size = spec.offloaded_block_size
         self.block_size_factor = self.offloaded_block_size // self.gpu_block_size
-        self.manager: OffloadingManager = spec.get_manager()
+        # Use HybridOffloadingManager for multiple groups (HMA support)
+        self.manager: OffloadingManager = spec.get_manager(
+            num_groups=num_kv_cache_groups
+        )
         self.num_kv_cache_groups = num_kv_cache_groups
 
         self._requests: dict[ReqId, Request] = {}
@@ -371,8 +374,10 @@ class OffloadingConnectorScheduler:
                 request, start_idx=start_block_idx, end_idx=num_blocks
             )
 
-            src_spec = self.manager.prepare_load(block_hashes)
-            dst_spec = GPULoadStoreSpec(block_ids[num_computed_gpu_blocks:])
+            src_spec = self.manager.prepare_load(block_hashes, group_id=group_id)
+            dst_spec = GPULoadStoreSpec(
+                block_ids[num_computed_gpu_blocks:], group_id=group_id
+            )
 
             block_hashes = self._get_block_hashes(
                 request, start_idx=start_block_idx, end_idx=num_blocks
@@ -439,7 +444,9 @@ class OffloadingConnectorScheduler:
                 new_block_hashes = self._get_block_hashes(
                     req, start_idx=start_block_idx, end_idx=num_blocks
                 )
-                store_output = self.manager.prepare_store(new_block_hashes)
+                store_output = self.manager.prepare_store(
+                    new_block_hashes, group_id=group_id
+                )
                 if store_output is None:
                     logger.warning(
                         "Request %s group %d: cannot store %s blocks",
@@ -458,7 +465,7 @@ class OffloadingConnectorScheduler:
                 block_hashes_to_store = set(store_output.block_hashes_to_store)
 
                 block_hashes = self._get_block_hashes(req, end_idx=num_blocks)
-                self.manager.touch(block_hashes)
+                self.manager.touch(block_hashes, group_id=group_id)
 
                 new_block_hashes = self._get_block_hashes(
                     req, start_idx=start_block_idx, end_idx=num_blocks
@@ -473,7 +480,7 @@ class OffloadingConnectorScheduler:
                     for i in range(self.block_size_factor):
                         if gpu_block_idx + i < len(block_ids):
                             src_block_ids.append(block_ids[gpu_block_idx + i])
-                src_spec = GPULoadStoreSpec(src_block_ids)
+                src_spec = GPULoadStoreSpec(src_block_ids, group_id=group_id)
 
                 if req_id not in reqs_to_store:
                     reqs_to_store[req_id] = {}
@@ -523,7 +530,7 @@ class OffloadingConnectorScheduler:
                 # Complete store for all groups
                 for group_id, block_hashes in req_groups.items():
                     if block_hashes:
-                        self.manager.complete_store(block_hashes)
+                        self.manager.complete_store(block_hashes, group_id=group_id)
 
         for req_id in connector_output.finished_recving or []:
             req_groups = self._reqs_being_loaded.pop(req_id, None)
@@ -531,7 +538,7 @@ class OffloadingConnectorScheduler:
                 # Complete load for all groups
                 for group_id, block_hashes in req_groups.items():
                     if block_hashes:
-                        self.manager.complete_load(block_hashes)
+                        self.manager.complete_load(block_hashes, group_id=group_id)
 
     def request_finished(
         self,
@@ -593,8 +600,11 @@ class OffloadingConnectorWorker:
     across groups before marking a request as finished.
     """
 
-    def __init__(self, spec: OffloadingSpec):
+    def __init__(
+        self, spec: OffloadingSpec, kv_cache_config: KVCacheConfig | None = None
+    ):
         self.spec = spec
+        self.kv_cache_config = kv_cache_config
         self.worker = OffloadingWorker()
 
         self._job_counter = 0
@@ -620,10 +630,17 @@ class OffloadingConnectorWorker:
         kv_caches: dict[str, torch.Tensor],
         attn_backends: dict[str, type[AttentionBackend]],
     ):
-        for src_cls, dst_cls, handler in self.spec.get_handlers(
-            kv_caches, attn_backends
+        for result in self.spec.get_handlers(
+            kv_caches, attn_backends, self.kv_cache_config
         ):
-            self.worker.register_handler(src_cls, dst_cls, handler)
+            if len(result) == 4:
+                # HMA mode: 4-tuple (src_cls, dst_cls, handler, group_id)
+                src_cls, dst_cls, handler, group_id = result
+                self.worker.register_group_handler(src_cls, dst_cls, group_id, handler)
+            else:
+                # Non-HMA mode: 3-tuple (src_cls, dst_cls, handler)
+                src_cls, dst_cls, handler = result
+                self.worker.register_handler(src_cls, dst_cls, handler)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         layer_names = list(kv_caches.keys())
