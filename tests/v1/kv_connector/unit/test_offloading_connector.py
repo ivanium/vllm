@@ -98,16 +98,16 @@ class MockOffloadingSpec(OffloadingSpec):
 
         self.manager = MagicMock(spec=OffloadingManager)
         self.manager.lookup.return_value = 0
-        self.manager.prepare_load = lambda block_hashes: (
+        self.manager.prepare_load = lambda block_hashes, group_id=0: (
             MockLoadStoreSpec(block_hashes)
         )
         self.handler = MockOffloadingHandler()
 
-    def get_manager(self) -> OffloadingManager:
+    def get_manager(self, num_groups: int = 1) -> OffloadingManager:
         return self.manager
 
     def get_handlers(
-        self, _, __
+        self, _, __, kv_cache_config=None
     ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]:
         yield GPULoadStoreSpec, MockLoadStoreSpec, self.handler
         yield MockLoadStoreSpec, GPULoadStoreSpec, self.handler
@@ -460,7 +460,7 @@ def test_offloading_connector(request_runner):
     # blocks = [0, 1, 2], [3, 4, 5], [6, 7, 8]
     runner.new_request(token_ids=[0] * offloaded_block_size * 3)
     runner.manager.prepare_store.side_effect = (
-        lambda block_hashes: generate_store_output(list(block_hashes)[1:2])
+        lambda block_hashes, group_id=0: generate_store_output(list(block_hashes)[1:2])
     )
     runner.run(decoded_tokens=[0])
 
@@ -472,19 +472,19 @@ def test_offloading_connector(request_runner):
     runner.manager.prepare_store.assert_not_called()
 
     # +1 token -> single block, fail prepare_store
-    runner.manager.prepare_store.side_effect = lambda block_hashes: None
+    runner.manager.prepare_store.side_effect = lambda block_hashes, group_id=0: None
     runner.run(decoded_tokens=[0])
     runner.manager.prepare_store.assert_called()
 
     # 1 more block, now set block_hashes_to_store = []
     runner.manager.prepare_store.side_effect = (
-        lambda block_hashes: generate_store_output([])
+        lambda block_hashes, group_id=0: generate_store_output([])
     )
     runner.run(decoded_tokens=[0] * offloaded_block_size)
 
     # 1 more block, now check touch was called with all 6 blocks
     runner.manager.prepare_store.side_effect = (
-        lambda block_hashes: generate_store_output(block_hashes)
+        lambda block_hashes, group_id=0: generate_store_output(block_hashes)
     )
     runner.run(decoded_tokens=[0] * offloaded_block_size)
     runner.manager.touch.assert_called()
@@ -519,7 +519,7 @@ def test_offloading_connector(request_runner):
         token_ids=[0] * gpu_block_size + [1] * (offloaded_block_size - gpu_block_size)
     )
     runner.manager.prepare_store.side_effect = (
-        lambda block_hashes: generate_store_output([])
+        lambda block_hashes, group_id=0: generate_store_output([])
     )
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
     runner.manager.lookup.assert_not_called()
@@ -527,7 +527,7 @@ def test_offloading_connector(request_runner):
     # single block lookup with no hits
     runner.new_request(token_ids=[1] * offloaded_block_size)
     runner.manager.prepare_store.side_effect = (
-        lambda block_hashes: generate_store_output([])
+        lambda block_hashes, group_id=0: generate_store_output([])
     )
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
     runner.manager.lookup.assert_called()
@@ -537,7 +537,7 @@ def test_offloading_connector(request_runner):
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * offloaded_block_size)
     runner.manager.prepare_store.side_effect = (
-        lambda block_hashes: generate_store_output([])
+        lambda block_hashes, group_id=0: generate_store_output([])
     )
     runner.manager.lookup.return_value = 1
     runner.run(
@@ -549,7 +549,7 @@ def test_offloading_connector(request_runner):
         token_ids=[0] * offloaded_block_size * 2 + [1] * offloaded_block_size
     )
     runner.manager.prepare_store.side_effect = (
-        lambda block_hashes: generate_store_output([])
+        lambda block_hashes, group_id=0: generate_store_output([])
     )
     runner.manager.lookup.return_value = 1
     runner.run(
