@@ -72,9 +72,14 @@ class OffloadingWorker:
     It kicks off async KV data transfer requests, by delegating
     to one of its registered OffloadingHandlers, based on the transfer type.
 
+    Supports HMA (Hybrid Memory Allocator) with per-group handlers:
+    - Use register_group_handler() to register handlers for specific KV cache groups
+    - transfer_async() routes to group-specific handlers when available
+    - Falls back to non-group handlers for backward compatibility
+
     The class provides the following primitives:
-        register_handler() - registers a new handler to handle
-            a specific transfer type
+        register_handler() - registers a handler for a transfer type
+        register_group_handler() - registers a handler for a transfer type + group
         transfer_async() - kicks off a new transfer job
             using one of the registered handlers.
         get_finished() - returns a list of newly finished job IDs
@@ -83,7 +88,12 @@ class OffloadingWorker:
 
     def __init__(self):
         self.handlers: set[OffloadingHandler] = set()
+        # Original: (src_medium, dst_medium) -> handler
         self.transfer_type_to_handler: dict[TransferType, OffloadingHandler] = {}
+        # HMA: ((src_medium, dst_medium), group_id) -> handler
+        self.group_transfer_handlers: dict[
+            tuple[TransferType, int], OffloadingHandler
+        ] = {}
 
     def register_handler(
         self,
@@ -92,7 +102,10 @@ class OffloadingWorker:
         handler: OffloadingHandler,
     ) -> None:
         """
-        Registers a new handler.
+        Registers a new handler for a transfer type.
+
+        This is the original non-group-aware method, kept for backward
+        compatibility with single-group models.
 
         Args:
             src_cls: the source type of transfers handled by this handler.
@@ -104,9 +117,41 @@ class OffloadingWorker:
         self.handlers.add(handler)
         self.transfer_type_to_handler[transfer_type] = handler
 
+    def register_group_handler(
+        self,
+        src_cls: type[LoadStoreSpec],
+        dst_cls: type[LoadStoreSpec],
+        group_id: int,
+        handler: OffloadingHandler,
+    ) -> None:
+        """
+        Registers a handler for a specific KV cache group (HMA support).
+
+        Each group can have its own handler that only knows about
+        that group's layer tensors. This enables per-group CPU offloading
+        for hybrid models with multiple KV cache types.
+
+        Args:
+            src_cls: the source type of transfers handled by this handler.
+            dst_cls: the destination type of transfers handled by this handler.
+            group_id: the KV cache group ID this handler is for.
+            handler: the handler that will handle transfers for this group.
+        """
+        transfer_type = (src_cls.medium(), dst_cls.medium())
+        key = (transfer_type, group_id)
+        assert key not in self.group_transfer_handlers, (
+            f"Handler already registered for {transfer_type}, group {group_id}"
+        )
+        self.handlers.add(handler)
+        self.group_transfer_handlers[key] = handler
+
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
         """
         Initiates an asynchronous transfer of KV data.
+
+        Routes transfers to the appropriate handler:
+        1. First tries group-specific handler based on spec's group_id (HMA)
+        2. Falls back to non-group handler for backward compatibility
 
         Args:
             job_id: a unique ID that will be used when notifying back on
@@ -118,25 +163,52 @@ class OffloadingWorker:
         """
         src, dst = spec
         transfer_type = (src.medium(), dst.medium())
-        handler = self.transfer_type_to_handler.get(transfer_type)
-        assert handler is not None
+
+        # Try group-specific handler first (HMA support)
+        group_id = getattr(src, "group_id", 0)
+        key = (transfer_type, group_id)
+        handler = self.group_transfer_handlers.get(key)
+
+        if handler is None:
+            # Fall back to non-group handler (backward compatibility)
+            handler = self.transfer_type_to_handler.get(transfer_type)
+
+        if handler is None:
+            logger.error(
+                "No handler registered for %r transfer (group %d)",
+                transfer_type,
+                group_id,
+            )
+            return False
 
         try:
             success = handler.transfer_async(job_id, spec)
         except Exception as e:
             logger.warning(
-                "Exception in %r transfer %d: %r",
+                "Exception in %r transfer %d (group %d): %r",
                 transfer_type,
                 job_id,
+                group_id,
                 e,
                 exc_info=True,
             )
             return False
 
         if not success:
-            logger.warning("Failed to submit %r transfer %d", transfer_type, job_id)
+            logger.warning(
+                "Failed to submit %r transfer %d (group %d)",
+                transfer_type,
+                job_id,
+                group_id,
+            )
         else:
-            logger.debug("Submitted %r transfer %d: %r", transfer_type, job_id, spec)
+            logger.debug(
+                "Submitted %r transfer %d (group %d): %r",
+                transfer_type,
+                job_id,
+                group_id,
+                spec,
+            )
 
         return success
 
