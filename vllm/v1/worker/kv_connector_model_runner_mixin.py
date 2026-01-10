@@ -187,6 +187,7 @@ class KVConnectorModelRunnerMixin:
         if not isinstance(kv_cache_spec, AttentionSpec):
             return False
 
+        ## YIFAN: code here is really hacky, we should fix it.
         attn_backend = attn_group.backend
         kv_cache_shape = attn_backend.get_kv_cache_shape(
             1234,
