@@ -1717,7 +1717,11 @@ class Scheduler(SchedulerInterface):
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
             # Now that the blocks are ready, actually cache them.
-            (block_ids,) = self.kv_cache_manager.get_block_ids(request.request_id)
+            # For HMA models, get_block_ids returns multiple lists (one per group).
+            # Use first group's block_ids for token counting (all groups have same
+            # number of blocks representing the same token ranges).
+            block_ids_tuple = self.kv_cache_manager.get_block_ids(request.request_id)
+            block_ids = block_ids_tuple[0]
             num_computed_tokens = len(block_ids) * self.block_size
             # Handle the case where num request tokens less than one block.
             num_computed_tokens = min(num_computed_tokens, request.num_tokens)
