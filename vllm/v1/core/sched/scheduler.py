@@ -1777,8 +1777,8 @@ class Scheduler(SchedulerInterface):
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
             ) // self.block_size
-            # For the purpose of marking blocks as invalid, only report FA ones to 
-            # handle blocks<>tokens mapping consistently. 
+            # For the purpose of marking blocks as invalid, only report FA ones to
+            # handle blocks<>tokens mapping consistently.
             # for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
             for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids[fa_blocks_idx]):
                 if block_id not in invalid_block_ids:
@@ -1810,12 +1810,12 @@ class Scheduler(SchedulerInterface):
                 )
                 total_affected_tokens += num_affected_tokens
                 request.num_external_computed_tokens -= num_affected_tokens
-                # Collect invalid block and all downstream dependent blocks, across 
+                # Collect invalid block and all downstream dependent blocks, across
                 # all groups.
                 if evict_blocks:
                     # Assuming groups are not padded, do SW-aware eviction, example:
                     # FA: [A B C D C]
-                    # SW: [      E F] 
+                    # SW: [      E F]
                     # =>Evict E only when failure index <= E.
                     for group in req_block_ids:
                         offset = max_num_blocks - len(group)
