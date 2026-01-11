@@ -203,11 +203,10 @@ class OffloadingWorker:
             )
         else:
             logger.debug(
-                "Submitted %r transfer %d (group %d): %r",
+                "Submitted %r transfer %d (group %d)",
                 transfer_type,
                 job_id,
                 group_id,
-                spec,
             )
 
         return success

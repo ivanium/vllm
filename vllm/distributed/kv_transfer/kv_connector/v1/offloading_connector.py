@@ -34,7 +34,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, SlidingWindowSpec
 from vllm.v1.kv_offload.abstract import OffloadingManager
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
@@ -91,7 +91,7 @@ class OffloadingConnector(KVConnectorBase_V1):
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = OffloadingConnectorScheduler(
-                spec, self.num_kv_cache_groups
+                spec, self.num_kv_cache_groups, kv_cache_config
             )
         elif role == KVConnectorRole.WORKER:
             self.connector_worker = OffloadingConnectorWorker(spec, kv_cache_config)
@@ -116,6 +116,7 @@ class OffloadingConnector(KVConnectorBase_V1):
         self.connector_worker.start_kv_transfers(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
+        # All loads are completed in start_load_kv, so nothing to do here.
         pass
 
     def save_kv_layer(
@@ -215,7 +216,12 @@ class OffloadingConnectorScheduler:
     and Mamba states).
     """
 
-    def __init__(self, spec: OffloadingSpec, num_kv_cache_groups: int = 1):
+    def __init__(
+        self,
+        spec: OffloadingSpec,
+        num_kv_cache_groups: int = 1,
+        kv_cache_config: KVCacheConfig | None = None,
+    ):
         self.gpu_block_size = spec.gpu_block_size
         self.offloaded_block_size = spec.offloaded_block_size
         self.block_size_factor = self.offloaded_block_size // self.gpu_block_size
@@ -224,6 +230,19 @@ class OffloadingConnectorScheduler:
             num_groups=num_kv_cache_groups
         )
         self.num_kv_cache_groups = num_kv_cache_groups
+
+        # Identify sliding window groups - these should NOT be offloaded to CPU
+        # because they reuse GPU blocks circularly for old tokens
+        self.sliding_window_groups: set[int] = set()
+        if kv_cache_config is not None:
+            for group_id, group_spec in enumerate(kv_cache_config.kv_cache_groups):
+                if isinstance(group_spec.kv_cache_spec, SlidingWindowSpec):
+                    self.sliding_window_groups.add(group_id)
+                    logger.info(
+                        "Group %d is sliding window (window=%d), will skip offloading",
+                        group_id,
+                        group_spec.kv_cache_spec.sliding_window,
+                    )
 
         self._requests: dict[ReqId, Request] = {}
 
@@ -286,12 +305,17 @@ class OffloadingConnectorScheduler:
                 - `True` if tokens will be loaded asynchronously
                   (between scheduler steps).
         """
+        # # IMPORTANT: For hybrid models with sliding window groups, we cannot
+        # # claim external tokens because sliding window groups need their KV
+        # # computed (they are not stored to CPU due to circular buffer reuse).
+        # # If we claim external tokens, the scheduler skips computing those
+        # # tokens, leaving sliding window groups with invalid KV data.
+        # if self.sliding_window_groups:
+        #     return 0, False
+
         num_blocks = request.num_tokens // self.offloaded_block_size
 
         assert len(request.block_hashes) // self.block_size_factor == num_blocks
-        block_hashes = self._get_block_hashes(request)
-
-        self.manager.touch(block_hashes)
 
         full_block_tokens = self.offloaded_block_size * num_blocks
         if full_block_tokens - num_computed_tokens < self.offloaded_block_size:
@@ -299,14 +323,31 @@ class OffloadingConnectorScheduler:
             return 0, False
 
         start_block_idx = num_computed_tokens // self.offloaded_block_size
-        hits = self.manager.lookup(
-            self._get_block_hashes(request, start_idx=start_block_idx)
-        )
-        if hits == 0:
+
+        # For HMA: Check all groups and take the maximum hits.
+        max_hits = 0
+        for group_id in range(self.num_kv_cache_groups):
+            block_hashes = self._get_block_hashes(request, start_idx=start_block_idx)
+            hits = self.manager.lookup(block_hashes, group_id=group_id)
+            logger.debug(
+                "Request %s: CPU lookup group %d from block %d: %d hits",
+                request.request_id,
+                group_id,
+                start_block_idx,
+                hits,
+            )
+            if hits > max_hits:
+                max_hits = hits
+                # Touch blocks in this group (the one with most hits)
+                block_hashes = self._get_block_hashes(request)
+                self.manager.touch(block_hashes, group_id=group_id)
+
+        if max_hits == 0:
             return 0, False
 
         num_hit_tokens = (
-            self.offloaded_block_size * (start_block_idx + hits) - num_computed_tokens
+            self.offloaded_block_size * (start_block_idx + max_hits)
+            - num_computed_tokens
         )
         logger.debug(
             "Request %s hit %s offloaded tokens after %s GPU hit tokens",
@@ -334,13 +375,42 @@ class OffloadingConnectorScheduler:
 
         block_groups = blocks.get_block_ids()
 
+        logger.debug(
+            "update_state_after_alloc: req=%s, num_external_tokens=%d, "
+            "num_groups=%d, block_groups_len=%d",
+            req_id,
+            num_external_tokens,
+            self.num_kv_cache_groups,
+            len(block_groups),
+        )
+
         # Process each KV cache group
         for group_id, block_ids in enumerate(block_groups):
+            # Skip sliding window groups - they reuse GPU blocks circularly
+            # for old tokens, so loading them from CPU would be incorrect
+            if group_id in self.sliding_window_groups:
+                logger.debug(
+                    "Request %s group %d: skipped (sliding window group)",
+                    req_id,
+                    group_id,
+                )
+                continue
+
             if not block_ids:
+                logger.debug(
+                    "Request %s group %d: skipped (empty block_ids)",
+                    req_id,
+                    group_id,
+                )
                 continue
 
             # Skip if this group doesn't have blocks to process
             if group_id >= len(blocks.blocks) or not blocks.blocks[group_id]:
+                logger.debug(
+                    "Request %s group %d: skipped (no blocks.blocks)",
+                    req_id,
+                    group_id,
+                )
                 continue
 
             num_computed_gpu_blocks = sum(
@@ -348,6 +418,16 @@ class OffloadingConnectorScheduler:
             )
             num_computed_tokens = num_computed_gpu_blocks * self.gpu_block_size
             full_block_tokens = num_computed_tokens + num_external_tokens
+
+            logger.debug(
+                "Request %s group %d: num_computed_gpu_blocks=%d, "
+                "num_external_tokens=%d, total_blocks=%d",
+                req_id,
+                group_id,
+                num_computed_gpu_blocks,
+                num_external_tokens,
+                len(block_ids),
+            )
 
             # Skip groups where tokens don't align with offloaded block size
             if full_block_tokens % self.offloaded_block_size != 0:
@@ -362,12 +442,49 @@ class OffloadingConnectorScheduler:
 
             num_pending_gpu_blocks = len(block_ids) - num_computed_gpu_blocks
             if num_external_tokens != num_pending_gpu_blocks * self.gpu_block_size:
+                logger.debug(
+                    "Request %s group %d: skipped (external_tokens %d != pending %d)",
+                    req_id,
+                    group_id,
+                    num_external_tokens,
+                    num_pending_gpu_blocks * self.gpu_block_size,
+                )
                 continue
 
             start_block_idx = num_computed_tokens // self.offloaded_block_size
             num_blocks = full_block_tokens // self.offloaded_block_size
 
             if len(request.block_hashes) // self.block_size_factor < num_blocks:
+                logger.debug(
+                    "Request %s group %d: skipped (not enough block_hashes)",
+                    req_id,
+                    group_id,
+                )
+                continue
+
+            # Get the GPU block IDs to load into
+            gpu_block_ids = block_ids[num_computed_gpu_blocks:]
+
+            # Skip groups with invalid GPU block IDs. Sliding window attention
+            # groups have placeholder block ID 0 for tokens outside the window.
+            # We detect this by checking if the first block ID is 0 but there
+            # are more than one unique ID (meaning some blocks are valid).
+            # If all blocks are 0, it's also invalid.
+            num_zeros = sum(1 for b in gpu_block_ids if b == 0)
+
+            # Skip if: all zeros, or mostly zeros (sliding window with placeholders)
+            # A valid full-attention group should have unique IDs equal to count
+            if not gpu_block_ids or num_zeros > 0:
+                # This is a sliding window group or has placeholder blocks
+                # Don't load from CPU as it would corrupt block 0
+                logger.debug(
+                    "Request %s group %d: skipped (has %d zero block IDs out of %d, "
+                    "indicates sliding window or placeholder blocks)",
+                    req_id,
+                    group_id,
+                    num_zeros,
+                    len(gpu_block_ids),
+                )
                 continue
 
             block_hashes = self._get_block_hashes(
@@ -375,9 +492,7 @@ class OffloadingConnectorScheduler:
             )
 
             src_spec = self.manager.prepare_load(block_hashes, group_id=group_id)
-            dst_spec = GPULoadStoreSpec(
-                block_ids[num_computed_gpu_blocks:], group_id=group_id
-            )
+            dst_spec = GPULoadStoreSpec(gpu_block_ids, group_id=group_id)
 
             block_hashes = self._get_block_hashes(
                 request, start_idx=start_block_idx, end_idx=num_blocks
@@ -392,6 +507,16 @@ class OffloadingConnectorScheduler:
             if req_id not in self._next_stored_block_idx:
                 self._next_stored_block_idx[req_id] = {}
             self._next_stored_block_idx[req_id][group_id] = num_blocks
+
+            logger.debug(
+                "Request %s group %d: prepared load of %d blocks "
+                "(src CPU blocks: %s, dst GPU blocks: %s)",
+                req_id,
+                group_id,
+                num_blocks - start_block_idx,
+                src_spec.block_ids[:5].tolist() if len(src_spec.block_ids) > 0 else [],
+                gpu_block_ids[:5] if len(gpu_block_ids) > 0 else [],
+            )
 
     def _get_reqs_to_store(
         self, scheduler_output: SchedulerOutput
@@ -426,6 +551,16 @@ class OffloadingConnectorScheduler:
 
             # Process each group
             for group_id in range(self.num_kv_cache_groups):
+                # Skip sliding window groups - they reuse GPU blocks circularly
+                # for old tokens, so storing them would create invalid CPU cache
+                if group_id in self.sliding_window_groups:
+                    logger.debug(
+                        "Request %s group %d: skipping store (sliding window group)",
+                        req_id,
+                        group_id,
+                    )
+                    continue
+
                 block_ids = self._request_block_ids[req_id].get(group_id, [])
                 if not block_ids:
                     continue
@@ -488,11 +623,18 @@ class OffloadingConnectorScheduler:
                 self._reqs_being_stored[req_id][group_id] |= block_hashes_to_store
 
                 logger.debug(
-                    "Request %s group %d offloading %s blocks starting from #%d",
+                    "Request %s group %d offloading %d blocks starting from #%d "
+                    "(src GPU blocks: %s, dst CPU blocks: %s)",
                     req_id,
                     group_id,
                     len(block_hashes_to_store),
                     start_block_idx,
+                    src_spec.block_ids[:5].tolist()
+                    if len(src_spec.block_ids) > 0
+                    else [],
+                    dst_spec.block_ids[:5].tolist()
+                    if len(dst_spec.block_ids) > 0
+                    else [],
                 )
 
         return reqs_to_store

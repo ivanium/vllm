@@ -9,10 +9,13 @@ This test verifies:
 3. Prefix cache hits from CPU are faster than cold computation
 
 The test uses the OffloadingConnector with HybridOffloadingManager and
-HybridCpuGpuOffloadingHandlers internally, even for single-group models.
+HybridCpuGpuOffloadingHandlers internally. Gemma-3 is used as it's a hybrid
+model with both full attention and sliding window attention layers.
+
+Note: Prompts must be long enough to fill at least one CPU block
+(cpu_block_size tokens) to trigger actual CPU offloading.
 """
 
-import socket
 import time
 
 import pytest
@@ -22,18 +25,11 @@ from vllm.config import KVTransferConfig
 from vllm.platforms import current_platform
 
 
-def get_free_port() -> int:
-    """Get a free port for ZMQ communication."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("0.0.0.0", 0))
-        return s.getsockname()[1]
-
-
 def create_llm_with_cpu_offloading(
     model: str,
     gpu_memory_utilization: float = 0.5,
     num_cpu_blocks: int = 1000,
-    cpu_block_size: int = 48,
+    cpu_block_size: int = 16,
     attn_backend: str | None = None,
 ) -> LLM:
     """
@@ -43,7 +39,8 @@ def create_llm_with_cpu_offloading(
         model: Model name or path.
         gpu_memory_utilization: GPU memory fraction to use.
         num_cpu_blocks: Number of CPU blocks for offloading.
-        cpu_block_size: Size of CPU blocks in tokens.
+        cpu_block_size: Size of CPU blocks in tokens. Smaller values make
+            testing easier by requiring shorter prompts to trigger offloading.
         attn_backend: Attention backend to use.
 
     Returns:
@@ -71,66 +68,6 @@ def create_llm_with_cpu_offloading(
     return LLM(**kwargs)
 
 
-def verify_generation_correctness(
-    llm: LLM,
-    prompt: str,
-    expected_output: str,
-    num_trials: int = 10,
-    success_threshold: float = 0.8,
-) -> bool:
-    """
-    Verify that generation produces expected output consistently.
-
-    Args:
-        llm: LLM instance.
-        prompt: Input prompt.
-        expected_output: Expected output text.
-        num_trials: Number of trials to run.
-        success_threshold: Minimum fraction of successful trials.
-
-    Returns:
-        True if success rate meets threshold.
-    """
-    sampling_params = SamplingParams(max_tokens=1, temperature=0.0)
-    success_count = 0
-
-    for _ in range(num_trials):
-        outputs = llm.generate(prompt, sampling_params, use_tqdm=False)
-        if outputs[0].outputs[0].text == expected_output:
-            success_count += 1
-
-    success_rate = success_count / num_trials
-    return success_rate >= success_threshold
-
-
-def measure_generation_latency(
-    llm: LLM,
-    prompt_token_ids: list[int],
-    num_trials: int = 5,
-) -> float:
-    """
-    Measure average generation latency.
-
-    Args:
-        llm: LLM instance.
-        prompt_token_ids: Token IDs for the prompt.
-        num_trials: Number of trials to average.
-
-    Returns:
-        Average latency in seconds.
-    """
-    sampling_params = SamplingParams(max_tokens=1)
-    prompts = [TokensPrompt(prompt_token_ids=prompt_token_ids)]
-
-    total_time = 0.0
-    for _ in range(num_trials):
-        start_time = time.time()
-        llm.generate(prompts, sampling_params, use_tqdm=False)
-        total_time += time.time() - start_time
-
-    return total_time / num_trials
-
-
 @pytest.mark.skipif(
     not current_platform.is_cuda_alike(),
     reason="CPU offloading requires CUDA-alike GPU",
@@ -140,31 +77,39 @@ def test_hma_cpu_offloading_correctness():
     Test that generation is correct after KV cache CPU offload and reload.
 
     This test:
-    1. Generates with a prompt (triggers KV computation and CPU offload)
-    2. Resets prefix cache (removes GPU cache)
-    3. Generates again (triggers CPU->GPU reload)
+    1. Generates with a long prompt (triggers KV computation and CPU offload)
+    2. Resets prefix cache (removes GPU cache but preserves CPU cache)
+    3. Generates again with same prompt (triggers CPU->GPU reload)
     4. Verifies output matches expected result
+
+    Note: The prompt must be long enough to fill at least one CPU block
+    (cpu_block_size tokens) to trigger actual offloading.
     """
+    cpu_block_size = 16
     llm = create_llm_with_cpu_offloading(
-        model="meta-llama/Llama-3.2-1B-Instruct",
+        model="google/gemma-3-1b-it",
         gpu_memory_utilization=0.4,
         num_cpu_blocks=500,
-        cpu_block_size=48,
+        cpu_block_size=cpu_block_size,
     )
 
     try:
-        # Use a simple counting prompt for deterministic output
-        prompt = "Count from 1 to 5: 1, 2, 3, 4,"
+        # Use dummy tokens to ensure prompt is long enough to trigger offloading
+        # Need > cpu_block_size tokens to fill at least one block
+        num_prefix_tokens = 50  # Well above cpu_block_size=16
+        prefix = "hi " * num_prefix_tokens
+        prompt = f"{prefix}1 2 3 4"
 
         # First generation - computes KV cache and offloads to CPU
-        sampling_params = SamplingParams(max_tokens=1, temperature=0.0)
+        sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
         outputs = llm.generate(prompt, sampling_params, use_tqdm=False)
         first_output = outputs[0].outputs[0].text
 
         # Reset prefix cache to force CPU reload on next generation
+        # This clears GPU prefix cache but preserves CPU offloaded blocks
         llm.reset_prefix_cache()
 
-        # Second generation - should load from CPU
+        # Second generation - should load KV cache from CPU
         outputs = llm.generate(prompt, sampling_params, use_tqdm=False)
         second_output = outputs[0].outputs[0].text
 
@@ -173,10 +118,8 @@ def test_hma_cpu_offloading_correctness():
             f"Output mismatch after CPU reload: '{first_output}' vs '{second_output}'"
         )
 
-        # Verify both outputs are reasonable
-        # Note: We don't strictly require " 5" since the model might generate
-        # differently, but outputs should be consistent
         print(f"Generation output: '{first_output}'")
+        print(f"Prompt tokens: ~{num_prefix_tokens + 4}")
 
     finally:
         del llm
@@ -195,19 +138,24 @@ def test_hma_cpu_offloading_latency():
     2. Measures GPU cache hit time
     3. Measures CPU cache hit time (after prefix reset)
     4. Verifies CPU hit is faster than cold computation
+
+    Uses a long prompt (5000 tokens) to make latency differences visible
+    and ensure many blocks are offloaded to CPU.
     """
+    cpu_block_size = 16
     llm = create_llm_with_cpu_offloading(
-        model="meta-llama/Llama-3.2-1B-Instruct",
+        model="google/gemma-3-1b-it",
         gpu_memory_utilization=0.4,
         num_cpu_blocks=500,
-        cpu_block_size=48,
+        cpu_block_size=cpu_block_size,
     )
 
     try:
-        # Use a longer prompt to make latency differences more visible
+        # Use a long prompt to make latency differences visible
+        # 5000 tokens / 16 block_size = 312 blocks to offload
         prompt_length = 5000
         prompt_token_ids = list(range(prompt_length))
-        sampling_params = SamplingParams(max_tokens=1)
+        sampling_params = SamplingParams(max_tokens=10)
         prompts = [TokensPrompt(prompt_token_ids=prompt_token_ids)]
 
         num_tests = 5
@@ -219,21 +167,22 @@ def test_hma_cpu_offloading_latency():
             # Vary the first token to avoid cross-test caching
             prompt_token_ids[0] = i
 
-            # Cold computation
+            # Cold computation - no cache
             llm.reset_prefix_cache()
             start = time.time()
             llm.generate(prompts, sampling_params, use_tqdm=False)
             cold_times.append(time.time() - start)
 
-            # GPU cache hit
+            # GPU cache hit - immediate reuse
             start = time.time()
             llm.generate(prompts, sampling_params, use_tqdm=False)
             gpu_hit_times.append(time.time() - start)
 
             # Reset prefix cache to force CPU reload
+            # GPU cache is cleared, CPU cache remains
             llm.reset_prefix_cache()
 
-            # CPU cache hit
+            # CPU cache hit - load from CPU
             start = time.time()
             llm.generate(prompts, sampling_params, use_tqdm=False)
             cpu_hit_times.append(time.time() - start)
@@ -242,7 +191,7 @@ def test_hma_cpu_offloading_latency():
         avg_gpu_hit = sum(gpu_hit_times) / len(gpu_hit_times)
         avg_cpu_hit = sum(cpu_hit_times) / len(cpu_hit_times)
 
-        print(f"\nLatency results ({num_tests} trials):")
+        print(f"\nLatency results ({num_tests} trials, {prompt_length} tokens):")
         print(f"  Cold computation: {avg_cold * 1000:.2f}ms")
         print(f"  GPU cache hit:    {avg_gpu_hit * 1000:.2f}ms")
         print(f"  CPU cache hit:    {avg_cpu_hit * 1000:.2f}ms")
@@ -272,43 +221,49 @@ def test_hma_cpu_offloading_multiple_requests():
     1. Multiple requests with shared prefix work correctly
     2. KV cache is properly shared and offloaded
     3. CPU reload produces correct results for all requests
+
+    Uses a long shared prefix to ensure CPU offloading triggers.
     """
+    cpu_block_size = 16
     llm = create_llm_with_cpu_offloading(
-        model="meta-llama/Llama-3.2-1B-Instruct",
+        model="google/gemma-3-1b-it",
         gpu_memory_utilization=0.4,
         num_cpu_blocks=500,
-        cpu_block_size=48,
+        cpu_block_size=cpu_block_size,
     )
 
     try:
-        # Common prefix with different endings
-        prefix = "The capital of France is"
+        # Use dummy tokens for shared prefix to ensure CPU offloading triggers
+        num_prefix_tokens = 50  # Well above cpu_block_size=16
+        shared_prefix = "hi " * num_prefix_tokens
+
+        # Different endings to test prefix sharing
         prompts = [
-            f"{prefix} Paris. The capital of Germany is",
-            f"{prefix} Paris. The capital of Italy is",
-            f"{prefix} Paris. The capital of Spain is",
+            f"{shared_prefix}A B C",
+            f"{shared_prefix}D E F",
+            f"{shared_prefix}G H I",
         ]
 
-        sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
+        sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
 
         # First generation - compute and offload
         outputs1 = llm.generate(prompts, sampling_params, use_tqdm=False)
         results1 = [o.outputs[0].text for o in outputs1]
 
-        # Reset and regenerate - should load from CPU
+        # Reset GPU cache and regenerate - should load from CPU
         llm.reset_prefix_cache()
         outputs2 = llm.generate(prompts, sampling_params, use_tqdm=False)
         results2 = [o.outputs[0].text for o in outputs2]
 
-        # Verify consistency
+        # Verify consistency after CPU reload
         for i, (r1, r2) in enumerate(zip(results1, results2)):
             assert r1 == r2, (
                 f"Request {i} output mismatch after CPU reload: '{r1}' vs '{r2}'"
             )
 
-        print("\nMultiple request results:")
-        for i, (prompt, result) in enumerate(zip(prompts, results1)):
-            print(f"  Request {i}: '{prompt}' -> '{result}'")
+        print(f"\nMultiple request results (prefix: ~{num_prefix_tokens} tokens):")
+        for i, result in enumerate(results1):
+            print(f"  Request {i}: '{result[:50]}...'")
 
     finally:
         del llm
@@ -323,27 +278,34 @@ def test_hma_cpu_offloading_eviction_and_reload():
     Test that evicted blocks can be reloaded correctly.
 
     This test:
-    1. Fills CPU cache with multiple prompts
+    1. Fills CPU cache with multiple long prompts
     2. Causes eviction by adding more prompts
     3. Reloads evicted content and verifies correctness
+
+    Uses a small CPU cache to ensure eviction happens.
     """
+    cpu_block_size = 16
     # Use smaller CPU cache to trigger eviction
     llm = create_llm_with_cpu_offloading(
-        model="meta-llama/Llama-3.2-1B-Instruct",
+        model="google/gemma-3-1b-it",
         gpu_memory_utilization=0.4,
-        num_cpu_blocks=100,  # Small cache to trigger eviction
-        cpu_block_size=48,
+        num_cpu_blocks=50,  # Small cache to trigger eviction
+        cpu_block_size=cpu_block_size,
     )
 
     try:
-        sampling_params = SamplingParams(max_tokens=5, temperature=0.0)
+        sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
+
+        # Use dummy tokens as prefix to ensure offloading triggers
+        num_prefix_tokens = 50  # Well above cpu_block_size=16
+        prefix = "hi " * num_prefix_tokens
 
         # Generate multiple prompts to fill cache
         prompts = [
-            "The quick brown fox jumps over the lazy",
-            "To be or not to be, that is the",
-            "In the beginning, there was",
-            "Once upon a time, in a land far",
+            f"{prefix}A B C D",
+            f"{prefix}E F G H",
+            f"{prefix}I J K L",
+            f"{prefix}M N O P",
         ]
 
         # Store original outputs
@@ -351,23 +313,23 @@ def test_hma_cpu_offloading_eviction_and_reload():
         for prompt in prompts:
             outputs = llm.generate(prompt, sampling_params, use_tqdm=False)
             original_outputs[prompt] = outputs[0].outputs[0].text
-            llm.reset_prefix_cache()  # Force offload
+            llm.reset_prefix_cache()  # Force offload to CPU
 
-        # Generate more to potentially cause eviction
-        extra_prompts = [f"Extra prompt number {i} for testing" for i in range(10)]
+        # Generate more prompts to cause eviction
+        extra_prompts = [f"{prefix}extra {i}" for i in range(10)]
         for prompt in extra_prompts:
             llm.generate(prompt, sampling_params, use_tqdm=False)
             llm.reset_prefix_cache()
 
         # Re-generate original prompts and verify
+        # Some may reload from CPU cache, others may be recomputed
         for prompt in prompts:
             outputs = llm.generate(prompt, sampling_params, use_tqdm=False)
             new_output = outputs[0].outputs[0].text
 
             # Output should be consistent (either from cache or recomputed)
             assert new_output == original_outputs[prompt], (
-                f"Output mismatch for '{prompt[:30]}...': "
-                f"'{original_outputs[prompt]}' vs '{new_output}'"
+                f"Output mismatch: '{original_outputs[prompt]}' vs '{new_output}'"
             )
 
         print("\nEviction and reload test passed")
