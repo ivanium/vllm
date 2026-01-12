@@ -1,16 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-KV cache offloading connector with full HMA (Hybrid Memory Allocator) support.
-
-This connector supports hybrid models with multiple KV cache groups
-(e.g., Full Attention + Mamba layers) by tracking and offloading
-each group independently.
-"""
-
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from itertools import islice
 from typing import Any
 
@@ -24,17 +16,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorMetadata,
-    SupportsHMA,
-)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.abstract import OffloadingManager
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
@@ -44,26 +33,14 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 ReqId = str
-GroupId = int
 
 logger = init_logger(__name__)
 
 
 @dataclass
 class OffloadingConnectorMetadata(KVConnectorMetadata):
-    """
-    Metadata for offloading connector with HMA support.
-
-    For HMA, transfer specs are organized per request and per group:
-    - reqs_to_load[req_id][group_id] = TransferSpec
-    - reqs_to_store[req_id][group_id] = TransferSpec
-    """
-
-    # req_id -> group_id -> TransferSpec
-    reqs_to_load: dict[ReqId, dict[GroupId, TransferSpec]] = field(default_factory=dict)
-    reqs_to_store: dict[ReqId, dict[GroupId, TransferSpec]] = field(
-        default_factory=dict
-    )
+    reqs_to_load: dict[ReqId, TransferSpec]
+    reqs_to_store: dict[ReqId, TransferSpec]
 
 
 class OffloadingConnector(KVConnectorBase_V1):
@@ -82,19 +59,12 @@ class OffloadingConnector(KVConnectorBase_V1):
 
         spec = OffloadingSpecFactory.create_spec(vllm_config)
 
-        # Store the number of KV cache groups for HMA support
-        self.num_kv_cache_groups = (
-            len(kv_cache_config.kv_cache_groups) if kv_cache_config else 1
-        )
-
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = OffloadingConnectorScheduler(
-                spec, self.num_kv_cache_groups, kv_cache_config
-            )
+            self.connector_scheduler = OffloadingConnectorScheduler(spec)
         elif role == KVConnectorRole.WORKER:
-            self.connector_worker = OffloadingConnectorWorker(spec, kv_cache_config)
+            self.connector_worker = OffloadingConnectorWorker(spec)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
@@ -116,7 +86,6 @@ class OffloadingConnector(KVConnectorBase_V1):
         self.connector_worker.start_kv_transfers(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # All loads are completed in start_load_kv, so nothing to do here.
         pass
 
     def save_kv_layer(
@@ -168,37 +137,6 @@ class OffloadingConnector(KVConnectorBase_V1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """
-        Called when a request has finished (single KV cache group).
-
-        For HMA support with multiple groups, use request_finished_all_groups.
-        """
-        assert self.connector_scheduler is not None
-        # Wrap as single-group tuple for unified handling
-        return self.connector_scheduler.request_finished(request, (block_ids,))
-
-    def request_finished_all_groups(
-        self,
-        request: "Request",
-        block_ids: tuple[list[int], ...],
-    ) -> tuple[bool, dict[str, Any] | None]:
-        """
-        HMA-compatible method: Called when a request has finished for ALL
-        KV cache groups, before its blocks are freed for each group.
-
-        This is required by the SupportsHMA interface for hybrid models
-        (e.g., Full Attention + Mamba).
-
-        Args:
-            request: The finished request.
-            block_ids: Tuple of block ID lists, one per KV cache group.
-                       e.g., (full_attn_blocks, mamba_blocks) for hybrid models.
-
-        Returns:
-            Tuple of (should_delay_free, optional_kv_transfer_params).
-            If should_delay_free is True, blocks won't be freed until
-            the request_id is returned from get_finished().
-        """
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
@@ -208,68 +146,26 @@ class OffloadingConnector(KVConnectorBase_V1):
 
 
 class OffloadingConnectorScheduler:
-    """
-    Scheduler-side implementation with full HMA support.
+    """Implementation of Scheduler side methods"""
 
-    Tracks block IDs and transfer state per KV cache group, allowing
-    independent offloading of different cache types (e.g., attention KV
-    and Mamba states).
-    """
-
-    def __init__(
-        self,
-        spec: OffloadingSpec,
-        num_kv_cache_groups: int = 1,
-        kv_cache_config: KVCacheConfig | None = None,
-    ):
+    def __init__(self, spec: OffloadingSpec):
         self.gpu_block_size = spec.gpu_block_size
         self.offloaded_block_size = spec.offloaded_block_size
         self.block_size_factor = self.offloaded_block_size // self.gpu_block_size
-        # Use HybridOffloadingManager for multiple groups (HMA support)
-        self.manager: OffloadingManager = spec.get_manager(
-            num_groups=num_kv_cache_groups
-        )
-        self.num_kv_cache_groups = num_kv_cache_groups
-
-        self.sliding_window_groups: set[int] = set()
-        if kv_cache_config is not None:
-            for group_id, group_spec in enumerate(kv_cache_config.kv_cache_groups):
-                if isinstance(group_spec.kv_cache_spec, SlidingWindowSpec):
-                    self.sliding_window_groups.add(group_id)
-                    logger.info(
-                        "Group %d is sliding window (window=%d), will skip offloading",
-                        group_id,
-                        group_spec.kv_cache_spec.sliding_window,
-                    )
+        self.manager: OffloadingManager = spec.get_manager()
 
         self._requests: dict[ReqId, Request] = {}
+        # list of GPU block IDs per request
+        self._request_block_ids: dict[ReqId, list[int]] = {}
+        # requests to load for the current scheduler step
+        self._reqs_to_load: dict[ReqId, TransferSpec] = {}
+        # request blocks are stored in order
+        # index of next block (of size offloaded_block_size) to offload
+        self._next_stored_block_idx: dict[ReqId, int] = {}
 
-        # HMA: Track block IDs per request per group
-        # req_id -> group_id -> list of GPU block IDs
-        self._request_block_ids: dict[ReqId, dict[GroupId, list[int]]] = {}
-
-        # HMA: Track load requests per group
-        # req_id -> group_id -> TransferSpec
-        self._reqs_to_load: dict[ReqId, dict[GroupId, TransferSpec]] = {}
-
-        # HMA: Track next stored block index per group
-        # req_id -> group_id -> next block index to offload
-        self._next_stored_block_idx: dict[ReqId, dict[GroupId, int]] = {}
-
-        # HMA: Track block hashes being stored/loaded per group
-        # req_id -> group_id -> set(block hashes)
-        self._reqs_being_stored: dict[ReqId, dict[GroupId, set[BlockHash]]] = (
-            defaultdict(lambda: defaultdict(set))
-        )
-        self._reqs_being_loaded: dict[ReqId, dict[GroupId, set[BlockHash]]] = (
-            defaultdict(lambda: defaultdict(set))
-        )
-
-    def _init_request_state(self, req_id: ReqId) -> None:
-        """Initialize per-group state for a new request."""
-        self._request_block_ids[req_id] = {
-            g: [] for g in range(self.num_kv_cache_groups)
-        }
+        # request ID -> set(block hashes being stored/load)
+        self._reqs_being_stored = defaultdict[ReqId, set[BlockHash]](set)
+        self._reqs_being_loaded = defaultdict[ReqId, set[BlockHash]](set)
 
     def _get_block_hashes(
         self,
@@ -303,10 +199,12 @@ class OffloadingConnectorScheduler:
                 - `True` if tokens will be loaded asynchronously
                   (between scheduler steps).
         """
-
         num_blocks = request.num_tokens // self.offloaded_block_size
 
         assert len(request.block_hashes) // self.block_size_factor == num_blocks
+        block_hashes = self._get_block_hashes(request)
+
+        self.manager.touch(block_hashes)
 
         full_block_tokens = self.offloaded_block_size * num_blocks
         if full_block_tokens - num_computed_tokens < self.offloaded_block_size:
@@ -314,31 +212,14 @@ class OffloadingConnectorScheduler:
             return 0, False
 
         start_block_idx = num_computed_tokens // self.offloaded_block_size
-
-        # For HMA: Check all groups and take the maximum hits.
-        max_hits = 0
-        for group_id in range(self.num_kv_cache_groups):
-            block_hashes = self._get_block_hashes(request, start_idx=start_block_idx)
-            hits = self.manager.lookup(block_hashes, group_id=group_id)
-            logger.debug(
-                "Request %s: CPU lookup group %d from block %d: %d hits",
-                request.request_id,
-                group_id,
-                start_block_idx,
-                hits,
-            )
-            if hits > max_hits:
-                max_hits = hits
-                # Touch blocks in this group (the one with most hits)
-                block_hashes = self._get_block_hashes(request)
-                self.manager.touch(block_hashes, group_id=group_id)
-
-        if max_hits == 0:
+        hits = self.manager.lookup(
+            self._get_block_hashes(request, start_idx=start_block_idx)
+        )
+        if hits == 0:
             return 0, False
 
         num_hit_tokens = (
-            self.offloaded_block_size * (start_block_idx + max_hits)
-            - num_computed_tokens
+            self.offloaded_block_size * (start_block_idx + hits) - num_computed_tokens
         )
         logger.debug(
             "Request %s hit %s offloaded tokens after %s GPU hit tokens",
@@ -354,277 +235,113 @@ class OffloadingConnectorScheduler:
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
-        """
-        Update state after block allocation for all KV cache groups.
-        """
-        req_id = request.request_id
-        self._requests[req_id] = request
-        self._init_request_state(req_id)
+        self._requests[request.request_id] = request
+        # the block ids are updated in _get_reqs_to_store
+        self._request_block_ids[request.request_id] = []
 
         if num_external_tokens == 0:
             return
 
         block_groups = blocks.get_block_ids()
+        block_ids = block_groups[0]
 
-        logger.debug(
-            "update_state_after_alloc: req=%s, num_external_tokens=%d, "
-            "num_groups=%d, block_groups_len=%d",
-            req_id,
-            num_external_tokens,
-            self.num_kv_cache_groups,
-            len(block_groups),
+        num_computed_gpu_blocks = sum(
+            block.block_hash is not None for block in blocks.blocks[0]
+        )
+        num_computed_tokens = num_computed_gpu_blocks * self.gpu_block_size
+        full_block_tokens = num_computed_tokens + num_external_tokens
+        assert full_block_tokens % self.offloaded_block_size == 0
+
+        num_pending_gpu_blocks = len(block_ids) - num_computed_gpu_blocks
+        assert num_external_tokens == num_pending_gpu_blocks * self.gpu_block_size
+
+        start_block_idx = num_computed_tokens // self.offloaded_block_size
+        num_blocks = full_block_tokens // self.offloaded_block_size
+
+        assert len(request.block_hashes) // self.block_size_factor >= num_blocks
+        block_hashes = self._get_block_hashes(
+            request, start_idx=start_block_idx, end_idx=num_blocks
         )
 
-        # Process each KV cache group
-        for group_id, block_ids in enumerate(block_groups):
-            # # Skip sliding window groups - they reuse GPU blocks circularly
-            # # for old tokens, so loading them from CPU would be incorrect
-            if group_id in self.sliding_window_groups:
-                logger.info(
-                    "Request %s group %d: (sliding window group)",
-                    req_id,
-                    group_id,
-                )
+        src_spec = self.manager.prepare_load(block_hashes)
+        dst_spec = GPULoadStoreSpec(block_ids[num_computed_gpu_blocks:])
 
-            if not block_ids:
-                logger.debug(
-                    "Request %s group %d: skipped (empty block_ids)",
-                    req_id,
-                    group_id,
-                )
-                continue
+        block_hashes = self._get_block_hashes(
+            request, start_idx=start_block_idx, end_idx=num_blocks
+        )
 
-            # Skip if this group doesn't have blocks to process
-            if group_id >= len(blocks.blocks) or not blocks.blocks[group_id]:
-                logger.debug(
-                    "Request %s group %d: skipped (no blocks.blocks)",
-                    req_id,
-                    group_id,
-                )
-                continue
+        self._reqs_to_load[request.request_id] = (src_spec, dst_spec)
+        self._reqs_being_loaded[request.request_id].update(block_hashes)
+        self._next_stored_block_idx[request.request_id] = num_blocks
 
-            num_computed_gpu_blocks = sum(
-                block.block_hash is not None for block in blocks.blocks[group_id]
-            )
-            num_computed_tokens = num_computed_gpu_blocks * self.gpu_block_size
-            full_block_tokens = num_computed_tokens + num_external_tokens
-
-            logger.info(
-                "Request %s group %d: num_computed_gpu_blocks=%d, "
-                "num_external_tokens=%d, total_blocks=%d",
-                req_id,
-                group_id,
-                num_computed_gpu_blocks,
-                num_external_tokens,
-                len(block_ids),
-            )
-
-            # Skip groups where tokens don't align with offloaded block size
-            if full_block_tokens % self.offloaded_block_size != 0:
-                logger.info(
-                    "Request %s group %d: tokens %d not aligned to block size %d",
-                    req_id,
-                    group_id,
-                    full_block_tokens,
-                    self.offloaded_block_size,
-                )
-                continue
-
-            num_pending_gpu_blocks = len(block_ids) - num_computed_gpu_blocks
-            if num_external_tokens != num_pending_gpu_blocks * self.gpu_block_size:
-                logger.info(
-                    "Request %s group %d: skipped (external_tokens %d != pending %d)",
-                    req_id,
-                    group_id,
-                    num_external_tokens,
-                    num_pending_gpu_blocks * self.gpu_block_size,
-                )
-                continue
-
-            start_block_idx = num_computed_tokens // self.offloaded_block_size
-            num_blocks = full_block_tokens // self.offloaded_block_size
-
-            if len(request.block_hashes) // self.block_size_factor < num_blocks:
-                logger.debug(
-                    "Request %s group %d: skipped (not enough block_hashes)",
-                    req_id,
-                    group_id,
-                )
-                continue
-
-            # Get the GPU block IDs to load into
-            gpu_block_ids = block_ids[num_computed_gpu_blocks:]
-
-            # Skip groups with invalid GPU block IDs. Sliding window attention
-            # groups have placeholder block ID 0 for tokens outside the window.
-            # We detect this by checking if the first block ID is 0 but there
-            # are more than one unique ID (meaning some blocks are valid).
-            # If all blocks are 0, it's also invalid.
-            num_zeros = sum(1 for b in gpu_block_ids if b == 0)
-
-            # Skip if: all zeros, or mostly zeros (sliding window with placeholders)
-            # A valid full-attention group should have unique IDs equal to count
-            if not gpu_block_ids or num_zeros > 0:
-                # This is a sliding window group or has placeholder blocks
-                # Don't load from CPU as it would corrupt block 0
-                logger.debug(
-                    "Request %s group %d: skipped (has %d zero block IDs out of %d, "
-                    "indicates sliding window or placeholder blocks)",
-                    req_id,
-                    group_id,
-                    num_zeros,
-                    len(gpu_block_ids),
-                )
-                continue
-
-            block_hashes = self._get_block_hashes(
-                request, start_idx=start_block_idx, end_idx=num_blocks
-            )
-
-            src_spec = self.manager.prepare_load(block_hashes, group_id=group_id)
-            dst_spec = GPULoadStoreSpec(gpu_block_ids, group_id=group_id)
-
-            block_hashes = self._get_block_hashes(
-                request, start_idx=start_block_idx, end_idx=num_blocks
-            )
-
-            # Store per-group transfer spec
-            if req_id not in self._reqs_to_load:
-                self._reqs_to_load[req_id] = {}
-            self._reqs_to_load[req_id][group_id] = (src_spec, dst_spec)
-            self._reqs_being_loaded[req_id][group_id].update(block_hashes)
-
-            if req_id not in self._next_stored_block_idx:
-                self._next_stored_block_idx[req_id] = {}
-            self._next_stored_block_idx[req_id][group_id] = num_blocks
-
-            logger.debug(
-                "Request %s group %d: prepared load of %d blocks "
-                "(src CPU blocks: %s, dst GPU blocks: %s)",
-                req_id,
-                group_id,
-                num_blocks - start_block_idx,
-                src_spec.block_ids[:5].tolist() if len(src_spec.block_ids) > 0 else [],
-                gpu_block_ids[:5] if len(gpu_block_ids) > 0 else [],
-            )
-
-    def _get_reqs_to_store(
-        self, scheduler_output: SchedulerOutput
-    ) -> dict[ReqId, dict[GroupId, TransferSpec]]:
-        """
-        Get requests to store with HMA support (all groups).
-        """
-        reqs_to_store: dict[ReqId, dict[GroupId, TransferSpec]] = {}
-
+    def _get_reqs_to_store(self, scheduler_output: SchedulerOutput):
+        reqs_to_store: dict[ReqId, TransferSpec] = {}
         # iterate over both new and cached requests
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
-            if req_id not in self._request_block_ids:
-                continue
-
             if preempted:
-                # Reset all groups on preemption
-                self._init_request_state(req_id)
+                self._request_block_ids[req_id] = []
 
-            # Update block IDs for each group
             if new_block_id_groups:
-                for group_id, new_block_ids in enumerate(new_block_id_groups):
-                    if group_id in self._request_block_ids[req_id]:
-                        self._request_block_ids[req_id][group_id] += list(new_block_ids)
+                new_block_ids = new_block_id_groups[0]
+                self._request_block_ids[req_id] += new_block_ids
 
-            req = self._requests.get(req_id)
-            if req is None:
-                continue
+            block_ids = self._request_block_ids[req_id]
 
-            new_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            req = self._requests[req_id]
+            new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             total_tokens = req.num_computed_tokens + new_tokens
             num_blocks = total_tokens // self.offloaded_block_size
+            start_block_idx = self._next_stored_block_idx.get(req_id, 0)
+            num_new_blocks = num_blocks - start_block_idx
 
-            # Process each group
-            for group_id in range(self.num_kv_cache_groups):
-                # Skip sliding window groups - they reuse GPU blocks circularly
-                # for old tokens, so storing them would create invalid CPU cache
-                if group_id in self.sliding_window_groups:
-                    logger.info(
-                        "Request %s group %d: store (sliding window group)",
-                        req_id,
-                        group_id,
-                    )
+            if num_new_blocks <= 0:
+                continue
 
-                block_ids = self._request_block_ids[req_id].get(group_id, [])
-                if not block_ids:
+            # NOTE: In async scheduling, placeholders may temporarily make
+            # len(req.block_hashes) < num_blocks * self.block_size_factor.
+
+            new_block_hashes = self._get_block_hashes(
+                req, start_idx=start_block_idx, end_idx=num_blocks
+            )
+            store_output = self.manager.prepare_store(new_block_hashes)
+            if store_output is None:
+                logger.warning(
+                    "Request %s: cannot store %s blocks", req_id, num_new_blocks
+                )
+                continue
+
+            self._next_stored_block_idx[req_id] = num_blocks
+
+            if not store_output.block_hashes_to_store:
+                continue
+            block_hashes_to_store = set(store_output.block_hashes_to_store)
+
+            block_hashes = self._get_block_hashes(req, end_idx=num_blocks)
+            self.manager.touch(block_hashes)
+
+            new_block_hashes = self._get_block_hashes(
+                req, start_idx=start_block_idx, end_idx=num_blocks
+            )
+            dst_spec = store_output.store_spec
+            src_block_ids: list[int] = []
+            for idx, blk_hash in enumerate(new_block_hashes):
+                if blk_hash not in block_hashes_to_store:
                     continue
+                offloaded_block_idx = start_block_idx + idx
+                gpu_block_idx = offloaded_block_idx * self.block_size_factor
+                for i in range(self.block_size_factor):
+                    src_block_ids.append(block_ids[gpu_block_idx + i])
+            src_spec = GPULoadStoreSpec(src_block_ids)
 
-                start_block_idx = self._next_stored_block_idx.get(req_id, {}).get(
-                    group_id, 0
-                )
-                num_new_blocks = num_blocks - start_block_idx
+            reqs_to_store[req_id] = (src_spec, dst_spec)
+            self._reqs_being_stored[req_id] |= block_hashes_to_store
 
-                if num_new_blocks <= 0:
-                    continue
-
-                # NOTE: In async scheduling, placeholders may temporarily make
-                # len(req.block_hashes) < num_blocks * self.block_size_factor.
-
-                new_block_hashes = self._get_block_hashes(
-                    req, start_idx=start_block_idx, end_idx=num_blocks
-                )
-                store_output = self.manager.prepare_store(
-                    new_block_hashes, group_id=group_id
-                )
-                if store_output is None:
-                    logger.warning(
-                        "Request %s group %d: cannot store %s blocks",
-                        req_id,
-                        group_id,
-                        num_new_blocks,
-                    )
-                    continue
-
-                if req_id not in self._next_stored_block_idx:
-                    self._next_stored_block_idx[req_id] = {}
-                self._next_stored_block_idx[req_id][group_id] = num_blocks
-
-                if not store_output.block_hashes_to_store:
-                    continue
-                block_hashes_to_store = set(store_output.block_hashes_to_store)
-
-                block_hashes = self._get_block_hashes(req, end_idx=num_blocks)
-                self.manager.touch(block_hashes, group_id=group_id)
-
-                new_block_hashes = self._get_block_hashes(
-                    req, start_idx=start_block_idx, end_idx=num_blocks
-                )
-                dst_spec = store_output.store_spec
-                src_block_ids: list[int] = []
-                for idx, blk_hash in enumerate(new_block_hashes):
-                    if blk_hash not in block_hashes_to_store:
-                        continue
-                    offloaded_block_idx = start_block_idx + idx
-                    gpu_block_idx = offloaded_block_idx * self.block_size_factor
-                    for i in range(self.block_size_factor):
-                        if gpu_block_idx + i < len(block_ids):
-                            src_block_ids.append(block_ids[gpu_block_idx + i])
-                src_spec = GPULoadStoreSpec(src_block_ids, group_id=group_id)
-
-                if req_id not in reqs_to_store:
-                    reqs_to_store[req_id] = {}
-                reqs_to_store[req_id][group_id] = (src_spec, dst_spec)
-                self._reqs_being_stored[req_id][group_id] |= block_hashes_to_store
-
-                logger.debug(
-                    "Request %s group %d offloading %d blocks starting from #%d "
-                    "(src GPU blocks: %s, dst CPU blocks: %s)",
-                    req_id,
-                    group_id,
-                    len(block_hashes_to_store),
-                    start_block_idx,
-                    src_spec.block_ids[:5].tolist()
-                    if len(src_spec.block_ids) > 0
-                    else [],
-                    dst_spec.block_ids[:5].tolist()
-                    if len(dst_spec.block_ids) > 0
-                    else [],
-                )
+            logger.debug(
+                "Request %s offloading %s blocks starting from block #%d",
+                req_id,
+                len(block_hashes_to_store),
+                start_block_idx,
+            )
 
         return reqs_to_store
 
@@ -656,33 +373,22 @@ class OffloadingConnectorScheduler:
                 connectors output.
         """
         for req_id in connector_output.finished_sending or []:
-            req_groups = self._reqs_being_stored.pop(req_id, None)
-            if req_groups:
-                # Complete store for all groups
-                for group_id, block_hashes in req_groups.items():
-                    if block_hashes:
-                        self.manager.complete_store(block_hashes, group_id=group_id)
+            block_hashes = self._reqs_being_stored.pop(req_id, None)
+            if block_hashes:
+                self.manager.complete_store(block_hashes)
 
         for req_id in connector_output.finished_recving or []:
-            req_groups = self._reqs_being_loaded.pop(req_id, None)
-            if req_groups:
-                # Complete load for all groups
-                for group_id, block_hashes in req_groups.items():
-                    if block_hashes:
-                        self.manager.complete_load(block_hashes, group_id=group_id)
+            block_hashes = self._reqs_being_loaded.pop(req_id, None)
+            if block_hashes:
+                self.manager.complete_load(block_hashes)
 
     def request_finished(
         self,
         request: Request,
-        block_ids: tuple[list[int], ...],
+        block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """
-        Called when a request has finished for all KV cache groups,
-        before its blocks are freed.
-
-        Args:
-            request: The finished request.
-            block_ids: Tuple of block ID lists, one per KV cache group.
+        Called when a request has finished, before its blocks are freed.
 
         Returns:
             True if the request is being saved/sent asynchronously and blocks
@@ -696,10 +402,7 @@ class OffloadingConnectorScheduler:
         self._request_block_ids.pop(req_id, None)
         self._next_stored_block_idx.pop(req_id, None)
 
-        # Check if ANY group has pending stores
-        request_being_stored = req_id in self._reqs_being_stored and any(
-            bool(hashes) for hashes in self._reqs_being_stored.get(req_id, {}).values()
-        )
+        request_being_stored = req_id in self._reqs_being_stored
         return request_being_stored, None
 
     def take_events(self) -> Iterable[KVCacheEvent]:
@@ -724,18 +427,10 @@ class OffloadingConnectorScheduler:
 
 
 class OffloadingConnectorWorker:
-    """
-    Worker-side implementation with HMA support.
+    """Implementation of Worker side methods"""
 
-    Handles transfer jobs for all KV cache groups, tracking completion
-    across groups before marking a request as finished.
-    """
-
-    def __init__(
-        self, spec: OffloadingSpec, kv_cache_config: KVCacheConfig | None = None
-    ):
+    def __init__(self, spec: OffloadingSpec):
         self.spec = spec
-        self.kv_cache_config = kv_cache_config
         self.worker = OffloadingWorker()
 
         self._job_counter = 0
@@ -761,17 +456,10 @@ class OffloadingConnectorWorker:
         kv_caches: dict[str, torch.Tensor],
         attn_backends: dict[str, type[AttentionBackend]],
     ):
-        for result in self.spec.get_handlers(
-            kv_caches, attn_backends, self.kv_cache_config
+        for src_cls, dst_cls, handler in self.spec.get_handlers(
+            kv_caches, attn_backends
         ):
-            if len(result) == 4:
-                # HMA mode: 4-tuple (src_cls, dst_cls, handler, group_id)
-                src_cls, dst_cls, handler, group_id = result
-                self.worker.register_group_handler(src_cls, dst_cls, group_id, handler)
-            else:
-                # Non-HMA mode: 3-tuple (src_cls, dst_cls, handler)
-                src_cls, dst_cls, handler = result
-                self.worker.register_handler(src_cls, dst_cls, handler)
+            self.worker.register_handler(src_cls, dst_cls, handler)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         layer_names = list(kv_caches.keys())
@@ -829,52 +517,41 @@ class OffloadingConnectorWorker:
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """
-        Get finished requests across all groups.
-
-        A request is only considered "finished" when ALL its groups
-        have completed their transfers.
+        Notifies worker-side connector ids of requests that have
+        finished generating tokens.
+        Returns a list of request IDs that finished loading or storing.
 
         Returns:
             ids of requests that have finished asynchronous transfer
             tuple of (sending/saving ids, recving/loading ids).
         """
-        finished_sending: set[str] = set()
-        finished_recving: set[str] = set()
-
+        finished_sending = set()
+        finished_recving = set()
         for job_id, success in self.worker.get_finished():
             # we currently do not support job failures
             assert success
-            req_id, group_id, is_store = self._jobs.pop(job_id)
+            req_id, store = self._jobs.pop(job_id)
+            if store:
+                req_jobs = self._store_jobs[req_id]
+                req_jobs.remove(job_id)
+                if req_jobs:
+                    continue
 
-            if is_store:
-                req_group_jobs = self._store_jobs[req_id][group_id]
-                req_group_jobs.discard(job_id)
-
-                # Check if ALL groups are done for this request
-                all_groups_done = all(
-                    len(jobs) == 0 for jobs in self._store_jobs[req_id].values()
-                )
-                if all_groups_done and req_id in self._finished_reqs_waiting_for_store:
+                if req_id in self._finished_reqs_waiting_for_store:
                     self._finished_reqs_waiting_for_store.remove(req_id)
                     finished_sending.add(req_id)
                     del self._store_jobs[req_id]
             else:
-                if group_id in self._load_jobs.get(req_id, {}):
-                    del self._load_jobs[req_id][group_id]
+                req_job = self._load_job[req_id]
+                assert job_id == req_job
+                del self._load_job[req_id]
+                finished_recving.add(req_id)
 
-                # Check if ALL groups are done loading
-                if not self._load_jobs.get(req_id):
-                    finished_recving.add(req_id)
-                    self._load_jobs.pop(req_id, None)
-
-        # Handle finished requests that may still have pending stores
         for req_id in finished_req_ids:
-            has_pending = any(
-                bool(jobs) for jobs in self._store_jobs.get(req_id, {}).values()
-            )
-            if has_pending:
+            pending_req_jobs = self._store_jobs.get(req_id)
+            if pending_req_jobs:
                 self._finished_reqs_waiting_for_store.add(req_id)
-            elif req_id in self._store_jobs:
+            elif pending_req_jobs is not None:
                 finished_sending.add(req_id)
                 del self._store_jobs[req_id]
 
