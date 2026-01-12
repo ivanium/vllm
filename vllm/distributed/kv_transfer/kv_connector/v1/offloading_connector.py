@@ -75,7 +75,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     each group independently.
     """
 
-    prefer_cross_layer_blocks: ClassVar[bool] = True
+    prefer_cross_layer_blocks: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -236,8 +236,6 @@ class OffloadingConnectorScheduler:
         )
         self.num_kv_cache_groups = num_kv_cache_groups
 
-        # Identify sliding window groups - these should NOT be offloaded to CPU
-        # because they reuse GPU blocks circularly for old tokens
         self.sliding_window_groups: set[int] = set()
         if kv_cache_config is not None:
             for group_id, group_spec in enumerate(kv_cache_config.kv_cache_groups):
@@ -310,13 +308,6 @@ class OffloadingConnectorScheduler:
                 - `True` if tokens will be loaded asynchronously
                   (between scheduler steps).
         """
-        # # IMPORTANT: For hybrid models with sliding window groups, we cannot
-        # # claim external tokens because sliding window groups need their KV
-        # # computed (they are not stored to CPU due to circular buffer reuse).
-        # # If we claim external tokens, the scheduler skips computing those
-        # # tokens, leaving sliding window groups with invalid KV data.
-        # if self.sliding_window_groups:
-        #     return 0, False
 
         num_blocks = request.num_tokens // self.offloaded_block_size
 
@@ -391,15 +382,14 @@ class OffloadingConnectorScheduler:
 
         # Process each KV cache group
         for group_id, block_ids in enumerate(block_groups):
-            # Skip sliding window groups - they reuse GPU blocks circularly
-            # for old tokens, so loading them from CPU would be incorrect
+            # # Skip sliding window groups - they reuse GPU blocks circularly
+            # # for old tokens, so loading them from CPU would be incorrect
             if group_id in self.sliding_window_groups:
-                logger.debug(
-                    "Request %s group %d: skipped (sliding window group)",
+                logger.info(
+                    "Request %s group %d: (sliding window group)",
                     req_id,
                     group_id,
                 )
-                continue
 
             if not block_ids:
                 logger.debug(
@@ -424,7 +414,7 @@ class OffloadingConnectorScheduler:
             num_computed_tokens = num_computed_gpu_blocks * self.gpu_block_size
             full_block_tokens = num_computed_tokens + num_external_tokens
 
-            logger.debug(
+            logger.info(
                 "Request %s group %d: num_computed_gpu_blocks=%d, "
                 "num_external_tokens=%d, total_blocks=%d",
                 req_id,
@@ -436,7 +426,7 @@ class OffloadingConnectorScheduler:
 
             # Skip groups where tokens don't align with offloaded block size
             if full_block_tokens % self.offloaded_block_size != 0:
-                logger.debug(
+                logger.info(
                     "Request %s group %d: tokens %d not aligned to block size %d",
                     req_id,
                     group_id,
@@ -447,7 +437,7 @@ class OffloadingConnectorScheduler:
 
             num_pending_gpu_blocks = len(block_ids) - num_computed_gpu_blocks
             if num_external_tokens != num_pending_gpu_blocks * self.gpu_block_size:
-                logger.debug(
+                logger.info(
                     "Request %s group %d: skipped (external_tokens %d != pending %d)",
                     req_id,
                     group_id,
@@ -559,12 +549,11 @@ class OffloadingConnectorScheduler:
                 # Skip sliding window groups - they reuse GPU blocks circularly
                 # for old tokens, so storing them would create invalid CPU cache
                 if group_id in self.sliding_window_groups:
-                    logger.debug(
-                        "Request %s group %d: skipping store (sliding window group)",
+                    logger.info(
+                        "Request %s group %d: store (sliding window group)",
                         req_id,
                         group_id,
                     )
-                    continue
 
                 block_ids = self._request_block_ids[req_id].get(group_id, [])
                 if not block_ids:
