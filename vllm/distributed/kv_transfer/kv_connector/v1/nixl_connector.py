@@ -293,7 +293,6 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, role, kv_cache_config)
-        print("NixlConnector init", kv_cache_config.kv_cache_groups, "\n", flush=True)
 
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
@@ -363,10 +362,6 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         # Hybrid memory allocator (HMA) enabled
-        print(
-            f"request_finished_all_groups: {request.request_id}, {block_ids}",
-            flush=True,
-        )
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
@@ -521,7 +516,6 @@ class NixlConnectorScheduler:
         # blocks per KV cache group. This is used to clip the local attention window.
         sw_sizes_tokens = [group.kv_cache_spec.sliding_window if isinstance(group.kv_cache_spec, SlidingWindowSpec) else 0 for group in kv_cache_config.kv_cache_groups]
         self.sw_sizes = [n_tokens // self.block_size for n_tokens in sw_sizes_tokens]
-        print(f"sw_sizes: {self.sw_sizes}\n", flush=True)
 
     def shutdown(self):
         self._stop_event.set()
@@ -545,8 +539,6 @@ class NixlConnectorScheduler:
         # because offloading connectors might want to receive the whole sequence even
         # for SWA groups. We will abstract this logic once the interface is more stable
         assert len(block_ids) == len(self.sw_sizes), "Number of KV cache groups must match"
-        print("CLIPPING BLOCKS", block_ids)
-        print("to ", tuple([blocks[-self.sw_sizes[i]:] for i, blocks in enumerate(block_ids)]), "\n", flush=True)
         return tuple([blocks[-self.sw_sizes[i]:] for i, blocks in enumerate(block_ids)])
 
     def set_xfer_handshake_metadata(
@@ -703,10 +695,7 @@ class NixlConnectorScheduler:
                         else []
                     )
                     local_block_ids = self.get_sw_clippped_blocks(local_block_ids)
-                    print(
-                        f"update_state_after_alloc local_block_ids unhashed: {local_block_ids}\n",
-                        flush=True,
-                    )
+
                     # Get unhashed blocks to pull from remote. Mind that a full prefix
                     # cache hit is indicated with an empty list.
                     self._reqs_need_recv[request.request_id] = (
@@ -777,8 +766,6 @@ class NixlConnectorScheduler:
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
         self._reqs_need_send = {}
-        if len(meta.reqs_to_recv) > 0:
-            print("build_connector_meta", meta.reqs_to_recv, "\n", flush=True)
 
         return meta
 
@@ -827,7 +814,6 @@ class NixlConnectorScheduler:
 
         # TODO: check whether block_ids actually ever be 0. If not we could
         # remove the conditional below
-        print(f"request_finished block_ids: {block_ids}\n\n", flush=True)
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
 
         if delay_free_blocks:
@@ -846,7 +832,6 @@ class NixlConnectorScheduler:
             # blocks are always at the start of the list.
             # Here we "unpad" blocks to send the actual remote blocks to be read.
             block_ids = self.get_sw_clippped_blocks(block_ids)
-            print(f"request_finished unpadded block_ids: {block_ids}\n\n", flush=True)
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -1304,10 +1289,8 @@ class NixlConnectorWorker:
         # Enable different block lengths for different layers when MLA is used.
         self.block_len_per_layer = list[int]()
         self.slot_size_per_layer = list[int]()  # HD bytes in kv terms
-        print("SPLIT K AND V", split_k_and_v, flush=True)
         for layer_name, cache_or_caches in xfer_buffers.items():
             cache_list = cache_or_caches if split_k_and_v else [cache_or_caches]
-            # print(f"{layer_name=} cache_list: {cache_list.shape}", flush=True)
 
             for cache in cache_list:
                 base_addr = cache.data_ptr()
@@ -1316,7 +1299,6 @@ class NixlConnectorWorker:
                     # across groups. This results in skipping all tensors but the ones
                     # pointed to by group0. Also, generally we will have more blocks
                     # per tensor but fewer regions.
-                    print(f"layer {layer_name} already seen, skipping", flush=True)
                     continue
 
                 kernel_block_size = cache.shape[block_size_position]
@@ -2311,7 +2293,6 @@ class NixlConnectorWorker:
         # same for [3], but group0-group1 blocks will always differ (different areas).
         # Therefore we can just flatten the block_ids and compute the descs ids for all
         # groups at once.
-        print("get_block_descs_ids", block_ids, "\n")
         num_blocks = self.dst_num_blocks[engine_id]
         if block_size_ratio is not None:
             num_blocks = int(num_blocks * block_size_ratio)
@@ -2320,9 +2301,6 @@ class NixlConnectorWorker:
         region_ids = region_ids[:, None]
         block_ids = np.concatenate(block_ids)[None, :]
         descs_ids = region_ids * num_blocks + block_ids
-        print(
-            "get_block_descs_ids num output", len(descs_ids.flatten()), "\n", flush=True
-        )
         return descs_ids.flatten()
 
     def _logical_to_kernel_block_ids(self, block_ids: BlockIds) -> BlockIds:
