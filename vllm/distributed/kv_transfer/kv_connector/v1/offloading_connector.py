@@ -4,7 +4,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -16,14 +16,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    SupportsHMA,
+)
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, SlidingWindowSpec
 from vllm.v1.kv_offload.abstract import OffloadingManager
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
@@ -32,7 +35,12 @@ from vllm.v1.kv_offload.worker.worker import OffloadingWorker, TransferSpec
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+if TYPE_CHECKING:
+    pass
+
 ReqId = str
+# Block IDs for all KV cache groups (HMA support)
+BlockIds = tuple[list[int], ...]
 
 logger = init_logger(__name__)
 
@@ -43,7 +51,16 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     reqs_to_store: dict[ReqId, TransferSpec]
 
 
-class OffloadingConnector(KVConnectorBase_V1):
+class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+    """
+    KV Connector for CPU offloading with HMA (Hybrid Memory Allocator) support.
+
+    Supports hybrid models with multiple KV cache groups (e.g., Full Attention
+    + Sliding Window Attention layers). Each group has independent block tracking
+    and offloading, with sliding window groups only storing blocks within their
+    attention window.
+    """
+
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         ## TODO (YIFAN): double check and update this
@@ -58,13 +75,18 @@ class OffloadingConnector(KVConnectorBase_V1):
         super().__init__(vllm_config, role, kv_cache_config)
 
         spec = OffloadingSpecFactory.create_spec(vllm_config)
+        self._is_hma_enabled = (
+            not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+        )
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = OffloadingConnectorScheduler(spec)
+            self.connector_scheduler = OffloadingConnectorScheduler(
+                spec, kv_cache_config
+            )
         elif role == KVConnectorRole.WORKER:
-            self.connector_worker = OffloadingConnectorWorker(spec)
+            self.connector_worker = OffloadingConnectorWorker(spec, kv_cache_config)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
@@ -140,22 +162,76 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: BlockIds,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """
+        Called exactly once when a request has finished for all kv cache groups
+        (HMA mode), before its blocks are freed for each group.
+
+        This method is required by the SupportsHMA interface.
+
+        Args:
+            request: The finished request.
+            block_ids: Block IDs for all KV cache groups, as tuple of lists.
+
+        Returns:
+            Tuple of (delay_free, metadata):
+            - delay_free: True if blocks should not be freed until the request_id
+              is returned from get_finished() (async store in progress).
+            - metadata: Optional KVTransferParams to include in request outputs.
+        """
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished_all_groups(request, block_ids)
+
     def take_events(self) -> Iterable[KVCacheEvent]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
 
 
 class OffloadingConnectorScheduler:
-    """Implementation of Scheduler side methods"""
+    """Implementation of Scheduler side methods with HMA support."""
 
-    def __init__(self, spec: OffloadingSpec):
+    def __init__(
+        self, spec: OffloadingSpec, kv_cache_config: KVCacheConfig | None = None
+    ):
+        self.spec = spec
         self.gpu_block_size = spec.gpu_block_size
         self.offloaded_block_size = spec.offloaded_block_size
         self.block_size_factor = self.offloaded_block_size // self.gpu_block_size
-        self.manager: OffloadingManager = spec.get_manager()
+        self.kv_cache_config = kv_cache_config
 
+        # Determine number of KV cache groups and sliding window sizes
+        self.num_kv_cache_groups = 1
+        self.sw_sizes: list[int] = [0]  # Sliding window size in blocks per group
+
+        if kv_cache_config is not None:
+            self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+            # Compute sliding window sizes in blocks for each group
+            # 0 means full attention (no sliding window)
+            sw_sizes_tokens = [
+                (
+                    group.kv_cache_spec.sliding_window
+                    if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+                    else 0
+                )
+                for group in kv_cache_config.kv_cache_groups
+            ]
+            self.sw_sizes = [
+                n_tokens // self.gpu_block_size for n_tokens in sw_sizes_tokens
+            ]
+
+        # Get manager with appropriate number of groups
+        # HybridOffloadingManager provides per-group tracking
+        self.manager: OffloadingManager = spec.get_manager(
+            num_groups=self.num_kv_cache_groups
+        )
+
+        # Request tracking
         self._requests: dict[ReqId, Request] = {}
-        # list of GPU block IDs per request
+        # list of GPU block IDs per request (uses group 0 for backward compatibility)
         self._request_block_ids: dict[ReqId, list[int]] = {}
         # requests to load for the current scheduler step
         self._reqs_to_load: dict[ReqId, TransferSpec] = {}
@@ -166,6 +242,47 @@ class OffloadingConnectorScheduler:
         # request ID -> set(block hashes being stored/load)
         self._reqs_being_stored = defaultdict[ReqId, set[BlockHash]](set)
         self._reqs_being_loaded = defaultdict[ReqId, set[BlockHash]](set)
+
+        logger.info(
+            "OffloadingConnectorScheduler initialized with %d groups, sw_sizes=%s",
+            self.num_kv_cache_groups,
+            self.sw_sizes,
+        )
+
+    def get_sw_clipped_blocks(self, block_ids: BlockIds) -> BlockIds:
+        """
+        Clip the number of blocks to the sliding window size for each kv cache
+        group that employs sliding window attention (SWA).
+
+        This is necessary because the KV Cache manager allocates blocks for
+        the entire sequence length initially, then cleans up blocks outside
+        the window before the request_finished hook.
+
+        For full attention groups (sw_sizes[i] == 0), all blocks are kept.
+        For SWA groups, only the last sw_sizes[i] blocks are kept.
+
+        Args:
+            block_ids: Block IDs for all KV cache groups.
+
+        Returns:
+            Clipped block IDs for each group.
+        """
+        if len(block_ids) == 0:
+            return block_ids
+        if len(block_ids) != len(self.sw_sizes):
+            # Single group mode or mismatch - return as-is
+            return block_ids
+
+        clipped = []
+        for i, blocks in enumerate(block_ids):
+            sw_size = self.sw_sizes[i]
+            if sw_size == 0 or len(blocks) == 0:
+                # Full attention or empty - keep all blocks
+                clipped.append(blocks)
+            else:
+                # Sliding window - keep only last sw_size blocks
+                clipped.append(blocks[-sw_size:])
+        return tuple(clipped)
 
     def _get_block_hashes(
         self,
@@ -242,37 +359,68 @@ class OffloadingConnectorScheduler:
         if num_external_tokens == 0:
             return
 
-        block_groups = blocks.get_block_ids()
-        block_ids = block_groups[0]
+        # For SWA (Sliding Window Attention), blocks may be padded with null
+        # blocks for out-of-window positions. We need to:
+        # 1. Filter out null blocks
+        # 2. Identify which blocks need data loaded (pending blocks)
+        # 3. Map block positions to the correct block hash indices
 
-        num_computed_gpu_blocks = sum(
-            block.block_hash is not None for block in blocks.blocks[0]
-        )
-        num_computed_tokens = num_computed_gpu_blocks * self.gpu_block_size
-        full_block_tokens = num_computed_tokens + num_external_tokens
-        assert full_block_tokens % self.offloaded_block_size == 0
+        # Get non-null blocks with their positions
+        # Position is the index in the blocks list (corresponds to token range)
+        pending_blocks_with_pos: list[tuple[int, int]] = []  # (position, block_id)
+        num_computed_non_null = 0
 
-        num_pending_gpu_blocks = len(block_ids) - num_computed_gpu_blocks
-        assert num_external_tokens == num_pending_gpu_blocks * self.gpu_block_size
+        for i, block in enumerate(blocks.blocks[0]):
+            if block.is_null:
+                # Null blocks are placeholders for out-of-window positions
+                continue
+            if block.block_hash is not None:
+                # This block has a hash = already computed/cached locally
+                num_computed_non_null += 1
+            else:
+                # This block needs data loaded from external source (CPU)
+                pending_blocks_with_pos.append((i, block.block_id))
 
-        start_block_idx = num_computed_tokens // self.offloaded_block_size
-        num_blocks = full_block_tokens // self.offloaded_block_size
+        if not pending_blocks_with_pos:
+            return  # Nothing to load
 
-        assert len(request.block_hashes) // self.block_size_factor >= num_blocks
-        block_hashes = self._get_block_hashes(
-            request, start_idx=start_block_idx, end_idx=num_blocks
+        pending_block_ids = [block_id for _, block_id in pending_blocks_with_pos]
+
+        # For SWA, pending blocks are at the END of the allocated range
+        # Their positions tell us which token range they cover
+        first_pending_position = pending_blocks_with_pos[0][0]
+        last_pending_position = pending_blocks_with_pos[-1][0]
+
+        # Convert GPU block positions to offloaded block indices
+        # Each offloaded block = block_size_factor GPU blocks
+        offloaded_start_idx = first_pending_position // self.block_size_factor
+        offloaded_end_idx = (
+            last_pending_position + 1 + self.block_size_factor - 1
+        ) // self.block_size_factor
+
+        # Validate we have enough block hashes
+        total_hashes = len(request.block_hashes) // self.block_size_factor
+        if offloaded_end_idx > total_hashes:
+            logger.warning(
+                "Request %s: offloaded_end_idx=%d > total_hashes=%d, clamping",
+                request.request_id,
+                offloaded_end_idx,
+                total_hashes,
+            )
+            offloaded_end_idx = total_hashes
+
+        block_hashes = list(
+            self._get_block_hashes(
+                request, start_idx=offloaded_start_idx, end_idx=offloaded_end_idx
+            )
         )
 
         src_spec = self.manager.prepare_load(block_hashes)
-        dst_spec = GPULoadStoreSpec(block_ids[num_computed_gpu_blocks:])
-
-        block_hashes = self._get_block_hashes(
-            request, start_idx=start_block_idx, end_idx=num_blocks
-        )
+        dst_spec = GPULoadStoreSpec(pending_block_ids)
 
         self._reqs_to_load[request.request_id] = (src_spec, dst_spec)
         self._reqs_being_loaded[request.request_id].update(block_hashes)
-        self._next_stored_block_idx[request.request_id] = num_blocks
+        self._next_stored_block_idx[request.request_id] = offloaded_end_idx
 
     def _get_reqs_to_store(self, scheduler_output: SchedulerOutput):
         reqs_to_store: dict[ReqId, TransferSpec] = {}
@@ -405,6 +553,42 @@ class OffloadingConnectorScheduler:
         request_being_stored = req_id in self._reqs_being_stored
         return request_being_stored, None
 
+    def request_finished_all_groups(
+        self,
+        request: Request,
+        block_ids: BlockIds,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """
+        Called exactly once when a request has finished for all kv cache groups
+        (HMA mode), before its blocks are freed for each group.
+
+        This method handles sliding window clipping: for SWA groups, blocks
+        outside the attention window are not tracked since the KV cache manager
+        only allocates blocks within the window.
+
+        Args:
+            request: The finished request.
+            block_ids: Block IDs for all KV cache groups.
+
+        Returns:
+            Tuple of (delay_free, metadata):
+            - delay_free: True if blocks should not be freed yet (async store).
+            - metadata: Optional KVTransferParams.
+        """
+        req_id = request.request_id
+        self._requests.pop(req_id, None)
+        self._request_block_ids.pop(req_id, None)
+        self._next_stored_block_idx.pop(req_id, None)
+
+        # Check if any blocks are still being stored
+        request_being_stored = req_id in self._reqs_being_stored
+
+        # Clip blocks to sliding window for SWA groups
+        # This matches the KV cache manager's allocation strategy
+        _ = self.get_sw_clipped_blocks(block_ids)
+
+        return request_being_stored, None
+
     def take_events(self) -> Iterable[KVCacheEvent]:
         """Take the KV cache events from the connector.
 
@@ -427,10 +611,13 @@ class OffloadingConnectorScheduler:
 
 
 class OffloadingConnectorWorker:
-    """Implementation of Worker side methods"""
+    """Implementation of Worker side methods with HMA support."""
 
-    def __init__(self, spec: OffloadingSpec):
+    def __init__(
+        self, spec: OffloadingSpec, kv_cache_config: KVCacheConfig | None = None
+    ):
         self.spec = spec
+        self.kv_cache_config = kv_cache_config
         self.worker = OffloadingWorker()
 
         self._job_counter = 0
@@ -456,10 +643,35 @@ class OffloadingConnectorWorker:
         kv_caches: dict[str, torch.Tensor],
         attn_backends: dict[str, type[AttentionBackend]],
     ):
-        for src_cls, dst_cls, handler in self.spec.get_handlers(
-            kv_caches, attn_backends
-        ):
-            self.worker.register_handler(src_cls, dst_cls, handler)
+        """Register handlers for KV offloading transfers.
+
+        Supports both single-group (backward compatible) and HMA modes.
+        In HMA mode, registers per-group handlers for each KV cache group.
+        """
+        handler_results = list(
+            self.spec.get_handlers(kv_caches, attn_backends, self.kv_cache_config)
+        )
+
+        for result in handler_results:
+            if len(result) == 4:
+                # HMA mode: 4-tuple (src_cls, dst_cls, handler, group_id)
+                src_cls, dst_cls, handler, group_id = result
+                self.worker.register_group_handler(src_cls, dst_cls, group_id, handler)
+                logger.debug(
+                    "Registered handler for group %d: %s -> %s",
+                    group_id,
+                    src_cls.medium(),
+                    dst_cls.medium(),
+                )
+            else:
+                # Single-group mode: 3-tuple (src_cls, dst_cls, handler)
+                src_cls, dst_cls, handler = result
+                self.worker.register_handler(src_cls, dst_cls, handler)
+                logger.debug(
+                    "Registered handler: %s -> %s",
+                    src_cls.medium(),
+                    dst_cls.medium(),
+                )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         layer_names = list(kv_caches.keys())

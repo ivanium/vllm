@@ -60,7 +60,7 @@ def create_mock_kv_cache_config(
     reason="CUDA required for CpuGpuOffloadingHandlers",
 )
 @torch.inference_mode()
-def test_hybrid_handlers_creation():
+def test_hybrid_handlers_creation(default_vllm_config):
     """
     Tests that HybridCpuGpuOffloadingHandlers creates handlers for each group
     with only that group's layers.
@@ -125,7 +125,7 @@ def test_hybrid_handlers_creation():
     reason="CUDA required for CpuGpuOffloadingHandlers",
 )
 @torch.inference_mode()
-def test_hybrid_handlers_partial_layers():
+def test_hybrid_handlers_partial_layers(default_vllm_config):
     """
     Tests HybridCpuGpuOffloadingHandlers when not all group layers
     have GPU caches (e.g., pipeline parallelism).
@@ -183,7 +183,7 @@ def test_hybrid_handlers_partial_layers():
     reason="CUDA required for CpuGpuOffloadingHandlers",
 )
 @torch.inference_mode()
-def test_hybrid_handlers_empty_group():
+def test_hybrid_handlers_empty_group(default_vllm_config):
     """
     Tests that HybridCpuGpuOffloadingHandlers skips groups with no
     present layers (e.g., all layers on different PP rank).
@@ -236,7 +236,7 @@ def test_hybrid_handlers_empty_group():
     reason="CUDA required for CpuGpuOffloadingHandlers",
 )
 @torch.inference_mode()
-def test_hybrid_handlers_single_group():
+def test_hybrid_handlers_single_group(default_vllm_config):
     """
     Tests HybridCpuGpuOffloadingHandlers with single group
     (backward compatibility with non-HMA models).
@@ -289,7 +289,7 @@ def test_hybrid_handlers_single_group():
     reason="CUDA required for CpuGpuOffloadingHandlers",
 )
 @torch.inference_mode()
-def test_hybrid_handlers_get_missing_group():
+def test_hybrid_handlers_get_missing_group(default_vllm_config):
     """
     Tests that accessing a non-existent group raises KeyError.
     """

@@ -206,6 +206,10 @@ class GroupHandler(OffloadingHandler):
                 del self.transfers[job_id]
         return finished
 
+    def wait(self, job_ids: set[int]) -> None:
+        # Test handler - no actual waiting needed
+        pass
+
 
 def test_offloading_worker_group_routing():
     """
@@ -269,6 +273,10 @@ class PermissiveGroupHandler(OffloadingHandler):
                 finished.append((job_id, True))
                 del self.transfers[job_id]
         return finished
+
+    def wait(self, job_ids: set[int]) -> None:
+        # Test handler - no actual waiting needed
+        pass
 
 
 def test_offloading_worker_group_fallback():
