@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
-from collections import defaultdict
+import contextlib
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
@@ -13,7 +14,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata im
 )
 from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
+from vllm.v1.core.kv_cache_utils import (
+    BlockHashWithGroupId,
+    get_block_hash,
+    make_block_hash_with_group_id,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -25,57 +30,87 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class SimpleCPUOffloadScheduler:
-    """
-    Scheduler-side manager for CPU offloading.
+@dataclass
+class ReqTransferMeta:
+    gpu_block_ids: list[int]
+    cpu_block_ids: list[int]
+    block_hashes: list[BlockHashWithGroupId]
 
-    Responsibilities:
-    - Maintain hash->CPU_block_id mapping via BlockPool
-    - LRU eviction of CPU blocks when cache is full
-    - Prepare load/store metadata for worker
-    - Track in-flight async transfers
-    """
+
+@dataclass
+class RequestState:
+    """Consolidated per-request state for CPU offloading."""
+
+    request: "Request"
+    gpu_block_ids: tuple[list[int], ...]
+
+    # Set when request_finished is called but transfers are still in-flight.
+    # Defers block cleanup to the completion handler.
+    finished: bool = False
+
+    # Load tracking
+    load_transfer: ReqTransferMeta | None = None
+    load_job_idx: int | None = None
+
+    # Store tracking (eager mode only)
+    store_job_idxs: set[int] = field(default_factory=set)
+    num_stored_blocks: int = 0
+
+
+class SimpleCPUOffloadScheduler:
+    """Scheduler-side manager for CPU offloading."""
 
     def __init__(
         self,
         vllm_config: VllmConfig,
         kv_cache_config: "KVCacheConfig | None",
         cpu_capacity_bytes: int,
-        offload_decode_blocks: bool = False,
-        store_block_budget_before_first_hit: int = 1,
+        lazy_offload: bool = False,
+        min_lookahead_blocks: int = 8,
     ):
-        """
-        Initialize the scheduler-side manager.
-
-        Args:
-            vllm_config: vLLM configuration
-            kv_cache_config: KV cache configuration
-            cpu_capacity_bytes: CPU memory capacity in bytes
-        """
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
-        offload_decode_blocks = True
-        store_block_budget_before_first_hit = 1000000
-        self.offload_decode_blocks = offload_decode_blocks
-        self._store_block_budget_before_first_hit = max(
-            0, store_block_budget_before_first_hit
-        )
-        self._has_observed_cache_hit = False
 
         cache_config = vllm_config.cache_config
         self.gpu_block_size = cache_config.block_size
+        # GPU block pool reference - injected after scheduler builds kv_cache_manager
+        self._gpu_block_pool: BlockPool | None = None
+
+        # Load metadata
+        self._reqs_to_load: dict[str, RequestState] = {}
+        # Inverse maps: job_idx -> req_ids. Keyed by job index because the
+        # worker reports completions by job index, not request id.
+        self._load_job_to_reqs: dict[int, list[str]] = {}
+
+        # Store metadata
+        self._lazy_mode = lazy_offload
+        # Lazy store mode only
+        self._min_lookahead_blocks = min_lookahead_blocks
+        # Job-level block data: job_idx -> (gpu_ids, cpu_ids, block_hashes).
+        # Used by both lazy and eager store paths for completion processing.
+        self.store_job_to_blocks: dict[
+            int, tuple[list[int], list[int], list[BlockHashWithGroupId]]
+        ] = {}  # TODO (yifan): use ReqTransferMeta instead
+
+        # Eager mode only
+        self._reqs_to_store: dict[str, RequestState] = {}
+        self._store_job_to_reqs: dict[int, list[str]] = {}
+
+        # Job counters
+        self._load_job_counter: int = 0
+        self._store_job_counter: int = 0
 
         # Calculate number of CPU blocks based on capacity
         self.num_cpu_blocks = self._calculate_num_blocks(cpu_capacity_bytes)
 
         logger.info(
-            "SimpleCPUOffloadScheduler: Allocating %d CPU blocks (%.2f GB capacity)",
+            "SimpleCPUOffloadScheduler: Allocating %d CPU blocks "
+            "(%.2f GB capacity, mode=%s)",
             self.num_cpu_blocks,
             cpu_capacity_bytes / (1024**3),
+            "lazy" if lazy_offload else "eager",
         )
 
-        # Create CPU block pool for LRU management
-        # BlockPool handles hash->block mapping and LRU eviction
         self.cpu_block_pool = BlockPool(
             num_gpu_blocks=self.num_cpu_blocks,
             enable_caching=True,
@@ -83,33 +118,8 @@ class SimpleCPUOffloadScheduler:
             enable_kv_cache_events=False,
         )
 
-        # Track requests for accessing block_hashes during store
-        self._requests: dict[str, Request] = {}
-
-        # Track GPU blocks for each request (for store operations)
-        self._request_gpu_blocks: dict[str, list[list[int]]] = {}
-
-        # Track in-flight transfers for async completion
-        # Use lists to preserve ordering for correct block hash -> cpu_block_id mapping
-        self._loading_requests: dict[str, list[BlockHash]] = defaultdict(list)
-        self._storing_requests: dict[str, list[BlockHash]] = defaultdict(list)
-
-        # Track number of blocks already stored to CPU per request
-        self._num_stored_blocks: dict[str, int] = {}
-
-        # Track touched CPU block IDs while async load is in-flight.
-        self._pending_load_blocks: dict[str, list[int]] = defaultdict(list)
-
-        # Track CPU block IDs allocated for storing (before caching)
-        self._pending_cpu_blocks: dict[str, list[int]] = defaultdict(list)
-
-        # Metadata for current step (load operations)
-        self._reqs_to_load: dict[str, tuple[list[int], list[int]]] = {}
-
     def _calculate_num_blocks(self, cpu_capacity_bytes: int) -> int:
-        """Calculate number of CPU blocks based on capacity."""
         assert self.kv_cache_config is not None
-        # Calculate from KV cache config
         page_sizes = {
             group.kv_cache_spec.page_size_bytes
             for group in self.kv_cache_config.kv_cache_groups
@@ -121,27 +131,23 @@ class SimpleCPUOffloadScheduler:
 
         return max(1, cpu_capacity_bytes // num_tensors // page_size_bytes)
 
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        """Inject GPU block pool. Called by Scheduler after kv_cache_manager
+        is ready. Required for ref_cnt-based block protection during stores."""
+        self._gpu_block_pool = gpu_block_pool
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
-        """
-        Check CPU cache for prefix matches.
+        """Return (num_new_tokens, is_async) from consecutive CPU cache hits."""
+        # Skip blocks already locally computed (GPU prefix cache hits).
+        skipped = num_computed_tokens // self.gpu_block_size
 
-        Args:
-            request: The request to check
-            num_computed_tokens: Number of already computed tokens
-
-        Returns:
-            Tuple of (num_matched_tokens, is_async):
-            - num_matched_tokens: Number of tokens that can be loaded from CPU
-            - is_async: True if tokens will be loaded asynchronously
-        """
-        # Count consecutive cache hits from the start
         num_matched_blocks = 0
-        for block_hash in request.block_hashes:
-            # Check if block exists in CPU cache
+        for block_hash in request.block_hashes[skipped:]:
+            # TODO (yifan): support HMA
             cpu_blocks = self.cpu_block_pool.get_cached_block(
                 block_hash, kv_cache_group_ids=[0]
             )
@@ -149,17 +155,14 @@ class SimpleCPUOffloadScheduler:
                 break
             num_matched_blocks += 1
 
-        num_matched_tokens = num_matched_blocks * self.gpu_block_size
-        num_new_tokens = max(0, num_matched_tokens - num_computed_tokens)
-
-        if num_new_tokens > 0:
-            self._has_observed_cache_hit = True
+        num_external_tokens = num_matched_blocks * self.gpu_block_size
+        if num_external_tokens > 0:
             logger.debug(
-                "Request %s: CPU cache hit, %d new tokens can be loaded",
+                "Request %s: CPU cache hit, %d external tokens can be loaded",
                 request.request_id,
-                num_new_tokens,
+                num_external_tokens,
             )
-            return num_new_tokens, True
+            return num_external_tokens, True
 
         return 0, False
 
@@ -169,165 +172,220 @@ class SimpleCPUOffloadScheduler:
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ) -> None:
-        """
-        Prepare load metadata for worker after GPU block allocation.
-
-        Args:
-            request: The request
-            blocks: Allocated GPU blocks
-            num_external_tokens: Number of tokens to load from CPU
-        """
+        """Prepare load metadata after GPU block allocation."""
         req_id = request.request_id
-
-        # Store request for later access to block_hashes
-        self._requests[req_id] = request
-
-        # Store GPU block IDs for this request (for store operations later)
         block_ids_by_group = blocks.get_block_ids()
-        self._request_gpu_blocks[req_id] = [list(ids) for ids in block_ids_by_group]
+
+        # Store tracking (eager mode only). Track here because this is the only
+        # place we can see all scheduled requests. With chunked prefill, this
+        # method is called multiple times for the same request across scheduling
+        # steps, so update gpu_block_ids if the entry already exists.
+        if not self._lazy_mode:
+            existing = self._reqs_to_store.get(req_id)
+            if existing is not None:
+                existing.gpu_block_ids = block_ids_by_group
+            else:
+                self._reqs_to_store[req_id] = RequestState(
+                    request=request, gpu_block_ids=block_ids_by_group
+                )
 
         if num_external_tokens == 0:
             return
 
-        # Determine which blocks to load from CPU
         num_blocks_to_load = num_external_tokens // self.gpu_block_size
-        block_hashes_to_load = list(request.block_hashes[:num_blocks_to_load])
+        assert num_blocks_to_load > 0, (
+            f"Request {request.request_id}: No blocks to load for "
+            f"{num_external_tokens} external tokens"
+        )
 
-        gpu_block_ids = block_ids_by_group[0]
+        # TODO (yifan): support HMA
+        # Skip blocks already locally computed (GPU prefix cache hits).
+        skipped = sum(block.block_hash is not None for block in blocks.blocks[0])
+        block_hashes_to_load = list(
+            request.block_hashes[skipped : skipped + num_blocks_to_load]
+        )
+
+        # TODO (yifan): support HMA
+        gpu_block_ids = block_ids_by_group[0][skipped : skipped + num_blocks_to_load]
         cpu_block_ids: list[int] = []
-        dst_gpu_blocks: list[int] = []
-        loaded_block_hashes: list[BlockHash] = []
         touched_blocks = []
-        for block_idx, block_hash in enumerate(block_hashes_to_load):
+        for block_hash in block_hashes_to_load:
+            # TODO (yifan): support HMA
             cpu_blocks = self.cpu_block_pool.get_cached_block(
                 block_hash, kv_cache_group_ids=[0]
             )
-            if cpu_blocks is None:
-                logger.warning(
-                    "CPU cache miss for block that was expected to be cached"
-                )
-                continue
+            assert cpu_blocks is not None, (
+                f"Request {request.request_id}: CPU cache miss for block "
+                f"{block_hash} that was expected to be cached"
+            )
             cpu_block = cpu_blocks[0]
             cpu_block_ids.append(cpu_block.block_id)
-            dst_gpu_blocks.append(gpu_block_ids[block_idx])
-            loaded_block_hashes.append(block_hash)
             touched_blocks.append(cpu_block)
 
-        if len(cpu_block_ids) != num_blocks_to_load:
-            logger.warning(
-                "Request %s: Expected %d blocks but found %d in CPU cache",
-                req_id,
-                num_blocks_to_load,
-                len(cpu_block_ids),
+        # Touch CPU blocks to prevent eviction during async load
+        self.cpu_block_pool.touch(touched_blocks)
+        # Touch GPU blocks to prevent freeing during async load
+        if self._gpu_block_pool is not None:
+            self._gpu_block_pool.touch(
+                [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
             )
 
-        if not cpu_block_ids:
-            return
-
-        # Touch to update LRU ordering while these blocks are in-flight.
-        self.cpu_block_pool.touch(touched_blocks)
-
-        # Prepare load spec (first group only for now)
-        self._reqs_to_load[req_id] = (dst_gpu_blocks, cpu_block_ids)
-
-        # Track for async completion (use extend to preserve order)
-        self._loading_requests[req_id].extend(loaded_block_hashes)
-        self._pending_load_blocks[req_id].extend(cpu_block_ids)
+        # External KV cache hits. Track the request for load
+        assert req_id not in self._reqs_to_load
+        self._reqs_to_load[req_id] = RequestState(
+            request=request,
+            gpu_block_ids=block_ids_by_group,
+            load_transfer=ReqTransferMeta(
+                gpu_block_ids, cpu_block_ids, block_hashes_to_load
+            ),
+        )
 
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
     ) -> SimpleCPUOffloadMetadata:
-        """
-        Build metadata for worker to execute transfers.
+        """Build metadata for worker to execute transfers this step."""
+        # --- Stores ---
+        store_job_idx = -1
+        store_gpu: list[int] = []
+        store_cpu: list[int] = []
+        block_hashes: list[BlockHashWithGroupId] = []
+        store_req_ids: list[str] = []  # For eager mode only
+        if self._lazy_mode:
+            # Lazy: offload GPU blocks that are evicted from the GPU block pool
+            store_gpu, store_cpu, block_hashes = self._prepare_lazy_store_specs()
+        else:
+            (store_gpu, store_cpu, block_hashes, store_req_ids) = (
+                self._prepare_eager_store_specs(scheduler_output)
+            )
+        if store_gpu:
+            store_job_idx = self._store_job_counter
+            self._store_job_counter += 1
+            self.store_job_to_blocks[store_job_idx] = (
+                store_gpu,
+                store_cpu,
+                block_hashes,
+            )
+            if store_req_ids:  # For eager mode only
+                self._store_job_to_reqs[store_job_idx] = store_req_ids
+                for req_id in store_req_ids:
+                    state = self._reqs_to_store.get(req_id)
+                    if state is not None:
+                        state.store_job_idxs.add(store_job_idx)
 
-        Args:
-            scheduler_output: The scheduler output for this step
+        # --- Loads ---
+        load_job_idx = -1
+        load_gpu: list[int] = []
+        load_cpu: list[int] = []
+        load_req_ids: list[str] = []
+        for req_id, state in self._reqs_to_load.items():
+            if state.load_job_idx is not None:
+                continue
+            transfer = state.load_transfer
+            assert transfer is not None
+            load_gpu.extend(transfer.gpu_block_ids)
+            load_cpu.extend(transfer.cpu_block_ids)
+            load_req_ids.append(req_id)
+        if load_req_ids:
+            load_job_idx = self._load_job_counter
+            self._load_job_counter += 1
+            for req_id in load_req_ids:
+                self._reqs_to_load[req_id].load_job_idx = load_job_idx
+            self._load_job_to_reqs[load_job_idx] = load_req_ids
 
-        Returns:
-            Metadata containing load and store specifications
-        """
-        # Prepare store specs for newly computed blocks
-        reqs_to_store = self._prepare_store_specs(scheduler_output)
-
-        # Package metadata
-        meta = SimpleCPUOffloadMetadata(
-            reqs_to_load=self._reqs_to_load,
-            reqs_to_store=reqs_to_store,
+        return SimpleCPUOffloadMetadata(
+            load_job_idx=load_job_idx,
+            load_gpu_blocks=load_gpu,
+            load_cpu_blocks=load_cpu,
+            # NOTE: passes reference, not copy. Safe because scheduler and
+            # worker run in separate processes (metadata is serialized via ZMQ).
+            load_job_to_reqs=self._load_job_to_reqs,
+            store_job_idx=store_job_idx,
+            store_gpu_blocks=store_gpu,
+            store_cpu_blocks=store_cpu,
         )
 
-        # Reset for next step
-        self._reqs_to_load = {}
-
-        return meta
-
-    def _prepare_store_specs(
+    def _prepare_lazy_store_specs(
         self,
-        scheduler_output: SchedulerOutput,
-    ) -> dict[str, tuple[list[int], list[int]]]:
-        """
-        Identify new blocks to offload to CPU.
+    ) -> tuple[list[int], list[int], list[BlockHashWithGroupId]]:
+        """Pick LRU-front GPU eviction candidates, allocate CPU slots.
 
-        This method determines which newly computed blocks should be stored
-        to CPU cache. It allocates CPU blocks and prepares the transfer specs.
-
-        Args:
-            scheduler_output: The scheduler output
+        Touches GPU blocks (ref_cnt 0->1) to prevent eviction during async copy.
+        On completion, update_connector_output decrements back to 0.
 
         Returns:
-            Dict mapping request_id to (gpu_block_ids, cpu_block_ids) for storing
+            (gpu_block_ids, cpu_block_ids, block_hashes) for the store job.
         """
-        reqs_to_store: dict[str, tuple[list[int], list[int]]] = {}
+        total_tokens = self.vllm_config.scheduler_config.max_num_scheduled_tokens
+        n_lookahead = max(
+            total_tokens // self.gpu_block_size, self._min_lookahead_blocks
+        )
+        if self._gpu_block_pool is None or n_lookahead <= 0:
+            return [], [], []
+
+        gpu_ids: list[int] = []
+        cpu_ids: list[int] = []
+        block_hashes: list[BlockHashWithGroupId] = []
+
+        candidates = self._gpu_block_pool.get_eviction_candidates(n_lookahead)
+        for gpu_block in candidates:
+            bhash_with_group = gpu_block.block_hash
+            if bhash_with_group is None:
+                continue
+            plain_hash = get_block_hash(bhash_with_group)
+            if self.cpu_block_pool.get_cached_block(plain_hash, [0]) is not None:
+                continue
+            if self.cpu_block_pool.get_num_free_blocks() == 0:
+                break
+            cpu_block = self.cpu_block_pool.get_new_blocks(1)[0]
+            gpu_ids.append(gpu_block.block_id)
+            cpu_ids.append(cpu_block.block_id)
+            block_hashes.append(bhash_with_group)
+
+        if gpu_ids:
+            # Touch GPU blocks to prevent freeing during async copy
+            self._gpu_block_pool.touch(
+                [self._gpu_block_pool.blocks[bid] for bid in gpu_ids]
+            )
+
+        return gpu_ids, cpu_ids, block_hashes
+
+    def _prepare_eager_store_specs(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> tuple[list[int], list[int], list[BlockHashWithGroupId], list[str]]:
+        """Identify newly computed blocks to offload.
+
+        Returns:
+            (gpu_block_ids, cpu_block_ids, block_hashes) for the store job.
+        """
+        merged_gpu_block_ids: list[int] = []
+        merged_cpu_block_ids: list[int] = []
+        merged_block_hashes: list[BlockHashWithGroupId] = []
+        req_ids: list[str] = []
 
         for req_id, num_new_tokens in scheduler_output.num_scheduled_tokens.items():
             if num_new_tokens == 0:
                 continue
 
-            # Avoid pure-offload overhead when there is no observed reuse.
-            if (
-                not self._has_observed_cache_hit
-                and self._store_block_budget_before_first_hit <= 0
-            ):
+            state = self._reqs_to_store.get(req_id)
+            if state is None or state.finished:
                 continue
 
-            # Get GPU blocks for this request
-            gpu_blocks_by_group = self._request_gpu_blocks.get(req_id)
-            if gpu_blocks_by_group is None:
-                continue
-
-            # Get request to access block hashes.
-            request = self._requests.get(req_id)
-            if request is None:
-                continue
-
-            # Calculate how many blocks are now full and sourceable on GPU.
+            request = state.request
             total_tokens = request.num_computed_tokens + num_new_tokens
             num_full_blocks = total_tokens // self.gpu_block_size
 
-            # By default, keep decode path lightweight and only offload prompt
-            # blocks for prefix reuse.
-            if not self.offload_decode_blocks:
-                num_full_blocks = min(
-                    num_full_blocks,
-                    request.num_prompt_tokens // self.gpu_block_size,
-                )
-
-            gpu_blocks = gpu_blocks_by_group[0]  # First group
+            # TODO (yifan): support HMA
+            gpu_blocks = state.gpu_block_ids[0]
             num_available_blocks = min(
                 num_full_blocks,
                 len(request.block_hashes),
                 len(gpu_blocks),
             )
-            if num_available_blocks <= 0:
-                continue
-
-            # Requests can be preempted/recomputed. Clamp stale stored counters
-            # to the currently available block span.
-            prev_num_stored = self._num_stored_blocks.get(req_id, 0)
-            num_already_stored = min(prev_num_stored, num_available_blocks)
-            if num_already_stored != prev_num_stored:
-                self._num_stored_blocks[req_id] = num_already_stored
-
+            # FIXME (yifan): handle CPU cache eviction, where num_stored_blocks can
+            # be stale and omit evicted blocks in the middle of the request.
+            num_already_stored = state.num_stored_blocks
             if num_available_blocks <= num_already_stored:
                 continue
 
@@ -336,28 +394,18 @@ class SimpleCPUOffloadScheduler:
             ]
             new_gpu_blocks = gpu_blocks[num_already_stored:num_available_blocks]
 
-            # Allocate CPU blocks for new blocks and keep src/dst aligned.
-            cpu_block_ids = []
-            src_gpu_blocks = []
-            block_hashes_to_store = []
+            gpu_block_ids: list[int] = []
+            cpu_block_ids: list[int] = []
+            block_hashes_to_store: list[BlockHashWithGroupId] = []
             num_cached_blocks = 0
-            for src_gpu_block, block_hash in zip(new_gpu_blocks, new_block_hashes):
-                if (
-                    not self._has_observed_cache_hit
-                    and self._store_block_budget_before_first_hit <= 0
-                ):
-                    break
-
-                # Check if already cached (skip if so)
+            for gpu_block_id, block_hash in zip(new_gpu_blocks, new_block_hashes):
                 existing = self.cpu_block_pool.get_cached_block(
                     block_hash, kv_cache_group_ids=[0]
                 )
                 if existing is not None:
-                    # Already cached, skip
                     num_cached_blocks += 1
                     continue
 
-                # Avoid exception-heavy fast path once pool is saturated.
                 if self.cpu_block_pool.get_num_free_blocks() <= 0:
                     logger.debug(
                         "Request %s: CPU cache full, cannot offload block",
@@ -365,21 +413,25 @@ class SimpleCPUOffloadScheduler:
                     )
                     break
 
-                # Try to allocate a new CPU block
-                new_blocks = self.cpu_block_pool.get_new_blocks(1)
-                cpu_block = new_blocks[0]
-                src_gpu_blocks.append(src_gpu_block)
+                cpu_block = self.cpu_block_pool.get_new_blocks(1)[0]
+                gpu_block_ids.append(gpu_block_id)
                 cpu_block_ids.append(cpu_block.block_id)
-                block_hashes_to_store.append(block_hash)
-                if not self._has_observed_cache_hit:
-                    self._store_block_budget_before_first_hit -= 1
+                # TODO (yifan): support HMA — hardcoded group_id=0
+                block_hashes_to_store.append(
+                    make_block_hash_with_group_id(block_hash, 0)
+                )
 
             if cpu_block_ids:
-                reqs_to_store[req_id] = (src_gpu_blocks, cpu_block_ids)
+                req_ids.append(req_id)
+                merged_gpu_block_ids.extend(gpu_block_ids)
+                merged_cpu_block_ids.extend(cpu_block_ids)
+                merged_block_hashes.extend(block_hashes_to_store)
 
-                # Track for async completion (use extend to preserve order)
-                self._storing_requests[req_id].extend(block_hashes_to_store)
-                self._pending_cpu_blocks[req_id].extend(cpu_block_ids)
+                # Touch GPU blocks to prevent freeing during async copy
+                if self._gpu_block_pool is not None:
+                    self._gpu_block_pool.touch(
+                        [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
+                    )
 
                 logger.debug(
                     "Request %s: Scheduling store of %d blocks to CPU",
@@ -387,168 +439,177 @@ class SimpleCPUOffloadScheduler:
                     len(cpu_block_ids),
                 )
 
-            # Count cached hits as already stored for this request so we keep
-            # moving forward across full blocks on subsequent steps.
+            # Advance cursor past both cached hits and newly-stored blocks
             total_advanced = num_cached_blocks + len(cpu_block_ids)
             if total_advanced > 0:
-                self._num_stored_blocks[req_id] = num_already_stored + total_advanced
+                state.num_stored_blocks = num_already_stored + total_advanced
 
-        return reqs_to_store
+        return (
+            merged_gpu_block_ids,
+            merged_cpu_block_ids,
+            merged_block_hashes,
+            req_ids,
+        )
 
     def update_connector_output(
         self,
         connector_output: KVConnectorOutput,
     ) -> None:
-        """
-        Handle async transfer completions from worker.
+        """Handle async transfer completions from worker.
 
-        Args:
-            connector_output: Output from worker containing completion info
+        The worker treats load and store differently:
+        - For load which blocks are tightly coupled with requests, the worker reports
+            finished_recving with the request ID.
+        - For store which blocks are not tightly coupled with requests, the worker
+            reports finished_sending with the job index, and the scheduler should
+            update request metadata accordingly.
+
+        The connector emits job-index sentinels (__load_done_N,
+        __store_done_N). We translate those back to req_ids using our
+        inverse maps, process completions, and mutate
+        connector_output.finished_recving with real req_ids for the
+        scheduler.
         """
-        # Mark loads complete
-        for req_id in connector_output.finished_recving or []:
-            block_hashes = self._loading_requests.pop(req_id, [])
-            load_block_ids = self._pending_load_blocks.pop(req_id, [])
-            if load_block_ids:
-                self.cpu_block_pool.free_blocks(
-                    self.cpu_block_pool.blocks[block_id] for block_id in load_block_ids
-                )
+        # --- Load completions ---
+        # Unlike stores, loads always clean up unconditionally on completion.
+        # A request has at most one load job, so completion means "done."
+        for req_id in list(connector_output.finished_recving or []):
+            self._cleanup_load_request(req_id)
+
+        # --- Store completions ---
+        for sentinel in connector_output.finished_sending or []:
+            job_idx = int(sentinel[len("__store_done_") :])
+
+            # Both lazy and eager: process job-level blocks
+            gpu_block_ids, cpu_block_ids, bhashes_w_group = (
+                self.store_job_to_blocks.pop(job_idx)
+            )
+            self._process_store_completion(
+                gpu_block_ids, cpu_block_ids, bhashes_w_group
+            )
             logger.debug(
-                "Request %s: Finished loading %d blocks from CPU",
-                req_id,
-                len(block_hashes),
+                "Store job %d completed: cached %d blocks to CPU",
+                job_idx,
+                len(cpu_block_ids),
             )
 
-        # Mark stores complete and cache the blocks
-        for req_id in connector_output.finished_sending or []:
-            block_hashes = self._storing_requests.pop(req_id, [])
-            cpu_block_ids = self._pending_cpu_blocks.pop(req_id, [])
+            # Eager only: update per-req state
+            if not self._lazy_mode:
+                for req_id in self._store_job_to_reqs.pop(job_idx, []):
+                    state = self._reqs_to_store.get(req_id)
+                    if state is None:
+                        continue
+                    state.store_job_idxs.discard(job_idx)
+                    if state.finished and not state.store_job_idxs:
+                        self._cleanup_store_request(req_id)
 
-            # Cache the stored blocks in the CPU pool
-            if block_hashes and cpu_block_ids:
-                if len(block_hashes) != len(cpu_block_ids):
-                    logger.warning(
-                        "Request %s: completed store length mismatch: "
-                        "hashes=%d, cpu_blocks=%d",
-                        req_id,
-                        len(block_hashes),
-                        len(cpu_block_ids),
-                    )
+        # Scheduler doesn't need finished_sending since we protect blocks with ref_cnt.
+        connector_output.finished_sending = None
 
-                # Get the actual blocks and cache them
-                # block_hashes is now a list preserving insertion order
-                cached_blocks = []
-                for block_hash, cpu_block_id in zip(block_hashes, cpu_block_ids):
-                    cpu_block = self.cpu_block_pool.blocks[cpu_block_id]
-                    # The block pool will cache the block with its hash
-                    block_hash_with_group = make_block_hash_with_group_id(
-                        block_hash, group_id=0
-                    )
-                    cpu_block.block_hash = block_hash_with_group
-                    self.cpu_block_pool.cached_block_hash_to_block.insert(
-                        block_hash_with_group, cpu_block
-                    )
-                    cached_blocks.append(cpu_block)
+    def _process_store_completion(
+        self,
+        gpu_block_ids: list[int],
+        cpu_block_ids: list[int],
+        bhashes_w_group: list[BlockHashWithGroupId],
+    ) -> None:
+        """Cache CPU blocks and release refs for a completed store."""
+        assert len(bhashes_w_group) == len(cpu_block_ids) == len(gpu_block_ids)
 
-                # Release scheduler-owned references from get_new_blocks().
-                # Cached blocks remain discoverable via hash map and evictable by LRU.
-                if cached_blocks:
-                    self.cpu_block_pool.free_blocks(cached_blocks)
-            elif cpu_block_ids:
-                logger.warning(
-                    "Request %s: completed store missing block hashes for %d "
-                    "CPU blocks",
-                    req_id,
-                    len(cpu_block_ids),
-                )
-
-            # Release any unmatched CPU blocks to avoid leaks on mismatch.
-            if len(cpu_block_ids) > len(block_hashes):
-                self.cpu_block_pool.free_blocks(
-                    self.cpu_block_pool.blocks[cpu_block_id]
-                    for cpu_block_id in cpu_block_ids[len(block_hashes) :]
-                )
-
-            logger.debug(
-                "Request %s: Finished storing %d blocks to CPU, cached",
-                req_id,
-                len(block_hashes),
+        cpu_blocks = [self.cpu_block_pool.blocks[bid] for bid in cpu_block_ids]
+        for bhash_w_group, cpu_block in zip(bhashes_w_group, cpu_blocks):
+            cpu_block.block_hash = bhash_w_group
+            self.cpu_block_pool.cached_block_hash_to_block.insert(
+                bhash_w_group, cpu_block
             )
 
-            # finished_sending is only reported after request completion.
-            self._cleanup_request(req_id)
+        self.cpu_block_pool.free_blocks(cpu_blocks)
+        if self._gpu_block_pool is not None:
+            self._gpu_block_pool.free_blocks(
+                self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
+            )
 
     def request_finished(
         self,
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """
-        Called when a request has finished.
-
-        Args:
-            request: The finished request
-            block_ids: Block IDs being freed
-
-        Returns:
-            Tuple of (is_async, kv_transfer_params)
-        """
+        """Always returns (False, None). GPU blocks are protected by ref_cnt,
+        so the scheduler can free blocks immediately."""
         req_id = request.request_id
 
-        # Check if storing in progress
-        is_async = req_id in self._storing_requests
+        # Handle load: defer cleanup if load is in-flight
+        load_state = self._reqs_to_load.get(req_id)
+        if load_state is not None:
+            if load_state.load_job_idx is not None:
+                load_state.finished = True  # Defer: load in-flight
+            else:
+                self._cleanup_load_request(req_id)
 
-        # Cleanup if not async (otherwise cleaned up in update_connector_output)
-        if not is_async:
-            self._cleanup_request(req_id)
+        # Handle store (eager mode only): defer cleanup if stores in-flight
+        store_state = self._reqs_to_store.get(req_id)
+        if store_state is not None:
+            if store_state.store_job_idxs:
+                store_state.finished = True  # Defer: stores in-flight
+            else:
+                self._cleanup_store_request(req_id)
 
-        return is_async, None
+        return False, None
 
     def request_finished_all_groups(
         self,
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
+        return self.request_finished(request, block_ids=[])
+
+    def _cleanup_load_request(self, req_id: str) -> None:
+        """Release all load resources for a request.
+
+        Shared between request_finished() and update_connector_output() paths.
+        Removes the request from _reqs_to_load, cleans up job mappings,
+        and frees CPU/GPU touch refs.
         """
-        Called when a request has finished for all KV cache groups.
-        (SupportsHMA interface)
-
-        Args:
-            request: The finished request
-            block_ids: Block IDs being freed for each group
-
-        Returns:
-            Tuple of (is_async, kv_transfer_params)
-        """
-        req_id = request.request_id
-        is_async = req_id in self._storing_requests
-
-        # Cleanup if not async
-        if not is_async:
-            self._cleanup_request(req_id)
-
-        return is_async, None
-
-    def _cleanup_request(self, req_id: str) -> None:
-        """Clean up all state for a request."""
-        pending_load_blocks = self._pending_load_blocks.pop(req_id, [])
-        if pending_load_blocks:
+        state = self._reqs_to_load.pop(req_id, None)
+        if state is None:
+            return
+        # Remove from load job mapping (only this req, not whole job)
+        if state.load_job_idx is not None:
+            reqs = self._load_job_to_reqs.get(state.load_job_idx)
+            if reqs is not None:
+                with contextlib.suppress(ValueError):
+                    reqs.remove(req_id)
+                if not reqs:
+                    self._load_job_to_reqs.pop(state.load_job_idx, None)
+        # Free CPU touch refs
+        if state.load_transfer is not None:
             self.cpu_block_pool.free_blocks(
-                self.cpu_block_pool.blocks[block_id] for block_id in pending_load_blocks
+                self.cpu_block_pool.blocks[bid]
+                for bid in state.load_transfer.cpu_block_ids
+            )
+        # Free GPU touch refs
+        if state.load_transfer is not None and self._gpu_block_pool is not None:
+            self._gpu_block_pool.free_blocks(
+                self._gpu_block_pool.blocks[bid]
+                for bid in state.load_transfer.gpu_block_ids
             )
 
-        pending_cpu_blocks = self._pending_cpu_blocks.pop(req_id, [])
-        if pending_cpu_blocks:
-            self.cpu_block_pool.free_blocks(
-                self.cpu_block_pool.blocks[block_id] for block_id in pending_cpu_blocks
-            )
+    def _cleanup_store_request(self, req_id: str) -> None:
+        """Release store metadata for a request.
 
-        self._requests.pop(req_id, None)
-        self._request_gpu_blocks.pop(req_id, None)
-        self._num_stored_blocks.pop(req_id, None)
-        self._loading_requests.pop(req_id, None)
-        self._storing_requests.pop(req_id, None)
-        self._reqs_to_load.pop(req_id, None)
+        Metadata-only cleanup — no block freeing. Job completion handles
+        block caching and GPU ref freeing via _process_store_completion().
+        """
+        state = self._reqs_to_store.pop(req_id, None)
+        if state is None:
+            return
+        for job_idx in list(state.store_job_idxs):
+            reqs = self._store_job_to_reqs.get(job_idx)
+            if reqs is not None:
+                with contextlib.suppress(ValueError):
+                    reqs.remove(req_id)
+                if not reqs:
+                    self._store_job_to_reqs.pop(job_idx, None)
+        state.store_job_idxs.clear()
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         """Return KV cache events for telemetry."""

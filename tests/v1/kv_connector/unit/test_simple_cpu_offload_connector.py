@@ -7,10 +7,8 @@ import torch
 
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
-from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload import (
-    triton_kernels,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.manager import (
+    RequestState,
     SimpleCPUOffloadScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata import (
@@ -24,8 +22,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector i
 )
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (
-    BlockHash,
     init_none_hash,
+    make_block_hash_with_group_id,
 )
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -38,7 +36,6 @@ from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import (
     create_request,
-    create_scheduler,
     create_vllm_config,
 )
 
@@ -53,43 +50,90 @@ class TestSimpleCPUOffloadMetadata:
     def test_empty_metadata_creation(self):
         """Test creating empty metadata with default values."""
         metadata = SimpleCPUOffloadMetadata()
-        assert metadata.reqs_to_load == {}
-        assert metadata.reqs_to_store == {}
+        assert metadata.load_job_idx == -1
+        assert metadata.load_gpu_blocks == []
+        assert metadata.load_cpu_blocks == []
+        assert metadata.store_job_idx == -1
+        assert metadata.store_gpu_blocks == []
+        assert metadata.store_cpu_blocks == []
 
     def test_metadata_with_load_specs(self):
         """Test metadata with load specifications."""
-        reqs_to_load = {
-            "req-1": ([0, 1, 2], [10, 11, 12]),
-            "req-2": ([3, 4], [13, 14]),
-        }
-        metadata = SimpleCPUOffloadMetadata(reqs_to_load=reqs_to_load)
-        assert metadata.reqs_to_load == reqs_to_load
-        assert metadata.reqs_to_store == {}
+        metadata = SimpleCPUOffloadMetadata(
+            load_job_idx=0,
+            load_gpu_blocks=[0, 1, 2, 3, 4],
+            load_cpu_blocks=[10, 11, 12, 13, 14],
+        )
+        assert metadata.load_job_idx == 0
+        assert metadata.load_gpu_blocks == [0, 1, 2, 3, 4]
+        assert metadata.load_cpu_blocks == [10, 11, 12, 13, 14]
+        assert metadata.store_job_idx == -1
 
     def test_metadata_with_store_specs(self):
         """Test metadata with store specifications."""
-        reqs_to_store = {
-            "req-1": ([0, 1], [5, 6]),
-        }
-        metadata = SimpleCPUOffloadMetadata(reqs_to_store=reqs_to_store)
-        assert metadata.reqs_to_load == {}
-        assert metadata.reqs_to_store == reqs_to_store
+        metadata = SimpleCPUOffloadMetadata(
+            store_job_idx=3,
+            store_gpu_blocks=[0, 1],
+            store_cpu_blocks=[5, 6],
+        )
+        assert metadata.store_job_idx == 3
+        assert metadata.store_gpu_blocks == [0, 1]
+        assert metadata.store_cpu_blocks == [5, 6]
+        assert metadata.load_job_idx == -1
 
     def test_metadata_with_both_specs(self):
         """Test metadata with both load and store specifications."""
-        reqs_to_load = {"req-1": ([0], [10])}
-        reqs_to_store = {"req-2": ([1], [11])}
         metadata = SimpleCPUOffloadMetadata(
-            reqs_to_load=reqs_to_load,
-            reqs_to_store=reqs_to_store,
+            load_job_idx=1,
+            load_gpu_blocks=[0],
+            load_cpu_blocks=[10],
+            store_job_idx=2,
+            store_gpu_blocks=[1],
+            store_cpu_blocks=[11],
         )
-        assert metadata.reqs_to_load == reqs_to_load
-        assert metadata.reqs_to_store == reqs_to_store
+        assert metadata.load_job_idx == 1
+        assert metadata.load_gpu_blocks == [0]
+        assert metadata.store_job_idx == 2
+        assert metadata.store_gpu_blocks == [1]
+
+    def test_metadata_fields(self):
+        """Test metadata only has block-level fields (no job->req maps)."""
+        metadata = SimpleCPUOffloadMetadata(
+            load_job_idx=0,
+            load_gpu_blocks=[1, 2],
+            load_cpu_blocks=[3, 4],
+            store_job_idx=1,
+            store_gpu_blocks=[5],
+            store_cpu_blocks=[6],
+        )
+        assert metadata.load_job_idx == 0
+        assert metadata.store_job_idx == 1
+        assert not hasattr(metadata, "pending_load_jobs")
+        assert not hasattr(metadata, "pending_store_jobs")
 
 
 # ============================================================
 # Test SimpleCPUOffloadScheduler
 # ============================================================
+
+
+class _MockBlock:
+    def __init__(self, block_hash=None):
+        self.block_hash = block_hash
+
+
+class _MockKVCacheBlocks:
+    def __init__(self, block_ids, num_computed_blocks=0):
+        self._block_ids = block_ids
+        self.blocks = [
+            [
+                _MockBlock(block_hash="computed" if i < num_computed_blocks else None)
+                for i in range(len(block_ids))
+            ]
+        ]
+
+    def get_block_ids(self):
+        return [self._block_ids]
 
 
 def _create_scheduler_manager(
@@ -105,7 +149,6 @@ def _create_scheduler_manager(
     vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
 
     # Calculate page size for the attention spec
-    # page_size_bytes = 2 * block_size * num_kv_heads * head_size * sizeof(dtype)
     num_kv_heads = 8
     head_size = 128
     dtype = torch.float16
@@ -170,28 +213,24 @@ class TestSimpleCPUOffloadScheduler:
         request = create_request(num_tokens=64, block_size=16)
 
         # Manually add blocks to CPU cache
-        block_hash = request.block_hashes[0]
         try:
             new_blocks = manager.cpu_block_pool.get_new_blocks(1)
             cpu_block = new_blocks[0]
 
-            # Set the block hash
-            from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
-
-            block_hash_with_group = make_block_hash_with_group_id(block_hash, 0)
+            block_hash_with_group = make_block_hash_with_group_id(
+                request.block_hashes[0], 0
+            )
             cpu_block._block_hash = block_hash_with_group
             manager.cpu_block_pool.cached_block_hash_to_block.insert(
                 block_hash_with_group, cpu_block
             )
 
-            # Now check for cache hit
             num_matched, is_async = manager.get_num_new_matched_tokens(
                 request, num_computed_tokens=0
             )
             assert num_matched == 16  # One block worth of tokens
             assert is_async is True
         except (ValueError, AttributeError):
-            # If get_new_blocks fails or block structure differs, skip
             pytest.skip("Could not allocate CPU blocks for test")
 
     def test_update_state_after_alloc_no_external_tokens(self):
@@ -199,26 +238,22 @@ class TestSimpleCPUOffloadScheduler:
         manager, _ = _create_scheduler_manager()
         request = create_request(num_tokens=32, block_size=16)
 
-        # Mock KVCacheBlocks
-        class MockKVCacheBlocks:
-            def get_block_ids(self):
-                return [[0, 1]]
-
-        blocks = MockKVCacheBlocks()
+        blocks = _MockKVCacheBlocks([0, 1])
         manager.update_state_after_alloc(request, blocks, num_external_tokens=0)
 
         # Should not have any load specs
         assert request.request_id not in manager._reqs_to_load
 
-        # But should track the request
-        assert request.request_id in manager._requests
-        assert request.request_id in manager._request_gpu_blocks
+        # Should track in _reqs_to_store (eager mode)
+        assert request.request_id in manager._reqs_to_store
+        state = manager._reqs_to_store[request.request_id]
+        assert isinstance(state, RequestState)
+        assert state.gpu_block_ids == [[0, 1]]
 
     def test_build_connector_meta_empty(self):
         """Test build_connector_meta with no operations."""
         manager, _ = _create_scheduler_manager()
 
-        # Create empty scheduler output
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
@@ -234,37 +269,36 @@ class TestSimpleCPUOffloadScheduler:
 
         metadata = manager.build_connector_meta(scheduler_output)
         assert isinstance(metadata, SimpleCPUOffloadMetadata)
-        assert metadata.reqs_to_load == {}
-        assert metadata.reqs_to_store == {}
+        assert metadata.load_job_idx == -1
+        assert metadata.load_gpu_blocks == []
+        assert metadata.store_job_idx == -1
+        assert metadata.store_gpu_blocks == []
 
     def test_request_finished_cleanup(self):
         """Test request_finished cleans up request state."""
         manager, _ = _create_scheduler_manager()
         request = create_request(num_tokens=32, block_size=16)
 
-        # Store some state for the request
-        manager._requests[request.request_id] = request
-        manager._request_gpu_blocks[request.request_id] = [[0, 1]]
-        manager._num_stored_blocks[request.request_id] = 1
+        # Set up state via the proper API
+        blocks = _MockKVCacheBlocks([0, 1])
+        manager.update_state_after_alloc(request, blocks, num_external_tokens=0)
+        assert request.request_id in manager._reqs_to_store
 
-        # Finish the request (not async)
+        # Finish the request (no in-flight transfers)
         is_async, params = manager.request_finished(request, block_ids=[0, 1])
         assert is_async is False
         assert params is None
 
         # Verify cleanup
-        assert request.request_id not in manager._requests
-        assert request.request_id not in manager._request_gpu_blocks
-        assert request.request_id not in manager._num_stored_blocks
+        assert request.request_id not in manager._reqs_to_store
 
     def test_request_finished_all_groups_cleanup(self):
         """Test request_finished_all_groups cleans up state."""
         manager, _ = _create_scheduler_manager()
         request = create_request(num_tokens=32, block_size=16)
 
-        # Store some state
-        manager._requests[request.request_id] = request
-        manager._request_gpu_blocks[request.request_id] = [[0, 1]]
+        blocks = _MockKVCacheBlocks([0, 1])
+        manager.update_state_after_alloc(request, blocks, num_external_tokens=0)
 
         # Finish via all_groups interface
         is_async, params = manager.request_finished_all_groups(
@@ -274,17 +308,46 @@ class TestSimpleCPUOffloadScheduler:
         assert params is None
 
         # Verify cleanup
-        assert request.request_id not in manager._requests
+        assert request.request_id not in manager._reqs_to_store
 
     def test_update_connector_output_finished_recving(self):
         """Test update_connector_output handles finished receiving."""
         manager, _ = _create_scheduler_manager()
 
-        # Set up a loading request
-        req_id = "test-req-1"
-        manager._loading_requests[req_id] = [BlockHash(b"hash1")]
+        # Cache a CPU block for the load
+        request = create_request(num_tokens=16, block_size=16)
+        req_id = request.request_id
 
-        # Mark as finished receiving
+        cpu_block = manager.cpu_block_pool.get_new_blocks(1)[0]
+        cpu_block.block_hash = make_block_hash_with_group_id(
+            request.block_hashes[0], group_id=0
+        )
+        manager.cpu_block_pool.cached_block_hash_to_block.insert(
+            cpu_block.block_hash, cpu_block
+        )
+        manager.cpu_block_pool.free_blocks([cpu_block])
+
+        # Set up load state
+        blocks = _MockKVCacheBlocks([7])
+        manager.update_state_after_alloc(request, blocks, num_external_tokens=16)
+        assert req_id in manager._reqs_to_load
+
+        # Build connector meta to assign load_job_idx
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            kv_connector_metadata=SimpleCPUOffloadMetadata(),
+        )
+        manager.build_connector_meta(scheduler_output)
+
+        # Mark as finished receiving with actual req_id
         connector_output = KVConnectorOutput(
             finished_sending=None,
             finished_recving={req_id},
@@ -293,40 +356,52 @@ class TestSimpleCPUOffloadScheduler:
         manager.update_connector_output(connector_output)
 
         # Should be removed from loading
-        assert req_id not in manager._loading_requests
+        assert req_id not in manager._reqs_to_load
+        # CPU touch ref released
+        assert cpu_block.ref_cnt == 0
 
     def test_update_connector_output_finished_sending(self):
         """Test update_connector_output handles finished sending and caches."""
         manager, _ = _create_scheduler_manager()
 
-        # Set up a storing request
-        req_id = "test-req-1"
         request = create_request(num_tokens=32, block_size=16)
-        request.request_id = req_id
+        req_id = request.request_id
 
-        block_hash = BlockHash(b"hash1")
-        manager._requests[req_id] = request
-        manager._storing_requests[req_id] = [block_hash]
+        blocks = _MockKVCacheBlocks([0, 1])
+        manager.update_state_after_alloc(request, blocks, num_external_tokens=0)
+        request.num_computed_tokens = 0
 
-        # Allocate a CPU block for the pending store
-        try:
-            new_blocks = manager.cpu_block_pool.get_new_blocks(1)
-            cpu_block_id = new_blocks[0].block_id
-            manager._pending_cpu_blocks[req_id] = [cpu_block_id]
+        # Build connector meta to create store job
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={req_id: 32},
+            total_num_scheduled_tokens=32,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            kv_connector_metadata=SimpleCPUOffloadMetadata(),
+        )
+        meta = manager.build_connector_meta(scheduler_output)
+        assert meta.store_job_idx >= 0
 
-            # Mark as finished sending
-            connector_output = KVConnectorOutput(
-                finished_sending={req_id},
-                finished_recving=None,
-                invalid_block_ids=set(),
-            )
-            manager.update_connector_output(connector_output)
+        # Mark as finished sending via sentinel
+        connector_output = KVConnectorOutput(
+            finished_sending={f"__store_done_{meta.store_job_idx}"},
+            finished_recving=None,
+            invalid_block_ids=set(),
+        )
+        manager.update_connector_output(connector_output)
 
-            # Should be removed from storing
-            assert req_id not in manager._storing_requests
-            assert req_id not in manager._pending_cpu_blocks
-        except ValueError:
-            pytest.skip("Could not allocate CPU blocks for test")
+        # finished_sending should be cleared
+        assert connector_output.finished_sending is None
+
+        # Blocks should be cached in CPU pool
+        for bh in request.block_hashes[:2]:
+            cached = manager.cpu_block_pool.get_cached_block(bh, kv_cache_group_ids=[0])
+            assert cached is not None
 
     def test_take_events(self):
         """Test take_events returns events from block pool."""
@@ -409,8 +484,6 @@ class TestSimpleCPUOffloadConnector:
     def test_prefer_cross_layer_blocks_default(self):
         """Test that prefer_cross_layer_blocks uses default (False)."""
         connector = _create_connector(KVConnectorRole.SCHEDULER)
-        # SimpleCPUOffloadConnector no longer overrides this property,
-        # so it should use the default from the base class
         assert (
             not hasattr(SimpleCPUOffloadConnector, "prefer_cross_layer_blocks")
             or not connector.prefer_cross_layer_blocks
@@ -478,21 +551,28 @@ class TestSimpleCPUOffloadConnector:
 
         metadata = connector.build_connector_meta(scheduler_output)
         assert isinstance(metadata, SimpleCPUOffloadMetadata)
-        assert metadata.reqs_to_load == {}
-        assert metadata.reqs_to_store == {}
+        assert metadata.load_job_idx == -1
+        assert metadata.load_gpu_blocks == []
+        assert metadata.store_job_idx == -1
+        assert metadata.store_gpu_blocks == []
 
     def test_bind_and_clear_connector_metadata(self):
         """Test bind and clear connector metadata for worker role."""
         connector = _create_connector(KVConnectorRole.WORKER)
 
         metadata = SimpleCPUOffloadMetadata(
-            reqs_to_load={"req-1": ([0], [10])},
+            load_job_idx=0,
+            load_gpu_blocks=[0],
+            load_cpu_blocks=[10],
         )
         connector.bind_connector_metadata(metadata)
-        assert connector._connector_metadata is metadata
+        assert connector.worker_handler is not None
+        assert connector.worker_handler._connector_metadata is metadata
+        # Job index should be added to the set.
+        assert 0 in connector.worker_handler._pending_load_job_indices
 
         connector.clear_connector_metadata()
-        assert connector._connector_metadata is None
+        assert connector.worker_handler._connector_metadata is None
 
     def test_request_finished_scheduler(self):
         """Test request_finished for scheduler role."""
@@ -535,92 +615,6 @@ class TestSimpleCPUOffloadConnector:
 
 
 # ============================================================
-# Test Triton Kernels (CPU-only tests without actual GPU)
-# ============================================================
-
-
-class TestTritonKernels:
-    """Tests for Triton kernel copy operations.
-
-    Note: These tests use the PyTorch fallback when GPU is not available.
-    """
-
-    def test_copy_blocks_torch_basic(self):
-        """Test PyTorch fallback copy_blocks."""
-        # Create source and destination tensors
-        src_cache = torch.randn(10, 4, 8)  # 10 blocks
-        dst_cache = torch.zeros(10, 4, 8)
-
-        # Copy blocks 0->5, 1->6
-        block_mapping = torch.tensor([[0, 5], [1, 6]], dtype=torch.int64)
-
-        triton_kernels.copy_blocks_torch(src_cache, dst_cache, block_mapping)
-
-        # Verify copies
-        assert torch.allclose(dst_cache[5], src_cache[0])
-        assert torch.allclose(dst_cache[6], src_cache[1])
-        # Other blocks should be zero
-        assert torch.allclose(dst_cache[0], torch.zeros_like(dst_cache[0]))
-
-    def test_copy_blocks_torch_empty_mapping(self):
-        """Test copy_blocks with empty block mapping."""
-        src_cache = torch.randn(5, 4, 8)
-        dst_cache = torch.zeros(5, 4, 8)
-        original_dst = dst_cache.clone()
-
-        # Empty mapping
-        block_mapping = torch.empty((0, 2), dtype=torch.int64)
-
-        triton_kernels.copy_blocks_torch(src_cache, dst_cache, block_mapping)
-
-        # Destination should be unchanged
-        assert torch.allclose(dst_cache, original_dst)
-
-    def test_copy_blocks_function_empty(self):
-        """Test copy_blocks wrapper handles empty mapping."""
-        src_cache = torch.randn(5, 4, 8)
-        dst_cache = torch.zeros(5, 4, 8)
-        original_dst = dst_cache.clone()
-
-        block_mapping = torch.empty((0, 2), dtype=torch.int64)
-
-        # Should handle empty gracefully
-        triton_kernels.copy_blocks(
-            src_cache, dst_cache, block_mapping, use_triton=False
-        )
-
-        assert torch.allclose(dst_cache, original_dst)
-
-    def test_copy_blocks_torch_preserves_dtype(self):
-        """Test that copy preserves tensor dtype."""
-        # Test with float16
-        src_cache = torch.randn(5, 4, 8, dtype=torch.float16)
-        dst_cache = torch.zeros(5, 4, 8, dtype=torch.float16)
-
-        block_mapping = torch.tensor([[0, 1]], dtype=torch.int64)
-
-        triton_kernels.copy_blocks_torch(src_cache, dst_cache, block_mapping)
-
-        assert dst_cache.dtype == torch.float16
-        assert torch.allclose(dst_cache[1], src_cache[0])
-
-    def test_copy_blocks_cpu_to_cpu(self):
-        """Test copying between CPU tensors."""
-        src_cache = torch.randn(5, 2, 4)
-        dst_cache = torch.zeros(5, 2, 4)
-
-        block_mapping = torch.tensor([[0, 2], [3, 4]], dtype=torch.int64)
-
-        # Use PyTorch fallback for CPU
-        triton_kernels.copy_blocks(
-            src_cache, dst_cache, block_mapping, use_triton=False
-        )
-
-        assert torch.allclose(dst_cache[2], src_cache[0])
-        assert torch.allclose(dst_cache[4], src_cache[3])
-
-
-# ============================================================
 # Test SimpleCPUOffloadWorker (basic tests without GPU)
 # ============================================================
 
@@ -637,9 +631,8 @@ class TestSimpleCPUOffloadWorker:
             cpu_capacity_bytes=1024 * 1024 * 100,  # 100 MB
         )
 
-        assert worker.gpu_kv_caches == {}  # Not registered yet
-        assert worker.cpu_kv_caches == {}
-        assert worker.layer_names == []
+        assert worker.gpu_kv_caches is None  # Not registered yet
+        assert worker.cpu_kv_caches is None
         assert worker.load_stream is None
         assert worker.store_stream is None
 
@@ -658,20 +651,6 @@ class TestSimpleCPUOffloadWorker:
 
         worker.clear_connector_metadata()
         assert worker._connector_metadata is None
-
-    def test_get_finished_no_active_jobs(self):
-        """Test get_finished with no active jobs."""
-        vllm_config = create_vllm_config(block_size=16)
-        worker = SimpleCPUOffloadWorker(
-            vllm_config=vllm_config,
-            kv_cache_config=None,
-            cpu_capacity_bytes=1024 * 1024 * 100,
-        )
-
-        finished_sending, finished_recving = worker.get_finished(finished_req_ids=set())
-        # No jobs, so both should be None
-        assert finished_sending is None
-        assert finished_recving is None
 
     def test_start_load_kv_no_metadata(self):
         """Test start_load_kv with no metadata does nothing."""
@@ -706,20 +685,8 @@ class TestSimpleCPUOffloadWorker:
             cpu_capacity_bytes=1024 * 1024 * 100,
         )
 
-        # Should not raise even with preempted request IDs
-        worker.handle_preemptions(preempted_req_ids={"req-1", "req-2"})
-
-    def test_wait_for_layer_load_no_stream(self):
-        """Test wait_for_layer_load with no stream."""
-        vllm_config = create_vllm_config(block_size=16)
-        worker = SimpleCPUOffloadWorker(
-            vllm_config=vllm_config,
-            kv_cache_config=None,
-            cpu_capacity_bytes=1024 * 1024 * 100,
-        )
-
-        # Should not raise even without stream
-        worker.wait_for_layer_load("layer.0")
+        # Should not raise
+        worker.handle_preemptions()
 
     def test_register_kv_caches_per_layer(self):
         """Test register_kv_caches with per-layer tensors."""
@@ -731,7 +698,6 @@ class TestSimpleCPUOffloadWorker:
         )
 
         # Create mock per-layer KV caches (CPU tensors for testing without GPU)
-        # Shape: [num_blocks, 2, num_kv_heads, block_size, head_size]
         num_blocks = 10
         num_kv_heads = 8
         block_size = 16
@@ -742,19 +708,16 @@ class TestSimpleCPUOffloadWorker:
             "layer.2": torch.randn(num_blocks, 2, num_kv_heads, block_size, head_size),
         }
 
-        # Register should work without error (though streams need GPU)
         # Just test the data structure setup
         worker.gpu_kv_caches = kv_caches
-        worker.layer_names = list(kv_caches.keys())
 
         assert len(worker.gpu_kv_caches) == 3
-        assert len(worker.layer_names) == 3
         assert "layer.0" in worker.gpu_kv_caches
         assert "layer.1" in worker.gpu_kv_caches
         assert "layer.2" in worker.gpu_kv_caches
 
     def test_register_kv_caches_empty(self):
-        """Test register_kv_caches with empty dict does nothing harmful."""
+        """Test register_kv_caches with empty dict raises StopIteration."""
         vllm_config = create_vllm_config(block_size=16)
         worker = SimpleCPUOffloadWorker(
             vllm_config=vllm_config,
@@ -762,12 +725,8 @@ class TestSimpleCPUOffloadWorker:
             cpu_capacity_bytes=1024 * 1024 * 100,
         )
 
-        # Empty dict should not raise, just warn
-        worker.register_kv_caches({})
-
-        assert worker.gpu_kv_caches == {}
-        assert worker.cpu_kv_caches == {}
-        assert worker.layer_names == []
+        with pytest.raises(StopIteration):
+            worker.register_kv_caches({})
 
 
 # ============================================================
@@ -781,8 +740,10 @@ class TestSimpleCPUOffloadIntegration:
     @pytest.fixture
     def scheduler_with_connector(self):
         """Create a scheduler with SimpleCPUOffloadConnector."""
+        block_size = 16
+        num_blocks = 100
         vllm_config = create_vllm_config(
-            block_size=16,
+            block_size=block_size,
             max_num_batched_tokens=256,
         )
         vllm_config.kv_transfer_config = KVTransferConfig(
@@ -793,7 +754,37 @@ class TestSimpleCPUOffloadIntegration:
 
         init_none_hash(sha256)
 
-        scheduler = create_scheduler(vllm_config, num_blocks=100)
+        # Need at least one kv_cache_tensor for SimpleCPUOffloadScheduler
+        num_kv_heads = 1
+        head_size = 1
+        page_size_bytes = 2 * block_size * num_kv_heads * head_size * 4
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[KVCacheTensor(size=page_size_bytes, shared_by=["layer"])],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["layer"],
+                    FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        dtype=torch.float32,
+                    ),
+                )
+            ],
+        )
+        vllm_config.cache_config.num_gpu_blocks = num_blocks
+
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm.v1.structured_output import StructuredOutputManager
+
+        scheduler = Scheduler(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            log_stats=True,
+            structured_output_manager=StructuredOutputManager(vllm_config),
+            block_size=block_size,
+        )
         return scheduler
 
     def test_add_request_and_schedule(self, scheduler_with_connector):
