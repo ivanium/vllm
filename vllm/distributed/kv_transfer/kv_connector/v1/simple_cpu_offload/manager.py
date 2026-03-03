@@ -13,9 +13,19 @@ from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata im
 )
 from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    BlockHashWithGroupId,
+    KVCacheBlock,
+    get_block_hash,
+    make_block_hash_with_group_id,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
+
+# Sentinel prefix used in finished_sending to signal completed lazy store jobs.
+# Format: f"{_LAZY_SENTINEL_PREFIX}{job_idx}"
+_LAZY_SENTINEL_PREFIX = "__lazy_store_"
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -41,6 +51,8 @@ class SimpleCPUOffloadScheduler:
         vllm_config: VllmConfig,
         kv_cache_config: "KVCacheConfig | None",
         cpu_capacity_bytes: int,
+        lazy_offload: bool = False,
+        min_lookahead_blocks: int = 8,
     ):
         """
         Initialize the scheduler-side manager.
@@ -49,6 +61,10 @@ class SimpleCPUOffloadScheduler:
             vllm_config: vLLM configuration
             kv_cache_config: KV cache configuration
             cpu_capacity_bytes: CPU memory capacity in bytes
+            lazy_offload: If True, use lazy (LRU-eviction-based) offloading
+                instead of eager (newly-computed block) offloading.
+            min_lookahead_blocks: Minimum number of LRU candidates to consider
+                per step in lazy mode (floor for lookahead window).
         """
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -56,13 +72,22 @@ class SimpleCPUOffloadScheduler:
         cache_config = vllm_config.cache_config
         self.gpu_block_size = cache_config.block_size
 
+        # Lazy vs eager mode config
+        self._lazy_mode = lazy_offload
+        self._min_lookahead_blocks = min_lookahead_blocks
+
+        # GPU block pool reference — injected after scheduler builds kv_cache_manager
+        self._gpu_block_pool: BlockPool | None = None
+
         # Calculate number of CPU blocks based on capacity
         self.num_cpu_blocks = self._calculate_num_blocks(cpu_capacity_bytes)
 
         logger.info(
-            "SimpleCPUOffloadScheduler: Allocating %d CPU blocks (%.2f GB capacity)",
+            "SimpleCPUOffloadScheduler: Allocating %d CPU blocks "
+            "(%.2f GB capacity, mode=%s)",
             self.num_cpu_blocks,
             cpu_capacity_bytes / (1024**3),
+            "lazy" if lazy_offload else "eager",
         )
 
         # Create CPU block pool for LRU management
@@ -105,6 +130,18 @@ class SimpleCPUOffloadScheduler:
         self._req_to_load_job: dict[str, int] = {}
         self._req_to_store_jobs: dict[str, set[int]] = defaultdict(set)
 
+        # --- Lazy-mode tracking ---
+        # Accumulates (BlockHashWithGroupId, cpu_block) for lazy stores in
+        # the current step; flushed into _pending_lazy_stores at the end of
+        # build_connector_meta().
+        self._pending_lazy_stores_current: list[
+            tuple[BlockHashWithGroupId, KVCacheBlock]
+        ] = []
+        # job_idx -> list of (BlockHashWithGroupId, cpu_block) pending registration
+        self._pending_lazy_stores: dict[
+            int, list[tuple[BlockHashWithGroupId, KVCacheBlock]]
+        ] = {}
+
     def _calculate_num_blocks(self, cpu_capacity_bytes: int) -> int:
         """Calculate number of CPU blocks based on capacity."""
         assert self.kv_cache_config is not None
@@ -119,6 +156,17 @@ class SimpleCPUOffloadScheduler:
         assert num_tensors > 0
 
         return max(1, cpu_capacity_bytes // num_tensors // page_size_bytes)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        """Inject the GPU block pool reference for lazy offloading.
+
+        Must be called by the Scheduler after kv_cache_manager is ready.
+        Required for lazy mode; harmless in eager mode.
+
+        Args:
+            gpu_block_pool: The GPU-side BlockPool from KVCacheManager.
+        """
+        self._gpu_block_pool = gpu_block_pool
 
     def get_num_new_matched_tokens(
         self,
@@ -232,6 +280,50 @@ class SimpleCPUOffloadScheduler:
         self._loading_requests[req_id].extend(loaded_block_hashes)
         self._pending_load_blocks[req_id].extend(cpu_block_ids)
 
+    def _prepare_lazy_store_specs(
+        self, n_lookahead: int
+    ) -> tuple[list[int], list[int]]:
+        """Identify LRU-front GPU blocks and allocate CPU slots for them.
+
+        Called instead of _prepare_store_specs() in lazy mode. Peeks at the
+        n_lookahead eviction candidates on the GPU free queue, skips blocks
+        already in CPU cache, and allocates new CPU blocks for the rest.
+
+        The (BlockHashWithGroupId, cpu_block) pairs are stashed in
+        _pending_lazy_stores_current so build_connector_meta() can record them
+        keyed by job_idx once the job counter is assigned.
+
+        Args:
+            n_lookahead: Number of eviction candidates to inspect.
+
+        Returns:
+            (gpu_block_ids, cpu_block_ids) — parallel lists for the store job.
+        """
+        if self._gpu_block_pool is None or n_lookahead <= 0:
+            return [], []
+
+        gpu_ids: list[int] = []
+        cpu_ids: list[int] = []
+        candidates = self._gpu_block_pool.get_eviction_candidates(n_lookahead)
+
+        for gpu_block in candidates:
+            bhash_with_group = gpu_block.block_hash  # BlockHashWithGroupId | None
+            if bhash_with_group is None:
+                continue
+            # Extract plain BlockHash for cpu_block_pool lookup (group_id=0)
+            plain_hash = get_block_hash(bhash_with_group)
+            if self.cpu_block_pool.get_cached_block(plain_hash, [0]) is not None:
+                continue  # already in CPU cache
+            if self.cpu_block_pool.get_num_free_blocks() == 0:
+                break  # CPU pool exhausted — best-effort
+            cpu_block = self.cpu_block_pool.get_new_blocks(1)[0]
+            gpu_ids.append(gpu_block.block_id)
+            cpu_ids.append(cpu_block.block_id)
+            # Stash for later registration on job completion
+            self._pending_lazy_stores_current.append((bhash_with_group, cpu_block))
+
+        return gpu_ids, cpu_ids
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -249,7 +341,43 @@ class SimpleCPUOffloadScheduler:
         Returns:
             Metadata containing per-job block lists and in-flight snapshot
         """
-        reqs_to_store = self._prepare_store_specs(scheduler_output)
+        # --- Stores (mode dispatch) ---
+        store_job_idx = -1
+        store_gpu: list[int] = []
+        store_cpu: list[int] = []
+
+        if self._lazy_mode:
+            # Lazy: offload LRU eviction candidates instead of newly-computed
+            # blocks. The lookahead window is at least _min_lookahead_blocks
+            # and scales with the number of tokens scheduled this step.
+            total_tokens = sum(scheduler_output.num_scheduled_tokens.values())
+            n_lookahead = max(
+                total_tokens // self.gpu_block_size,
+                self._min_lookahead_blocks,
+            )
+            store_gpu, store_cpu = self._prepare_lazy_store_specs(n_lookahead)
+            if store_gpu:
+                store_job_idx = self._store_job_counter
+                self._store_job_counter += 1
+                # Record lazy entries keyed by job_idx for completion handling
+                self._pending_lazy_stores[store_job_idx] = (
+                    self._pending_lazy_stores_current.copy()
+                )
+                # Register a sentinel req_id so the connector can detect
+                # completion of this lazy job via the watermark mechanism.
+                sentinel = f"{_LAZY_SENTINEL_PREFIX}{store_job_idx}"
+                self._req_to_store_jobs[sentinel].add(store_job_idx)
+            self._pending_lazy_stores_current.clear()
+        else:
+            # Eager: offload newly-computed full blocks from scheduled requests
+            reqs_to_store = self._prepare_store_specs(scheduler_output)
+            if reqs_to_store:
+                store_job_idx = self._store_job_counter
+                self._store_job_counter += 1
+                for req_id, (gpu, cpu) in reqs_to_store.items():
+                    store_gpu.extend(gpu)
+                    store_cpu.extend(cpu)
+                    self._req_to_store_jobs[req_id].add(store_job_idx)
 
         # --- Loads ---
         load_job_idx = -1
@@ -262,18 +390,6 @@ class SimpleCPUOffloadScheduler:
                 load_gpu.extend(gpu)
                 load_cpu.extend(cpu)
                 self._req_to_load_job[req_id] = load_job_idx
-
-        # --- Stores ---
-        store_job_idx = -1
-        store_gpu: list[int] = []
-        store_cpu: list[int] = []
-        if reqs_to_store:
-            store_job_idx = self._store_job_counter
-            self._store_job_counter += 1
-            for req_id, (gpu, cpu) in reqs_to_store.items():
-                store_gpu.extend(gpu)
-                store_cpu.extend(cpu)
-                self._req_to_store_jobs[req_id].add(store_job_idx)
 
         # --- Complete snapshot for connector translation ---
         # Invert _req_to_load_job: job_idx → [req_ids]
@@ -438,6 +554,28 @@ class SimpleCPUOffloadScheduler:
 
         # Mark stores complete and cache the blocks
         for req_id in connector_output.finished_sending or []:
+            # Handle lazy-mode sentinel completions
+            if req_id.startswith(_LAZY_SENTINEL_PREFIX):
+                self._req_to_store_jobs.pop(req_id, None)
+                job_idx = int(req_id[len(_LAZY_SENTINEL_PREFIX) :])
+                lazy_entries = self._pending_lazy_stores.pop(job_idx, None)
+                if lazy_entries:
+                    for bhash_with_group, cpu_block in lazy_entries:
+                        cpu_block.block_hash = bhash_with_group
+                        self.cpu_block_pool.cached_block_hash_to_block.insert(
+                            bhash_with_group, cpu_block
+                        )
+                    # Release scheduler-owned refs; blocks stay cached via hash map.
+                    self.cpu_block_pool.free_blocks(
+                        [entry[1] for entry in lazy_entries]
+                    )
+                    logger.debug(
+                        "Lazy store job %d: cached %d blocks to CPU",
+                        job_idx,
+                        len(lazy_entries),
+                    )
+                continue
+
             self._req_to_store_jobs.pop(req_id, None)
             block_hashes = self._storing_requests.pop(req_id, [])
             cpu_block_ids = self._pending_cpu_blocks.pop(req_id, [])

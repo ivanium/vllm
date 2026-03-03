@@ -25,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.manager import (
+    _LAZY_SENTINEL_PREFIX,
     SimpleCPUOffloadScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata import (
@@ -40,6 +41,7 @@ from vllm.v1.outputs import KVConnectorOutput
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.attention.backend import AttentionMetadata
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -86,11 +88,15 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         cpu_capacity_bytes = int(
             extra_config.get("cpu_bytes_to_use", DEFAULT_CPU_CAPACITY_BYTES)
         )
+        lazy_offload = bool(extra_config.get("lazy_offload", True))
+        min_lookahead_blocks = int(extra_config.get("min_lookahead_blocks", 8))
 
         logger.info(
-            "CPUOffloadConnector: Initializing with role=%s, cpu_capacity=%.2f GB",
+            "CPUOffloadConnector: Initializing with role=%s, cpu_capacity=%.2f GB, "
+            "mode=%s",
             role.name,
             cpu_capacity_bytes / (1024**3),
+            "lazy" if lazy_offload else "eager",
         )
 
         # Role-specific initialization
@@ -99,7 +105,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         if role == KVConnectorRole.SCHEDULER:
             self.scheduler_manager = SimpleCPUOffloadScheduler(
-                vllm_config, kv_cache_config, cpu_capacity_bytes
+                vllm_config,
+                kv_cache_config,
+                cpu_capacity_bytes,
+                lazy_offload=lazy_offload,
+                min_lookahead_blocks=min_lookahead_blocks,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
@@ -223,7 +233,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         for req_id in fired_store_reqs:
             if req_id not in still_pending_reqs:
                 # All store jobs for this req have fired.
-                if req_id in self._finished_reqs_waiting_for_store:
+                if req_id.startswith(_LAZY_SENTINEL_PREFIX):
+                    # Lazy store sentinels don't need two-phase timing — they
+                    # have no corresponding engine request to wait for.
+                    finished_sending.add(req_id)
+                elif req_id in self._finished_reqs_waiting_for_store:
                     self._finished_reqs_waiting_for_store.discard(req_id)
                     finished_sending.add(req_id)
                 else:
@@ -246,6 +260,14 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # ==============================
     # Scheduler-side methods
     # ==============================
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        """Inject the GPU block pool for lazy offloading.
+
+        Called by the Scheduler after kv_cache_manager is constructed.
+        """
+        if self.scheduler_manager is not None:
+            self.scheduler_manager.bind_gpu_block_pool(gpu_block_pool)
 
     def get_num_new_matched_tokens(
         self,
