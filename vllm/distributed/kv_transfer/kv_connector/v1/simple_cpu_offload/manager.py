@@ -41,8 +41,6 @@ class SimpleCPUOffloadScheduler:
         vllm_config: VllmConfig,
         kv_cache_config: "KVCacheConfig | None",
         cpu_capacity_bytes: int,
-        offload_decode_blocks: bool = False,
-        store_block_budget_before_first_hit: int = 1,
     ):
         """
         Initialize the scheduler-side manager.
@@ -54,13 +52,6 @@ class SimpleCPUOffloadScheduler:
         """
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
-        offload_decode_blocks = True
-        store_block_budget_before_first_hit = 1000000
-        self.offload_decode_blocks = offload_decode_blocks
-        self._store_block_budget_before_first_hit = max(
-            0, store_block_budget_before_first_hit
-        )
-        self._has_observed_cache_hit = False
 
         cache_config = vllm_config.cache_config
         self.gpu_block_size = cache_config.block_size
@@ -153,7 +144,6 @@ class SimpleCPUOffloadScheduler:
         num_new_tokens = max(0, num_matched_tokens - num_computed_tokens)
 
         if num_new_tokens > 0:
-            self._has_observed_cache_hit = True
             logger.debug(
                 "Request %s: CPU cache hit, %d new tokens can be loaded",
                 request.request_id,
@@ -283,13 +273,6 @@ class SimpleCPUOffloadScheduler:
             if num_new_tokens == 0:
                 continue
 
-            # Avoid pure-offload overhead when there is no observed reuse.
-            if (
-                not self._has_observed_cache_hit
-                and self._store_block_budget_before_first_hit <= 0
-            ):
-                continue
-
             # Get GPU blocks for this request
             gpu_blocks_by_group = self._request_gpu_blocks.get(req_id)
             if gpu_blocks_by_group is None:
@@ -303,14 +286,6 @@ class SimpleCPUOffloadScheduler:
             # Calculate how many blocks are now full and sourceable on GPU.
             total_tokens = request.num_computed_tokens + num_new_tokens
             num_full_blocks = total_tokens // self.gpu_block_size
-
-            # By default, keep decode path lightweight and only offload prompt
-            # blocks for prefix reuse.
-            if not self.offload_decode_blocks:
-                num_full_blocks = min(
-                    num_full_blocks,
-                    request.num_prompt_tokens // self.gpu_block_size,
-                )
 
             gpu_blocks = gpu_blocks_by_group[0]  # First group
             num_available_blocks = min(
@@ -342,12 +317,6 @@ class SimpleCPUOffloadScheduler:
             block_hashes_to_store = []
             num_cached_blocks = 0
             for src_gpu_block, block_hash in zip(new_gpu_blocks, new_block_hashes):
-                if (
-                    not self._has_observed_cache_hit
-                    and self._store_block_budget_before_first_hit <= 0
-                ):
-                    break
-
                 # Check if already cached (skip if so)
                 existing = self.cpu_block_pool.get_cached_block(
                     block_hash, kv_cache_group_ids=[0]
@@ -371,8 +340,6 @@ class SimpleCPUOffloadScheduler:
                 src_gpu_blocks.append(src_gpu_block)
                 cpu_block_ids.append(cpu_block.block_id)
                 block_hashes_to_store.append(block_hash)
-                if not self._has_observed_cache_hit:
-                    self._store_block_budget_before_first_hit -= 1
 
             if cpu_block_ids:
                 reqs_to_store[req_id] = (src_gpu_blocks, cpu_block_ids)

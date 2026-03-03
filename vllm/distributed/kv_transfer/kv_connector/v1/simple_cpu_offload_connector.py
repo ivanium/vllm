@@ -39,7 +39,7 @@ from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
-    from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
+    from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -66,11 +66,6 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     - Pinned CPU memory for high bandwidth
     """
 
-    @property
-    def prefer_cross_layer_blocks(self) -> bool:
-        """Use per-layer blocks for standard KV cache layout."""
-        return False
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -91,7 +86,6 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         cpu_capacity_bytes = int(
             extra_config.get("cpu_bytes_to_use", DEFAULT_CPU_CAPACITY_BYTES)
         )
-        offload_decode_blocks = bool(extra_config.get("offload_decode_blocks", False))
 
         logger.info(
             "CPUOffloadConnector: Initializing with role=%s, cpu_capacity=%.2f GB",
@@ -105,16 +99,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         if role == KVConnectorRole.SCHEDULER:
             self.scheduler_manager = SimpleCPUOffloadScheduler(
-                vllm_config,
-                kv_cache_config,
-                cpu_capacity_bytes,
-                offload_decode_blocks=offload_decode_blocks,
+                vllm_config, kv_cache_config, cpu_capacity_bytes
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
-                vllm_config,
-                kv_cache_config,
-                cpu_capacity_bytes,
+                vllm_config, kv_cache_config, cpu_capacity_bytes
             )
 
     # ==============================
@@ -125,15 +114,6 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """Register per-layer KV caches with the connector."""
         if self.worker_handler is not None:
             self.worker_handler.register_kv_caches(kv_caches)
-
-    def register_cross_layers_kv_cache(
-        self,
-        kv_cache: torch.Tensor,
-        attn_backend: type["AttentionBackend"],
-    ) -> None:
-        """Register cross-layer KV cache tensor."""
-        if self.worker_handler is not None:
-            self.worker_handler.register_cross_layers_kv_cache(kv_cache, attn_backend)
 
     def bind_connector_metadata(
         self,
@@ -177,13 +157,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        """
-        Save KV cache for a layer.
-
-        Note: For cross-layer cache, saving happens in wait_for_save()
-        after all layers are computed.
-        """
-        # Not used for cross-layer cache
+        """Save KV cache for a layer. All stores are driven by wait_for_save()."""
         pass
 
     def wait_for_save(self) -> None:

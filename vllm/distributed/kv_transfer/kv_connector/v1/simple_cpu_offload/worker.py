@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload import (
+    triton_kernels,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata import (
     SimpleCPUOffloadMetadata,
 )
@@ -19,7 +22,6 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.triton_kernels import (  # noqa: E501
         MultiLayerLaunchParams,
     )
-    from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -61,12 +63,9 @@ class SimpleCPUOffloadWorker:
         self.gpu_block_size = cache_config.block_size
 
         # Will be set when KV cache is registered
-        # Cross-layer mode (when prefer_cross_layer_blocks=True)
-        self.gpu_kv_cache: torch.Tensor | None = None
-        self.cpu_kv_cache: torch.Tensor | None = None
-        # Per-layer mode (when prefer_cross_layer_blocks=False)
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
+        self._first_layer_name: str | None = None
         self.num_cpu_blocks: int = 0
         # Cached Triton launch params for per-layer transfers (store/load)
         self._store_launch_params: MultiLayerLaunchParams | None = None
@@ -93,14 +92,12 @@ class SimpleCPUOffloadWorker:
     @property
     def _is_initialized(self) -> bool:
         """Whether KV caches are registered and ready for transfers."""
-        return (self.gpu_kv_cache is not None and self.cpu_kv_cache is not None) or (
-            self.gpu_kv_caches is not None and self.cpu_kv_caches is not None
+        return (
+            self.gpu_kv_caches is not None
+            and self.cpu_kv_caches is not None
+            and self.load_stream is not None
+            and self.store_stream is not None
         )
-
-    @property
-    def _is_per_layer(self) -> bool:
-        """Whether per-layer KV cache mode is active."""
-        return self.gpu_kv_caches is not None
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """
@@ -110,6 +107,7 @@ class SimpleCPUOffloadWorker:
             kv_caches: Dict mapping layer name to KV cache tensor
         """
         self.gpu_kv_caches = kv_caches
+        self._first_layer_name = next(iter(kv_caches))
 
         # Compute per-layer block size from any layer
         first_tensor = next(iter(kv_caches.values()))
@@ -145,64 +143,12 @@ class SimpleCPUOffloadWorker:
             )
 
         # Pre-compute Triton launch params (pointer tables, block/warp config)
-        from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload import (
-            triton_kernels,
-        )
-
-        self._store_launch_params = triton_kernels.build_multi_layer_launch_params(
+        self._store_launch_params = triton_kernels.build_launch_params(
             self.gpu_kv_caches, self.cpu_kv_caches
         )
-        self._load_launch_params = triton_kernels.build_multi_layer_launch_params(
+        self._load_launch_params = triton_kernels.build_launch_params(
             self.cpu_kv_caches, self.gpu_kv_caches
         )
-
-        # Initialize CUDA streams
-        self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
-
-    def register_cross_layers_kv_cache(
-        self,
-        kv_cache: torch.Tensor,
-        attn_backend: type["AttentionBackend"],
-    ) -> None:
-        """
-        Register cross-layer KV cache tensor.
-
-        Args:
-            kv_cache: Cross-layer KV cache tensor [num_blocks, ...]
-            attn_backend: The attention backend
-        """
-        self.gpu_kv_cache = kv_cache
-
-        # Calculate CPU block capacity
-        # kv_cache shape: [num_blocks, num_layers, 2, num_heads, block_size, ...]
-        # Shape may be permuted depending on attention backend
-        block_size_bytes = kv_cache[0].numel() * kv_cache.element_size()
-        self.num_cpu_blocks = max(1, self.cpu_capacity_bytes // block_size_bytes)
-
-        logger.info(
-            "SimpleCPUOffloadWorker: GPU KV cache shape %s, "
-            "allocating %d CPU blocks (%.2f GB)",
-            kv_cache.shape,
-            self.num_cpu_blocks,
-            (self.num_cpu_blocks * block_size_bytes) / (1024**3),
-        )
-
-        # Allocate pinned CPU tensor with same shape as single GPU block
-        cpu_shape = (self.num_cpu_blocks,) + kv_cache.shape[1:]
-        pin_memory = is_pin_memory_available()
-
-        self.cpu_kv_cache = torch.zeros(
-            cpu_shape,
-            dtype=kv_cache.dtype,
-            device="cpu",
-            pin_memory=pin_memory,
-        )
-
-        if not pin_memory:
-            logger.warning(
-                "Pinned memory not available. CPU offload performance may be degraded."
-            )
 
         # Initialize CUDA streams
         self.load_stream = torch.cuda.Stream()
@@ -236,6 +182,15 @@ class SimpleCPUOffloadWorker:
         if self._connector_metadata is None:
             return
 
+        assert self.load_stream is not None
+        assert self.cpu_kv_caches is not None
+        assert self.gpu_kv_caches is not None
+
+        # Collect per-request load info and merge block lists for a single
+        # kernel launch.
+        all_src_blocks: list[int] = []
+        all_dst_blocks: list[int] = []
+        load_requests: list[tuple[int, str, int]] = []  # (job_id, req_id, n)
         for req_id, (
             dst_gpu_blocks,
             src_cpu_blocks,
@@ -245,39 +200,35 @@ class SimpleCPUOffloadWorker:
 
             job_id = self._job_counter
             self._job_counter += 1
+            load_requests.append((job_id, req_id, len(src_cpu_blocks)))
+            all_src_blocks.extend(src_cpu_blocks)
+            all_dst_blocks.extend(dst_gpu_blocks)
 
-            # Submit async load
-            assert self.load_stream is not None
-            with torch.cuda.stream(self.load_stream):
-                if self.gpu_kv_caches is not None and self.cpu_kv_caches is not None:
-                    self._transfer_blocks_per_layer(
-                        src_caches=self.cpu_kv_caches,
-                        dst_caches=self.gpu_kv_caches,
-                        src_block_ids=src_cpu_blocks,
-                        dst_block_ids=dst_gpu_blocks,
-                        is_store=False,
-                    )
-                else:
-                    self._transfer_blocks(
-                        src_cache=self.cpu_kv_cache,
-                        dst_cache=self.gpu_kv_cache,
-                        src_block_ids=src_cpu_blocks,
-                        dst_block_ids=dst_gpu_blocks,
-                    )
-                event = torch.cuda.Event()
-                event.record(self.load_stream)
+        if not load_requests:
+            return
 
+        with torch.cuda.stream(self.load_stream):
+            self._copy_blocks(
+                src_caches=self.cpu_kv_caches,
+                dst_caches=self.gpu_kv_caches,
+                src_block_ids=all_src_blocks,
+                dst_block_ids=all_dst_blocks,
+                is_store=False,
+            )
+            event = torch.cuda.Event()
+            event.record(self.load_stream)
+
+        for job_id, req_id, n_blocks in load_requests:
             self._active_jobs[job_id] = TransferJob(
                 req_id=req_id,
                 is_store=False,
                 event=event,
             )
             self._load_jobs[req_id] = job_id
-
             logger.debug(
                 "Request %s: Started loading %d blocks from CPU",
                 req_id,
-                len(src_cpu_blocks),
+                n_blocks,
             )
 
     def wait_for_save(self) -> None:
@@ -322,50 +273,39 @@ class SimpleCPUOffloadWorker:
             return
 
         assert self.store_stream is not None
+
+        # Merge all block pairs so we launch the Triton kernel only once.
+        all_src_blocks: list[int] = []
+        all_dst_blocks: list[int] = []
+        for _, _, src_gpu_blocks, dst_cpu_blocks in self._unsubmitted_store_jobs:
+            all_src_blocks.extend(src_gpu_blocks)
+            all_dst_blocks.extend(dst_cpu_blocks)
+
         with torch.cuda.stream(self.store_stream):
-            # Ensure source blocks are ready before store DMA begins.
-            self.store_stream.wait_stream(torch.cuda.current_stream())
-            for (
-                job_id,
+            if all_src_blocks:
+                self._copy_blocks(
+                    src_caches=self.gpu_kv_caches,  # type: ignore
+                    dst_caches=self.cpu_kv_caches,  # type: ignore
+                    src_block_ids=all_src_blocks,
+                    dst_block_ids=all_dst_blocks,
+                )
+            event = torch.cuda.Event()
+            event.record(self.store_stream)
+
+        for job_id, req_id, src_gpu_blocks, _ in self._unsubmitted_store_jobs:
+            self._active_jobs[job_id] = TransferJob(
+                req_id=req_id, is_store=True, event=event
+            )
+            logger.debug(
+                "Request %s: Started deferred storing %d blocks to CPU",
                 req_id,
-                src_gpu_blocks,
-                dst_cpu_blocks,
-            ) in self._unsubmitted_store_jobs:
-                if self.gpu_kv_caches is not None and self.cpu_kv_caches is not None:
-                    self._transfer_blocks_per_layer(
-                        src_caches=self.gpu_kv_caches,
-                        dst_caches=self.cpu_kv_caches,
-                        src_block_ids=src_gpu_blocks,
-                        dst_block_ids=dst_cpu_blocks,
-                    )
-                else:
-                    self._transfer_blocks(
-                        src_cache=self.gpu_kv_cache,
-                        dst_cache=self.cpu_kv_cache,
-                        src_block_ids=src_gpu_blocks,
-                        dst_block_ids=dst_cpu_blocks,
-                    )
-                event = torch.cuda.Event()
-                event.record(self.store_stream)
-                self._active_jobs[job_id] = TransferJob(
-                    req_id=req_id,
-                    is_store=True,
-                    event=event,
-                )
-                logger.debug(
-                    "Request %s: Started deferred storing %d blocks to CPU",
-                    req_id,
-                    len(src_gpu_blocks),
-                )
+                len(src_gpu_blocks),
+            )
 
         self._unsubmitted_store_jobs.clear()
 
     @staticmethod
-    def _validate_block_ids(
-        block_ids: list[int],
-        num_blocks: int,
-        label: str,
-    ) -> None:
+    def _validate_block_ids(block_ids: list[int], num_blocks: int, label: str) -> None:
         """Validate that all block IDs are within bounds."""
         if not block_ids:
             return
@@ -374,39 +314,7 @@ class SimpleCPUOffloadWorker:
             bad = lo if lo < 0 else hi
             raise ValueError(f"{label} block ID {bad} out of bounds [0, {num_blocks})")
 
-    def _transfer_blocks(
-        self,
-        src_cache: torch.Tensor,
-        dst_cache: torch.Tensor,
-        src_block_ids: list[int],
-        dst_block_ids: list[int],
-    ) -> None:
-        """
-        Execute block transfer using Triton kernel.
-
-        Args:
-            src_cache: Source KV cache tensor
-            dst_cache: Destination KV cache tensor
-            src_block_ids: Source block IDs
-            dst_block_ids: Destination block IDs
-        """
-        from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload import (
-            triton_kernels,
-        )
-
-        self._validate_block_ids(src_block_ids, src_cache.shape[0], "Source")
-        self._validate_block_ids(dst_block_ids, dst_cache.shape[0], "Dest")
-
-        # Build block mapping tensor: [[src_id, dst_id], ...]
-        block_mapping = torch.tensor(
-            list(zip(src_block_ids, dst_block_ids)),
-            dtype=torch.int64,
-            device="cuda",
-        )
-
-        triton_kernels.copy_blocks(src_cache, dst_cache, block_mapping, use_triton=True)
-
-    def _transfer_blocks_per_layer(
+    def _copy_blocks(
         self,
         src_caches: dict[str, torch.Tensor],
         dst_caches: dict[str, torch.Tensor],
@@ -428,10 +336,6 @@ class SimpleCPUOffloadWorker:
             dst_block_ids: Destination block IDs
             is_store: True for GPU->CPU, False for CPU->GPU
         """
-        from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload import (
-            triton_kernels,
-        )
-
         # Validate block IDs against first layer (all layers share block count)
         first_src = next(iter(src_caches.values()))
         first_dst = next(iter(dst_caches.values()))
@@ -450,25 +354,12 @@ class SimpleCPUOffloadWorker:
             self._store_launch_params if is_store else self._load_launch_params
         )
 
-        try:
-            triton_kernels.copy_blocks_multi_layer(
-                src_caches,
-                dst_caches,
-                block_mapping,
-                launch_params=launch_params,
-            )
-        except Exception as e:
-            logger.warning(
-                "Multi-layer Triton kernel failed, falling back to "
-                "per-layer PyTorch copy: %s",
-                e,
-            )
-            for layer_name in src_caches:
-                triton_kernels.copy_blocks_torch(
-                    src_caches[layer_name],
-                    dst_caches[layer_name],
-                    block_mapping,
-                )
+        triton_kernels.copy_blocks(
+            src_caches,
+            dst_caches,
+            block_mapping,
+            launch_params=launch_params,
+        )
 
     def get_finished(
         self,
@@ -556,8 +447,10 @@ class SimpleCPUOffloadWorker:
                     job.event.synchronize()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Block until the KV for a specific layer is loaded."""
-        # For cross-layer cache, all layers are loaded together
-        # Just sync the load stream
-        if self.load_stream is not None:
+        """Block until the KV for a specific layer is loaded.
+
+        All layers are transferred in a single kernel launch, so only the
+        first layer call needs to synchronize the stream.
+        """
+        if layer_name == self._first_layer_name and self.load_stream is not None:
             self.load_stream.synchronize()

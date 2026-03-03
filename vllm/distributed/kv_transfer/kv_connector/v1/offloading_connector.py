@@ -432,9 +432,14 @@ class OffloadingConnectorScheduler:
             )
             store_output = self.manager.prepare_store(new_block_hashes)
             if store_output is None:
-                logger.warning(
-                    "Request %s: cannot store %s blocks", req_id, num_new_blocks
+                # CPU buffer is full of in-use blocks; skip these blocks
+                # rather than retrying every step.
+                logger.debug(
+                    "Request %s: CPU buffer full, skipping %s blocks",
+                    req_id,
+                    num_new_blocks,
                 )
+                self._next_stored_block_idx[req_id] = num_blocks
                 continue
 
             self._next_stored_block_idx[req_id] = num_blocks
