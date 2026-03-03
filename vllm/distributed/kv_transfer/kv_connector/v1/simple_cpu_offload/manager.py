@@ -97,6 +97,14 @@ class SimpleCPUOffloadScheduler:
         # Metadata for current step (load operations)
         self._reqs_to_load: dict[str, tuple[list[int], list[int]]] = {}
 
+        # Monotonic job counters
+        self._load_job_counter: int = 0
+        self._store_job_counter: int = 0
+
+        # req_id -> job_idx mappings (for snapshot sent to connector)
+        self._req_to_load_job: dict[str, int] = {}
+        self._req_to_store_jobs: dict[str, set[int]] = defaultdict(set)
+
     def _calculate_num_blocks(self, cpu_capacity_bytes: int) -> int:
         """Calculate number of CPU blocks based on capacity."""
         assert self.kv_cache_config is not None
@@ -231,25 +239,66 @@ class SimpleCPUOffloadScheduler:
         """
         Build metadata for worker to execute transfers.
 
+        Assigns monotonic job_idxes to this step's load/store work and
+        includes a complete snapshot of all in-flight jobs so the connector
+        can translate watermarks back to req_ids.
+
         Args:
             scheduler_output: The scheduler output for this step
 
         Returns:
-            Metadata containing load and store specifications
+            Metadata containing per-job block lists and in-flight snapshot
         """
-        # Prepare store specs for newly computed blocks
         reqs_to_store = self._prepare_store_specs(scheduler_output)
 
-        # Package metadata
-        meta = SimpleCPUOffloadMetadata(
-            reqs_to_load=self._reqs_to_load,
-            reqs_to_store=reqs_to_store,
-        )
+        # --- Loads ---
+        load_job_idx = -1
+        load_gpu: list[int] = []
+        load_cpu: list[int] = []
+        if self._reqs_to_load:
+            load_job_idx = self._load_job_counter
+            self._load_job_counter += 1
+            for req_id, (gpu, cpu) in self._reqs_to_load.items():
+                load_gpu.extend(gpu)
+                load_cpu.extend(cpu)
+                self._req_to_load_job[req_id] = load_job_idx
 
-        # Reset for next step
+        # --- Stores ---
+        store_job_idx = -1
+        store_gpu: list[int] = []
+        store_cpu: list[int] = []
+        if reqs_to_store:
+            store_job_idx = self._store_job_counter
+            self._store_job_counter += 1
+            for req_id, (gpu, cpu) in reqs_to_store.items():
+                store_gpu.extend(gpu)
+                store_cpu.extend(cpu)
+                self._req_to_store_jobs[req_id].add(store_job_idx)
+
+        # --- Complete snapshot for connector translation ---
+        # Invert _req_to_load_job: job_idx → [req_ids]
+        pending_load_jobs: dict[int, list[str]] = defaultdict(list)
+        for req_id, job_idx in self._req_to_load_job.items():
+            pending_load_jobs[job_idx].append(req_id)
+
+        # Invert _req_to_store_jobs: job_idx → [req_ids]
+        pending_store_jobs: dict[int, list[str]] = defaultdict(list)
+        for req_id, job_idxes in self._req_to_store_jobs.items():
+            for job_idx in job_idxes:
+                pending_store_jobs[job_idx].append(req_id)
+
         self._reqs_to_load = {}
 
-        return meta
+        return SimpleCPUOffloadMetadata(
+            load_job_idx=load_job_idx,
+            load_gpu_blocks=load_gpu,
+            load_cpu_blocks=load_cpu,
+            store_job_idx=store_job_idx,
+            store_gpu_blocks=store_gpu,
+            store_cpu_blocks=store_cpu,
+            pending_load_jobs=dict(pending_load_jobs),
+            pending_store_jobs=dict(pending_store_jobs),
+        )
 
     def _prepare_store_specs(
         self,
@@ -374,6 +423,7 @@ class SimpleCPUOffloadScheduler:
         """
         # Mark loads complete
         for req_id in connector_output.finished_recving or []:
+            self._req_to_load_job.pop(req_id, None)
             block_hashes = self._loading_requests.pop(req_id, [])
             load_block_ids = self._pending_load_blocks.pop(req_id, [])
             if load_block_ids:
@@ -388,6 +438,7 @@ class SimpleCPUOffloadScheduler:
 
         # Mark stores complete and cache the blocks
         for req_id in connector_output.finished_sending or []:
+            self._req_to_store_jobs.pop(req_id, None)
             block_hashes = self._storing_requests.pop(req_id, [])
             cpu_block_ids = self._pending_cpu_blocks.pop(req_id, [])
 
@@ -498,6 +549,8 @@ class SimpleCPUOffloadScheduler:
 
     def _cleanup_request(self, req_id: str) -> None:
         """Clean up all state for a request."""
+        self._req_to_load_job.pop(req_id, None)
+        self._req_to_store_jobs.pop(req_id, None)
         pending_load_blocks = self._pending_load_blocks.pop(req_id, [])
         if pending_load_blocks:
             self.cpu_block_pool.free_blocks(

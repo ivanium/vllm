@@ -3,6 +3,7 @@
 """Lifecycle and scheduling tests for SimpleCPUOffloadConnector internals."""
 
 from types import SimpleNamespace
+from unittest.mock import PropertyMock, patch
 
 import torch
 
@@ -14,7 +15,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata im
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.worker import (
     SimpleCPUOffloadWorker,
-    TransferJob,
 )
 from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
@@ -229,17 +229,25 @@ def test_worker_wait_for_save_queues_store_jobs():
         cpu_capacity_bytes=1024 * 1024,
     )
 
-    worker.gpu_kv_cache = torch.zeros((8, 1), dtype=torch.float16)
-    worker.cpu_kv_cache = torch.zeros((8, 1), dtype=torch.float16)
     worker.bind_connector_metadata(
-        SimpleCPUOffloadMetadata(reqs_to_store={"req-1": ([1, 2], [3, 4])})
+        SimpleCPUOffloadMetadata(
+            store_job_idx=0,
+            store_gpu_blocks=[1, 2],
+            store_cpu_blocks=[3, 4],
+        )
     )
 
-    worker.wait_for_save()
+    with patch.object(
+        type(worker), "_is_initialized", new_callable=PropertyMock, return_value=True
+    ):
+        worker.wait_for_save()
 
-    assert len(worker._unsubmitted_store_jobs) == 1
-    assert worker._store_jobs["req-1"]
-    assert not worker._active_jobs
+    assert len(worker._pending_store_jobs) == 1
+    job_idx, src, dst = worker._pending_store_jobs[0]
+    assert job_idx == 0
+    assert src == [1, 2]
+    assert dst == [3, 4]
+    assert not worker._store_events
 
 
 def test_worker_start_load_submits_pending_stores_without_metadata():
@@ -249,8 +257,6 @@ def test_worker_start_load_submits_pending_stores_without_metadata():
         kv_cache_config=None,
         cpu_capacity_bytes=1024 * 1024,
     )
-    worker.gpu_kv_cache = torch.zeros((4, 1), dtype=torch.float16)
-    worker.cpu_kv_cache = torch.zeros((4, 1), dtype=torch.float16)
     worker.clear_connector_metadata()
 
     called = {"count": 0}
@@ -258,38 +264,61 @@ def test_worker_start_load_submits_pending_stores_without_metadata():
     def _fake_submit():
         called["count"] += 1
 
-    worker._submit_pending_store_jobs = _fake_submit  # type: ignore[method-assign]
-    worker.start_load_kv()
+    worker._submit_pending_stores = _fake_submit  # type: ignore[method-assign]
+    with patch.object(
+        type(worker), "_is_initialized", new_callable=PropertyMock, return_value=True
+    ):
+        worker.start_load_kv()
 
     assert called["count"] == 1
 
 
-def test_worker_emits_finished_sending_if_stores_complete_before_req_finishes():
-    vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
-    worker = SimpleCPUOffloadWorker(
-        vllm_config=vllm_config,
-        kv_cache_config=None,
-        cpu_capacity_bytes=1024 * 1024,
+def test_connector_emits_finished_sending_if_stores_complete_before_req_finishes():
+    """Timing logic now lives in the connector, not the worker."""
+    from unittest.mock import MagicMock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
+        SimpleCPUOffloadConnector,
     )
+
+    _ = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16, num_gpu_blocks=64),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="SimpleCPUOffloadConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={},
+        ),
+    )
+    connector = SimpleCPUOffloadConnector.__new__(SimpleCPUOffloadConnector)
+    connector.scheduler_manager = None
+    connector._connector_metadata = None
+    connector._pending_load_wm_jobs = {}
+    connector._pending_store_wm_jobs = {}
+    connector._stores_completed_reqs = set()
+    connector._finished_reqs_waiting_for_store = set()
+
+    # Mock the worker_handler to return a known watermark.
+    mock_worker = MagicMock()
+    # job_idx=0 store has fired (store_wm=0), no loads.
+    mock_worker.get_completed_watermarks.return_value = (-1, 0)
+    connector.worker_handler = mock_worker
 
     req_id = "req-early-store-done"
-    worker._store_jobs[req_id].add(7)
-    worker._active_jobs[7] = TransferJob(  # type: ignore[arg-type]
-        req_id=req_id,
-        is_store=True,
-        event=_DoneEvent(),
-    )
+    # Set up snapshot: job 0 is associated with req_id.
+    connector._pending_store_wm_jobs = {0: [req_id]}
 
-    finished_sending, finished_recving = worker.get_finished(set())
+    # Store event fires, but request hasn't finished yet.
+    finished_sending, finished_recving = connector.get_finished(set())
     assert finished_sending is None
     assert finished_recving is None
-    assert req_id in worker._store_jobs
-    assert not worker._store_jobs[req_id]
+    assert req_id not in connector._pending_store_wm_jobs
+    assert req_id in connector._stores_completed_reqs
 
-    finished_sending, finished_recving = worker.get_finished({req_id})
+    # Now the request finishes → should be emitted as finished_sending.
+    finished_sending, finished_recving = connector.get_finished({req_id})
     assert finished_sending == {req_id}
     assert finished_recving is None
-    assert req_id not in worker._store_jobs
+    assert req_id not in connector._stores_completed_reqs
 
 
 def test_cached_blocks_advance_store_cursor():
@@ -312,10 +341,12 @@ def test_cached_blocks_advance_store_cursor():
     request.num_computed_tokens = 0
 
     meta = manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
-    assert req_id in meta.reqs_to_store
-    assert meta.reqs_to_store[req_id][0] == [1]
+    # Block 0 is already cached, so only block 1 should be stored.
+    assert meta.store_gpu_blocks == [1]
+    assert meta.store_job_idx >= 0
     assert manager._num_stored_blocks[req_id] == 2
 
-    # Repeating the same scheduling span should not re-check from block 0.
+    # Repeating the same scheduling span should not re-issue any store.
     meta2 = manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
-    assert req_id not in meta2.reqs_to_store
+    assert meta2.store_job_idx == -1
+    assert meta2.store_gpu_blocks == []

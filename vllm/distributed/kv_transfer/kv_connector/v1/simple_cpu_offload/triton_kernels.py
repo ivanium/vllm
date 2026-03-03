@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton kernels for efficient GPU<->CPU block transfers."""
+"""GPU kernels for efficient GPU<->CPU block transfers."""
 
 from typing import NamedTuple
 
 import torch
 
 from vllm.logger import init_logger
-from vllm.triton_utils import triton
+from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
-
-tl = triton.language
 
 
 class MultiLayerLaunchParams(NamedTuple):

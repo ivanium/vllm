@@ -7,9 +7,6 @@ import torch
 
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
-from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload import (
-    triton_kernels,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.manager import (
     SimpleCPUOffloadScheduler,
 )
@@ -53,38 +50,62 @@ class TestSimpleCPUOffloadMetadata:
     def test_empty_metadata_creation(self):
         """Test creating empty metadata with default values."""
         metadata = SimpleCPUOffloadMetadata()
-        assert metadata.reqs_to_load == {}
-        assert metadata.reqs_to_store == {}
+        assert metadata.load_job_idx == -1
+        assert metadata.load_gpu_blocks == []
+        assert metadata.load_cpu_blocks == []
+        assert metadata.store_job_idx == -1
+        assert metadata.store_gpu_blocks == []
+        assert metadata.store_cpu_blocks == []
+        assert metadata.pending_load_jobs == {}
+        assert metadata.pending_store_jobs == {}
 
     def test_metadata_with_load_specs(self):
         """Test metadata with load specifications."""
-        reqs_to_load = {
-            "req-1": ([0, 1, 2], [10, 11, 12]),
-            "req-2": ([3, 4], [13, 14]),
-        }
-        metadata = SimpleCPUOffloadMetadata(reqs_to_load=reqs_to_load)
-        assert metadata.reqs_to_load == reqs_to_load
-        assert metadata.reqs_to_store == {}
+        metadata = SimpleCPUOffloadMetadata(
+            load_job_idx=0,
+            load_gpu_blocks=[0, 1, 2, 3, 4],
+            load_cpu_blocks=[10, 11, 12, 13, 14],
+        )
+        assert metadata.load_job_idx == 0
+        assert metadata.load_gpu_blocks == [0, 1, 2, 3, 4]
+        assert metadata.load_cpu_blocks == [10, 11, 12, 13, 14]
+        assert metadata.store_job_idx == -1
 
     def test_metadata_with_store_specs(self):
         """Test metadata with store specifications."""
-        reqs_to_store = {
-            "req-1": ([0, 1], [5, 6]),
-        }
-        metadata = SimpleCPUOffloadMetadata(reqs_to_store=reqs_to_store)
-        assert metadata.reqs_to_load == {}
-        assert metadata.reqs_to_store == reqs_to_store
+        metadata = SimpleCPUOffloadMetadata(
+            store_job_idx=3,
+            store_gpu_blocks=[0, 1],
+            store_cpu_blocks=[5, 6],
+        )
+        assert metadata.store_job_idx == 3
+        assert metadata.store_gpu_blocks == [0, 1]
+        assert metadata.store_cpu_blocks == [5, 6]
+        assert metadata.load_job_idx == -1
 
     def test_metadata_with_both_specs(self):
         """Test metadata with both load and store specifications."""
-        reqs_to_load = {"req-1": ([0], [10])}
-        reqs_to_store = {"req-2": ([1], [11])}
         metadata = SimpleCPUOffloadMetadata(
-            reqs_to_load=reqs_to_load,
-            reqs_to_store=reqs_to_store,
+            load_job_idx=1,
+            load_gpu_blocks=[0],
+            load_cpu_blocks=[10],
+            store_job_idx=2,
+            store_gpu_blocks=[1],
+            store_cpu_blocks=[11],
         )
-        assert metadata.reqs_to_load == reqs_to_load
-        assert metadata.reqs_to_store == reqs_to_store
+        assert metadata.load_job_idx == 1
+        assert metadata.load_gpu_blocks == [0]
+        assert metadata.store_job_idx == 2
+        assert metadata.store_gpu_blocks == [1]
+
+    def test_metadata_with_snapshot(self):
+        """Test metadata with job snapshot maps."""
+        metadata = SimpleCPUOffloadMetadata(
+            pending_load_jobs={0: ["req-1"], 1: ["req-2", "req-3"]},
+            pending_store_jobs={0: ["req-4"]},
+        )
+        assert metadata.pending_load_jobs == {0: ["req-1"], 1: ["req-2", "req-3"]}
+        assert metadata.pending_store_jobs == {0: ["req-4"]}
 
 
 # ============================================================
@@ -234,8 +255,10 @@ class TestSimpleCPUOffloadScheduler:
 
         metadata = manager.build_connector_meta(scheduler_output)
         assert isinstance(metadata, SimpleCPUOffloadMetadata)
-        assert metadata.reqs_to_load == {}
-        assert metadata.reqs_to_store == {}
+        assert metadata.load_job_idx == -1
+        assert metadata.load_gpu_blocks == []
+        assert metadata.store_job_idx == -1
+        assert metadata.store_gpu_blocks == []
 
     def test_request_finished_cleanup(self):
         """Test request_finished cleans up request state."""
@@ -478,18 +501,25 @@ class TestSimpleCPUOffloadConnector:
 
         metadata = connector.build_connector_meta(scheduler_output)
         assert isinstance(metadata, SimpleCPUOffloadMetadata)
-        assert metadata.reqs_to_load == {}
-        assert metadata.reqs_to_store == {}
+        assert metadata.load_job_idx == -1
+        assert metadata.load_gpu_blocks == []
+        assert metadata.store_job_idx == -1
+        assert metadata.store_gpu_blocks == []
 
     def test_bind_and_clear_connector_metadata(self):
         """Test bind and clear connector metadata for worker role."""
         connector = _create_connector(KVConnectorRole.WORKER)
 
         metadata = SimpleCPUOffloadMetadata(
-            reqs_to_load={"req-1": ([0], [10])},
+            load_job_idx=0,
+            load_gpu_blocks=[0],
+            load_cpu_blocks=[10],
+            pending_load_jobs={0: ["req-1"]},
         )
         connector.bind_connector_metadata(metadata)
         assert connector._connector_metadata is metadata
+        # Snapshot maps should be refreshed.
+        assert connector._pending_load_wm_jobs == {0: ["req-1"]}
 
         connector.clear_connector_metadata()
         assert connector._connector_metadata is None
@@ -535,92 +565,6 @@ class TestSimpleCPUOffloadConnector:
 
 
 # ============================================================
-# Test Triton Kernels (CPU-only tests without actual GPU)
-# ============================================================
-
-
-class TestTritonKernels:
-    """Tests for Triton kernel copy operations.
-
-    Note: These tests use the PyTorch fallback when GPU is not available.
-    """
-
-    def test_copy_blocks_torch_basic(self):
-        """Test PyTorch fallback copy_blocks."""
-        # Create source and destination tensors
-        src_cache = torch.randn(10, 4, 8)  # 10 blocks
-        dst_cache = torch.zeros(10, 4, 8)
-
-        # Copy blocks 0->5, 1->6
-        block_mapping = torch.tensor([[0, 5], [1, 6]], dtype=torch.int64)
-
-        triton_kernels.copy_blocks_torch(src_cache, dst_cache, block_mapping)
-
-        # Verify copies
-        assert torch.allclose(dst_cache[5], src_cache[0])
-        assert torch.allclose(dst_cache[6], src_cache[1])
-        # Other blocks should be zero
-        assert torch.allclose(dst_cache[0], torch.zeros_like(dst_cache[0]))
-
-    def test_copy_blocks_torch_empty_mapping(self):
-        """Test copy_blocks with empty block mapping."""
-        src_cache = torch.randn(5, 4, 8)
-        dst_cache = torch.zeros(5, 4, 8)
-        original_dst = dst_cache.clone()
-
-        # Empty mapping
-        block_mapping = torch.empty((0, 2), dtype=torch.int64)
-
-        triton_kernels.copy_blocks_torch(src_cache, dst_cache, block_mapping)
-
-        # Destination should be unchanged
-        assert torch.allclose(dst_cache, original_dst)
-
-    def test_copy_blocks_function_empty(self):
-        """Test copy_blocks wrapper handles empty mapping."""
-        src_cache = torch.randn(5, 4, 8)
-        dst_cache = torch.zeros(5, 4, 8)
-        original_dst = dst_cache.clone()
-
-        block_mapping = torch.empty((0, 2), dtype=torch.int64)
-
-        # Should handle empty gracefully
-        triton_kernels.copy_blocks(
-            src_cache, dst_cache, block_mapping, use_triton=False
-        )
-
-        assert torch.allclose(dst_cache, original_dst)
-
-    def test_copy_blocks_torch_preserves_dtype(self):
-        """Test that copy preserves tensor dtype."""
-        # Test with float16
-        src_cache = torch.randn(5, 4, 8, dtype=torch.float16)
-        dst_cache = torch.zeros(5, 4, 8, dtype=torch.float16)
-
-        block_mapping = torch.tensor([[0, 1]], dtype=torch.int64)
-
-        triton_kernels.copy_blocks_torch(src_cache, dst_cache, block_mapping)
-
-        assert dst_cache.dtype == torch.float16
-        assert torch.allclose(dst_cache[1], src_cache[0])
-
-    def test_copy_blocks_cpu_to_cpu(self):
-        """Test copying between CPU tensors."""
-        src_cache = torch.randn(5, 2, 4)
-        dst_cache = torch.zeros(5, 2, 4)
-
-        block_mapping = torch.tensor([[0, 2], [3, 4]], dtype=torch.int64)
-
-        # Use PyTorch fallback for CPU
-        triton_kernels.copy_blocks(
-            src_cache, dst_cache, block_mapping, use_triton=False
-        )
-
-        assert torch.allclose(dst_cache[2], src_cache[0])
-        assert torch.allclose(dst_cache[4], src_cache[3])
-
-
-# ============================================================
 # Test SimpleCPUOffloadWorker (basic tests without GPU)
 # ============================================================
 
@@ -637,9 +581,8 @@ class TestSimpleCPUOffloadWorker:
             cpu_capacity_bytes=1024 * 1024 * 100,  # 100 MB
         )
 
-        assert worker.gpu_kv_caches == {}  # Not registered yet
-        assert worker.cpu_kv_caches == {}
-        assert worker.layer_names == []
+        assert worker.gpu_kv_caches is None  # Not registered yet
+        assert worker.cpu_kv_caches is None
         assert worker.load_stream is None
         assert worker.store_stream is None
 
@@ -659,8 +602,8 @@ class TestSimpleCPUOffloadWorker:
         worker.clear_connector_metadata()
         assert worker._connector_metadata is None
 
-    def test_get_finished_no_active_jobs(self):
-        """Test get_finished with no active jobs."""
+    def test_get_completed_watermarks_no_events(self):
+        """Test get_completed_watermarks with no events returns (-1, -1)."""
         vllm_config = create_vllm_config(block_size=16)
         worker = SimpleCPUOffloadWorker(
             vllm_config=vllm_config,
@@ -668,10 +611,9 @@ class TestSimpleCPUOffloadWorker:
             cpu_capacity_bytes=1024 * 1024 * 100,
         )
 
-        finished_sending, finished_recving = worker.get_finished(finished_req_ids=set())
-        # No jobs, so both should be None
-        assert finished_sending is None
-        assert finished_recving is None
+        load_wm, store_wm = worker.get_completed_watermarks()
+        assert load_wm == -1
+        assert store_wm == -1
 
     def test_start_load_kv_no_metadata(self):
         """Test start_load_kv with no metadata does nothing."""
@@ -706,8 +648,8 @@ class TestSimpleCPUOffloadWorker:
             cpu_capacity_bytes=1024 * 1024 * 100,
         )
 
-        # Should not raise even with preempted request IDs
-        worker.handle_preemptions(preempted_req_ids={"req-1", "req-2"})
+        # Should not raise; worker no longer takes req_id args.
+        worker.handle_preemptions()
 
     def test_wait_for_layer_load_no_stream(self):
         """Test wait_for_layer_load with no stream."""
@@ -745,16 +687,14 @@ class TestSimpleCPUOffloadWorker:
         # Register should work without error (though streams need GPU)
         # Just test the data structure setup
         worker.gpu_kv_caches = kv_caches
-        worker.layer_names = list(kv_caches.keys())
 
         assert len(worker.gpu_kv_caches) == 3
-        assert len(worker.layer_names) == 3
         assert "layer.0" in worker.gpu_kv_caches
         assert "layer.1" in worker.gpu_kv_caches
         assert "layer.2" in worker.gpu_kv_caches
 
     def test_register_kv_caches_empty(self):
-        """Test register_kv_caches with empty dict does nothing harmful."""
+        """Test register_kv_caches with empty dict raises StopIteration."""
         vllm_config = create_vllm_config(block_size=16)
         worker = SimpleCPUOffloadWorker(
             vllm_config=vllm_config,
@@ -762,12 +702,8 @@ class TestSimpleCPUOffloadWorker:
             cpu_capacity_bytes=1024 * 1024 * 100,
         )
 
-        # Empty dict should not raise, just warn
-        worker.register_kv_caches({})
-
-        assert worker.gpu_kv_caches == {}
-        assert worker.cpu_kv_caches == {}
-        assert worker.layer_names == []
+        with pytest.raises(StopIteration):
+            worker.register_kv_caches({})
 
 
 # ============================================================

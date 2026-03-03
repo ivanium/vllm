@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
-from collections import defaultdict
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -25,15 +23,6 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class TransferJob:
-    """Tracks an in-flight transfer."""
-
-    req_id: str
-    is_store: bool  # True for GPU->CPU, False for CPU->GPU
-    event: torch.cuda.Event
 
 
 class SimpleCPUOffloadWorker:
@@ -65,6 +54,7 @@ class SimpleCPUOffloadWorker:
         # Will be set when KV cache is registered
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
+        self.device: torch.device | None = None
         self._first_layer_name: str | None = None
         self.num_cpu_blocks: int = 0
         # Cached Triton launch params for per-layer transfers (store/load)
@@ -75,16 +65,15 @@ class SimpleCPUOffloadWorker:
         self.load_stream: torch.cuda.Stream | None = None
         self.store_stream: torch.cuda.Stream | None = None
 
-        # Job tracking
-        self._job_counter = 0
-        self._active_jobs: dict[int, TransferJob] = {}
-        self._load_jobs: dict[str, int] = {}  # req_id -> job_id
-        self._store_jobs: dict[str, set[int]] = defaultdict(set)
-        # Pending store jobs are deferred to the beginning of the next step.
-        self._unsubmitted_store_jobs: list[tuple[int, str, list[int], list[int]]] = []
+        # Per-stream ordered list of (job_idx, event).
+        # CUDA stream ordering guarantees: if event at index i has not fired,
+        # no event at index > i has fired either.
+        self._load_events: list[tuple[int, torch.cuda.Event]] = []
+        self._store_events: list[tuple[int, torch.cuda.Event]] = []
 
-        # Track requests that have finished generating but still have pending stores
-        self._finished_reqs_waiting_for_store: set[str] = set()
+        # Deferred stores: queued in wait_for_save(), submitted in start_load_kv()
+        # of the next step to avoid contention with post-forward sampling work.
+        self._pending_store_jobs: list[tuple[int, list[int], list[int]]] = []
 
         # Current metadata (set per step)
         self._connector_metadata: SimpleCPUOffloadMetadata | None = None
@@ -107,6 +96,7 @@ class SimpleCPUOffloadWorker:
             kv_caches: Dict mapping layer name to KV cache tensor
         """
         self.gpu_kv_caches = kv_caches
+        self.device = next(iter(kv_caches.values())).device
         self._first_layer_name = next(iter(kv_caches))
 
         # Compute per-layer block size from any layer
@@ -167,69 +157,47 @@ class SimpleCPUOffloadWorker:
 
     def start_load_kv(self) -> None:
         """
-        Start async loads from CPU to GPU.
+        Flush deferred stores and start async loads from CPU to GPU.
 
         Called before the forward pass to overlap transfer with compute.
+        Stores from the previous step are submitted here to avoid contention
+        with post-forward sampling work.
         """
         if not self._is_initialized:
             logger.warning("KV caches not registered, skipping load")
             return
 
-        # Defer stores to start of the next step to avoid contention with
-        # post-forward sampling work in the current step.
-        self._submit_pending_store_jobs()
+        # Always flush deferred stores first, regardless of metadata.
+        self._submit_pending_stores()
 
         if self._connector_metadata is None:
+            return
+
+        metadata = self._connector_metadata
+        if not metadata.load_gpu_blocks:
             return
 
         assert self.load_stream is not None
         assert self.cpu_kv_caches is not None
         assert self.gpu_kv_caches is not None
 
-        # Collect per-request load info and merge block lists for a single
-        # kernel launch.
-        all_src_blocks: list[int] = []
-        all_dst_blocks: list[int] = []
-        load_requests: list[tuple[int, str, int]] = []  # (job_id, req_id, n)
-        for req_id, (
-            dst_gpu_blocks,
-            src_cpu_blocks,
-        ) in self._connector_metadata.reqs_to_load.items():
-            if not dst_gpu_blocks or not src_cpu_blocks:
-                continue
-
-            job_id = self._job_counter
-            self._job_counter += 1
-            load_requests.append((job_id, req_id, len(src_cpu_blocks)))
-            all_src_blocks.extend(src_cpu_blocks)
-            all_dst_blocks.extend(dst_gpu_blocks)
-
-        if not load_requests:
-            return
-
         with torch.cuda.stream(self.load_stream):
             self._copy_blocks(
                 src_caches=self.cpu_kv_caches,
                 dst_caches=self.gpu_kv_caches,
-                src_block_ids=all_src_blocks,
-                dst_block_ids=all_dst_blocks,
+                src_block_ids=metadata.load_cpu_blocks,
+                dst_block_ids=metadata.load_gpu_blocks,
                 is_store=False,
             )
             event = torch.cuda.Event()
             event.record(self.load_stream)
 
-        for job_id, req_id, n_blocks in load_requests:
-            self._active_jobs[job_id] = TransferJob(
-                req_id=req_id,
-                is_store=False,
-                event=event,
-            )
-            self._load_jobs[req_id] = job_id
-            logger.debug(
-                "Request %s: Started loading %d blocks from CPU",
-                req_id,
-                n_blocks,
-            )
+        self._load_events.append((metadata.load_job_idx, event))
+        logger.debug(
+            "Started loading %d blocks from CPU (job_idx=%d)",
+            len(metadata.load_gpu_blocks),
+            metadata.load_job_idx,
+        )
 
     def wait_for_save(self) -> None:
         """
@@ -244,65 +212,84 @@ class SimpleCPUOffloadWorker:
         if not self._is_initialized:
             return
 
-        for req_id, (
-            src_gpu_blocks,
-            dst_cpu_blocks,
-        ) in self._connector_metadata.reqs_to_store.items():
-            if not src_gpu_blocks or not dst_cpu_blocks:
-                continue
+        metadata = self._connector_metadata
+        if not metadata.store_gpu_blocks:
+            return
 
-            job_id = self._job_counter
-            self._job_counter += 1
-
-            self._store_jobs[req_id].add(job_id)
-            self._unsubmitted_store_jobs.append(
-                (job_id, req_id, list(src_gpu_blocks), list(dst_cpu_blocks))
+        self._pending_store_jobs.append(
+            (
+                metadata.store_job_idx,
+                list(metadata.store_gpu_blocks),
+                list(metadata.store_cpu_blocks),
             )
+        )
+        logger.debug(
+            "Queued storing %d blocks to CPU (job_idx=%d)",
+            len(metadata.store_gpu_blocks),
+            metadata.store_job_idx,
+        )
 
-            logger.debug(
-                "Request %s: Queued storing %d blocks to CPU",
-                req_id,
-                len(src_gpu_blocks),
-            )
-
-    def _submit_pending_store_jobs(self) -> None:
-        """Submit deferred store jobs."""
-        if not self._unsubmitted_store_jobs:
+    def _submit_pending_stores(self) -> None:
+        """Submit all deferred store jobs in a single kernel launch."""
+        if not self._pending_store_jobs:
             return
         if not self._is_initialized:
             return
 
         assert self.store_stream is not None
+        assert self.gpu_kv_caches is not None
+        assert self.cpu_kv_caches is not None
 
-        # Merge all block pairs so we launch the Triton kernel only once.
-        all_src_blocks: list[int] = []
-        all_dst_blocks: list[int] = []
-        for _, _, src_gpu_blocks, dst_cpu_blocks in self._unsubmitted_store_jobs:
-            all_src_blocks.extend(src_gpu_blocks)
-            all_dst_blocks.extend(dst_cpu_blocks)
+        all_src: list[int] = []
+        all_dst: list[int] = []
+        for _, src, dst in self._pending_store_jobs:
+            all_src.extend(src)
+            all_dst.extend(dst)
 
         with torch.cuda.stream(self.store_stream):
-            if all_src_blocks:
+            if all_src:
                 self._copy_blocks(
-                    src_caches=self.gpu_kv_caches,  # type: ignore
-                    dst_caches=self.cpu_kv_caches,  # type: ignore
-                    src_block_ids=all_src_blocks,
-                    dst_block_ids=all_dst_blocks,
+                    src_caches=self.gpu_kv_caches,
+                    dst_caches=self.cpu_kv_caches,
+                    src_block_ids=all_src,
+                    dst_block_ids=all_dst,
+                    is_store=True,
                 )
+            # One event covers all batched jobs; they share the same completion point.
             event = torch.cuda.Event()
             event.record(self.store_stream)
 
-        for job_id, req_id, src_gpu_blocks, _ in self._unsubmitted_store_jobs:
-            self._active_jobs[job_id] = TransferJob(
-                req_id=req_id, is_store=True, event=event
-            )
-            logger.debug(
-                "Request %s: Started deferred storing %d blocks to CPU",
-                req_id,
-                len(src_gpu_blocks),
-            )
+        for job_idx, _, _ in self._pending_store_jobs:
+            self._store_events.append((job_idx, event))
+            logger.debug("Submitted deferred store to CPU (job_idx=%d)", job_idx)
 
-        self._unsubmitted_store_jobs.clear()
+        self._pending_store_jobs.clear()
+
+    def get_completed_watermarks(self) -> tuple[int, int]:
+        """Return (load_watermark, store_watermark).
+
+        watermark = highest job_idx whose CUDA event has fired (-1 if none).
+        Drains fired events from the front of each list.  CUDA stream ordering
+        guarantees that if the event at index i has not fired, no event at
+        index > i has fired either, so we can break early.
+        """
+        return (
+            self._drain_stream_events(self._load_events),
+            self._drain_stream_events(self._store_events),
+        )
+
+    @staticmethod
+    def _drain_stream_events(events: list[tuple[int, torch.cuda.Event]]) -> int:
+        """Pop all fired events from the front; return highest job_idx seen."""
+        watermark = -1
+        while events:
+            job_idx, event = events[0]
+            if event.query():
+                watermark = job_idx
+                events.pop(0)
+            else:
+                break  # Stream ordering: nothing after this can have fired.
+        return watermark
 
     @staticmethod
     def _validate_block_ids(block_ids: list[int], num_blocks: int, label: str) -> None:
@@ -346,7 +333,7 @@ class SimpleCPUOffloadWorker:
         block_mapping = torch.tensor(
             list(zip(src_block_ids, dst_block_ids)),
             dtype=torch.int64,
-            device="cuda",
+            device=self.device,
         )
 
         # Use cached launch params when available
@@ -361,90 +348,22 @@ class SimpleCPUOffloadWorker:
             launch_params=launch_params,
         )
 
-    def get_finished(
-        self,
-        finished_req_ids: set[str],
-    ) -> tuple[set[str] | None, set[str] | None]:
+    def handle_preemptions(self) -> None:
         """
-        Check for completed transfers and return finished request IDs.
+        Synchronize all in-flight transfers before preempted blocks are reused.
 
-        Args:
-            finished_req_ids: Request IDs that have finished generating
-
-        Returns:
-            Tuple of (finished_sending, finished_recving)
-            - finished_sending: Requests that finished generating AND completed
-              all async stores
-            - finished_recving: Requests that completed async loading
+        Conservatively syncs everything (both streams) since we no longer
+        track which events belong to which requests.
         """
-        finished_sending: set[str] = set()
-        finished_recving: set[str] = set()
+        self._submit_pending_stores()
 
-        # Poll CUDA events for completion
-        completed_job_ids = []
-        for job_id, job in list(self._active_jobs.items()):
-            if job.event.query():  # Non-blocking check
-                completed_job_ids.append(job_id)
+        for _, event in self._load_events:
+            event.synchronize()
+        self._load_events.clear()
 
-        # Process completed jobs
-        for job_id in completed_job_ids:
-            job = self._active_jobs.pop(job_id)
-
-            if job.is_store:
-                self._store_jobs[job.req_id].discard(job_id)
-                if (
-                    not self._store_jobs[job.req_id]
-                    and job.req_id in self._finished_reqs_waiting_for_store
-                ):
-                    self._finished_reqs_waiting_for_store.remove(job.req_id)
-                    finished_sending.add(job.req_id)
-                    self._store_jobs.pop(job.req_id, None)
-            else:
-                self._load_jobs.pop(job.req_id, None)
-                finished_recving.add(job.req_id)
-
-        # Track requests that finished generating but still have pending stores
-        for req_id in finished_req_ids:
-            pending_store_jobs = self._store_jobs.get(req_id)
-            if pending_store_jobs:
-                # Request finished generating but has pending stores
-                self._finished_reqs_waiting_for_store.add(req_id)
-            elif pending_store_jobs is not None:
-                # Request finished and no pending stores (empty set)
-                finished_sending.add(req_id)
-                del self._store_jobs[req_id]
-
-        return (
-            finished_sending if finished_sending else None,
-            finished_recving if finished_recving else None,
-        )
-
-    def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
-        """
-        Handle preempted requests before their blocks are overwritten.
-
-        Args:
-            preempted_req_ids: IDs of preempted requests
-        """
-        # Flush deferred stores first so waits below include them.
-        self._submit_pending_store_jobs()
-
-        # Wait for any in-flight loads for preempted requests
-        # (to avoid overwriting GPU blocks still being loaded into)
-        for req_id in preempted_req_ids:
-            job_id = self._load_jobs.get(req_id)
-            if job_id is not None:
-                job = self._active_jobs.get(job_id)
-                if job is not None:
-                    job.event.synchronize()
-
-        # Wait for any in-flight stores for preempted requests
-        for req_id in preempted_req_ids:
-            job_ids = self._store_jobs.get(req_id, set())
-            for job_id in job_ids:
-                job = self._active_jobs.get(job_id)
-                if job is not None:
-                    job.event.synchronize()
+        for _, event in self._store_events:
+            event.synchronize()
+        self._store_events.clear()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Block until the KV for a specific layer is loaded.
