@@ -643,6 +643,13 @@ class SimpleCPUOffloadScheduler:
                 len(block_hashes),
             )
 
+            # Decrement GPU block ref_cnt — blocks are now safe to free.
+            gpu_block_ids = self._pending_gpu_store_blocks.pop(req_id, [])
+            if gpu_block_ids and self._gpu_block_pool is not None:
+                self._gpu_block_pool.free_blocks(
+                    self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
+                )
+
             # finished_sending is only reported after request completion.
             self._cleanup_request(req_id)
 

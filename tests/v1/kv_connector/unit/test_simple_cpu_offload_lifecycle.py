@@ -383,3 +383,47 @@ def test_store_touches_gpu_blocks_to_prevent_freeing():
     assert len(stored_gpu_ids) > 0
     for bid in stored_gpu_ids:
         assert gpu_block_pool.blocks[bid].ref_cnt == 2
+
+
+def test_store_completion_decrements_gpu_refcnt():
+    """When a store completes, GPU blocks should have ref_cnt decremented."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    manager = _create_scheduler_manager()
+    request = create_request(num_tokens=32, block_size=16)
+    req_id = request.request_id
+
+    gpu_block_pool = BlockPool(
+        num_gpu_blocks=64, enable_caching=True, hash_block_size=16
+    )
+    manager.bind_gpu_block_pool(gpu_block_pool)
+
+    # Allocate GPU blocks.
+    gpu_blocks = gpu_block_pool.get_new_blocks(2)
+    gpu_block_ids = [b.block_id for b in gpu_blocks]
+
+    manager._requests[req_id] = request
+    manager._request_gpu_blocks[req_id] = [gpu_block_ids]
+    request.num_computed_tokens = 0
+
+    # Build connector meta triggers store, touching GPU blocks.
+    manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
+    stored_gpu_ids = manager._pending_gpu_store_blocks[req_id]
+    assert all(gpu_block_pool.blocks[bid].ref_cnt == 2 for bid in stored_gpu_ids)
+
+    # Simulate store completion.
+    manager.update_connector_output(
+        KVConnectorOutput(
+            finished_sending={req_id},
+            finished_recving=None,
+            invalid_block_ids=set(),
+        )
+    )
+
+    # GPU blocks should have ref_cnt decremented back to 1
+    # (still held by the kv_cache_manager allocation).
+    for bid in stored_gpu_ids:
+        assert gpu_block_pool.blocks[bid].ref_cnt == 1
+
+    # Pending GPU store blocks should be cleaned up.
+    assert req_id not in manager._pending_gpu_store_blocks
