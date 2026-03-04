@@ -26,9 +26,7 @@ logger = init_logger(__name__)
 
 
 class SimpleCPUOffloadWorker:
-    """
-    Worker-side handler for CPU offloading transfers.
-    """
+    """Worker-side handler for CPU offloading transfers."""
 
     def __init__(
         self,
@@ -36,14 +34,6 @@ class SimpleCPUOffloadWorker:
         kv_cache_config: "KVCacheConfig | None",
         cpu_capacity_bytes: int,
     ):
-        """
-        Initialize the worker-side handler.
-
-        Args:
-            vllm_config: vLLM configuration
-            kv_cache_config: KV cache configuration
-            cpu_capacity_bytes: CPU memory capacity in bytes
-        """
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.cpu_capacity_bytes = cpu_capacity_bytes
@@ -51,31 +41,23 @@ class SimpleCPUOffloadWorker:
         cache_config = vllm_config.cache_config
         self.gpu_block_size = cache_config.block_size
 
-        # Will be set when KV cache is registered
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.device: torch.device | None = None
         self._first_layer_name: str | None = None
         self.num_cpu_blocks: int = 0
-        # Cached Triton launch params for per-layer transfers (store/load)
         self._store_launch_params: MultiLayerLaunchParams | None = None
         self._load_launch_params: MultiLayerLaunchParams | None = None
 
-        # CUDA streams for async transfers
         self.load_stream: torch.cuda.Stream | None = None
         self.store_stream: torch.cuda.Stream | None = None
 
-        # Per-stream ordered list of (job_idx, event).
-        # CUDA stream ordering guarantees: if event at index i has not fired,
-        # no event at index > i has fired either.
+        # Ordered (job_idx, event) — stream ordering lets us break early
         self._load_events: list[tuple[int, torch.cuda.Event]] = []
         self._store_events: list[tuple[int, torch.cuda.Event]] = []
 
-        # Deferred stores: queued in wait_for_save(), submitted in start_load_kv()
-        # of the next step to avoid contention with post-forward sampling work.
+        # Deferred stores: queued in wait_for_save(), flushed in start_load_kv()
         self._pending_store_jobs: list[tuple[int, list[int], list[int]]] = []
-
-        # Current metadata (set per step)
         self._connector_metadata: SimpleCPUOffloadMetadata | None = None
 
     @property
@@ -89,17 +71,11 @@ class SimpleCPUOffloadWorker:
         )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """
-        Register per-layer KV caches.
-
-        Args:
-            kv_caches: Dict mapping layer name to KV cache tensor
-        """
+        """Register per-layer GPU KV caches and allocate pinned CPU tensors."""
         self.gpu_kv_caches = kv_caches
         self.device = next(iter(kv_caches.values())).device
         self._first_layer_name = next(iter(kv_caches))
 
-        # Compute per-layer block size from any layer
         first_tensor = next(iter(kv_caches.values()))
         block_size_bytes = first_tensor[0].numel() * first_tensor.element_size()
         num_layers = len(kv_caches)
@@ -115,7 +91,6 @@ class SimpleCPUOffloadWorker:
             (self.num_cpu_blocks * block_size_bytes * num_layers) / (1024**3),
         )
 
-        # Allocate pinned CPU tensors matching each GPU layer
         pin_memory = is_pin_memory_available()
         self.cpu_kv_caches = {}
         for name, gpu_tensor in kv_caches.items():
@@ -132,7 +107,6 @@ class SimpleCPUOffloadWorker:
                 "Pinned memory not available. CPU offload performance may be degraded."
             )
 
-        # Pre-compute Triton launch params (pointer tables, block/warp config)
         self._store_launch_params = triton_kernels.build_launch_params(
             self.gpu_kv_caches, self.cpu_kv_caches
         )
@@ -140,34 +114,21 @@ class SimpleCPUOffloadWorker:
             self.cpu_kv_caches, self.gpu_kv_caches
         )
 
-        # Initialize CUDA streams
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
 
-    def bind_connector_metadata(
-        self,
-        metadata: SimpleCPUOffloadMetadata,
-    ) -> None:
-        """Bind metadata for the current step."""
+    def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
 
     def clear_connector_metadata(self) -> None:
-        """Clear metadata after the step."""
         self._connector_metadata = None
 
     def start_load_kv(self) -> None:
-        """
-        Flush deferred stores and start async loads from CPU to GPU.
-
-        Called before the forward pass to overlap transfer with compute.
-        Stores from the previous step are submitted here to avoid contention
-        with post-forward sampling work.
-        """
+        """Flush deferred stores, then start async loads from CPU to GPU."""
         if not self._is_initialized:
             logger.warning("KV caches not registered, skipping load")
             return
 
-        # Always flush deferred stores first, regardless of metadata.
         self._submit_pending_stores()
 
         if self._connector_metadata is None:
@@ -200,12 +161,7 @@ class SimpleCPUOffloadWorker:
         )
 
     def wait_for_save(self) -> None:
-        """
-        Queue async stores from GPU to CPU.
-
-        Called after the forward pass to stage computed KV cache stores.
-        Stores are submitted in start_load_kv() of the next step.
-        """
+        """Queue store jobs; actual submission deferred to start_load_kv()."""
         if self._connector_metadata is None:
             return
 
@@ -230,7 +186,6 @@ class SimpleCPUOffloadWorker:
         )
 
     def _submit_pending_stores(self) -> None:
-        """Submit all deferred store jobs in a single kernel launch."""
         if not self._pending_store_jobs:
             return
         if not self._is_initialized:
@@ -266,13 +221,7 @@ class SimpleCPUOffloadWorker:
         self._pending_store_jobs.clear()
 
     def get_completed_watermarks(self) -> tuple[int, int]:
-        """Return (load_watermark, store_watermark).
-
-        watermark = highest job_idx whose CUDA event has fired (-1 if none).
-        Drains fired events from the front of each list.  CUDA stream ordering
-        guarantees that if the event at index i has not fired, no event at
-        index > i has fired either, so we can break early.
-        """
+        """Return (load_wm, store_wm): highest job_idx whose event fired."""
         return (
             self._drain_stream_events(self._load_events),
             self._drain_stream_events(self._store_events),
@@ -280,7 +229,6 @@ class SimpleCPUOffloadWorker:
 
     @staticmethod
     def _drain_stream_events(events: list[tuple[int, torch.cuda.Event]]) -> int:
-        """Pop all fired events from the front; return highest job_idx seen."""
         watermark = -1
         while events:
             job_idx, event = events[0]
@@ -293,7 +241,6 @@ class SimpleCPUOffloadWorker:
 
     @staticmethod
     def _validate_block_ids(block_ids: list[int], num_blocks: int, label: str) -> None:
-        """Validate that all block IDs are within bounds."""
         if not block_ids:
             return
         lo, hi = min(block_ids), max(block_ids)
@@ -309,34 +256,18 @@ class SimpleCPUOffloadWorker:
         dst_block_ids: list[int],
         is_store: bool = True,
     ) -> None:
-        """
-        Execute per-layer block transfer using a single multi-layer Triton
-        kernel launch.
-
-        Uses pointer tables and stride-based addressing to handle
-        non-contiguous (permuted) GPU tensors without requiring .view(-1).
-
-        Args:
-            src_caches: Dict of layer name -> source KV cache tensor
-            dst_caches: Dict of layer name -> destination KV cache tensor
-            src_block_ids: Source block IDs
-            dst_block_ids: Destination block IDs
-            is_store: True for GPU->CPU, False for CPU->GPU
-        """
-        # Validate block IDs against first layer (all layers share block count)
+        """Execute multi-layer Triton kernel block transfer."""
         first_src = next(iter(src_caches.values()))
         first_dst = next(iter(dst_caches.values()))
         self._validate_block_ids(src_block_ids, first_src.shape[0], "Source")
         self._validate_block_ids(dst_block_ids, first_dst.shape[0], "Dest")
 
-        # Build block mapping tensor once for all layers
         block_mapping = torch.tensor(
             list(zip(src_block_ids, dst_block_ids)),
             dtype=torch.int64,
             device=self.device,
         )
 
-        # Use cached launch params when available
         launch_params = (
             self._store_launch_params if is_store else self._load_launch_params
         )
@@ -349,12 +280,7 @@ class SimpleCPUOffloadWorker:
         )
 
     def handle_preemptions(self) -> None:
-        """
-        Synchronize all in-flight transfers before preempted blocks are reused.
-
-        Conservatively syncs everything (both streams) since we no longer
-        track which events belong to which requests.
-        """
+        """Sync all in-flight transfers before preempted blocks are reused."""
         self._submit_pending_stores()
 
         for _, event in self._load_events:
@@ -366,10 +292,6 @@ class SimpleCPUOffloadWorker:
         self._store_events.clear()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Block until the KV for a specific layer is loaded.
-
-        All layers are transferred in a single kernel launch, so only the
-        first layer call needs to synchronize the stream.
-        """
+        """Sync on first layer only (all layers transferred in one launch)."""
         if layer_name == self._first_layer_name and self.load_stream is not None:
             self.load_stream.synchronize()

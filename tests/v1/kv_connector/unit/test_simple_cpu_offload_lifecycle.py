@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata im
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.worker import (
     SimpleCPUOffloadWorker,
 )
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -94,9 +95,8 @@ class _MockKVCacheBlocks:
         return [self._block_ids]
 
 
-class _DoneEvent:
-    def query(self) -> bool:
-        return True
+def _create_gpu_block_pool(num_blocks: int = 64) -> BlockPool:
+    return BlockPool(num_gpu_blocks=num_blocks, enable_caching=True, hash_block_size=16)
 
 
 def test_accumulates_pending_cpu_blocks_across_steps():
@@ -274,8 +274,7 @@ def test_worker_start_load_submits_pending_stores_without_metadata():
 
 
 def test_connector_emits_finished_sending_immediately_on_store_completion():
-    """With ref_cnt, finished_sending is emitted as soon as stores complete,
-    regardless of request lifecycle."""
+    """finished_sending emitted as soon as stores complete (no two-phase)."""
     from unittest.mock import MagicMock
 
     from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
@@ -291,13 +290,10 @@ def test_connector_emits_finished_sending_immediately_on_store_completion():
     mock_worker = MagicMock()
     mock_worker.get_completed_watermarks.return_value = (-1, 0)
     connector.worker_handler = mock_worker
+    connector._pending_store_wm_jobs = {0: ["req-early-store-done"]}
 
-    req_id = "req-early-store-done"
-    connector._pending_store_wm_jobs = {0: [req_id]}
-
-    # Store event fires — should be emitted immediately, no two-phase wait.
     finished_sending, finished_recving = connector.get_finished(set())
-    assert finished_sending == {req_id}
+    assert finished_sending == {"req-early-store-done"}
     assert finished_recving is None
 
 
@@ -334,19 +330,13 @@ def test_cached_blocks_advance_store_cursor():
 
 def test_store_touches_gpu_blocks_to_prevent_freeing():
     """When a store is submitted, GPU blocks should have ref_cnt incremented."""
-    from vllm.v1.core.block_pool import BlockPool
-
     manager = _create_scheduler_manager()
     request = create_request(num_tokens=32, block_size=16)
     req_id = request.request_id
 
-    # Create a GPU block pool and bind it.
-    gpu_block_pool = BlockPool(
-        num_gpu_blocks=64, enable_caching=True, hash_block_size=16
-    )
+    gpu_block_pool = _create_gpu_block_pool()
     manager.bind_gpu_block_pool(gpu_block_pool)
 
-    # Allocate GPU blocks 0 and 1 for this request.
     gpu_blocks = gpu_block_pool.get_new_blocks(2)
     gpu_block_ids = [b.block_id for b in gpu_blocks]
     assert all(gpu_block_pool.blocks[bid].ref_cnt == 1 for bid in gpu_block_ids)
@@ -355,10 +345,8 @@ def test_store_touches_gpu_blocks_to_prevent_freeing():
     manager._request_gpu_blocks[req_id] = [gpu_block_ids]
     request.num_computed_tokens = 0
 
-    # Build connector meta triggers _prepare_store_specs(), which should touch.
     manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
 
-    # GPU blocks that are being stored should have ref_cnt incremented to 2.
     stored_gpu_ids = manager._pending_gpu_store_blocks.get(req_id, [])
     assert len(stored_gpu_ids) > 0
     for bid in stored_gpu_ids:
@@ -367,18 +355,13 @@ def test_store_touches_gpu_blocks_to_prevent_freeing():
 
 def test_store_completion_decrements_gpu_refcnt():
     """When a store completes, GPU blocks should have ref_cnt decremented."""
-    from vllm.v1.core.block_pool import BlockPool
-
     manager = _create_scheduler_manager()
     request = create_request(num_tokens=32, block_size=16)
     req_id = request.request_id
 
-    gpu_block_pool = BlockPool(
-        num_gpu_blocks=64, enable_caching=True, hash_block_size=16
-    )
+    gpu_block_pool = _create_gpu_block_pool()
     manager.bind_gpu_block_pool(gpu_block_pool)
 
-    # Allocate GPU blocks.
     gpu_blocks = gpu_block_pool.get_new_blocks(2)
     gpu_block_ids = [b.block_id for b in gpu_blocks]
 
@@ -386,12 +369,10 @@ def test_store_completion_decrements_gpu_refcnt():
     manager._request_gpu_blocks[req_id] = [gpu_block_ids]
     request.num_computed_tokens = 0
 
-    # Build connector meta triggers store, touching GPU blocks.
     manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
     stored_gpu_ids = manager._pending_gpu_store_blocks[req_id]
     assert all(gpu_block_pool.blocks[bid].ref_cnt == 2 for bid in stored_gpu_ids)
 
-    # Simulate store completion.
     manager.update_connector_output(
         KVConnectorOutput(
             finished_sending={req_id},
@@ -400,37 +381,22 @@ def test_store_completion_decrements_gpu_refcnt():
         )
     )
 
-    # GPU blocks should have ref_cnt decremented back to 1
-    # (still held by the kv_cache_manager allocation).
     for bid in stored_gpu_ids:
         assert gpu_block_pool.blocks[bid].ref_cnt == 1
-
-    # Pending GPU store blocks should be cleaned up.
     assert req_id not in manager._pending_gpu_store_blocks
 
 
 def test_lazy_store_touches_and_releases_gpu_blocks():
     """Lazy mode: GPU eviction candidates are touched during store,
     freed on completion."""
-    from vllm.v1.core.block_pool import BlockPool
-
     manager = _create_scheduler_manager()
     manager._lazy_mode = True
 
-    # Use a small GPU pool so that hashed free blocks are reachable by
-    # get_eviction_candidates (which peeks from the LRU front with 2x
-    # oversample). With 5 total blocks (1 null + 4 usable), after we
-    # allocate all 4, set hashes on 2, and free them all, the hashed
-    # blocks sit near the front of the free queue.
-    gpu_block_pool = BlockPool(
-        num_gpu_blocks=5, enable_caching=True, hash_block_size=16
-    )
+    # Small pool: 1 null + 4 usable. Hashed blocks land at LRU front.
+    gpu_block_pool = _create_gpu_block_pool(num_blocks=5)
     manager.bind_gpu_block_pool(gpu_block_pool)
 
-    # Allocate all usable blocks from the pool.
     all_blocks = gpu_block_pool.get_new_blocks(4)
-
-    # Set block hashes on the first 2 (simulating cached prefix blocks).
     hashed_blocks = all_blocks[:2]
     unhashed_blocks = all_blocks[2:]
     for i, block in enumerate(hashed_blocks):
@@ -439,24 +405,17 @@ def test_lazy_store_touches_and_releases_gpu_blocks():
         )
         gpu_block_pool.cached_block_hash_to_block.insert(block.block_hash, block)
 
-    # Free hashed blocks first so they land at the LRU front,
-    # then free unhashed blocks (which go after).
     gpu_block_pool.free_blocks(hashed_blocks)
     gpu_block_pool.free_blocks(unhashed_blocks)
     gpu_block_ids = [b.block_id for b in hashed_blocks]
     assert all(gpu_block_pool.blocks[bid].ref_cnt == 0 for bid in gpu_block_ids)
 
-    # Build connector meta triggers lazy store.
     meta = manager.build_connector_meta(_build_scheduler_output({"some_req": 32}))
-
-    # Lazy store should have picked up the hashed blocks.
     assert meta.store_job_idx >= 0, "Expected a lazy store job"
 
-    # GPU blocks being stored should be touched (ref_cnt > 0).
     for bid in meta.store_gpu_blocks:
         assert gpu_block_pool.blocks[bid].ref_cnt > 0
 
-    # Simulate lazy store completion via sentinel.
     sentinel = f"__lazy_store_{meta.store_job_idx}"
     manager.update_connector_output(
         KVConnectorOutput(
@@ -466,49 +425,36 @@ def test_lazy_store_touches_and_releases_gpu_blocks():
         )
     )
 
-    # GPU blocks should be back to ref_cnt=0.
     for bid in meta.store_gpu_blocks:
         assert gpu_block_pool.blocks[bid].ref_cnt == 0
 
 
 def test_cleanup_request_releases_gpu_refcnt_on_abort():
-    """If a request is cleaned up before store completion,
-    GPU ref_cnt is released."""
-    from vllm.v1.core.block_pool import BlockPool
-
+    """Cleanup releases GPU ref_cnt as safety net for aborts."""
     manager = _create_scheduler_manager()
-    gpu_block_pool = BlockPool(
-        num_gpu_blocks=64, enable_caching=True, hash_block_size=16
-    )
+    gpu_block_pool = _create_gpu_block_pool()
     manager.bind_gpu_block_pool(gpu_block_pool)
 
     req_id = "aborted-req"
     gpu_blocks = gpu_block_pool.get_new_blocks(2)
     gpu_block_ids = [b.block_id for b in gpu_blocks]
 
-    # Simulate connector having touched GPU blocks for a store.
     gpu_block_pool.touch(gpu_blocks)  # ref_cnt: 1 -> 2
     manager._pending_gpu_store_blocks[req_id] = gpu_block_ids
-
-    # Cleanup should release the connector's ref.
     manager._cleanup_request(req_id)
 
     for bid in gpu_block_ids:
-        assert gpu_block_pool.blocks[bid].ref_cnt == 1  # Back to original
+        assert gpu_block_pool.blocks[bid].ref_cnt == 1
     assert req_id not in manager._pending_gpu_store_blocks
 
 
 def test_multistep_gpu_block_accumulation():
     """GPU blocks from multiple scheduler steps accumulate and are all freed."""
-    from vllm.v1.core.block_pool import BlockPool
-
     manager = _create_scheduler_manager()
     request = create_request(num_tokens=64, block_size=16)
     req_id = request.request_id
 
-    gpu_block_pool = BlockPool(
-        num_gpu_blocks=64, enable_caching=True, hash_block_size=16
-    )
+    gpu_block_pool = _create_gpu_block_pool()
     manager.bind_gpu_block_pool(gpu_block_pool)
 
     gpu_blocks = gpu_block_pool.get_new_blocks(4)
@@ -517,23 +463,19 @@ def test_multistep_gpu_block_accumulation():
     manager._requests[req_id] = request
     manager._request_gpu_blocks[req_id] = [gpu_block_ids]
 
-    # Step 1: store first block (tokens 0-15).
     request.num_computed_tokens = 0
     manager.build_connector_meta(_build_scheduler_output({req_id: 16}))
     step1_gpu_ids = list(manager._pending_gpu_store_blocks[req_id])
     assert len(step1_gpu_ids) > 0
 
-    # Step 2: store second block (tokens 16-31).
     request.num_computed_tokens = 16
     manager.build_connector_meta(_build_scheduler_output({req_id: 16}))
     all_gpu_ids = list(manager._pending_gpu_store_blocks[req_id])
     assert len(all_gpu_ids) > len(step1_gpu_ids)
 
-    # All accumulated GPU blocks should have ref_cnt == 2.
     for bid in all_gpu_ids:
         assert gpu_block_pool.blocks[bid].ref_cnt == 2
 
-    # Simulate store completion — all GPU blocks freed at once.
     manager.update_connector_output(
         KVConnectorOutput(
             finished_sending={req_id},
@@ -548,17 +490,13 @@ def test_multistep_gpu_block_accumulation():
 
 
 def test_preemption_with_inflight_store_refcnt_trace():
-    """Preemption: kv_cache_manager frees blocks (ref_cnt 2->1),
-    store completion later frees connector ref (1->0)."""
-    from vllm.v1.core.block_pool import BlockPool
-
+    """Preemption: kv_cache_manager frees (ref_cnt 2->1),
+    store completion frees connector ref (1->0)."""
     manager = _create_scheduler_manager()
     request = create_request(num_tokens=32, block_size=16)
     req_id = request.request_id
 
-    gpu_block_pool = BlockPool(
-        num_gpu_blocks=64, enable_caching=True, hash_block_size=16
-    )
+    gpu_block_pool = _create_gpu_block_pool()
     manager.bind_gpu_block_pool(gpu_block_pool)
 
     gpu_blocks = gpu_block_pool.get_new_blocks(2)
@@ -568,19 +506,16 @@ def test_preemption_with_inflight_store_refcnt_trace():
     manager._request_gpu_blocks[req_id] = [gpu_block_ids]
     request.num_computed_tokens = 0
 
-    # Store submission: ref_cnt 1 -> 2.
     manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
     stored_ids = list(manager._pending_gpu_store_blocks[req_id])
     assert all(gpu_block_pool.blocks[bid].ref_cnt == 2 for bid in stored_ids)
 
-    # Simulate preemption: kv_cache_manager.free() decrements ref_cnt 2 -> 1.
+    # Preemption: kv_cache_manager.free() decrements ref_cnt 2 -> 1
     gpu_block_pool.free_blocks(gpu_blocks)
     assert all(gpu_block_pool.blocks[bid].ref_cnt == 1 for bid in stored_ids)
-
-    # Blocks should NOT be in the free queue (ref_cnt > 0).
     free_count_before = gpu_block_pool.get_num_free_blocks()
 
-    # Store completes: connector frees ref_cnt 1 -> 0 (block truly freed).
+    # Store completes: connector frees ref_cnt 1 -> 0
     manager.update_connector_output(
         KVConnectorOutput(
             finished_sending={req_id},
@@ -591,24 +526,20 @@ def test_preemption_with_inflight_store_refcnt_trace():
 
     for bid in stored_ids:
         assert gpu_block_pool.blocks[bid].ref_cnt == 0
-    # Blocks should now be in the free queue.
     assert gpu_block_pool.get_num_free_blocks() > free_count_before
 
 
 def test_request_finished_returns_false_even_with_inflight_stores():
-    """request_finished() always returns False now; ref_cnt protects blocks."""
+    """request_finished() always returns False; ref_cnt protects blocks."""
     manager = _create_scheduler_manager()
     request = create_request(num_tokens=32, block_size=16)
     req_id = request.request_id
 
-    # Set up state as if stores are in-flight.
     manager._requests[req_id] = request
     manager._request_gpu_blocks[req_id] = [[0, 1]]
     manager._storing_requests[req_id].extend(list(request.block_hashes[:2]))
 
     is_async, params = manager.request_finished(request, block_ids=[0, 1])
-    assert is_async is False  # NEW: always False
+    assert is_async is False
     assert params is None
-
-    # Connector state should NOT be cleaned up yet (stores still in-flight).
     assert req_id in manager._storing_requests
