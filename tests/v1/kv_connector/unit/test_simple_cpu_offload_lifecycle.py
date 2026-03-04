@@ -16,7 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata im
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.worker import (
     SimpleCPUOffloadWorker,
 )
-from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -427,3 +427,65 @@ def test_store_completion_decrements_gpu_refcnt():
 
     # Pending GPU store blocks should be cleaned up.
     assert req_id not in manager._pending_gpu_store_blocks
+
+
+def test_lazy_store_touches_and_releases_gpu_blocks():
+    """Lazy mode: GPU eviction candidates are touched during store,
+    freed on completion."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    manager = _create_scheduler_manager()
+    manager._lazy_mode = True
+
+    # Use a small GPU pool so that hashed free blocks are reachable by
+    # get_eviction_candidates (which peeks from the LRU front with 2x
+    # oversample). With 5 total blocks (1 null + 4 usable), after we
+    # allocate all 4, set hashes on 2, and free them all, the hashed
+    # blocks sit near the front of the free queue.
+    gpu_block_pool = BlockPool(
+        num_gpu_blocks=5, enable_caching=True, hash_block_size=16
+    )
+    manager.bind_gpu_block_pool(gpu_block_pool)
+
+    # Allocate all usable blocks from the pool.
+    all_blocks = gpu_block_pool.get_new_blocks(4)
+
+    # Set block hashes on the first 2 (simulating cached prefix blocks).
+    hashed_blocks = all_blocks[:2]
+    unhashed_blocks = all_blocks[2:]
+    for i, block in enumerate(hashed_blocks):
+        block.block_hash = make_block_hash_with_group_id(
+            BlockHash(b"hash" + str(i).encode()), group_id=0
+        )
+        gpu_block_pool.cached_block_hash_to_block.insert(block.block_hash, block)
+
+    # Free hashed blocks first so they land at the LRU front,
+    # then free unhashed blocks (which go after).
+    gpu_block_pool.free_blocks(hashed_blocks)
+    gpu_block_pool.free_blocks(unhashed_blocks)
+    gpu_block_ids = [b.block_id for b in hashed_blocks]
+    assert all(gpu_block_pool.blocks[bid].ref_cnt == 0 for bid in gpu_block_ids)
+
+    # Build connector meta triggers lazy store.
+    meta = manager.build_connector_meta(_build_scheduler_output({"some_req": 32}))
+
+    # Lazy store should have picked up the hashed blocks.
+    assert meta.store_job_idx >= 0, "Expected a lazy store job"
+
+    # GPU blocks being stored should be touched (ref_cnt > 0).
+    for bid in meta.store_gpu_blocks:
+        assert gpu_block_pool.blocks[bid].ref_cnt > 0
+
+    # Simulate lazy store completion via sentinel.
+    sentinel = f"__lazy_store_{meta.store_job_idx}"
+    manager.update_connector_output(
+        KVConnectorOutput(
+            finished_sending={sentinel},
+            finished_recving=None,
+            invalid_block_ids=set(),
+        )
+    )
+
+    # GPU blocks should be back to ref_cnt=0.
+    for bid in meta.store_gpu_blocks:
+        assert gpu_block_pool.blocks[bid].ref_cnt == 0

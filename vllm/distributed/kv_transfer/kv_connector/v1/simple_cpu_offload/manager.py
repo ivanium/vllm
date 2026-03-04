@@ -135,15 +135,16 @@ class SimpleCPUOffloadScheduler:
         self._req_to_store_jobs: dict[str, set[int]] = defaultdict(set)
 
         # --- Lazy-mode tracking ---
-        # Accumulates (BlockHashWithGroupId, cpu_block) for lazy stores in
-        # the current step; flushed into _pending_lazy_stores at the end of
-        # build_connector_meta().
+        # Accumulates (BlockHashWithGroupId, cpu_block, gpu_block_id) for lazy
+        # stores in the current step; flushed into _pending_lazy_stores at the
+        # end of build_connector_meta().
         self._pending_lazy_stores_current: list[
-            tuple[BlockHashWithGroupId, KVCacheBlock]
+            tuple[BlockHashWithGroupId, KVCacheBlock, int]
         ] = []
-        # job_idx -> list of (BlockHashWithGroupId, cpu_block) pending registration
+        # job_idx -> list of (BlockHashWithGroupId, cpu_block, gpu_block_id)
+        # pending registration
         self._pending_lazy_stores: dict[
-            int, list[tuple[BlockHashWithGroupId, KVCacheBlock]]
+            int, list[tuple[BlockHashWithGroupId, KVCacheBlock, int]]
         ] = {}
 
     def _calculate_num_blocks(self, cpu_capacity_bytes: int) -> int:
@@ -324,7 +325,15 @@ class SimpleCPUOffloadScheduler:
             gpu_ids.append(gpu_block.block_id)
             cpu_ids.append(cpu_block.block_id)
             # Stash for later registration on job completion
-            self._pending_lazy_stores_current.append((bhash_with_group, cpu_block))
+            self._pending_lazy_stores_current.append(
+                (bhash_with_group, cpu_block, gpu_block.block_id)
+            )
+
+        # Touch GPU blocks to prevent eviction during copy.
+        if gpu_ids and self._gpu_block_pool is not None:
+            self._gpu_block_pool.touch(
+                [self._gpu_block_pool.blocks[bid] for bid in gpu_ids]
+            )
 
         return gpu_ids, cpu_ids
 
@@ -572,7 +581,7 @@ class SimpleCPUOffloadScheduler:
                 job_idx = int(req_id[len(_LAZY_SENTINEL_PREFIX) :])
                 lazy_entries = self._pending_lazy_stores.pop(job_idx, None)
                 if lazy_entries:
-                    for bhash_with_group, cpu_block in lazy_entries:
+                    for bhash_with_group, cpu_block, _gpu_bid in lazy_entries:
                         cpu_block.block_hash = bhash_with_group
                         self.cpu_block_pool.cached_block_hash_to_block.insert(
                             bhash_with_group, cpu_block
@@ -581,6 +590,12 @@ class SimpleCPUOffloadScheduler:
                     self.cpu_block_pool.free_blocks(
                         [entry[1] for entry in lazy_entries]
                     )
+                    # Decrement GPU block ref_cnt for lazy stores.
+                    if self._gpu_block_pool is not None:
+                        gpu_bids = [entry[2] for entry in lazy_entries]
+                        self._gpu_block_pool.free_blocks(
+                            self._gpu_block_pool.blocks[bid] for bid in gpu_bids
+                        )
                     logger.debug(
                         "Lazy store job %d: cached %d blocks to CPU",
                         job_idx,
