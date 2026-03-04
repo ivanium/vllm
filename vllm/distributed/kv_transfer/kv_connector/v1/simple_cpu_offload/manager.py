@@ -686,13 +686,13 @@ class SimpleCPUOffloadScheduler:
         req_id = request.request_id
 
         # Check if storing in progress
-        is_async = req_id in self._storing_requests
+        is_storing = req_id in self._storing_requests
 
-        # Cleanup if not async (otherwise cleaned up in update_connector_output)
-        if not is_async:
+        # Cleanup if not storing (otherwise cleaned up in update_connector_output)
+        if not is_storing:
             self._cleanup_request(req_id)
 
-        return is_async, None
+        return False, None
 
     def request_finished_all_groups(
         self,
@@ -711,13 +711,13 @@ class SimpleCPUOffloadScheduler:
             Tuple of (is_async, kv_transfer_params)
         """
         req_id = request.request_id
-        is_async = req_id in self._storing_requests
+        is_storing = req_id in self._storing_requests
 
-        # Cleanup if not async
-        if not is_async:
+        # Cleanup if not storing
+        if not is_storing:
             self._cleanup_request(req_id)
 
-        return is_async, None
+        return False, None
 
     def _cleanup_request(self, req_id: str) -> None:
         """Clean up all state for a request."""

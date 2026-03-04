@@ -135,7 +135,7 @@ def test_store_completion_releases_refs_and_cleans_request():
     manager._pending_cpu_blocks[req_id].extend(block_ids)
 
     is_async, _ = manager.request_finished(request, block_ids=[0, 1])
-    assert is_async
+    assert not is_async  # Always False with ref_cnt approach
 
     manager.update_connector_output(
         KVConnectorOutput(
@@ -516,3 +516,22 @@ def test_cleanup_request_releases_gpu_refcnt_on_abort():
     for bid in gpu_block_ids:
         assert gpu_block_pool.blocks[bid].ref_cnt == 1  # Back to original
     assert req_id not in manager._pending_gpu_store_blocks
+
+
+def test_request_finished_returns_false_even_with_inflight_stores():
+    """request_finished() always returns False now; ref_cnt protects blocks."""
+    manager = _create_scheduler_manager()
+    request = create_request(num_tokens=32, block_size=16)
+    req_id = request.request_id
+
+    # Set up state as if stores are in-flight.
+    manager._requests[req_id] = request
+    manager._request_gpu_blocks[req_id] = [[0, 1]]
+    manager._storing_requests[req_id].extend(list(request.block_hashes[:2]))
+
+    is_async, params = manager.request_finished(request, block_ids=[0, 1])
+    assert is_async is False  # NEW: always False
+    assert params is None
+
+    # Connector state should NOT be cleaned up yet (stores still in-flight).
+    assert req_id in manager._storing_requests
