@@ -489,3 +489,30 @@ def test_lazy_store_touches_and_releases_gpu_blocks():
     # GPU blocks should be back to ref_cnt=0.
     for bid in meta.store_gpu_blocks:
         assert gpu_block_pool.blocks[bid].ref_cnt == 0
+
+
+def test_cleanup_request_releases_gpu_refcnt_on_abort():
+    """If a request is cleaned up before store completion,
+    GPU ref_cnt is released."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    manager = _create_scheduler_manager()
+    gpu_block_pool = BlockPool(
+        num_gpu_blocks=64, enable_caching=True, hash_block_size=16
+    )
+    manager.bind_gpu_block_pool(gpu_block_pool)
+
+    req_id = "aborted-req"
+    gpu_blocks = gpu_block_pool.get_new_blocks(2)
+    gpu_block_ids = [b.block_id for b in gpu_blocks]
+
+    # Simulate connector having touched GPU blocks for a store.
+    gpu_block_pool.touch(gpu_blocks)  # ref_cnt: 1 -> 2
+    manager._pending_gpu_store_blocks[req_id] = gpu_block_ids
+
+    # Cleanup should release the connector's ref.
+    manager._cleanup_request(req_id)
+
+    for bid in gpu_block_ids:
+        assert gpu_block_pool.blocks[bid].ref_cnt == 1  # Back to original
+    assert req_id not in manager._pending_gpu_store_blocks

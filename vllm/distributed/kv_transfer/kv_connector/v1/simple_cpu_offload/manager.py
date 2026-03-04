@@ -735,6 +735,13 @@ class SimpleCPUOffloadScheduler:
                 self.cpu_block_pool.blocks[block_id] for block_id in pending_cpu_blocks
             )
 
+        # Release any GPU block refs held for in-flight stores.
+        gpu_block_ids = self._pending_gpu_store_blocks.pop(req_id, [])
+        if gpu_block_ids and self._gpu_block_pool is not None:
+            self._gpu_block_pool.free_blocks(
+                self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
+            )
+
         self._requests.pop(req_id, None)
         self._request_gpu_blocks.pop(req_id, None)
         self._num_stored_blocks.pop(req_id, None)
