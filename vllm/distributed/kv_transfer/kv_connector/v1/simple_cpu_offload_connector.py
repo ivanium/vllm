@@ -25,7 +25,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.manager import (
-    _LAZY_SENTINEL_PREFIX,
     SimpleCPUOffloadScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata import (
@@ -121,11 +120,6 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._pending_load_wm_jobs: dict[int, list[str]] = {}
         self._pending_store_wm_jobs: dict[int, list[str]] = {}
 
-        # Timing state: persists across steps, owns the "store done but req not
-        # finished yet" and "req finished but store not done yet" bookkeeping.
-        self._stores_completed_reqs: set[str] = set()
-        self._finished_reqs_waiting_for_store: set[str] = set()
-
     # ==============================
     # Worker-side methods
     # ==============================
@@ -157,12 +151,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
         """Handle preempted requests before their blocks are overwritten."""
         if self.worker_handler is not None:
-            # Worker syncs all streams conservatively (no per-req tracking).
             self.worker_handler.handle_preemptions()
-        # Clean up connector timing state for preempted reqs.
-        for req_id in preempted_req_ids:
-            self._stores_completed_reqs.discard(req_id)
-            self._finished_reqs_waiting_for_store.discard(req_id)
 
     def start_load_kv(
         self,
@@ -199,12 +188,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[set[str] | None, set[str] | None]:
         """Translate worker watermarks into finished req_id sets.
 
-        The worker reports monotonic watermarks (highest fired job_idx per
-        stream).  This method converts those watermarks to req_ids using the
-        snapshot maps refreshed in bind_connector_metadata(), then applies
-        two-phase timing logic for stores: a request is only emitted as
-        finished_sending once *both* its store jobs have completed *and* it
-        has been signalled as done by the engine.
+        With the ref_cnt approach, finished_sending is emitted as soon as
+        all store jobs for a request complete. No two-phase timing with
+        request lifecycle is needed -- GPU blocks are protected by ref_cnt.
         """
         if self.worker_handler is None:
             return None, None
@@ -214,11 +200,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         load_wm, store_wm = self.worker_handler.get_completed_watermarks()
 
-        # --- Load completions ---
+        # --- Load completions (unchanged) ---
         for job_idx in [j for j in self._pending_load_wm_jobs if j <= load_wm]:
             finished_recving.update(self._pending_load_wm_jobs.pop(job_idx))
 
-        # --- Store completions ---
+        # --- Store completions (simplified -- no two-phase timing) ---
         fired_store_reqs: set[str] = set()
         for job_idx in [j for j in self._pending_store_wm_jobs if j <= store_wm]:
             fired_store_reqs.update(self._pending_store_wm_jobs.pop(job_idx))
@@ -232,28 +218,8 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         for req_id in fired_store_reqs:
             if req_id not in still_pending_reqs:
-                # All store jobs for this req have fired.
-                if req_id.startswith(_LAZY_SENTINEL_PREFIX):
-                    # Lazy store sentinels don't need two-phase timing — they
-                    # have no corresponding engine request to wait for.
-                    finished_sending.add(req_id)
-                elif req_id in self._finished_reqs_waiting_for_store:
-                    self._finished_reqs_waiting_for_store.discard(req_id)
-                    finished_sending.add(req_id)
-                else:
-                    # Store done before engine declared the req finished.
-                    self._stores_completed_reqs.add(req_id)
-            # else: req has more pending store jobs — don't emit yet.
-
-        # --- Handle newly engine-finished requests ---
-        for req_id in finished_req_ids:
-            if req_id in self._stores_completed_reqs:
-                self._stores_completed_reqs.discard(req_id)
+                # All store jobs for this req have fired -- emit immediately.
                 finished_sending.add(req_id)
-            elif req_id in still_pending_reqs:
-                # Stores still in-flight; revisit when they complete.
-                self._finished_reqs_waiting_for_store.add(req_id)
-            # else: no stores for this req → not a sender.
 
         return finished_sending or None, finished_recving or None
 

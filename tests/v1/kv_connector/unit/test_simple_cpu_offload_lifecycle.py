@@ -273,52 +273,32 @@ def test_worker_start_load_submits_pending_stores_without_metadata():
     assert called["count"] == 1
 
 
-def test_connector_emits_finished_sending_if_stores_complete_before_req_finishes():
-    """Timing logic now lives in the connector, not the worker."""
+def test_connector_emits_finished_sending_immediately_on_store_completion():
+    """With ref_cnt, finished_sending is emitted as soon as stores complete,
+    regardless of request lifecycle."""
     from unittest.mock import MagicMock
 
     from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
         SimpleCPUOffloadConnector,
     )
 
-    _ = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=16, num_gpu_blocks=64),
-        kv_transfer_config=SimpleNamespace(
-            kv_connector="SimpleCPUOffloadConnector",
-            kv_role="kv_both",
-            kv_connector_extra_config={},
-        ),
-    )
     connector = SimpleCPUOffloadConnector.__new__(SimpleCPUOffloadConnector)
     connector.scheduler_manager = None
     connector._connector_metadata = None
     connector._pending_load_wm_jobs = {}
     connector._pending_store_wm_jobs = {}
-    connector._stores_completed_reqs = set()
-    connector._finished_reqs_waiting_for_store = set()
 
-    # Mock the worker_handler to return a known watermark.
     mock_worker = MagicMock()
-    # job_idx=0 store has fired (store_wm=0), no loads.
     mock_worker.get_completed_watermarks.return_value = (-1, 0)
     connector.worker_handler = mock_worker
 
     req_id = "req-early-store-done"
-    # Set up snapshot: job 0 is associated with req_id.
     connector._pending_store_wm_jobs = {0: [req_id]}
 
-    # Store event fires, but request hasn't finished yet.
+    # Store event fires — should be emitted immediately, no two-phase wait.
     finished_sending, finished_recving = connector.get_finished(set())
-    assert finished_sending is None
-    assert finished_recving is None
-    assert req_id not in connector._pending_store_wm_jobs
-    assert req_id in connector._stores_completed_reqs
-
-    # Now the request finishes → should be emitted as finished_sending.
-    finished_sending, finished_recving = connector.get_finished({req_id})
     assert finished_sending == {req_id}
     assert finished_recving is None
-    assert req_id not in connector._stores_completed_reqs
 
 
 def test_cached_blocks_advance_store_cursor():
