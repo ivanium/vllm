@@ -88,7 +88,10 @@ class SimpleCPUOffloadScheduler:
         self._pending_load_blocks: dict[str, list[int]] = defaultdict(list)
         self._pending_cpu_blocks: dict[str, list[int]] = defaultdict(list)
 
-        # GPU blocks with extra ref_cnt to prevent freeing during async copy
+        # GPU blocks with extra ref_cnt to prevent freeing during async copy.
+        # Lifecycle: touch in _prepare_store_specs (ref_cnt++), free in
+        # update_connector_output on store completion (ref_cnt--), or in
+        # _cleanup_request as a safety net for aborts/preemption.
         self._pending_gpu_store_blocks: dict[str, list[int]] = defaultdict(list)
 
         # Load specs accumulated in update_state_after_alloc(), consumed in
@@ -214,7 +217,10 @@ class SimpleCPUOffloadScheduler:
         list[int],
         list[tuple[BlockHashWithGroupId, KVCacheBlock, int]],
     ]:
-        """Pick LRU-front GPU blocks, allocate CPU slots, touch GPU blocks.
+        """Pick LRU-front GPU eviction candidates, allocate CPU slots.
+
+        Touches GPU blocks (ref_cnt 0→1) to prevent eviction during async copy.
+        On completion, update_connector_output decrements back to 0.
 
         Returns:
             (gpu_block_ids, cpu_block_ids, lazy_entries) for the store job.
@@ -417,7 +423,13 @@ class SimpleCPUOffloadScheduler:
         self,
         connector_output: KVConnectorOutput,
     ) -> None:
-        """Handle async transfer completions from worker."""
+        """Handle async transfer completions from worker.
+
+        For stores: register CPU blocks in the hash→block cache so future
+        requests can hit them, then release scheduler-owned refs (blocks stay
+        discoverable via the cache). Finally decrement GPU ref_cnt so the
+        scheduler can reclaim those GPU blocks.
+        """
         for req_id in connector_output.finished_recving or []:
             self._req_to_load_job.pop(req_id, None)
             block_hashes = self._loading_requests.pop(req_id, [])
@@ -539,7 +551,12 @@ class SimpleCPUOffloadScheduler:
         return self.request_finished(request, block_ids=[])
 
     def _cleanup_request(self, req_id: str) -> None:
-        """Release all resources for a request (CPU blocks, GPU refs, state)."""
+        """Release all resources for a request.
+
+        Acts as a safety net: if stores are still in-flight when a request is
+        aborted or preempted, this decrements the extra GPU ref_cnt so blocks
+        can eventually return to the free pool.
+        """
         self._req_to_load_job.pop(req_id, None)
         self._req_to_store_jobs.pop(req_id, None)
 

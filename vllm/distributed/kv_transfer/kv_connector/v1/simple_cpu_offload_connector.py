@@ -155,6 +155,8 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         for job_idx in [j for j in self._pending_load_wm_jobs if j <= load_wm]:
             finished_recving.update(self._pending_load_wm_jobs.pop(job_idx))
 
+        # A req can span multiple store jobs (e.g. multi-step accumulation).
+        # Only report it as finished_sending once ALL its jobs have completed.
         fired_store_reqs: set[str] = set()
         for job_idx in [j for j in self._pending_store_wm_jobs if j <= store_wm]:
             fired_store_reqs.update(self._pending_store_wm_jobs.pop(job_idx))
