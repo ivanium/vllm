@@ -2093,6 +2093,8 @@ class Scheduler(SchedulerInterface):
             if req_id not in self.requests:
                 # Already freed via ref_cnt approach (e.g., SimpleCPUOffload).
                 continue
+            if not self.requests[req_id].is_finished():
+                continue
             self._free_blocks(self.requests[req_id])
 
     def _update_requests_with_invalid_blocks(

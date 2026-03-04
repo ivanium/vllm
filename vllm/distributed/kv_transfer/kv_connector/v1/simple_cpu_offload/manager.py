@@ -88,6 +88,9 @@ class SimpleCPUOffloadScheduler:
         self._pending_load_blocks: dict[str, list[int]] = defaultdict(list)
         self._pending_cpu_blocks: dict[str, list[int]] = defaultdict(list)
 
+        # Requests that finished generating while stores were still in-flight.
+        self._finished_while_storing: set[str] = set()
+
         # GPU blocks with extra ref_cnt to prevent freeing during async copy.
         # Lifecycle: touch in _prepare_store_specs (ref_cnt++), free in
         # update_connector_output on store completion (ref_cnt--), or in
@@ -528,7 +531,12 @@ class SimpleCPUOffloadScheduler:
                     self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
                 )
 
-            self._cleanup_request(req_id)
+            # Only clean up if the request finished generating while this
+            # store was in-flight.  Otherwise the request is still running
+            # and needs its state for future eager store jobs.
+            if req_id in self._finished_while_storing:
+                self._finished_while_storing.discard(req_id)
+                self._cleanup_request(req_id)
 
     def request_finished(
         self,
@@ -540,6 +548,9 @@ class SimpleCPUOffloadScheduler:
         req_id = request.request_id
         if req_id not in self._storing_requests:
             self._cleanup_request(req_id)
+        else:
+            # Store still in-flight — defer cleanup until it completes.
+            self._finished_while_storing.add(req_id)
         return False, None
 
     def request_finished_all_groups(
@@ -559,6 +570,7 @@ class SimpleCPUOffloadScheduler:
         """
         self._req_to_load_job.pop(req_id, None)
         self._req_to_store_jobs.pop(req_id, None)
+        self._finished_while_storing.discard(req_id)
 
         pending_load_blocks = self._pending_load_blocks.pop(req_id, [])
         if pending_load_blocks:
