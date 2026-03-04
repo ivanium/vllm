@@ -119,6 +119,10 @@ class SimpleCPUOffloadScheduler:
         # Track CPU block IDs allocated for storing (before caching)
         self._pending_cpu_blocks: dict[str, list[int]] = defaultdict(list)
 
+        # Track GPU block IDs that have been touched for in-flight stores.
+        # These blocks have an extra ref_cnt to prevent freeing during async copy.
+        self._pending_gpu_store_blocks: dict[str, list[int]] = defaultdict(list)
+
         # Metadata for current step (load operations)
         self._reqs_to_load: dict[str, tuple[list[int], list[int]]] = {}
 
@@ -512,6 +516,14 @@ class SimpleCPUOffloadScheduler:
                 # Track for async completion (use extend to preserve order)
                 self._storing_requests[req_id].extend(block_hashes_to_store)
                 self._pending_cpu_blocks[req_id].extend(cpu_block_ids)
+
+                # Touch GPU source blocks to prevent them from being freed
+                # while the async copy is in progress.
+                if self._gpu_block_pool is not None:
+                    self._gpu_block_pool.touch(
+                        [self._gpu_block_pool.blocks[bid] for bid in src_gpu_blocks]
+                    )
+                self._pending_gpu_store_blocks[req_id].extend(b for b in src_gpu_blocks)
 
                 logger.debug(
                     "Request %s: Scheduling store of %d blocks to CPU",

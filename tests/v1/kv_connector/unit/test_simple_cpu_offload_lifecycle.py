@@ -350,3 +350,36 @@ def test_cached_blocks_advance_store_cursor():
     meta2 = manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
     assert meta2.store_job_idx == -1
     assert meta2.store_gpu_blocks == []
+
+
+def test_store_touches_gpu_blocks_to_prevent_freeing():
+    """When a store is submitted, GPU blocks should have ref_cnt incremented."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    manager = _create_scheduler_manager()
+    request = create_request(num_tokens=32, block_size=16)
+    req_id = request.request_id
+
+    # Create a GPU block pool and bind it.
+    gpu_block_pool = BlockPool(
+        num_gpu_blocks=64, enable_caching=True, hash_block_size=16
+    )
+    manager.bind_gpu_block_pool(gpu_block_pool)
+
+    # Allocate GPU blocks 0 and 1 for this request.
+    gpu_blocks = gpu_block_pool.get_new_blocks(2)
+    gpu_block_ids = [b.block_id for b in gpu_blocks]
+    assert all(gpu_block_pool.blocks[bid].ref_cnt == 1 for bid in gpu_block_ids)
+
+    manager._requests[req_id] = request
+    manager._request_gpu_blocks[req_id] = [gpu_block_ids]
+    request.num_computed_tokens = 0
+
+    # Build connector meta triggers _prepare_store_specs(), which should touch.
+    manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
+
+    # GPU blocks that are being stored should have ref_cnt incremented to 2.
+    stored_gpu_ids = manager._pending_gpu_store_blocks.get(req_id, [])
+    assert len(stored_gpu_ids) > 0
+    for bid in stored_gpu_ids:
+        assert gpu_block_pool.blocks[bid].ref_cnt == 2
