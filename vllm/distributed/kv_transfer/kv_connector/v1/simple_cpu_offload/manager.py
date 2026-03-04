@@ -532,7 +532,7 @@ class SimpleCPUOffloadScheduler:
                     self._gpu_block_pool.touch(
                         [self._gpu_block_pool.blocks[bid] for bid in src_gpu_blocks]
                     )
-                self._pending_gpu_store_blocks[req_id].extend(b for b in src_gpu_blocks)
+                self._pending_gpu_store_blocks[req_id].extend(src_gpu_blocks)
 
                 logger.debug(
                     "Request %s: Scheduling store of %d blocks to CPU",
