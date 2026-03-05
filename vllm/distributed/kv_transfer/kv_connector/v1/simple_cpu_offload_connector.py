@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SimpleCPUOffloadConnector: CPU KV cache offloading with Triton transfers."""
+"""SimpleCPUOffloadConnector: minimal CPU KV cache offloading."""
 
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -43,7 +43,7 @@ DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
 
 
 class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
-    """CPU KV cache offloading with Triton kernel transfers and BlockPool LRU."""
+    """CPU KV cache offloading with custom kernel transfers and BlockPool LRU."""
 
     def __init__(
         self,
@@ -57,7 +57,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         cpu_capacity_bytes = int(
             extra_config.get("cpu_bytes_to_use", DEFAULT_CPU_CAPACITY_BYTES)
         )
-        lazy_offload = bool(extra_config.get("lazy_offload", True))
+        lazy_offload = bool(extra_config.get("lazy_offload", False))
         min_lookahead_blocks = int(extra_config.get("min_lookahead_blocks", 8))
 
         logger.info(
@@ -84,10 +84,6 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_config, kv_cache_config, cpu_capacity_bytes
             )
 
-        # Worker-side job→req_id maps, refreshed each step from scheduler snapshot
-        self._pending_load_wm_jobs: dict[int, list[str]] = {}
-        self._pending_store_wm_jobs: dict[int, list[str]] = {}
-
     # --- Worker-side methods ---
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -102,8 +98,6 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self.worker_handler is not None:
             assert isinstance(connector_metadata, SimpleCPUOffloadMetadata)
             self.worker_handler.bind_connector_metadata(connector_metadata)
-            self._pending_load_wm_jobs = dict(connector_metadata.pending_load_jobs)
-            self._pending_store_wm_jobs = dict(connector_metadata.pending_store_jobs)
 
     def clear_connector_metadata(self) -> None:
         super().clear_connector_metadata()
@@ -123,8 +117,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             self.worker_handler.start_load_kv()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        if self.worker_handler is not None:
-            self.worker_handler.wait_for_layer_load(layer_name)
+        pass  # Always load asynchronously
 
     def save_kv_layer(
         self,
@@ -143,34 +136,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         finished_req_ids: set[str],
     ) -> tuple[set[str] | None, set[str] | None]:
-        """Translate worker watermarks into finished req_id sets."""
-        if self.worker_handler is None:
-            return None, None
-
-        finished_sending: set[str] = set()
-        finished_recving: set[str] = set()
-
-        load_wm, store_wm = self.worker_handler.get_completed_watermarks()
-
-        for job_idx in [j for j in self._pending_load_wm_jobs if j <= load_wm]:
-            finished_recving.update(self._pending_load_wm_jobs.pop(job_idx))
-
-        # A req can span multiple store jobs (e.g. multi-step accumulation).
-        # Only report it as finished_sending once ALL its jobs have completed.
-        fired_store_reqs: set[str] = set()
-        for job_idx in [j for j in self._pending_store_wm_jobs if j <= store_wm]:
-            fired_store_reqs.update(self._pending_store_wm_jobs.pop(job_idx))
-
-        still_pending_reqs: set[str] = (
-            set().union(*self._pending_store_wm_jobs.values())
-            if self._pending_store_wm_jobs
-            else set()
-        )
-        for req_id in fired_store_reqs:
-            if req_id not in still_pending_reqs:
-                finished_sending.add(req_id)
-
-        return finished_sending or None, finished_recving or None
+        if self.worker_handler is not None:
+            return self.worker_handler.get_finished(finished_req_ids)
+        return None, None
 
     # --- Scheduler-side methods ---
 

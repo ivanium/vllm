@@ -44,7 +44,6 @@ class SimpleCPUOffloadWorker:
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.device: torch.device | None = None
-        self._first_layer_name: str | None = None
         self.num_cpu_blocks: int = 0
         self._store_launch_params: MultiLayerLaunchParams | None = None
         self._load_launch_params: MultiLayerLaunchParams | None = None
@@ -60,6 +59,10 @@ class SimpleCPUOffloadWorker:
         self._pending_store_jobs: list[tuple[int, list[int], list[int]]] = []
         self._connector_metadata: SimpleCPUOffloadMetadata | None = None
 
+        # Pending job index sets, populated in bind_connector_metadata
+        self._pending_load_job_indices: set[int] = set()
+        self._pending_store_job_indices: set[int] = set()
+
     @property
     def _is_initialized(self) -> bool:
         """Whether KV caches are registered and ready for transfers."""
@@ -74,7 +77,6 @@ class SimpleCPUOffloadWorker:
         """Register per-layer GPU KV caches and allocate pinned CPU tensors."""
         self.gpu_kv_caches = kv_caches
         self.device = next(iter(kv_caches.values())).device
-        self._first_layer_name = next(iter(kv_caches))
 
         first_tensor = next(iter(kv_caches.values()))
         block_size_bytes = first_tensor[0].numel() * first_tensor.element_size()
@@ -119,6 +121,10 @@ class SimpleCPUOffloadWorker:
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
+        if metadata.load_job_idx >= 0:
+            self._pending_load_job_indices.add(metadata.load_job_idx)
+        if metadata.store_job_idx >= 0:
+            self._pending_store_job_indices.add(metadata.store_job_idx)
 
     def clear_connector_metadata(self) -> None:
         self._connector_metadata = None
@@ -220,12 +226,36 @@ class SimpleCPUOffloadWorker:
 
         self._pending_store_jobs.clear()
 
-    def get_completed_watermarks(self) -> tuple[int, int]:
-        """Return (load_wm, store_wm): highest job_idx whose event fired."""
-        return (
-            self._drain_stream_events(self._load_events),
-            self._drain_stream_events(self._store_events),
-        )
+    def get_finished(
+        self,
+        finished_req_ids: set[str],
+    ) -> tuple[set[str] | None, set[str] | None]:
+        """Updates from worker to scheduler on completed transfer events.
+
+        Returns:
+            tuple of (finished_sending, finished_recving).
+            - finish_sending is only used by connector scheduler, and we use it to
+            store the finished store job ids rather than req_ids.
+            - finished_recving still tracks the req_ids that have finished loading.
+        """
+        finished_recving: set[str] = set()
+        finished_sending: set[str] = set()
+
+        load_wm = self._drain_stream_events(self._load_events)
+        meta = self._connector_metadata
+        for j in [j for j in self._pending_load_job_indices if j <= load_wm]:
+            req_ids = meta.load_job_to_reqs.get(j) if meta is not None else None
+            if req_ids:
+                finished_recving.update(req_ids)
+                self._pending_load_job_indices.discard(j)
+
+        store_wm = self._drain_stream_events(self._store_events)
+
+        for j in [j for j in self._pending_store_job_indices if j <= store_wm]:
+            self._pending_store_job_indices.discard(j)
+            finished_sending.add(f"__store_done_{j}")
+
+        return finished_sending or None, finished_recving or None
 
     @staticmethod
     def _drain_stream_events(events: list[tuple[int, torch.cuda.Event]]) -> int:
@@ -290,8 +320,3 @@ class SimpleCPUOffloadWorker:
         for _, event in self._store_events:
             event.synchronize()
         self._store_events.clear()
-
-    def wait_for_layer_load(self, layer_name: str) -> None:
-        """Sync on first layer only (all layers transferred in one launch)."""
-        if layer_name == self._first_layer_name and self.load_stream is not None:
-            self.load_stream.synchronize()
