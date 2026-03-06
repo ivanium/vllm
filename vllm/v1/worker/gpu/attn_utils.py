@@ -149,11 +149,11 @@ def init_kv_cache(
     kv_cache_config: KVCacheConfig,
     attn_backends: dict[str, AttentionBackend],
     device: torch.device,
-) -> dict[str, torch.Tensor]:
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     kv_cache_raw_tensors = _allocate_kv_cache(kv_cache_config, device)
     kv_caches = _reshape_kv_cache(kv_cache_config, kv_cache_raw_tensors, attn_backends)
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
-    return kv_caches
+    return kv_caches, kv_cache_raw_tensors
 
 
 def build_slot_mappings_by_layer(

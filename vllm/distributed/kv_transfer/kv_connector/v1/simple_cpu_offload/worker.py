@@ -73,29 +73,60 @@ class SimpleCPUOffloadWorker:
             and self.store_stream is not None
         )
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Register per-layer GPU KV caches and allocate pinned CPU tensors."""
-        self.gpu_kv_caches = kv_caches
-        self.device = next(iter(kv_caches.values())).device
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        kv_cache_raw_tensors: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        """Register GPU KV caches and allocate pinned CPU tensors.
 
-        first_tensor = next(iter(kv_caches.values()))
-        block_size_bytes = first_tensor[0].numel() * first_tensor.element_size()
-        num_layers = len(kv_caches)
+        Args:
+            kv_caches: Reshaped per-layer GPU KV caches.
+            kv_cache_raw_tensors: Raw int8 tensors before reshape. If provided,
+                used for transfers (HMA-safe). Falls back to kv_caches if None.
+        """
+        raw = kv_cache_raw_tensors if kv_cache_raw_tensors is not None else kv_caches
+        self.device = next(iter(raw.values())).device
+
+        # Deduplicate shared tensors (multiple layers may share the same tensor)
+        seen_ptrs: dict[int, tuple[str, torch.Tensor]] = {}
+        for name, tensor in raw.items():
+            ptr = tensor.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs[ptr] = (name, tensor)
+
+        # Build ordered dict of unique raw tensors for the Triton kernel
+        unique_gpu_caches: dict[str, torch.Tensor] = {}
+        for name, tensor in seen_ptrs.values():
+            # Raw tensors are 1D int8. Reshape to [num_blocks, page_size_bytes]
+            # so stride(0) gives page_size_bytes for the Triton kernel.
+            if tensor.dim() == 1:
+                assert self.kv_cache_config is not None
+                num_blocks = self.kv_cache_config.num_blocks
+                tensor = tensor.view(num_blocks, -1)
+            unique_gpu_caches[name] = tensor
+
+        first = next(iter(unique_gpu_caches.values()))
+        bytes_per_block = first.stride(0) * first.element_size()
+        num_unique_tensors = len(unique_gpu_caches)
+
         self.num_cpu_blocks = max(
-            1, self.cpu_capacity_bytes // (block_size_bytes * num_layers)
+            1, self.cpu_capacity_bytes // (bytes_per_block * num_unique_tensors)
         )
 
         logger.info(
-            "SimpleCPUOffloadWorker: %d per-layer GPU KV caches, "
+            "SimpleCPUOffloadWorker: %d unique GPU KV tensors, "
             "allocating %d CPU blocks (%.2f GB)",
-            num_layers,
+            num_unique_tensors,
             self.num_cpu_blocks,
-            (self.num_cpu_blocks * block_size_bytes * num_layers) / (1024**3),
+            (self.num_cpu_blocks * bytes_per_block * num_unique_tensors) / (1024**3),
         )
 
         pin_memory = is_pin_memory_available()
+
+        self.gpu_kv_caches = unique_gpu_caches
         self.cpu_kv_caches = {}
-        for name, gpu_tensor in kv_caches.items():
+        for name, gpu_tensor in unique_gpu_caches.items():
             cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
             self.cpu_kv_caches[name] = torch.zeros(
                 cpu_shape,
