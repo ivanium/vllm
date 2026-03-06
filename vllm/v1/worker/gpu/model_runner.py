@@ -311,14 +311,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self.kv_caches: list[torch.Tensor] = []
-        kv_caches_dict = init_kv_cache(
+        kv_caches_dict, kv_cache_raw_tensors = init_kv_cache(
             self.kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_cache_config,
             self.attn_backends,
             self.device,
         )
-        self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        self.kv_connector = get_kv_connector(
+            self.vllm_config, kv_caches_dict, kv_cache_raw_tensors
+        )
 
     @torch.inference_mode()
     def _dummy_run(
