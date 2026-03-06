@@ -14,11 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata im
 )
 from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import (
-    BlockHashWithGroupId,
-    get_block_hash,
-    make_block_hash_with_group_id,
-)
+from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -28,6 +24,10 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Pre-computed 4-byte big-endian suffix for group_id=0.
+# Avoids repeated int.to_bytes(4, "big") calls in the hot loop.
+_GROUP_0_SUFFIX: bytes = (0).to_bytes(4, "big", signed=False)
 
 
 @dataclass
@@ -324,29 +324,35 @@ class SimpleCPUOffloadScheduler:
             return [], [], []
 
         gpu_ids: list[int] = []
-        cpu_ids: list[int] = []
         block_hashes: list[BlockHashWithGroupId] = []
+
+        cache_map = self.cpu_block_pool.cached_block_hash_to_block
+        num_free = self.cpu_block_pool.get_num_free_blocks()
 
         candidates = self._gpu_block_pool.get_eviction_candidates(n_lookahead)
         for gpu_block in candidates:
             bhash_with_group = gpu_block.block_hash
             if bhash_with_group is None:
                 continue
-            plain_hash = get_block_hash(bhash_with_group)
-            if self.cpu_block_pool.get_cached_block(plain_hash, [0]) is not None:
+            # Direct lookup — bhash_with_group IS already a BlockHashWithGroupId
+            if cache_map.get_one_block(bhash_with_group) is not None:
                 continue
-            if self.cpu_block_pool.get_num_free_blocks() == 0:
+            if num_free <= 0:
                 break
-            cpu_block = self.cpu_block_pool.get_new_blocks(1)[0]
+            num_free -= 1
             gpu_ids.append(gpu_block.block_id)
-            cpu_ids.append(cpu_block.block_id)
             block_hashes.append(bhash_with_group)
 
+        # Batch allocate CPU blocks
         if gpu_ids:
+            cpu_blocks = self.cpu_block_pool.get_new_blocks(len(gpu_ids))
+            cpu_ids = [blk.block_id for blk in cpu_blocks]
             # Touch GPU blocks to prevent freeing during async copy
             self._gpu_block_pool.touch(
                 [self._gpu_block_pool.blocks[bid] for bid in gpu_ids]
             )
+        else:
+            cpu_ids = []
 
         return gpu_ids, cpu_ids, block_hashes
 
@@ -363,6 +369,10 @@ class SimpleCPUOffloadScheduler:
         merged_cpu_block_ids: list[int] = []
         merged_block_hashes: list[BlockHashWithGroupId] = []
         req_ids: list[str] = []
+
+        cpu_pool = self.cpu_block_pool
+        cache_map = cpu_pool.cached_block_hash_to_block
+        num_free = cpu_pool.get_num_free_blocks()
 
         for req_id, num_new_tokens in scheduler_output.num_scheduled_tokens.items():
             if num_new_tokens == 0:
@@ -394,32 +404,37 @@ class SimpleCPUOffloadScheduler:
             ]
             new_gpu_blocks = gpu_blocks[num_already_stored:num_available_blocks]
 
+            # --- Phase 1: Scan blocks, classify as cached vs to-store ---
             gpu_block_ids: list[int] = []
-            cpu_block_ids: list[int] = []
             block_hashes_to_store: list[BlockHashWithGroupId] = []
             num_cached_blocks = 0
+
             for gpu_block_id, block_hash in zip(new_gpu_blocks, new_block_hashes):
-                existing = self.cpu_block_pool.get_cached_block(
-                    block_hash, kv_cache_group_ids=[0]
-                )
-                if existing is not None:
+                # Inline cache check: avoid get_cached_block wrapper overhead
+                # TODO (yifan): support HMA — hardcoded group_id=0
+                bhash_with_gid = BlockHashWithGroupId(block_hash + _GROUP_0_SUFFIX)
+                if cache_map.get_one_block(bhash_with_gid) is not None:
                     num_cached_blocks += 1
                     continue
 
-                if self.cpu_block_pool.get_num_free_blocks() <= 0:
+                if num_free <= 0:
                     logger.debug(
                         "Request %s: CPU cache full, cannot offload block",
                         req_id,
                     )
                     break
+                num_free -= 1
 
-                cpu_block = self.cpu_block_pool.get_new_blocks(1)[0]
                 gpu_block_ids.append(gpu_block_id)
-                cpu_block_ids.append(cpu_block.block_id)
-                # TODO (yifan): support HMA — hardcoded group_id=0
-                block_hashes_to_store.append(
-                    make_block_hash_with_group_id(block_hash, 0)
-                )
+                block_hashes_to_store.append(bhash_with_gid)
+
+            # --- Phase 2: Batch allocate CPU blocks ---
+            n_to_alloc = len(gpu_block_ids)
+            if n_to_alloc > 0:
+                cpu_blocks = cpu_pool.get_new_blocks(n_to_alloc)
+                cpu_block_ids = [blk.block_id for blk in cpu_blocks]
+            else:
+                cpu_block_ids = []
 
             if cpu_block_ids:
                 req_ids.append(req_id)
