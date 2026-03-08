@@ -3,7 +3,7 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -13,14 +13,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata im
     SimpleCPUOffloadMetadata,
 )
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
     get_kv_cache_coordinator,
-)
-from vllm.v1.core.kv_cache_utils import (
-    get_block_hash,
-    make_block_hash_with_group_id,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
@@ -38,7 +35,6 @@ logger = init_logger(__name__)
 class TransferMeta:
     gpu_block_ids: list[int]
     cpu_block_ids: list[int]
-    block_hashes: list[bytes]
 
 
 @dataclass
@@ -58,7 +54,8 @@ class RequestState:
 
     # Store tracking (eager mode only)
     store_events: set[int] = field(default_factory=set)
-    num_stored_blocks: int = 0
+    # Per-group cursors tracking how many blocks have been stored/skipped.
+    num_stored_blocks: list[int] = field(default_factory=list)
 
 
 class SimpleCPUOffloadScheduler:
@@ -110,6 +107,11 @@ class SimpleCPUOffloadScheduler:
         # Inverse maps: job_idx -> req_ids. Keyed by job index because the
         # worker reports completions by job index, not request id.
         self._load_job_to_reqs: dict[int, list[str]] = {}
+        # FIXME (yifan): This is a hack to get num_local_computed_tokens without
+        # modifying the connector API. But this will cause potential memory leaks.
+        # Temporarily stores num_computed_tokens per request between
+        # get_num_new_matched_tokens() and update_state_after_alloc().
+        self._req_local_computed: dict[str, int] = {}
 
         # Store metadata
         self._lazy_mode = lazy_offload
@@ -182,6 +184,8 @@ class SimpleCPUOffloadScheduler:
         )
 
         if hit_length > 0:
+            # Save for update_state_after_alloc to avoid recomputing skipped.
+            self._req_local_computed[request.request_id] = num_computed_tokens
             logger.debug(
                 "Request %s: CPU cache hit, %d external tokens can be loaded",
                 request.request_id,
@@ -202,13 +206,6 @@ class SimpleCPUOffloadScheduler:
         num_external_tokens: int,
     ) -> None:
         """Prepare load metadata after GPU block allocation."""
-
-        def _get_num_skipped_blocks(block_list: Sequence["KVCacheBlock"]) -> int:
-            return next(
-                (i for i, b in enumerate(block_list) if b.block_hash is None),
-                len(block_list),
-            )
-
         req_id = request.request_id
         block_ids_by_group = blocks.get_block_ids()
 
@@ -222,7 +219,9 @@ class SimpleCPUOffloadScheduler:
                 existing.gpu_block_ids = block_ids_by_group
             else:
                 self._reqs_to_store[req_id] = RequestState(
-                    request=request, gpu_block_ids=block_ids_by_group
+                    request=request,
+                    gpu_block_ids=block_ids_by_group,
+                    num_stored_blocks=[0] * len(block_ids_by_group),
                 )
 
         if num_external_tokens == 0:
@@ -231,18 +230,11 @@ class SimpleCPUOffloadScheduler:
         num_blocks_to_load = num_external_tokens // self.block_size
         assert num_blocks_to_load > 0
 
-        # Skip blocks already locally computed (GPU prefix cache hits).
-        # TODO (yifan): better to pass num_computed_tokens from the coordinator and
-        # avoid recomputing `skipped` here.
-        # The current approach assumes 1st group is full attn and its block size
-        # matches the hash_block_size. Beside, it is inefficient.
-        # Use group 0 (full attention) for hash slicing.
-        skipped = next(
-            (i for i, b in enumerate(blocks.blocks[0]) if b.block_hash is None),
-            len(blocks.blocks[0]),
-        )
+        num_computed_tokens = self._req_local_computed.pop(req_id, 0)
+        skipped = num_computed_tokens // self.block_size
         hashes_to_load = request.block_hashes[skipped : skipped + num_blocks_to_load]
 
+        # Find CPU cached blocks across all groups.
         max_hit_len = len(hashes_to_load) * self.block_size
         cpu_hit_blocks, hit_length = self.cpu_coordinator.find_longest_cache_hit(
             hashes_to_load, max_hit_len
@@ -251,14 +243,39 @@ class SimpleCPUOffloadScheduler:
             f"Expected {num_external_tokens} hit tokens, got {hit_length}"
         )
 
-        # Block IDs are shared across groups -- use group 0 for flat ID list
-        gpu_block_ids = block_ids_by_group[0][skipped : skipped + num_blocks_to_load]
-        cpu_block_ids = [b.block_id for b in cpu_hit_blocks[0]]
+        # Build transfer pairs across all groups.
+        total_computed_tokens = num_computed_tokens + num_external_tokens
+        kv_cache_groups = self.cpu_kv_cache_config.kv_cache_groups
+        num_groups = len(kv_cache_groups)
 
-        # Touch ALL CPU blocks across all groups to prevent eviction during
-        # async load
-        all_cpu_blocks = [b for group_blocks in cpu_hit_blocks for b in group_blocks]
-        self.cpu_block_pool.touch(all_cpu_blocks)
+        gpu_block_ids: list[int] = []
+        cpu_block_ids: list[int] = []
+        cpu_blocks_to_touch: list[KVCacheBlock] = []
+
+        for g in range(num_groups):
+            cpu_blocks_g = cpu_hit_blocks[g]
+            n_ext_g = len(cpu_blocks_g)
+            if n_ext_g == 0:
+                continue
+
+            # Number of blocks in the computed range for this group.
+            g_block_size = kv_cache_groups[g].kv_cache_spec.block_size
+            n_computed_g = cdiv(total_computed_tokens, g_block_size)
+
+            # Back-trace: ext blocks sit at the tail of the computed range.
+            gpu_ext_start = n_computed_g - n_ext_g
+            group_gpu_ids = block_ids_by_group[g]
+
+            for i, cpu_blk in enumerate(cpu_blocks_g):
+                # Skip null blocks (e.g. sliding window or mamba padding).
+                if cpu_blk.is_null:
+                    continue
+                gpu_block_ids.append(group_gpu_ids[gpu_ext_start + i])
+                cpu_block_ids.append(cpu_blk.block_id)
+                cpu_blocks_to_touch.append(cpu_blk)
+
+        # Touch CPU blocks to prevent eviction during async load.
+        self.cpu_block_pool.touch(cpu_blocks_to_touch)
 
         # Touch GPU blocks to prevent freeing during async load
         if self._gpu_block_pool is not None:
@@ -270,7 +287,7 @@ class SimpleCPUOffloadScheduler:
         self._reqs_to_load[req_id] = RequestState(
             request=request,
             gpu_block_ids=block_ids_by_group,
-            load_transfer=TransferMeta(gpu_block_ids, cpu_block_ids, hashes_to_load),
+            load_transfer=TransferMeta(gpu_block_ids, cpu_block_ids),
         )
 
     def build_connector_meta(
@@ -280,26 +297,15 @@ class SimpleCPUOffloadScheduler:
         """Build metadata for worker to execute transfers this step."""
         # --- Stores ---
         store_event = -1
-        store_gpu: list[int] = []
-        store_cpu: list[int] = []
-        block_hashes: list[bytes] = []
-        store_req_ids: list[str] = []  # For eager mode only
-        if self._lazy_mode:
-            # Lazy: offload GPU blocks that are evicted from the GPU block pool
-            store_gpu, store_cpu, block_hashes = self._prepare_lazy_store_specs()
-        else:
-            (store_gpu, store_cpu, block_hashes, store_req_ids) = (
-                self._prepare_eager_store_specs(scheduler_output)
-            )
+        store_gpu, store_cpu, store_req_ids = self.prepare_store_specs(scheduler_output)
         if store_gpu:
             store_event = self._store_event_counter
             self._store_event_counter += 1
             self._store_event_to_blocks[store_event] = TransferMeta(
                 store_gpu,
                 store_cpu,
-                block_hashes,
             )
-            if store_req_ids:  # For eager mode only
+            if store_req_ids:  # For eager mode only, track req->blocks mapping
                 self._store_job_to_reqs[store_event] = store_req_ids
                 for req_id in store_req_ids:
                     state = self._reqs_to_store.get(req_id)
@@ -330,24 +336,37 @@ class SimpleCPUOffloadScheduler:
             load_event=load_event,
             load_gpu_blocks=load_gpu,
             load_cpu_blocks=load_cpu,
-            # NOTE: passes reference, not copy. Safe because scheduler and
-            # worker run in separate processes (metadata is serialized via ZMQ).
             load_job_to_reqs=self._load_job_to_reqs,
             store_event=store_event,
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
         )
 
+    def prepare_store_specs(
+        self, scheduler_output: SchedulerOutput
+    ) -> tuple[list[int], list[int], list[str]]:
+        """Prepare store specs for the store job."""
+        if self._lazy_mode:
+            return self._prepare_lazy_store_specs()
+        else:
+            return self._prepare_eager_store_specs(scheduler_output)
+
     def _prepare_lazy_store_specs(
         self,
-    ) -> tuple[list[int], list[int], list[bytes]]:
+    ) -> tuple[list[int], list[int], list[str]]:
         """Pick LRU-front GPU eviction candidates, allocate CPU slots.
 
         Touches GPU blocks (ref_cnt 0->1) to prevent eviction during async copy.
         On completion, update_connector_output decrements back to 0.
 
+        Block hashes (``BlockHashWithGroupId``) are stamped directly on the
+        allocated CPU blocks so that ``_process_store_completion`` can read
+        them back without a separate ``block_hashes`` list.  Eviction
+        candidates from different groups are processed independently - a
+        position is fully cached only once every group has been stored.
+
         Returns:
-            (gpu_block_ids, cpu_block_ids, block_hashes) for the store job.
+            (gpu_block_ids, cpu_block_ids, req_ids) for the store job.
         """
         total_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         n_lookahead = max(total_tokens // self.block_size, self._min_lookahead_blocks)
@@ -358,32 +377,31 @@ class SimpleCPUOffloadScheduler:
         block_hashes: list[bytes] = []
 
         num_free = self.cpu_block_pool.get_num_free_blocks()
-        all_group_ids = list(range(len(self.cpu_kv_cache_config.kv_cache_groups)))
 
         candidates = self._gpu_block_pool.get_eviction_candidates(n_lookahead)
         for gpu_block in candidates:
             bhash_with_group = gpu_block.block_hash
             if bhash_with_group is None:
                 continue
-            # Extract raw block hash (strip group_id suffix)
-            raw_hash = get_block_hash(bhash_with_group)
-            # Check all groups in CPU cache
-            cpu_blocks = self.cpu_block_pool.get_cached_block(
-                raw_hash,
-                kv_cache_group_ids=all_group_ids,
-            )
-            if cpu_blocks is not None:
+            if (
+                self.cpu_block_pool.cached_block_hash_to_block.get_one_block(
+                    bhash_with_group
+                )
+                is not None
+            ):
                 continue
             if num_free <= 0:
                 break
             num_free -= 1
             gpu_ids.append(gpu_block.block_id)
-            block_hashes.append(raw_hash)
+            block_hashes.append(bhash_with_group)
 
-        # Batch allocate CPU blocks
+        # Batch allocate CPU blocks and stamp their hashes ahead of time.
         if gpu_ids:
             cpu_blocks_alloc = self.cpu_block_pool.get_new_blocks(len(gpu_ids))
             cpu_ids = [blk.block_id for blk in cpu_blocks_alloc]
+            for cpu_blk, bhash in zip(cpu_blocks_alloc, block_hashes):
+                cpu_blk._block_hash = bhash
             # Touch GPU blocks to prevent freeing during async copy
             self._gpu_block_pool.touch(
                 [self._gpu_block_pool.blocks[bid] for bid in gpu_ids]
@@ -391,26 +409,35 @@ class SimpleCPUOffloadScheduler:
         else:
             cpu_ids = []
 
-        return gpu_ids, cpu_ids, block_hashes
+        return gpu_ids, cpu_ids, []
 
     def _prepare_eager_store_specs(
         self,
         scheduler_output: SchedulerOutput,
-    ) -> tuple[list[int], list[int], list[bytes], list[str]]:
-        """Identify newly computed blocks to offload.
+    ) -> tuple[list[int], list[int], list[str]]:
+        """Identify newly computed blocks to offload from scheduler requests.
+
+        Iterates over all KV cache groups for each request, retrieving block
+        hashes directly from GPU blocks so that hash_block_size vs group
+        block_size mismatches are handled correctly.
+
+        Block hashes (``BlockHashWithGroupId``) are stamped directly on the
+        allocated CPU blocks so that ``_process_store_completion`` can read
+        them back without a separate list.
 
         Returns:
-            (gpu_block_ids, cpu_block_ids, block_hashes, req_ids) for the
-            store job.
+            (gpu_block_ids, cpu_block_ids, req_ids) for the store job.
         """
         merged_gpu_block_ids: list[int] = []
         merged_cpu_block_ids: list[int] = []
-        merged_block_hashes: list[bytes] = []
         req_ids: list[str] = []
 
-        cpu_pool = self.cpu_block_pool
-        num_free = cpu_pool.get_num_free_blocks()
-        all_group_ids = list(range(len(self.cpu_kv_cache_config.kv_cache_groups)))
+        gpu_block_pool = self._gpu_block_pool
+        cpu_block_pool = self.cpu_block_pool
+        num_free = cpu_block_pool.get_num_free_blocks()
+        num_groups = len(self.cpu_kv_cache_config.kv_cache_groups)
+        if gpu_block_pool is None:
+            return [], [], []
 
         for req_id, num_new_tokens in scheduler_output.num_scheduled_tokens.items():
             if num_new_tokens == 0:
@@ -420,58 +447,54 @@ class SimpleCPUOffloadScheduler:
             if state is None or state.finished:
                 continue
 
-            request = state.request
-            total_tokens = request.num_computed_tokens + num_new_tokens
-            num_full_blocks = total_tokens // self.block_size
-
-            gpu_blocks = state.gpu_block_ids[0]
-            num_available_blocks = min(
-                num_full_blocks,
-                len(request.block_hashes),
-                len(gpu_blocks),
-            )
-            # FIXME (yifan): handle CPU cache eviction, where num_stored_blocks can
-            # be stale and omit evicted blocks in the middle of the request.
-            num_already_stored = state.num_stored_blocks
-            if num_available_blocks <= num_already_stored:
-                continue
-
-            new_block_hashes = request.block_hashes[
-                num_already_stored:num_available_blocks
-            ]
-            new_gpu_blocks = gpu_blocks[num_already_stored:num_available_blocks]
-
             # --- Phase 1: Scan blocks, classify as cached vs to-store ---
             gpu_block_ids: list[int] = []
             block_hashes_to_store: list[bytes] = []
-            num_cached_blocks = 0
+            advanced_per_group: list[int] = [0] * num_groups
+            out_of_space = False
 
-            for gpu_block_id, block_hash in zip(new_gpu_blocks, new_block_hashes):
-                # Check if already cached in CPU across all groups
-                cpu_blocks = cpu_pool.get_cached_block(
-                    block_hash,
-                    kv_cache_group_ids=all_group_ids,
-                )
-                if cpu_blocks is not None:
-                    num_cached_blocks += 1
-                    continue
+            for g in range(num_groups):
+                # FIXME (yifan): handle CPU cache eviction, where
+                # num_stored_blocks can be stale and omit evicted blocks in
+                # the middle of the request.
+                already_stored_g = state.num_stored_blocks[g]
+                group_gpu_ids = state.gpu_block_ids[g]
 
-                if num_free <= 0:
-                    logger.debug(
-                        "Request %s: CPU cache full, cannot offload block",
-                        req_id,
-                    )
+                for gpu_block_id in group_gpu_ids[already_stored_g:]:
+                    gpu_block = gpu_block_pool.blocks[gpu_block_id]
+                    bhash_with_group = gpu_block.block_hash
+                    if bhash_with_group is None:
+                        break
+
+                    # Check if this group's data is already cached in CPU.
+                    if (
+                        cpu_block_pool.cached_block_hash_to_block.get_one_block(
+                            bhash_with_group
+                        )
+                        is not None
+                    ):
+                        advanced_per_group[g] += 1
+                        continue
+
+                    if num_free <= 0:
+                        out_of_space = True
+                        break
+                    num_free -= 1
+
+                    gpu_block_ids.append(gpu_block_id)
+                    block_hashes_to_store.append(bhash_with_group)
+                    advanced_per_group[g] += 1
+
+                if out_of_space:
                     break
-                num_free -= 1
 
-                gpu_block_ids.append(gpu_block_id)
-                block_hashes_to_store.append(block_hash)
-
-            # --- Phase 2: Batch allocate CPU blocks ---
+            # --- Phase 2: Batch allocate CPU blocks and stamp hashes ---
             n_to_alloc = len(gpu_block_ids)
             if n_to_alloc > 0:
-                cpu_blocks_alloc = cpu_pool.get_new_blocks(n_to_alloc)
+                cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
                 cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
+                for cpu_blk, bhash in zip(cpu_blocks_alloc, block_hashes_to_store):
+                    cpu_blk._block_hash = bhash
             else:
                 cpu_block_ids = []
 
@@ -479,29 +502,26 @@ class SimpleCPUOffloadScheduler:
                 req_ids.append(req_id)
                 merged_gpu_block_ids.extend(gpu_block_ids)
                 merged_cpu_block_ids.extend(cpu_block_ids)
-                merged_block_hashes.extend(block_hashes_to_store)
 
                 # Touch GPU blocks to prevent freeing during async copy
-                if self._gpu_block_pool is not None:
-                    self._gpu_block_pool.touch(
-                        [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
-                    )
-
-                logger.debug(
-                    "Request %s: Scheduling store of %d blocks to CPU",
-                    req_id,
-                    len(cpu_block_ids),
+                gpu_block_pool.touch(
+                    [gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
                 )
 
-            # Advance cursor past both cached hits and newly-stored blocks
-            total_advanced = num_cached_blocks + len(cpu_block_ids)
-            if total_advanced > 0:
-                state.num_stored_blocks = num_already_stored + total_advanced
+                logger.debug(
+                    "Request %s: Scheduling store of %d blocks to CPU (%d groups)",
+                    req_id,
+                    len(cpu_block_ids),
+                    num_groups,
+                )
+
+            # Advance per-group cursors (includes cached hits + newly stored)
+            for g in range(num_groups):
+                state.num_stored_blocks[g] += advanced_per_group[g]
 
         return (
             merged_gpu_block_ids,
             merged_cpu_block_ids,
-            merged_block_hashes,
             req_ids,
         )
 
@@ -525,8 +545,7 @@ class SimpleCPUOffloadScheduler:
         scheduler.
         """
         # --- Load completions ---
-        # Unlike stores, loads always clean up unconditionally on completion.
-        # A request has at most one load job, so completion means "done."
+        # Unlike stores, a request has at most one load job, so completion means "done."
         for req_id in list(connector_output.finished_recving or []):
             self._cleanup_load_request(req_id)
 
@@ -537,9 +556,7 @@ class SimpleCPUOffloadScheduler:
             # Both lazy and eager: process job-level blocks
             transfer = self._store_event_to_blocks.pop(job_idx)
             self._process_store_completion(
-                transfer.gpu_block_ids,
-                transfer.cpu_block_ids,
-                transfer.block_hashes,
+                transfer.gpu_block_ids, transfer.cpu_block_ids
             )
             logger.debug(
                 "Store job %d completed: cached %d blocks to CPU",
@@ -561,26 +578,22 @@ class SimpleCPUOffloadScheduler:
         connector_output.finished_sending = None
 
     def _process_store_completion(
-        self,
-        gpu_block_ids: list[int],
-        cpu_block_ids: list[int],
-        block_hashes: list[bytes],
+        self, gpu_block_ids: list[int], cpu_block_ids: list[int]
     ) -> None:
-        """Cache CPU blocks for all groups and release GPU refs."""
-        assert len(block_hashes) == len(cpu_block_ids) == len(gpu_block_ids)
+        """Cache CPU blocks per-group and release GPU refs.
 
-        num_groups = len(self.cpu_kv_cache_config.kv_cache_groups)
+        Block hashes were stamped on CPU blocks at allocation time (in
+        ``_prepare_*_store_specs``).  Here we just register them in the
+        cache map so they become discoverable by the load path.
+        """
+        assert len(cpu_block_ids) == len(gpu_block_ids)
+
         cpu_blocks = [self.cpu_block_pool.blocks[bid] for bid in cpu_block_ids]
 
-        for block_hash, cpu_block in zip(block_hashes, cpu_blocks):
-            for gid in range(num_groups):
-                bhash_with_gid = make_block_hash_with_group_id(block_hash, gid)
-                self.cpu_block_pool.cached_block_hash_to_block.insert(
-                    bhash_with_gid, cpu_block
-                )
-            # block_hash attr stores the last group's hash; the hash map has
-            # all groups so lookups still work for any group.
-            cpu_block.block_hash = bhash_with_gid
+        for cpu_block in cpu_blocks:
+            bhash = cpu_block.block_hash
+            assert bhash is not None
+            self.cpu_block_pool.cached_block_hash_to_block.insert(bhash, cpu_block)
 
         self.cpu_block_pool.free_blocks(cpu_blocks)
         if self._gpu_block_pool is not None:
@@ -606,12 +619,17 @@ class SimpleCPUOffloadScheduler:
                 self._cleanup_load_request(req_id)
 
         # Handle store (eager mode only): defer cleanup if stores in-flight
-        store_state = self._reqs_to_store.get(req_id)
-        if store_state is not None:
-            if store_state.store_events:
-                store_state.finished = True  # Defer: stores in-flight
-            else:
-                self._cleanup_store_request(req_id)
+        if not self._lazy_mode:
+            store_state = self._reqs_to_store.get(req_id)
+            if store_state is not None:
+                if store_state.store_events:
+                    store_state.finished = True  # Defer: stores in-flight
+                else:
+                    self._cleanup_store_request(req_id)
+
+            # FIXME (yifan): remove this after the connector API is modified.
+            if req_id in self._req_local_computed:
+                del self._req_local_computed[req_id]
 
         return False, None
 
