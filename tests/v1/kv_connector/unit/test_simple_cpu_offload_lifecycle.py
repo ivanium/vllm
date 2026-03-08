@@ -194,12 +194,12 @@ def test_cached_blocks_advance_store_cursor():
     meta = manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
     # Block 0 already cached, only block 1 should be stored
     assert meta.store_gpu_blocks == [1]
-    assert meta.store_job_idx >= 0
+    assert meta.store_event >= 0
     assert manager._reqs_to_store[req_id].num_stored_blocks == 2
 
     # Repeating should not re-issue any store
     meta2 = manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
-    assert meta2.store_job_idx == -1
+    assert meta2.store_event == -1
     assert meta2.store_gpu_blocks == []
 
 
@@ -224,7 +224,7 @@ def test_store_touches_gpu_blocks_to_prevent_freeing():
     request.num_computed_tokens = 0
 
     meta = manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
-    assert meta.store_job_idx >= 0
+    assert meta.store_event >= 0
     # GPU blocks touched: ref_cnt 1 -> 2
     for bid in meta.store_gpu_blocks:
         assert gpu_block_pool.blocks[bid].ref_cnt == 2
@@ -255,7 +255,7 @@ def test_store_completion_caches_and_releases_refs():
 
     manager.update_connector_output(
         KVConnectorOutput(
-            finished_sending={f"__store_done_{meta.store_job_idx}"},
+            finished_sending={f"__store_done_{meta.store_event}"},
             finished_recving=None,
             invalid_block_ids=set(),
         )
@@ -303,7 +303,7 @@ def test_preemption_with_inflight_store():
     # Store completes: connector frees ref_cnt 1 -> 0
     manager.update_connector_output(
         KVConnectorOutput(
-            finished_sending={f"__store_done_{meta.store_job_idx}"},
+            finished_sending={f"__store_done_{meta.store_event}"},
             finished_recving=None,
             invalid_block_ids=set(),
         )
@@ -350,8 +350,8 @@ def test_multistep_gpu_block_accumulation():
     manager.update_connector_output(
         KVConnectorOutput(
             finished_sending={
-                f"__store_done_{meta1.store_job_idx}",
-                f"__store_done_{meta2.store_job_idx}",
+                f"__store_done_{meta1.store_event}",
+                f"__store_done_{meta2.store_event}",
             },
             finished_recving=None,
             invalid_block_ids=set(),
@@ -403,9 +403,9 @@ def test_load_touch_refs_are_released_on_finished_recving():
     assert gpu_block_pool.blocks[gpu_block_id].ref_cnt == 2
     assert req_id in manager._reqs_to_load
 
-    # Build connector meta to assign load_job_idx
+    # Build connector meta to assign load_event
     meta = manager.build_connector_meta(_build_scheduler_output({}))
-    assert meta.load_job_idx >= 0
+    assert meta.load_event >= 0
 
     # Simulate load completion
     output = KVConnectorOutput(
@@ -448,7 +448,7 @@ def test_request_finished_releases_inflight_load_refs():
     assert cpu_block.ref_cnt == 1
     assert gpu_block_pool.blocks[gpu_block.block_id].ref_cnt == 2
 
-    # Load not yet submitted (no load_job_idx), so request_finished cleans up directly
+    # Load not yet submitted (no load_event), so request_finished cleans up directly
     is_async, _ = manager.request_finished(request, block_ids=[gpu_block.block_id])
     assert not is_async
     assert cpu_block.ref_cnt == 0
@@ -518,7 +518,7 @@ def test_finished_flag_defers_store_cleanup():
     request.num_computed_tokens = 0
 
     meta = manager.build_connector_meta(_build_scheduler_output({req_id: 32}))
-    assert meta.store_job_idx >= 0
+    assert meta.store_event >= 0
 
     # Request finishes while store is in-flight
     is_async, _ = manager.request_finished(request, block_ids=gpu_block_ids)
@@ -530,7 +530,7 @@ def test_finished_flag_defers_store_cleanup():
     # Store completes -> deferred cleanup triggers
     manager.update_connector_output(
         KVConnectorOutput(
-            finished_sending={f"__store_done_{meta.store_job_idx}"},
+            finished_sending={f"__store_done_{meta.store_event}"},
             finished_recving=None,
             invalid_block_ids=set(),
         )
@@ -565,9 +565,9 @@ def test_finished_flag_defers_load_cleanup():
         num_external_tokens=16,
     )
 
-    # Assign load_job_idx (simulates build_connector_meta)
+    # Assign load_event (simulates build_connector_meta)
     meta = manager.build_connector_meta(_build_scheduler_output({}))
-    assert meta.load_job_idx >= 0
+    assert meta.load_event >= 0
 
     # Request finishes while load is in-flight
     is_async, _ = manager.request_finished(request, block_ids=[gpu_block.block_id])
@@ -658,14 +658,14 @@ def test_lazy_store_touches_and_releases_gpu_blocks():
     assert all(gpu_block_pool.blocks[bid].ref_cnt == 0 for bid in gpu_block_ids)
 
     meta = manager.build_connector_meta(_build_scheduler_output({"some_req": 32}))
-    assert meta.store_job_idx >= 0, "Expected a lazy store job"
+    assert meta.store_event >= 0, "Expected a lazy store job"
 
     for bid in meta.store_gpu_blocks:
         assert gpu_block_pool.blocks[bid].ref_cnt > 0
 
     manager.update_connector_output(
         KVConnectorOutput(
-            finished_sending={f"__store_done_{meta.store_job_idx}"},
+            finished_sending={f"__store_done_{meta.store_event}"},
             finished_recving=None,
             invalid_block_ids=set(),
         )
@@ -703,7 +703,7 @@ def test_worker_wait_for_save_queues_store_jobs():
 
     worker.bind_connector_metadata(
         SimpleCPUOffloadMetadata(
-            store_job_idx=0,
+            store_event=0,
             store_gpu_blocks=[1, 2],
             store_cpu_blocks=[3, 4],
         )

@@ -152,10 +152,10 @@ class SimpleCPUOffloadWorker:
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
-        if metadata.load_job_idx >= 0:
-            self._pending_load_job_indices.add(metadata.load_job_idx)
-        if metadata.store_job_idx >= 0:
-            self._pending_store_job_indices.add(metadata.store_job_idx)
+        if metadata.load_event >= 0:
+            self._pending_load_job_indices.add(metadata.load_event)
+        if metadata.store_event >= 0:
+            self._pending_store_job_indices.add(metadata.store_event)
 
     def clear_connector_metadata(self) -> None:
         self._connector_metadata = None
@@ -190,11 +190,11 @@ class SimpleCPUOffloadWorker:
             event = torch.cuda.Event()
             event.record(self.load_stream)
 
-        self._load_events.append((metadata.load_job_idx, event))
+        self._load_events.append((metadata.load_event, event))
         logger.debug(
             "Started loading %d blocks from CPU (job_idx=%d)",
             len(metadata.load_gpu_blocks),
-            metadata.load_job_idx,
+            metadata.load_event,
         )
 
     def wait_for_save(self) -> None:
@@ -211,7 +211,7 @@ class SimpleCPUOffloadWorker:
 
         self._pending_store_jobs.append(
             (
-                metadata.store_job_idx,
+                metadata.store_event,
                 list(metadata.store_gpu_blocks),
                 list(metadata.store_cpu_blocks),
             )
@@ -219,7 +219,7 @@ class SimpleCPUOffloadWorker:
         logger.debug(
             "Queued storing %d blocks to CPU (job_idx=%d)",
             len(metadata.store_gpu_blocks),
-            metadata.store_job_idx,
+            metadata.store_event,
         )
 
     def _submit_pending_stores(self) -> None:
