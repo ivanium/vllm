@@ -12,7 +12,7 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 
 
-class MultiLayerLaunchParams(NamedTuple):
+class LaunchParams(NamedTuple):
     """Pre-computed launch parameters for copy_blocks."""
 
     src_ptr_table: torch.Tensor
@@ -80,9 +80,8 @@ def _copy_blocks_kernel(
 
 
 def build_launch_params(
-    src_caches: dict[str, torch.Tensor],
-    dst_caches: dict[str, torch.Tensor],
-) -> MultiLayerLaunchParams:
+    src_caches: dict[str, torch.Tensor], dst_caches: dict[str, torch.Tensor]
+) -> LaunchParams:
     """
     Pre-compute launch parameters for copy_blocks.
 
@@ -90,7 +89,7 @@ def build_launch_params(
     to avoid per-call overhead of pointer table construction.
 
     Returns:
-        MultiLayerLaunchParams with pointer tables, layer count, and
+        LaunchParams with pointer tables, layer count, and
         kernel configuration.
     """
     assert list(src_caches.keys()) == list(dst_caches.keys()), (
@@ -119,18 +118,14 @@ def build_launch_params(
         )
 
     src_ptr_table = torch.tensor(
-        [t.data_ptr() for t in src_tensors],
-        device="cuda",
-        dtype=torch.uint64,
+        [t.data_ptr() for t in src_tensors], device="cuda", dtype=torch.uint64
     )
     dst_ptr_table = torch.tensor(
-        [t.data_ptr() for t in dst_tensors],
-        device="cuda",
-        dtype=torch.uint64,
+        [t.data_ptr() for t in dst_tensors], device="cuda", dtype=torch.uint64
     )
 
     block_size, num_warps = _compute_launch_params(words_per_block)
-    return MultiLayerLaunchParams(
+    return LaunchParams(
         src_ptr_table=src_ptr_table,
         dst_ptr_table=dst_ptr_table,
         num_layers=num_layers,
@@ -145,7 +140,7 @@ def copy_blocks(
     dst_caches: dict[str, torch.Tensor],
     block_mapping: torch.Tensor,
     *,
-    launch_params: MultiLayerLaunchParams | None = None,
+    launch_params: LaunchParams | None = None,
 ) -> None:
     """
     Copy blocks across all layers in a single Triton kernel launch.
