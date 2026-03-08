@@ -20,13 +20,13 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     """
 
     # Load event per step. INVALID_JOB_ID means no blocks to load this step.
-    load_job_idx: int = INVALID_JOB_ID
+    load_event: int = INVALID_JOB_ID
     load_gpu_blocks: list[int] = field(default_factory=list)
     load_cpu_blocks: list[int] = field(default_factory=list)
     # Reverse map: load_job->req_ids, for tracking requests with finished load jobs
     load_job_to_reqs: dict[int, list[str]] = field(default_factory=dict)
 
     # Store event per step. INVALID_JOB_ID means no blocks to store this step.
-    store_job_idx: int = INVALID_JOB_ID
+    store_event: int = INVALID_JOB_ID
     store_gpu_blocks: list[int] = field(default_factory=list)
     store_cpu_blocks: list[int] = field(default_factory=list)

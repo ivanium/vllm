@@ -50,64 +50,64 @@ class TestSimpleCPUOffloadMetadata:
     def test_empty_metadata_creation(self):
         """Test creating empty metadata with default values."""
         metadata = SimpleCPUOffloadMetadata()
-        assert metadata.load_job_idx == -1
+        assert metadata.load_event == -1
         assert metadata.load_gpu_blocks == []
         assert metadata.load_cpu_blocks == []
-        assert metadata.store_job_idx == -1
+        assert metadata.store_event == -1
         assert metadata.store_gpu_blocks == []
         assert metadata.store_cpu_blocks == []
 
     def test_metadata_with_load_specs(self):
         """Test metadata with load specifications."""
         metadata = SimpleCPUOffloadMetadata(
-            load_job_idx=0,
+            load_event=0,
             load_gpu_blocks=[0, 1, 2, 3, 4],
             load_cpu_blocks=[10, 11, 12, 13, 14],
         )
-        assert metadata.load_job_idx == 0
+        assert metadata.load_event == 0
         assert metadata.load_gpu_blocks == [0, 1, 2, 3, 4]
         assert metadata.load_cpu_blocks == [10, 11, 12, 13, 14]
-        assert metadata.store_job_idx == -1
+        assert metadata.store_event == -1
 
     def test_metadata_with_store_specs(self):
         """Test metadata with store specifications."""
         metadata = SimpleCPUOffloadMetadata(
-            store_job_idx=3,
+            store_event=3,
             store_gpu_blocks=[0, 1],
             store_cpu_blocks=[5, 6],
         )
-        assert metadata.store_job_idx == 3
+        assert metadata.store_event == 3
         assert metadata.store_gpu_blocks == [0, 1]
         assert metadata.store_cpu_blocks == [5, 6]
-        assert metadata.load_job_idx == -1
+        assert metadata.load_event == -1
 
     def test_metadata_with_both_specs(self):
         """Test metadata with both load and store specifications."""
         metadata = SimpleCPUOffloadMetadata(
-            load_job_idx=1,
+            load_event=1,
             load_gpu_blocks=[0],
             load_cpu_blocks=[10],
-            store_job_idx=2,
+            store_event=2,
             store_gpu_blocks=[1],
             store_cpu_blocks=[11],
         )
-        assert metadata.load_job_idx == 1
+        assert metadata.load_event == 1
         assert metadata.load_gpu_blocks == [0]
-        assert metadata.store_job_idx == 2
+        assert metadata.store_event == 2
         assert metadata.store_gpu_blocks == [1]
 
     def test_metadata_fields(self):
         """Test metadata only has block-level fields (no job->req maps)."""
         metadata = SimpleCPUOffloadMetadata(
-            load_job_idx=0,
+            load_event=0,
             load_gpu_blocks=[1, 2],
             load_cpu_blocks=[3, 4],
-            store_job_idx=1,
+            store_event=1,
             store_gpu_blocks=[5],
             store_cpu_blocks=[6],
         )
-        assert metadata.load_job_idx == 0
-        assert metadata.store_job_idx == 1
+        assert metadata.load_event == 0
+        assert metadata.store_event == 1
         assert not hasattr(metadata, "pending_load_jobs")
         assert not hasattr(metadata, "pending_store_jobs")
 
@@ -269,9 +269,9 @@ class TestSimpleCPUOffloadScheduler:
 
         metadata = manager.build_connector_meta(scheduler_output)
         assert isinstance(metadata, SimpleCPUOffloadMetadata)
-        assert metadata.load_job_idx == -1
+        assert metadata.load_event == -1
         assert metadata.load_gpu_blocks == []
-        assert metadata.store_job_idx == -1
+        assert metadata.store_event == -1
         assert metadata.store_gpu_blocks == []
 
     def test_request_finished_cleanup(self):
@@ -332,7 +332,7 @@ class TestSimpleCPUOffloadScheduler:
         manager.update_state_after_alloc(request, blocks, num_external_tokens=16)
         assert req_id in manager._reqs_to_load
 
-        # Build connector meta to assign load_job_idx
+        # Build connector meta to assign load_event
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
@@ -385,11 +385,11 @@ class TestSimpleCPUOffloadScheduler:
             kv_connector_metadata=SimpleCPUOffloadMetadata(),
         )
         meta = manager.build_connector_meta(scheduler_output)
-        assert meta.store_job_idx >= 0
+        assert meta.store_event >= 0
 
         # Mark as finished sending via sentinel
         connector_output = KVConnectorOutput(
-            finished_sending={f"__store_done_{meta.store_job_idx}"},
+            finished_sending={f"__store_done_{meta.store_event}"},
             finished_recving=None,
             invalid_block_ids=set(),
         )
@@ -551,9 +551,9 @@ class TestSimpleCPUOffloadConnector:
 
         metadata = connector.build_connector_meta(scheduler_output)
         assert isinstance(metadata, SimpleCPUOffloadMetadata)
-        assert metadata.load_job_idx == -1
+        assert metadata.load_event == -1
         assert metadata.load_gpu_blocks == []
-        assert metadata.store_job_idx == -1
+        assert metadata.store_event == -1
         assert metadata.store_gpu_blocks == []
 
     def test_bind_and_clear_connector_metadata(self):
@@ -561,7 +561,7 @@ class TestSimpleCPUOffloadConnector:
         connector = _create_connector(KVConnectorRole.WORKER)
 
         metadata = SimpleCPUOffloadMetadata(
-            load_job_idx=0,
+            load_event=0,
             load_gpu_blocks=[0],
             load_cpu_blocks=[10],
         )
