@@ -8,7 +8,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload import (
-    triton_kernels,
+    copy_ops,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -17,8 +17,8 @@ from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 
 if TYPE_CHECKING:
-    from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.triton_kernels import (  # noqa: E501
-        MultiLayerLaunchParams,
+    from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.copy_ops import (  # noqa: E501
+        LaunchParams,
     )
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -38,20 +38,20 @@ class SimpleCPUOffloadWorker:
         self.kv_cache_config = kv_cache_config
         self.cpu_capacity_bytes = cpu_capacity_bytes
 
-        cache_config = vllm_config.cache_config
-        self.gpu_block_size = cache_config.block_size
-
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.device: torch.device | None = None
         self.num_cpu_blocks: int = 0
-        self._store_launch_params: MultiLayerLaunchParams | None = None
-        self._load_launch_params: MultiLayerLaunchParams | None = None
 
+        # Cached launch params for the Triton kernel
+        self._store_launch_params: LaunchParams | None = None
+        self._load_launch_params: LaunchParams | None = None
+
+        # CUDA streams for the async transfers
         self.load_stream: torch.cuda.Stream | None = None
         self.store_stream: torch.cuda.Stream | None = None
 
-        # Ordered (job_idx, event) — stream ordering lets us break early
+        # Ordered (event_idx, event) — stream ordering lets us break early
         self._load_events: list[tuple[int, torch.cuda.Event]] = []
         self._store_events: list[tuple[int, torch.cuda.Event]] = []
 
@@ -140,10 +140,10 @@ class SimpleCPUOffloadWorker:
                 "Pinned memory not available. CPU offload performance may be degraded."
             )
 
-        self._store_launch_params = triton_kernels.build_launch_params(
+        self._store_launch_params = copy_ops.build_launch_params(
             self.gpu_kv_caches, self.cpu_kv_caches
         )
-        self._load_launch_params = triton_kernels.build_launch_params(
+        self._load_launch_params = copy_ops.build_launch_params(
             self.cpu_kv_caches, self.gpu_kv_caches
         )
 
@@ -210,11 +210,7 @@ class SimpleCPUOffloadWorker:
             return
 
         self._pending_store_jobs.append(
-            (
-                metadata.store_event,
-                list(metadata.store_gpu_blocks),
-                list(metadata.store_cpu_blocks),
-            )
+            (metadata.store_event, metadata.store_gpu_blocks, metadata.store_cpu_blocks)
         )
         logger.debug(
             "Queued storing %d blocks to CPU (job_idx=%d)",
@@ -333,7 +329,7 @@ class SimpleCPUOffloadWorker:
             self._store_launch_params if is_store else self._load_launch_params
         )
 
-        triton_kernels.copy_blocks(
+        copy_ops.copy_blocks(
             src_caches,
             dst_caches,
             block_mapping,
