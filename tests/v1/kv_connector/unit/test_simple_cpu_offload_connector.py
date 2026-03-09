@@ -133,7 +133,7 @@ class _MockKVCacheBlocks:
         ]
 
     def get_block_ids(self):
-        return [self._block_ids]
+        return (self._block_ids,)
 
 
 def _create_scheduler_manager(
@@ -191,7 +191,7 @@ class TestSimpleCPUOffloadScheduler:
         """Test scheduler manager initialization."""
         manager, _ = _create_scheduler_manager()
         assert manager.num_cpu_blocks > 0
-        assert manager.gpu_block_size == 16
+        assert manager.block_size == 16
         assert manager.cpu_block_pool is not None
 
     def test_get_num_new_matched_tokens_no_cache(self):
@@ -248,7 +248,7 @@ class TestSimpleCPUOffloadScheduler:
         assert request.request_id in manager._reqs_to_store
         state = manager._reqs_to_store[request.request_id]
         assert isinstance(state, RequestState)
-        assert state.gpu_block_ids == [[0, 1]]
+        assert state.gpu_block_ids == ([0, 1],)
 
     def test_build_connector_meta_empty(self):
         """Test build_connector_meta with no operations."""
@@ -367,7 +367,23 @@ class TestSimpleCPUOffloadScheduler:
         request = create_request(num_tokens=32, block_size=16)
         req_id = request.request_id
 
-        blocks = _MockKVCacheBlocks([0, 1])
+        # Set up a GPU block pool so the eager store can read block hashes.
+        from vllm.v1.core.block_pool import BlockPool
+
+        gpu_pool = BlockPool(
+            num_gpu_blocks=100,
+            enable_caching=True,
+            hash_block_size=16,
+        )
+        manager.bind_gpu_block_pool(gpu_pool)
+
+        # Allocate two blocks and give them hashes (simulating cache_full_blocks).
+        alloc = gpu_pool.get_new_blocks(2)
+        blk_ids = [b.block_id for b in alloc]
+        for i, blk in enumerate(alloc):
+            blk._block_hash = make_block_hash_with_group_id(request.block_hashes[i], 0)
+
+        blocks = _MockKVCacheBlocks(blk_ids)
         manager.update_state_after_alloc(request, blocks, num_external_tokens=0)
         request.num_computed_tokens = 0
 
