@@ -53,12 +53,23 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         super().__init__(vllm_config, role, kv_cache_config)
 
+        enable_prefix_caching = vllm_config.cache_config.enable_prefix_caching
         extra_config = self._kv_transfer_config.kv_connector_extra_config or {}
         cpu_capacity_bytes = int(
             extra_config.get("cpu_bytes_to_use", DEFAULT_CPU_CAPACITY_BYTES)
         )
         lazy_offload = bool(extra_config.get("lazy_offload", False))
         min_lookahead_blocks = int(extra_config.get("min_lookahead_blocks", 8))
+
+        self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
+        self.worker_handler: SimpleCPUOffloadWorker | None = None
+
+        if not enable_prefix_caching:
+            logger.warning(
+                "Detected prefix caching disabled, disabling CPU offload "
+                "since it requires prefix caching."
+            )
+            return
 
         logger.info(
             "CPUOffloadConnector: Initializing with role=%s, cpu_capacity=%.2f GB, "
@@ -67,9 +78,6 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             cpu_capacity_bytes / (1024**3),
             "lazy" if lazy_offload else "eager",
         )
-
-        self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
-        self.worker_handler: SimpleCPUOffloadWorker | None = None
 
         if role == KVConnectorRole.SCHEDULER:
             self.scheduler_manager = SimpleCPUOffloadScheduler(
