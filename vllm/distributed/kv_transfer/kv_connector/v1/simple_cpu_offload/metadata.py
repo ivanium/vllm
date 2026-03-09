@@ -14,7 +14,7 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     """
     Metadata passed from scheduler to worker for CPU offload operations.
 
-    The worker receives flat block lists keyed by a monotonic job_idx.
+    The worker receives flat block lists keyed by a monotonic event_idx.
     Job->req_id translation is handled by the scheduler-side manager
     (via inverse maps), so the worker never knows about request identities.
     """
@@ -23,8 +23,8 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     load_event: int = INVALID_JOB_ID
     load_gpu_blocks: list[int] = field(default_factory=list)
     load_cpu_blocks: list[int] = field(default_factory=list)
-    # Reverse map: load_job->req_ids, for tracking requests with finished load jobs
-    load_job_to_reqs: dict[int, list[str]] = field(default_factory=dict)
+    # Reverse map: load_event->req_ids, for tracking requests with finished load events
+    load_event_to_reqs: dict[int, list[str]] = field(default_factory=dict)
 
     # Store event per step. INVALID_JOB_ID means no blocks to store this step.
     store_event: int = INVALID_JOB_ID

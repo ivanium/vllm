@@ -56,12 +56,12 @@ class SimpleCPUOffloadWorker:
         self._store_events: list[tuple[int, torch.cuda.Event]] = []
 
         # Deferred stores: queued in wait_for_save(), flushed in start_load_kv()
-        self._pending_store_jobs: list[tuple[int, list[int], list[int]]] = []
+        self._pending_store_events: list[tuple[int, list[int], list[int]]] = []
         self._connector_metadata: SimpleCPUOffloadMetadata | None = None
 
-        # Pending job index sets, populated in bind_connector_metadata
-        self._pending_load_job_indices: set[int] = set()
-        self._pending_store_job_indices: set[int] = set()
+        # Pending event index sets, populated in bind_connector_metadata
+        self._pending_load_event_indices: set[int] = set()
+        self._pending_store_event_indices: set[int] = set()
 
     @property
     def _is_initialized(self) -> bool:
@@ -155,9 +155,9 @@ class SimpleCPUOffloadWorker:
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
         if metadata.load_event >= 0:
-            self._pending_load_job_indices.add(metadata.load_event)
+            self._pending_load_event_indices.add(metadata.load_event)
         if metadata.store_event >= 0:
-            self._pending_store_job_indices.add(metadata.store_event)
+            self._pending_store_event_indices.add(metadata.store_event)
 
     def clear_connector_metadata(self) -> None:
         self._connector_metadata = None
@@ -194,13 +194,13 @@ class SimpleCPUOffloadWorker:
 
         self._load_events.append((metadata.load_event, event))
         logger.debug(
-            "Started loading %d blocks from CPU (job_idx=%d)",
+            "Started loading %d blocks from CPU (event_idx=%d)",
             len(metadata.load_gpu_blocks),
             metadata.load_event,
         )
 
     def wait_for_save(self) -> None:
-        """Queue store jobs; actual submission deferred to start_load_kv()."""
+        """Queue store events; actual submission deferred to start_load_kv()."""
         if self._connector_metadata is None:
             return
 
@@ -211,17 +211,17 @@ class SimpleCPUOffloadWorker:
         if not metadata.store_gpu_blocks:
             return
 
-        self._pending_store_jobs.append(
+        self._pending_store_events.append(
             (metadata.store_event, metadata.store_gpu_blocks, metadata.store_cpu_blocks)
         )
         logger.debug(
-            "Queued storing %d blocks to CPU (job_idx=%d)",
+            "Queued storing %d blocks to CPU (event_idx=%d)",
             len(metadata.store_gpu_blocks),
             metadata.store_event,
         )
 
     def _submit_pending_stores(self) -> None:
-        if not self._pending_store_jobs:
+        if not self._pending_store_events:
             return
         if not self._is_initialized:
             return
@@ -232,7 +232,7 @@ class SimpleCPUOffloadWorker:
 
         all_src: list[int] = []
         all_dst: list[int] = []
-        for _, src, dst in self._pending_store_jobs:
+        for _, src, dst in self._pending_store_events:
             all_src.extend(src)
             all_dst.extend(dst)
 
@@ -249,11 +249,11 @@ class SimpleCPUOffloadWorker:
             event = torch.cuda.Event()
             event.record(self.store_stream)
 
-        for job_idx, _, _ in self._pending_store_jobs:
-            self._store_events.append((job_idx, event))
-            logger.debug("Submitted deferred store to CPU (job_idx=%d)", job_idx)
+        for event_idx, _, _ in self._pending_store_events:
+            self._store_events.append((event_idx, event))
+            logger.debug("Submitted deferred store to CPU (event_idx=%d)", event_idx)
 
-        self._pending_store_jobs.clear()
+        self._pending_store_events.clear()
 
     def get_finished(
         self,
@@ -264,7 +264,7 @@ class SimpleCPUOffloadWorker:
         Returns:
             tuple of (finished_sending, finished_recving).
             - finish_sending is only used by connector scheduler, and we use it to
-            store the finished store job ids rather than req_ids.
+            store the finished store event ids rather than req_ids.
             - finished_recving still tracks the req_ids that have finished loading.
         """
         finished_recving: set[str] = set()
@@ -272,16 +272,16 @@ class SimpleCPUOffloadWorker:
 
         load_wm = self._drain_stream_events(self._load_events)
         meta = self._connector_metadata
-        for j in [j for j in self._pending_load_job_indices if j <= load_wm]:
-            req_ids = meta.load_job_to_reqs.get(j) if meta is not None else None
+        for j in [j for j in self._pending_load_event_indices if j <= load_wm]:
+            req_ids = meta.load_event_to_reqs.get(j) if meta is not None else None
             if req_ids:
                 finished_recving.update(req_ids)
-                self._pending_load_job_indices.discard(j)
+                self._pending_load_event_indices.discard(j)
 
         store_wm = self._drain_stream_events(self._store_events)
 
-        for j in [j for j in self._pending_store_job_indices if j <= store_wm]:
-            self._pending_store_job_indices.discard(j)
+        for j in [j for j in self._pending_store_event_indices if j <= store_wm]:
+            self._pending_store_event_indices.discard(j)
             finished_sending.add(f"__store_done_{j}")
 
         return finished_sending or None, finished_recving or None
@@ -290,9 +290,9 @@ class SimpleCPUOffloadWorker:
     def _drain_stream_events(events: list[tuple[int, torch.cuda.Event]]) -> int:
         watermark = -1
         while events:
-            job_idx, event = events[0]
+            event_idx, event = events[0]
             if event.query():
-                watermark = job_idx
+                watermark = event_idx
                 events.pop(0)
             else:
                 break  # Stream ordering: nothing after this can have fired.
