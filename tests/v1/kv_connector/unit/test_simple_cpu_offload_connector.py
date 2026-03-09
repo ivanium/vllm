@@ -2,11 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for SimpleCPUOffloadConnector."""
 
+import os
+import tempfile
+import time
+
 import pytest
 import torch
 
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.backends import (
+    DiskTransferBackend,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.manager import (
     RequestState,
     SimpleCPUOffloadScheduler,
@@ -585,7 +592,7 @@ class TestSimpleCPUOffloadConnector:
         assert connector.worker_handler is not None
         assert connector.worker_handler._connector_metadata is metadata
         # Job index should be added to the set.
-        assert 0 in connector.worker_handler._pending_load_job_indices
+        assert 0 in connector.worker_handler._pending_load_event_indices
 
         connector.clear_connector_metadata()
         assert connector.worker_handler._connector_metadata is None
@@ -635,22 +642,56 @@ class TestSimpleCPUOffloadConnector:
 # ============================================================
 
 
+class _MockBackend:
+    """Minimal mock backend for testing worker without GPU."""
+
+    def __init__(self):
+        self._initialized = False
+        self.gpu_kv_caches = None
+
+    @property
+    def is_initialized(self):
+        return self._initialized
+
+    def setup(self, src_caches, capacity_bytes, kv_cache_config):
+        self.gpu_kv_caches = src_caches
+        self._initialized = True
+        return 1
+
+    def copy_blocks(self, src_block_ids, dst_block_ids, is_store):
+        pass
+
+    def record_event(self):
+        return object()
+
+    def query_event(self, event):
+        return True
+
+    def sync_event(self, event):
+        pass
+
+    def sync_all(self):
+        pass
+
+    def validate_block_ids(self, block_ids, is_src):
+        pass
+
+
 class TestSimpleCPUOffloadWorker:
     """Tests for SimpleCPUOffloadWorker."""
 
     def test_worker_initialization(self):
         """Test worker initializes correctly."""
         vllm_config = create_vllm_config(block_size=16)
+        backend = _MockBackend()
         worker = SimpleCPUOffloadWorker(
             vllm_config=vllm_config,
             kv_cache_config=None,
-            cpu_capacity_bytes=1024 * 1024 * 100,  # 100 MB
+            capacity_bytes=1024 * 1024 * 100,  # 100 MB
+            backend=backend,
         )
 
-        assert worker.gpu_kv_caches is None  # Not registered yet
-        assert worker.cpu_kv_caches is None
-        assert worker.load_stream is None
-        assert worker.store_stream is None
+        assert not worker._is_initialized  # Backend not set up yet
 
     def test_bind_clear_metadata(self):
         """Test binding and clearing metadata."""
@@ -658,7 +699,8 @@ class TestSimpleCPUOffloadWorker:
         worker = SimpleCPUOffloadWorker(
             vllm_config=vllm_config,
             kv_cache_config=None,
-            cpu_capacity_bytes=1024 * 1024 * 100,
+            capacity_bytes=1024 * 1024 * 100,
+            backend=_MockBackend(),
         )
 
         metadata = SimpleCPUOffloadMetadata()
@@ -674,7 +716,8 @@ class TestSimpleCPUOffloadWorker:
         worker = SimpleCPUOffloadWorker(
             vllm_config=vllm_config,
             kv_cache_config=None,
-            cpu_capacity_bytes=1024 * 1024 * 100,
+            capacity_bytes=1024 * 1024 * 100,
+            backend=_MockBackend(),
         )
 
         # Should not raise
@@ -686,7 +729,8 @@ class TestSimpleCPUOffloadWorker:
         worker = SimpleCPUOffloadWorker(
             vllm_config=vllm_config,
             kv_cache_config=None,
-            cpu_capacity_bytes=1024 * 1024 * 100,
+            capacity_bytes=1024 * 1024 * 100,
+            backend=_MockBackend(),
         )
 
         # Should not raise
@@ -698,7 +742,8 @@ class TestSimpleCPUOffloadWorker:
         worker = SimpleCPUOffloadWorker(
             vllm_config=vllm_config,
             kv_cache_config=None,
-            cpu_capacity_bytes=1024 * 1024 * 100,
+            capacity_bytes=1024 * 1024 * 100,
+            backend=_MockBackend(),
         )
 
         # Should not raise
@@ -707,10 +752,12 @@ class TestSimpleCPUOffloadWorker:
     def test_register_kv_caches_per_layer(self):
         """Test register_kv_caches with per-layer tensors."""
         vllm_config = create_vllm_config(block_size=16)
+        backend = _MockBackend()
         worker = SimpleCPUOffloadWorker(
             vllm_config=vllm_config,
             kv_cache_config=None,
-            cpu_capacity_bytes=1024 * 1024 * 100,  # 100 MB
+            capacity_bytes=1024 * 1024 * 100,  # 100 MB
+            backend=backend,
         )
 
         # Create mock per-layer KV caches (CPU tensors for testing without GPU)
@@ -724,25 +771,28 @@ class TestSimpleCPUOffloadWorker:
             "layer.2": torch.randn(num_blocks, 2, num_kv_heads, block_size, head_size),
         }
 
-        # Just test the data structure setup
-        worker.gpu_kv_caches = kv_caches
+        worker.register_kv_caches(kv_caches)
 
-        assert len(worker.gpu_kv_caches) == 3
-        assert "layer.0" in worker.gpu_kv_caches
-        assert "layer.1" in worker.gpu_kv_caches
-        assert "layer.2" in worker.gpu_kv_caches
+        # After registration, backend should have the caches
+        assert backend.gpu_kv_caches is not None
+        assert len(backend.gpu_kv_caches) == 3
+        assert "layer.0" in backend.gpu_kv_caches
+        assert "layer.1" in backend.gpu_kv_caches
+        assert "layer.2" in backend.gpu_kv_caches
 
     def test_register_kv_caches_empty(self):
-        """Test register_kv_caches with empty dict raises StopIteration."""
+        """Test register_kv_caches with empty dict calls setup with empty."""
         vllm_config = create_vllm_config(block_size=16)
         worker = SimpleCPUOffloadWorker(
             vllm_config=vllm_config,
             kv_cache_config=None,
-            cpu_capacity_bytes=1024 * 1024 * 100,
+            capacity_bytes=1024 * 1024 * 100,
+            backend=_MockBackend(),
         )
 
-        with pytest.raises(StopIteration):
-            worker.register_kv_caches({})
+        # Empty caches passed through to backend setup; mock accepts it.
+        worker.register_kv_caches({})
+        assert worker._is_initialized
 
 
 # ============================================================
@@ -824,3 +874,199 @@ class TestSimpleCPUOffloadIntegration:
         if scheduler.connector is not None:
             assert isinstance(scheduler.connector, SimpleCPUOffloadConnector)
             assert scheduler.connector.scheduler_manager is not None
+
+
+# ============================================================
+# DiskTransferBackend tests
+# ============================================================
+
+
+class TestDiskTransferBackend:
+    """Tests for DiskTransferBackend (direct GPU↔Disk with staging)."""
+
+    def test_setup_creates_file(self):
+        """setup() creates a pre-allocated flat file and staging buffers."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = DiskTransferBackend(
+                disk_path=os.path.join(tmpdir, "kv_cache"),
+            )
+            src_caches = {
+                "layer.0": torch.zeros(10, 64, dtype=torch.float16),
+            }
+            num_blocks = backend.setup(
+                src_caches, capacity_bytes=10 * 64 * 2, kv_cache_config=None
+            )
+            assert num_blocks > 0
+            assert backend.is_initialized
+            assert os.path.exists(os.path.join(tmpdir, "kv_cache"))
+            backend.shutdown()
+
+    def test_store_and_load_roundtrip(self):
+        """Writing blocks to disk and reading them back produces same data."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = DiskTransferBackend(
+                disk_path=os.path.join(tmpdir, "kv_cache"),
+            )
+            src_caches = {
+                "layer.0": torch.arange(640, dtype=torch.float16).view(10, 64),
+            }
+            backend.setup(src_caches, capacity_bytes=10 * 64 * 2, kv_cache_config=None)
+
+            # Store blocks 0,1 from GPU to disk blocks 0,1
+            backend.copy_blocks([0, 1], [0, 1], is_store=True)
+            event = backend.record_event()
+            backend.sync_event(event)
+
+            # Zero out blocks 2,3 to verify load works
+            src_caches["layer.0"][2:4] = 0
+
+            # Load disk blocks 0,1 back to GPU blocks 2,3
+            backend.copy_blocks([0, 1], [2, 3], is_store=False)
+            event = backend.record_event()
+            backend.sync_event(event)
+
+            assert torch.equal(src_caches["layer.0"][0], src_caches["layer.0"][2])
+            assert torch.equal(src_caches["layer.0"][1], src_caches["layer.0"][3])
+            backend.shutdown()
+
+    def test_query_event_after_sync(self):
+        """query_event returns True after sync_event."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = DiskTransferBackend(
+                disk_path=os.path.join(tmpdir, "kv_cache"),
+            )
+            src_caches = {
+                "layer.0": torch.zeros(10, 64, dtype=torch.float16),
+            }
+            backend.setup(src_caches, capacity_bytes=10 * 64 * 2, kv_cache_config=None)
+
+            backend.copy_blocks([0], [0], is_store=True)
+            event = backend.record_event()
+            backend.sync_event(event)
+            assert backend.query_event(event) is True
+            backend.shutdown()
+
+    def test_multi_layer_roundtrip(self):
+        """Roundtrip works with multiple KV cache layers."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = DiskTransferBackend(
+                disk_path=os.path.join(tmpdir, "kv_cache"),
+            )
+            src_caches = {
+                "layer.0": torch.randn(8, 32, dtype=torch.float16),
+                "layer.1": torch.randn(8, 32, dtype=torch.float16),
+            }
+            # capacity for 8 blocks * 2 layers * 32 * 2 bytes
+            backend.setup(
+                src_caches,
+                capacity_bytes=8 * 32 * 2 * 2,
+                kv_cache_config=None,
+            )
+
+            original_0 = src_caches["layer.0"][0].clone()
+            original_1 = src_caches["layer.1"][0].clone()
+
+            backend.copy_blocks([0], [0], is_store=True)
+            event = backend.record_event()
+            backend.sync_event(event)
+
+            # Corrupt source
+            src_caches["layer.0"][1] = 0
+            src_caches["layer.1"][1] = 0
+
+            # Load back to block 1
+            backend.copy_blocks([0], [1], is_store=False)
+            event = backend.record_event()
+            backend.sync_event(event)
+
+            assert torch.equal(src_caches["layer.0"][1], original_0)
+            assert torch.equal(src_caches["layer.1"][1], original_1)
+            backend.shutdown()
+
+    def test_shutdown_cleans_up_file(self):
+        """shutdown() closes fd and unlinks the file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kv_cache")
+            backend = DiskTransferBackend(disk_path=path)
+            src_caches = {
+                "layer.0": torch.zeros(4, 16, dtype=torch.float16),
+            }
+            backend.setup(
+                src_caches,
+                capacity_bytes=4 * 16 * 2,
+                kv_cache_config=None,
+            )
+            assert os.path.exists(path)
+            backend.shutdown()
+            assert not os.path.exists(path)
+
+    def test_worker_roundtrip_via_metadata(self):
+        """Full store/load roundtrip through SimpleCPUOffloadWorker."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = DiskTransferBackend(
+                disk_path=os.path.join(tmpdir, "kv_cache"),
+            )
+            vllm_config = create_vllm_config(block_size=16)
+            worker = SimpleCPUOffloadWorker(
+                vllm_config=vllm_config,
+                kv_cache_config=None,
+                capacity_bytes=1024 * 64,
+                backend=backend,
+            )
+
+            num_blocks = 10
+            block_data_size = 64
+            src_caches = {
+                "layer.0": torch.arange(
+                    num_blocks * block_data_size, dtype=torch.int8
+                ).view(num_blocks, block_data_size),
+            }
+            worker.register_kv_caches(src_caches)
+            assert worker._is_initialized
+
+            # Store blocks 0,1
+            metadata = SimpleCPUOffloadMetadata(
+                store_event=0,
+                store_gpu_blocks=[0, 1],
+                store_cpu_blocks=[0, 1],
+            )
+            worker.bind_connector_metadata(metadata)
+            worker.wait_for_save()
+            worker.start_load_kv()
+
+            for _ in range(200):
+                finished_sending, _ = worker.get_finished(set())
+                if finished_sending:
+                    break
+                time.sleep(0.01)
+            assert finished_sending is not None
+            assert "__store_done_0" in finished_sending
+
+            original_0 = src_caches["layer.0"][0].clone()
+            original_1 = src_caches["layer.0"][1].clone()
+            src_caches["layer.0"][2] = 0
+            src_caches["layer.0"][3] = 0
+
+            # Load from disk blocks 0,1 to GPU blocks 2,3
+            worker.clear_connector_metadata()
+            load_meta = SimpleCPUOffloadMetadata(
+                load_event=1,
+                load_gpu_blocks=[2, 3],
+                load_cpu_blocks=[0, 1],
+                load_event_to_reqs={1: ["test-req"]},
+            )
+            worker.bind_connector_metadata(load_meta)
+            worker.start_load_kv()
+
+            finished_recving = None
+            for _ in range(200):
+                _, finished_recving = worker.get_finished(set())
+                if finished_recving:
+                    break
+                time.sleep(0.01)
+            assert finished_recving is not None
+            assert "test-req" in finished_recving
+
+            assert torch.equal(original_0, src_caches["layer.0"][2])
+            assert torch.equal(original_1, src_caches["layer.0"][3])
+            backend.shutdown()

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SimpleCPUOffloadConnector: minimal CPU KV cache offloading."""
+"""SimpleCPUOffloadConnector: minimal KV cache offloading."""
 
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -14,6 +14,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
     SupportsHMA,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.backends import (
+    CudaTransferBackend,
+    DiskTransferBackend,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.manager import (
     SimpleCPUOffloadScheduler,
@@ -43,7 +47,11 @@ DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
 
 
 class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
-    """CPU KV cache offloading with custom kernel transfers and BlockPool LRU."""
+    """KV cache offloading with configurable transfer backend.
+
+    Supports GPU↔CPU (CudaTransferBackend, default) and GPU↔Disk
+    (DiskTransferBackend, via backend_type="disk" config).
+    """
 
     def __init__(
         self,
@@ -55,41 +63,54 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         enable_prefix_caching = vllm_config.cache_config.enable_prefix_caching
         extra_config = self._kv_transfer_config.kv_connector_extra_config or {}
-        cpu_capacity_bytes = int(
-            extra_config.get("cpu_bytes_to_use", DEFAULT_CPU_CAPACITY_BYTES)
-        )
         lazy_offload = bool(extra_config.get("lazy_offload", False))
         min_lookahead_blocks = int(extra_config.get("min_lookahead_blocks", 8))
+
+        # Backend selection
+        backend_type = str(extra_config.get("backend_type", "cuda"))
+        backend: CudaTransferBackend | DiskTransferBackend
+        if backend_type == "disk":
+            capacity_bytes = int(extra_config.get("disk_bytes_to_use", 0))
+            disk_path = str(extra_config.get("disk_path", "/tmp/vllm_kv_cache"))
+            backend = DiskTransferBackend(disk_path=disk_path)
+        else:
+            capacity_bytes = int(
+                extra_config.get("cpu_bytes_to_use", DEFAULT_CPU_CAPACITY_BYTES)
+            )
+            backend = CudaTransferBackend()
 
         self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
         self.worker_handler: SimpleCPUOffloadWorker | None = None
 
         if not enable_prefix_caching:
             logger.warning(
-                "Detected prefix caching disabled, disabling CPU offload "
+                "Detected prefix caching disabled, disabling offload "
                 "since it requires prefix caching."
             )
             return
 
         logger.info(
-            "CPUOffloadConnector: Initializing with role=%s, cpu_capacity=%.2f GB, "
-            "mode=%s",
+            "SimpleCPUOffloadConnector: role=%s, capacity=%.2f GB, mode=%s, backend=%s",
             role.name,
-            cpu_capacity_bytes / (1024**3),
+            capacity_bytes / (1024**3),
             "lazy" if lazy_offload else "eager",
+            backend_type,
         )
 
         if role == KVConnectorRole.SCHEDULER:
             self.scheduler_manager = SimpleCPUOffloadScheduler(
                 vllm_config,
                 kv_cache_config,
-                cpu_capacity_bytes,
+                capacity_bytes,
                 lazy_offload=lazy_offload,
                 min_lookahead_blocks=min_lookahead_blocks,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
-                vllm_config, kv_cache_config, cpu_capacity_bytes
+                vllm_config,
+                kv_cache_config,
+                capacity_bytes,
+                backend=backend,
             )
 
     # --- Worker-side methods ---
@@ -129,7 +150,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             self.worker_handler.start_load_kv()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        pass  # Always load asynchronously
+        pass
 
     def save_kv_layer(
         self,
@@ -138,7 +159,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        pass  # All stores are driven by wait_for_save()
+        pass
 
     def wait_for_save(self) -> None:
         if self.worker_handler is not None:
@@ -153,6 +174,12 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         return None, None
 
     # --- Scheduler-side methods ---
+
+    def get_offload_block_pool(self) -> "BlockPool | None":
+        """Return the offload-tier block pool (for cross-connector wiring)."""
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.cpu_block_pool
+        return None
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         if self.scheduler_manager is not None:
@@ -184,9 +211,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        if self.scheduler_manager is not None:
-            return self.scheduler_manager.build_connector_meta(scheduler_output)
-        return SimpleCPUOffloadMetadata()
+        if self.scheduler_manager is None:
+            return SimpleCPUOffloadMetadata()
+        return self.scheduler_manager.build_connector_meta(scheduler_output)
 
     def update_connector_output(
         self,

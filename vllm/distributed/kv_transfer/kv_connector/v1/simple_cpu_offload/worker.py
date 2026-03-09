@@ -2,24 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload import (
-    copy_ops,
+from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.backends import (
+    CudaTransferBackend,
+    TransferBackend,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata import (
     SimpleCPUOffloadMetadata,
 )
 from vllm.logger import init_logger
-from vllm.utils.platform_utils import is_pin_memory_available
 
 if TYPE_CHECKING:
-    from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.copy_ops import (  # noqa: E501
-        LaunchParams,
-    )
+    from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -30,30 +27,19 @@ class SimpleCPUOffloadWorker:
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
+        vllm_config: "VllmConfig",
         kv_cache_config: "KVCacheConfig | None",
-        cpu_capacity_bytes: int,
+        capacity_bytes: int,
+        backend: TransferBackend,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
-        self.cpu_capacity_bytes = cpu_capacity_bytes
+        self.capacity_bytes = capacity_bytes
+        self.backend = backend
 
-        self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
-        self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
-        self.device: torch.device | None = None
-        self.num_cpu_blocks: int = 0
-
-        # Cached launch params for the Triton kernel
-        self._store_launch_params: LaunchParams | None = None
-        self._load_launch_params: LaunchParams | None = None
-
-        # CUDA streams for the async transfers
-        self.load_stream: torch.cuda.Stream | None = None
-        self.store_stream: torch.cuda.Stream | None = None
-
-        # Ordered (event_idx, event) — stream ordering lets us break early
-        self._load_events: list[tuple[int, torch.cuda.Event]] = []
-        self._store_events: list[tuple[int, torch.cuda.Event]] = []
+        # Ordered (event_idx, event) -- stream ordering lets us break early
+        self._load_events: list[tuple[int, Any]] = []
+        self._store_events: list[tuple[int, Any]] = []
 
         # Deferred stores: queued in wait_for_save(), flushed in start_load_kv()
         self._pending_store_events: list[tuple[int, list[int], list[int]]] = []
@@ -66,19 +52,14 @@ class SimpleCPUOffloadWorker:
     @property
     def _is_initialized(self) -> bool:
         """Whether KV caches are registered and ready for transfers."""
-        return (
-            self.gpu_kv_caches is not None
-            and self.cpu_kv_caches is not None
-            and self.load_stream is not None
-            and self.store_stream is not None
-        )
+        return self.backend.is_initialized
 
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
         kv_cache_raw_tensors: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        """Register GPU KV caches and allocate pinned CPU tensors.
+        """Register GPU KV caches and set up the transfer backend.
 
         Args:
             kv_caches: Reshaped per-layer GPU KV caches.
@@ -86,7 +67,6 @@ class SimpleCPUOffloadWorker:
                 used for transfers (HMA-safe). Falls back to kv_caches if None.
         """
         raw = kv_cache_raw_tensors if kv_cache_raw_tensors is not None else kv_caches
-        self.device = next(iter(raw.values())).device
 
         # Deduplicate shared tensors (multiple layers may share the same tensor)
         seen_ptrs: dict[int, tuple[str, torch.Tensor]] = {}
@@ -95,7 +75,7 @@ class SimpleCPUOffloadWorker:
             if ptr not in seen_ptrs:
                 seen_ptrs[ptr] = (name, tensor)
 
-        # Build ordered dict of unique raw tensors for the Triton kernel
+        # Build ordered dict of unique raw tensors for the backend
         unique_gpu_caches: dict[str, torch.Tensor] = {}
         for name, tensor in seen_ptrs.values():
             # Raw tensors are 1D int8. Reshape to [num_blocks, page_size_bytes]
@@ -106,51 +86,7 @@ class SimpleCPUOffloadWorker:
                 tensor = tensor.view(num_blocks, -1)
             unique_gpu_caches[name] = tensor
 
-        first = next(iter(unique_gpu_caches.values()))
-        bytes_per_block = first.stride(0) * first.element_size()
-        num_unique_tensors = len(unique_gpu_caches)
-
-        self.num_cpu_blocks = max(
-            1, self.cpu_capacity_bytes // (bytes_per_block * num_unique_tensors)
-        )
-
-        logger.info(
-            "SimpleCPUOffloadWorker: %d unique GPU KV tensors, "
-            "allocating %d CPU blocks (%.2f GB)",
-            num_unique_tensors,
-            self.num_cpu_blocks,
-            (self.num_cpu_blocks * bytes_per_block * num_unique_tensors) / (1024**3),
-        )
-
-        pin_memory = is_pin_memory_available()
-
-        self.gpu_kv_caches = unique_gpu_caches
-        self.cpu_kv_caches = {}
-        for name, gpu_tensor in unique_gpu_caches.items():
-            cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
-            self.cpu_kv_caches[name] = torch.zeros(
-                cpu_shape,
-                dtype=gpu_tensor.dtype,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
-
-        if not pin_memory:
-            logger.warning(
-                "Pinned memory not available. CPU offload performance may be degraded."
-            )
-
-        self._store_launch_params = copy_ops.build_launch_params(
-            self.gpu_kv_caches, self.cpu_kv_caches
-        )
-        self._load_launch_params = copy_ops.build_launch_params(
-            self.cpu_kv_caches, self.gpu_kv_caches
-        )
-
-        # Use lowest priority so KV cache I/O yields to compute streams.
-        low_pri, _ = torch.cuda.Stream.priority_range()
-        self.load_stream = torch.cuda.Stream(priority=low_pri)
-        self.store_stream = torch.cuda.Stream(priority=low_pri)
+        self.backend.setup(unique_gpu_caches, self.capacity_bytes, self.kv_cache_config)
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
@@ -177,20 +113,23 @@ class SimpleCPUOffloadWorker:
         if not metadata.load_gpu_blocks:
             return
 
-        assert self.load_stream is not None
-        assert self.cpu_kv_caches is not None
-        assert self.gpu_kv_caches is not None
-
-        with torch.cuda.stream(self.load_stream):
-            self._copy_blocks(
-                src_caches=self.cpu_kv_caches,
-                dst_caches=self.gpu_kv_caches,
-                src_block_ids=metadata.load_cpu_blocks,
-                dst_block_ids=metadata.load_gpu_blocks,
+        backend = self.backend
+        if isinstance(backend, CudaTransferBackend):
+            assert backend.load_stream is not None
+            with torch.cuda.stream(backend.load_stream):
+                backend.copy_blocks(
+                    metadata.load_cpu_blocks,
+                    metadata.load_gpu_blocks,
+                    is_store=False,
+                )
+                event = backend.record_event()
+        else:
+            backend.copy_blocks(
+                metadata.load_cpu_blocks,
+                metadata.load_gpu_blocks,
                 is_store=False,
             )
-            event = torch.cuda.Event()
-            event.record(self.load_stream)
+            event = backend.record_event()
 
         self._load_events.append((metadata.load_event, event))
         logger.debug(
@@ -221,14 +160,8 @@ class SimpleCPUOffloadWorker:
         )
 
     def _submit_pending_stores(self) -> None:
-        if not self._pending_store_events:
+        if not self._pending_store_events or not self._is_initialized:
             return
-        if not self._is_initialized:
-            return
-
-        assert self.store_stream is not None
-        assert self.gpu_kv_caches is not None
-        assert self.cpu_kv_caches is not None
 
         all_src: list[int] = []
         all_dst: list[int] = []
@@ -236,18 +169,17 @@ class SimpleCPUOffloadWorker:
             all_src.extend(src)
             all_dst.extend(dst)
 
-        with torch.cuda.stream(self.store_stream):
+        backend = self.backend
+        if isinstance(backend, CudaTransferBackend):
+            assert backend.store_stream is not None
+            with torch.cuda.stream(backend.store_stream):
+                if all_src:
+                    backend.copy_blocks(all_src, all_dst, is_store=True)
+                event = backend.record_event()
+        else:
             if all_src:
-                self._copy_blocks(
-                    src_caches=self.gpu_kv_caches,
-                    dst_caches=self.cpu_kv_caches,
-                    src_block_ids=all_src,
-                    dst_block_ids=all_dst,
-                    is_store=True,
-                )
-            # One event covers all batched jobs; they share the same completion point.
-            event = torch.cuda.Event()
-            event.record(self.store_stream)
+                backend.copy_blocks(all_src, all_dst, is_store=True)
+            event = backend.record_event()
 
         for event_idx, _, _ in self._pending_store_events:
             self._store_events.append((event_idx, event))
@@ -286,66 +218,25 @@ class SimpleCPUOffloadWorker:
 
         return finished_sending or None, finished_recving or None
 
-    @staticmethod
-    def _drain_stream_events(events: list[tuple[int, torch.cuda.Event]]) -> int:
+    def _drain_stream_events(self, events: list[tuple[int, Any]]) -> int:
         watermark = -1
         while events:
             event_idx, event = events[0]
-            if event.query():
+            if self.backend.query_event(event):
                 watermark = event_idx
                 events.pop(0)
             else:
                 break  # Stream ordering: nothing after this can have fired.
         return watermark
 
-    @staticmethod
-    def _validate_block_ids(block_ids: list[int], num_blocks: int, label: str) -> None:
-        if not block_ids:
-            return
-        lo, hi = min(block_ids), max(block_ids)
-        if lo < 0 or hi >= num_blocks:
-            bad = lo if lo < 0 else hi
-            raise ValueError(f"{label} block ID {bad} out of bounds [0, {num_blocks})")
-
-    def _copy_blocks(
-        self,
-        src_caches: dict[str, torch.Tensor],
-        dst_caches: dict[str, torch.Tensor],
-        src_block_ids: list[int],
-        dst_block_ids: list[int],
-        is_store: bool = True,
-    ) -> None:
-        """Execute multi-layer Triton kernel block transfer."""
-        first_src = next(iter(src_caches.values()))
-        first_dst = next(iter(dst_caches.values()))
-        self._validate_block_ids(src_block_ids, first_src.shape[0], "Source")
-        self._validate_block_ids(dst_block_ids, first_dst.shape[0], "Dest")
-
-        block_mapping = torch.tensor(
-            list(zip(src_block_ids, dst_block_ids)),
-            dtype=torch.int64,
-            device=self.device,
-        )
-
-        launch_params = (
-            self._store_launch_params if is_store else self._load_launch_params
-        )
-
-        copy_ops.copy_blocks(
-            src_caches,
-            dst_caches,
-            block_mapping,
-            launch_params=launch_params,
-        )
-
     def handle_preemptions(self) -> None:
         """Sync all in-flight transfers before preempted blocks are reused."""
         self._submit_pending_stores()
 
         for _, event in self._load_events:
-            event.synchronize()
+            self.backend.sync_event(event)
         self._load_events.clear()
 
         for _, event in self._store_events:
-            event.synchronize()
+            self.backend.sync_event(event)
         self._store_events.clear()

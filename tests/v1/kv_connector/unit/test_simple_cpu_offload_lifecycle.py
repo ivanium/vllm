@@ -3,7 +3,6 @@
 """Lifecycle and scheduling tests for SimpleCPUOffloadConnector internals."""
 
 from types import SimpleNamespace
-from unittest.mock import PropertyMock, patch
 
 import torch
 
@@ -693,12 +692,47 @@ def test_lazy_mode_does_not_track_reqs_to_store():
 # ============================================================
 
 
+class _MockBackend:
+    """Minimal mock backend for testing worker without GPU."""
+
+    def __init__(self, initialized=False):
+        self._initialized = initialized
+
+    @property
+    def is_initialized(self):
+        return self._initialized
+
+    def setup(self, src_caches, capacity_bytes, kv_cache_config):
+        self._initialized = True
+        return 1
+
+    def copy_blocks(self, src_block_ids, dst_block_ids, is_store):
+        pass
+
+    def record_event(self):
+        return object()
+
+    def query_event(self, event):
+        return True
+
+    def sync_event(self, event):
+        pass
+
+    def sync_all(self):
+        pass
+
+    def validate_block_ids(self, block_ids, is_src):
+        pass
+
+
 def test_worker_wait_for_save_queues_store_jobs():
     vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
+    backend = _MockBackend(initialized=True)
     worker = SimpleCPUOffloadWorker(
         vllm_config=vllm_config,
         kv_cache_config=None,
-        cpu_capacity_bytes=1024 * 1024,
+        capacity_bytes=1024 * 1024,
+        backend=backend,
     )
 
     worker.bind_connector_metadata(
@@ -709,10 +743,7 @@ def test_worker_wait_for_save_queues_store_jobs():
         )
     )
 
-    with patch.object(
-        type(worker), "_is_initialized", new_callable=PropertyMock, return_value=True
-    ):
-        worker.wait_for_save()
+    worker.wait_for_save()
 
     assert len(worker._pending_store_jobs) == 1
     job_idx, src, dst = worker._pending_store_jobs[0]
@@ -724,10 +755,12 @@ def test_worker_wait_for_save_queues_store_jobs():
 
 def test_worker_start_load_submits_pending_stores_without_metadata():
     vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
+    backend = _MockBackend(initialized=True)
     worker = SimpleCPUOffloadWorker(
         vllm_config=vllm_config,
         kv_cache_config=None,
-        cpu_capacity_bytes=1024 * 1024,
+        capacity_bytes=1024 * 1024,
+        backend=backend,
     )
     worker.clear_connector_metadata()
 
@@ -737,10 +770,7 @@ def test_worker_start_load_submits_pending_stores_without_metadata():
         called["count"] += 1
 
     worker._submit_pending_stores = _fake_submit  # type: ignore[method-assign]
-    with patch.object(
-        type(worker), "_is_initialized", new_callable=PropertyMock, return_value=True
-    ):
-        worker.start_load_kv()
+    worker.start_load_kv()
 
     assert called["count"] == 1
 

@@ -634,3 +634,11 @@ class KVConnectorBase_V1(ABC):
         )
 
         return None
+
+    def get_offload_block_pool(self) -> Any:
+        """Return the offload-tier block pool, if any.
+
+        Used by MultiConnector cross-wiring to let one connector's
+        offload pool serve as another connector's source pool.
+        """
+        return None
