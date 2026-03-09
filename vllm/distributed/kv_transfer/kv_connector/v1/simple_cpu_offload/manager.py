@@ -104,9 +104,9 @@ class SimpleCPUOffloadScheduler:
 
         # Load metadata
         self._reqs_to_load: dict[str, RequestState] = {}
-        # Inverse maps: job_idx -> req_ids. Keyed by job index because the
-        # worker reports completions by job index, not request id.
-        self._load_job_to_reqs: dict[int, list[str]] = {}
+        # Inverse maps: event_idx -> req_ids. Keyed by event index because the
+        # worker reports completions by event index, not request id.
+        self._load_event_to_reqs: dict[int, list[str]] = {}
         # FIXME (yifan): This is a hack to get num_local_computed_tokens without
         # modifying the connector API. But this will cause potential memory leaks.
         # Temporarily stores num_computed_tokens per request between
@@ -120,7 +120,7 @@ class SimpleCPUOffloadScheduler:
         self._store_event_to_blocks: dict[int, TransferMeta] = {}
         # Eager mode only
         self._reqs_to_store: dict[str, RequestState] = {}
-        self._store_job_to_reqs: dict[int, list[str]] = {}
+        self._store_event_to_reqs: dict[int, list[str]] = {}
 
         # Event counters
         self._load_event_counter: int = 0
@@ -162,7 +162,7 @@ class SimpleCPUOffloadScheduler:
         )
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
-        """Inject GPU block pool so that we can touch blocks during stores.
+        """Bind GPU block pool so that we can touch blocks during stores.
         Called by Scheduler after kv_cache_manager is ready."""
         self._gpu_block_pool = gpu_block_pool
 
@@ -306,7 +306,7 @@ class SimpleCPUOffloadScheduler:
                 store_cpu,
             )
             if store_req_ids:  # For eager mode only, track req->blocks mapping
-                self._store_job_to_reqs[store_event] = store_req_ids
+                self._store_event_to_reqs[store_event] = store_req_ids
                 for req_id in store_req_ids:
                     state = self._reqs_to_store.get(req_id)
                     if state is not None:
@@ -330,13 +330,13 @@ class SimpleCPUOffloadScheduler:
             self._load_event_counter += 1
             for req_id in load_req_ids:
                 self._reqs_to_load[req_id].load_event = load_event
-            self._load_job_to_reqs[load_event] = load_req_ids
+            self._load_event_to_reqs[load_event] = load_req_ids
 
         return SimpleCPUOffloadMetadata(
             load_event=load_event,
             load_gpu_blocks=load_gpu,
             load_cpu_blocks=load_cpu,
-            load_job_to_reqs=self._load_job_to_reqs,
+            load_event_to_reqs=self._load_event_to_reqs,
             store_event=store_event,
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
@@ -345,7 +345,7 @@ class SimpleCPUOffloadScheduler:
     def prepare_store_specs(
         self, scheduler_output: SchedulerOutput
     ) -> tuple[list[int], list[int], list[str]]:
-        """Prepare store specs for the store job."""
+        """Prepare store specs for the store event."""
         if self._lazy_mode:
             return self._prepare_lazy_store_specs()
         else:
@@ -359,14 +359,8 @@ class SimpleCPUOffloadScheduler:
         Touches GPU blocks (ref_cnt 0->1) to prevent eviction during async copy.
         On completion, update_connector_output decrements back to 0.
 
-        Block hashes (``BlockHashWithGroupId``) are stamped directly on the
-        allocated CPU blocks so that ``_process_store_completion`` can read
-        them back without a separate ``block_hashes`` list.  Eviction
-        candidates from different groups are processed independently - a
-        position is fully cached only once every group has been stored.
-
         Returns:
-            (gpu_block_ids, cpu_block_ids, req_ids) for the store job.
+            (gpu_block_ids, cpu_block_ids, req_ids) for the store event.
         """
         total_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         n_lookahead = max(total_tokens // self.block_size, self._min_lookahead_blocks)
@@ -421,12 +415,8 @@ class SimpleCPUOffloadScheduler:
         hashes directly from GPU blocks so that hash_block_size vs group
         block_size mismatches are handled correctly.
 
-        Block hashes (``BlockHashWithGroupId``) are stamped directly on the
-        allocated CPU blocks so that ``_process_store_completion`` can read
-        them back without a separate list.
-
         Returns:
-            (gpu_block_ids, cpu_block_ids, req_ids) for the store job.
+            (gpu_block_ids, cpu_block_ids, req_ids) for the store event.
         """
         merged_gpu_block_ids: list[int] = []
         merged_cpu_block_ids: list[int] = []
@@ -535,42 +525,42 @@ class SimpleCPUOffloadScheduler:
         - For load which blocks are tightly coupled with requests, the worker reports
             finished_recving with the request ID.
         - For store which blocks are not tightly coupled with requests, the worker
-            reports finished_sending with the job index, and the scheduler should
+            reports finished_sending with the event index, and the scheduler should
             update request metadata accordingly.
 
-        The connector emits job-index sentinels (__load_done_N,
+        The connector emits event-index sentinels (__load_done_N,
         __store_done_N). We translate those back to req_ids using our
         inverse maps, process completions, and mutate
         connector_output.finished_recving with real req_ids for the
         scheduler.
         """
         # --- Load completions ---
-        # Unlike stores, a request has at most one load job, so completion means "done."
+        # Unlike stores, a request has at most one load event, so completion means done
         for req_id in list(connector_output.finished_recving or []):
             self._cleanup_load_request(req_id)
 
         # --- Store completions ---
         for sentinel in connector_output.finished_sending or []:
-            job_idx = int(sentinel[len("__store_done_") :])
+            event_idx = int(sentinel[len("__store_done_") :])
 
-            # Both lazy and eager: process job-level blocks
-            transfer = self._store_event_to_blocks.pop(job_idx)
+            # Both lazy and eager: process event-level blocks
+            transfer = self._store_event_to_blocks.pop(event_idx)
             self._process_store_completion(
                 transfer.gpu_block_ids, transfer.cpu_block_ids
             )
             logger.debug(
-                "Store job %d completed: cached %d blocks to CPU",
-                job_idx,
+                "Store event %d completed: cached %d blocks to CPU",
+                event_idx,
                 len(transfer.cpu_block_ids),
             )
 
             # Eager only: update per-req state
             if not self._lazy_mode:
-                for req_id in self._store_job_to_reqs.pop(job_idx, []):
+                for req_id in self._store_event_to_reqs.pop(event_idx, []):
                     state = self._reqs_to_store.get(req_id)
                     if state is None:
                         continue
-                    state.store_events.discard(job_idx)
+                    state.store_events.discard(event_idx)
                     if state.finished and not state.store_events:
                         self._cleanup_store_request(req_id)
 
@@ -644,20 +634,20 @@ class SimpleCPUOffloadScheduler:
         """Release all load resources for a request.
 
         Shared between request_finished() and update_connector_output() paths.
-        Removes the request from _reqs_to_load, cleans up job mappings,
+        Removes the request from _reqs_to_load, cleans up event mappings,
         and frees CPU/GPU touch refs.
         """
         state = self._reqs_to_load.pop(req_id, None)
         if state is None:
             return
-        # Remove from load job mapping (only this req, not whole job)
+        # Remove from load event mapping (only this req, not whole event)
         if state.load_event is not None:
-            reqs = self._load_job_to_reqs.get(state.load_event)
+            reqs = self._load_event_to_reqs.get(state.load_event)
             if reqs is not None:
                 with contextlib.suppress(ValueError):
                     reqs.remove(req_id)
                 if not reqs:
-                    self._load_job_to_reqs.pop(state.load_event, None)
+                    self._load_event_to_reqs.pop(state.load_event, None)
         # Free CPU touch refs
         if state.load_transfer is not None:
             self.cpu_block_pool.free_blocks(
@@ -680,13 +670,13 @@ class SimpleCPUOffloadScheduler:
         state = self._reqs_to_store.pop(req_id, None)
         if state is None:
             return
-        for job_idx in list(state.store_events):
-            reqs = self._store_job_to_reqs.get(job_idx)
+        for event_idx in list(state.store_events):
+            reqs = self._store_event_to_reqs.get(event_idx)
             if reqs is not None:
                 with contextlib.suppress(ValueError):
                     reqs.remove(req_id)
                 if not reqs:
-                    self._store_job_to_reqs.pop(job_idx, None)
+                    self._store_event_to_reqs.pop(event_idx, None)
         state.store_events.clear()
 
     def take_events(self) -> Iterable[KVCacheEvent]:
