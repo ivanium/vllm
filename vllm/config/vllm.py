@@ -644,8 +644,6 @@ class VllmConfig:
             self.kv_transfer_config.kv_connector_extra_config.update(
                 {"cpu_bytes_to_use": kv_offloading_size * (1 << 30)}
             )
-        elif kv_offloading_backend == "zero":
-            self.kv_transfer_config.kv_connector = "ZeroCPUOffloadConnector"
         elif kv_offloading_backend == "native":
             self.kv_transfer_config.kv_connector = "OffloadingConnector"
             self.kv_transfer_config.kv_connector_extra_config.update(
