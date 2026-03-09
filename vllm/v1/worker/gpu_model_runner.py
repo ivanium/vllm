@@ -5997,8 +5997,6 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
 
-        # Raw tensors are available in the general (HMA) path but not in the
-        # uniform path.  Save them for connector use when available.
         self._kv_cache_raw_tensors: dict[str, torch.Tensor] | None = None
 
         # Try creating KV caches optimized for kv-connector transfers
@@ -6019,8 +6017,6 @@ class GPUModelRunner(
             # Fallback to the general case
             # Initialize the memory buffer for KV cache
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
-
-            # Save raw tensors for connector use (HMA-safe transfers)
             self._kv_cache_raw_tensors = kv_cache_raw_tensors
 
             # Change the memory buffer to the desired shape

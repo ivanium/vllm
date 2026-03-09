@@ -7,7 +7,7 @@ This module provides a minimal, efficient CPU offloading connector that:
 - Uses Triton kernels for GPU<->CPU block transfers
 - Reuses BlockPool for CPU block management with LRU eviction
 - Supports hybrid KV cache manager (SupportsHMA)
-- Maintains scheduler-side hash->CPU_block_id mapping
+- Supports lazy offloading (offload only when blocks are evicted from GPU cache)
 """
 
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.metadata import (

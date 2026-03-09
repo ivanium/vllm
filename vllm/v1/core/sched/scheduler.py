@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -59,42 +58,6 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
-
-# ── Scheduler-side connector profiler ────────────────────────────────
-_SCHED_PROFILE_INTERVAL = int(os.environ.get("VLLM_PROFILE_KV_INTERVAL", "100"))
-
-
-class _SchedulerConnectorProfiler:
-    """Accumulates per-step timing for scheduler-side connector hooks."""
-
-    def __init__(self) -> None:
-        self._steps: int = 0
-        self._build_meta_ns: int = 0
-        self._update_output_ns: int = 0
-
-    def record_build_meta(self, ns: int) -> None:
-        self._build_meta_ns += ns
-        self._steps += 1
-        if self._steps >= _SCHED_PROFILE_INTERVAL:
-            self._report()
-
-    def record_update_output(self, ns: int) -> None:
-        self._update_output_ns += ns
-
-    def _report(self) -> None:
-        s = self._steps or 1
-        logger.info(
-            "[KVConnector sched profiler] last %d steps: "
-            "build_meta=%.1f us  update_output=%.1f us  "
-            "total=%.1f us  (per-step averages)",
-            self._steps,
-            self._build_meta_ns / s / 1000,
-            self._update_output_ns / s / 1000,
-            (self._build_meta_ns + self._update_output_ns) / s / 1000,
-        )
-        self._steps = 0
-        self._build_meta_ns = 0
-        self._update_output_ns = 0
 
 
 class Scheduler(SchedulerInterface):
@@ -168,11 +131,6 @@ class Scheduler(SchedulerInterface):
                 self.vllm_config.kv_transfer_config.kv_load_failure_policy
             )
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
-
-        self._profile_kv_connector = (
-            os.environ.get("VLLM_PROFILE_KV_CONNECTOR", "0") == "1"
-        )
-        self._sched_profiler = _SchedulerConnectorProfiler()
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -272,8 +230,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
         )
-        # Inject GPU block pool into the KV connector if it supports lazy
-        # offloading (i.e. has bind_gpu_block_pool).  This must happen after
+        # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None and hasattr(
             self.connector, "bind_gpu_block_pool"
@@ -962,13 +919,9 @@ class Scheduler(SchedulerInterface):
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
-            if self._profile_kv_connector:
-                _t0 = time.perf_counter_ns()
             meta: KVConnectorMetadata = self.connector.build_connector_meta(
                 scheduler_output
             )
-            if self._profile_kv_connector:
-                self._sched_profiler.record_build_meta(time.perf_counter_ns() - _t0)
             scheduler_output.kv_connector_metadata = meta
 
         # Build the connector meta for ECConnector
@@ -2091,11 +2044,7 @@ class Scheduler(SchedulerInterface):
         """
 
         if self.connector is not None:
-            if self._profile_kv_connector:
-                _t0 = time.perf_counter_ns()
             self.connector.update_connector_output(kv_connector_output)
-            if self._profile_kv_connector:
-                self._sched_profiler.record_update_output(time.perf_counter_ns() - _t0)
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
@@ -2110,7 +2059,7 @@ class Scheduler(SchedulerInterface):
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             if req_id not in self.requests:
-                # Already freed via ref_cnt approach (e.g., SimpleCPUOffload).
+                # Already freed (e.g., SimpleCPUOffload).
                 continue
             if not self.requests[req_id].is_finished():
                 continue
