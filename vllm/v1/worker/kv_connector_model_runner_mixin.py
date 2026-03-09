@@ -5,8 +5,6 @@ Define KV connector functionality mixin for model runners.
 """
 
 import copy
-import os
-import time
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -36,76 +34,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
-
-# ── Worker-side connector profiler ───────────────────────────────────
-_PROFILE_INTERVAL = int(os.environ.get("VLLM_PROFILE_KV_INTERVAL", "100"))
-
-
-class _WorkerProfiler:
-    """Accumulates per-step timing for the worker-side connector hooks."""
-
-    _steps: int = 0
-    _bind_ns: int = 0
-    _load_ns: int = 0
-    _save_ns: int = 0
-    _finish_ns: int = 0
-    _clear_ns: int = 0
-
-    @classmethod
-    def record(
-        cls,
-        bind_ns: int,
-        load_ns: int,
-        save_ns: int,
-        finish_ns: int,
-        clear_ns: int,
-    ) -> None:
-        cls._steps += 1
-        cls._bind_ns += bind_ns
-        cls._load_ns += load_ns
-        cls._save_ns += save_ns
-        cls._finish_ns += finish_ns
-        cls._clear_ns += clear_ns
-
-        if cls._steps >= _PROFILE_INTERVAL:
-            cls._report()
-
-    @classmethod
-    def _report(cls) -> None:
-        s = cls._steps or 1
-        logger.info(
-            "[KVConnector worker profiler] last %d steps: "
-            "bind=%.1f us  start_load=%.1f us  wait_save=%.1f us  "
-            "get_finished=%.1f us  clear=%.1f us  "
-            "total=%.1f us  (per-step averages)",
-            cls._steps,
-            cls._bind_ns / s / 1000,
-            cls._load_ns / s / 1000,
-            cls._save_ns / s / 1000,
-            cls._finish_ns / s / 1000,
-            cls._clear_ns / s / 1000,
-            (
-                cls._bind_ns
-                + cls._load_ns
-                + cls._save_ns
-                + cls._finish_ns
-                + cls._clear_ns
-            )
-            / s
-            / 1000,
-        )
-        # Also report per-layer overhead from the layer decorator.
-        from vllm.model_executor.layers.attention.kv_transfer_utils import (
-            _report_layer_stats,
-        )
-
-        _report_layer_stats(num_steps=s)
-        cls._steps = 0
-        cls._bind_ns = 0
-        cls._load_ns = 0
-        cls._save_ns = 0
-        cls._finish_ns = 0
-        cls._clear_ns = 0
 
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
@@ -169,42 +97,25 @@ class KVConnectorModelRunnerMixin:
         wait_for_save: bool = True,
         defer_finalize: bool = False,
     ) -> Generator[KVConnectorOutput, None, None]:
-        _profile = os.environ.get("VLLM_PROFILE_KV_CONNECTOR", "0") == "1"
         output = KVConnectorOutput()
 
         # Update KVConnector with the KVConnector metadata forward().
         kv_connector = get_kv_transfer_group()
         assert isinstance(kv_connector, KVConnectorBase)
         assert scheduler_output.kv_connector_metadata is not None
-
-        if _profile:
-            t_bind = time.perf_counter_ns()
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
-        if _profile:
-            t_bind = time.perf_counter_ns() - t_bind
 
         # Background KV cache transfers happen here.
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
-        if _profile:
-            t_load = time.perf_counter_ns()
         kv_connector.start_load_kv(get_forward_context())
-        if _profile:
-            t_load = time.perf_counter_ns() - t_load
-
         try:
             yield output
         finally:
-            if _profile:
-                t_save = time.perf_counter_ns()
             if wait_for_save and not defer_finalize:
                 kv_connector.wait_for_save()
-            if _profile:
-                t_save = time.perf_counter_ns() - t_save
 
-            if _profile:
-                t_finish = time.perf_counter_ns()
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids)
             )
@@ -212,18 +123,9 @@ class KVConnectorModelRunnerMixin:
 
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
-            if _profile:
-                t_finish = time.perf_counter_ns() - t_finish
 
-            if _profile:
-                t_clear = time.perf_counter_ns()
             if not defer_finalize:
                 kv_connector.clear_connector_metadata()
-            if _profile:
-                t_clear = time.perf_counter_ns() - t_clear
-
-            if _profile:
-                _WorkerProfiler.record(t_bind, t_load, t_save, t_finish, t_clear)
 
     @staticmethod
     def use_uniform_kv_cache(
