@@ -147,8 +147,10 @@ class SimpleCPUOffloadWorker:
             self.cpu_kv_caches, self.gpu_kv_caches
         )
 
-        self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
+        # Use lowest priority so KV cache I/O yields to compute streams.
+        low_pri, _ = torch.cuda.Stream.priority_range()
+        self.load_stream = torch.cuda.Stream(priority=low_pri)
+        self.store_stream = torch.cuda.Stream(priority=low_pri)
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
