@@ -11,6 +11,9 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
+# Limits SM occupancy so compute kernels can run concurrently.
+DEFAULT_COPY_NUM_SMS = 16
+
 
 class LaunchParams(NamedTuple):
     """Pre-computed launch parameters for copy_blocks."""
@@ -21,6 +24,7 @@ class LaunchParams(NamedTuple):
     words_per_block: int
     block_size: int
     num_warps: int
+    num_sms: int
 
 
 def _compute_launch_params(
@@ -37,56 +41,77 @@ def _copy_blocks_kernel(
     src_ptrs,
     dst_ptrs,
     mapping_ptr,
+    total_jobs,  # type: ignore[name-defined]
+    num_pairs,  # type: ignore[name-defined]
     words_per_block: tl.constexpr,  # type: ignore[name-defined]
     BLOCK_SIZE: tl.constexpr,  # type: ignore[name-defined]
 ):
     """
-    Triton kernel for copying blocks across multiple layers in one launch.
+    Kernel for copying blocks across multiple layers.
 
-    Uses pointer tables to handle non-contiguous (permuted) tensors by
-    addressing each layer's storage via its base data_ptr and stride.
+    Uses a grid-stride loop so the kernel can be launched with a small
+    grid (e.g., 32 CTAs) to limit SM occupancy, allowing compute kernels
+    to run concurrently on remaining SMs.
 
-    Grid: (num_block_pairs, num_layers)
+    Grid: (num_sms,)
 
     Args:
         src_ptrs: Pointer to uint64 tensor [num_layers] of source base addrs
         dst_ptrs: Pointer to uint64 tensor [num_layers] of dest base addrs
         mapping_ptr: Pointer to int64 tensor [N * 2] of (src_id, dst_id) pairs
+        total_jobs: num_pairs * num_layers
+        num_pairs: Number of (src, dst) block pairs
         words_per_block: Number of int64 words per block (stride-based)
         BLOCK_SIZE: Triton block size for vectorization
     """
-    pair_id = tl.program_id(0)
-    layer_id = tl.program_id(1)
+    pid = tl.program_id(0)
+    num_ctas = tl.num_programs(0)
 
-    # Load source and destination block IDs from mapping
-    src_block = tl.load(mapping_ptr + pair_id * 2).to(tl.int64)
-    dst_block = tl.load(mapping_ptr + pair_id * 2 + 1).to(tl.int64)
+    # Grid-stride loop: each CTA processes multiple (pair, layer) jobs
+    job_id = pid
+    while job_id < total_jobs:
+        pair_id = job_id % num_pairs
+        layer_id = job_id // num_pairs
 
-    # Load base addresses from pointer tables and cast to typed pointers
-    src_base = tl.load(src_ptrs + layer_id).to(tl.pointer_type(tl.int64))
-    dst_base = tl.load(dst_ptrs + layer_id).to(tl.pointer_type(tl.int64))
+        # Load source and destination block IDs from mapping
+        src_block = tl.load(mapping_ptr + pair_id * 2).to(tl.int64)
+        dst_block = tl.load(mapping_ptr + pair_id * 2 + 1).to(tl.int64)
 
-    # Compute offsets using stride-based addressing
-    src_off = src_block * words_per_block
-    dst_off = dst_block * words_per_block
+        # Load base addresses from pointer tables and cast to typed pointers
+        src_base = tl.load(src_ptrs + layer_id).to(tl.pointer_type(tl.int64))
+        dst_base = tl.load(dst_ptrs + layer_id).to(tl.pointer_type(tl.int64))
 
-    # Copy in chunks of BLOCK_SIZE
-    offsets = tl.arange(0, BLOCK_SIZE)
-    for start in range(0, words_per_block, BLOCK_SIZE):
-        idx = start + offsets
-        mask = idx < words_per_block
-        data = tl.load(src_base + src_off + idx, mask=mask, other=0)
-        tl.store(dst_base + dst_off + idx, data, mask=mask)
+        # Compute offsets using stride-based addressing
+        src_off = src_block * words_per_block
+        dst_off = dst_block * words_per_block
+
+        # Copy in chunks of BLOCK_SIZE
+        offsets = tl.arange(0, BLOCK_SIZE)
+        for start in range(0, words_per_block, BLOCK_SIZE):
+            idx = start + offsets
+            mask = idx < words_per_block
+            data = tl.load(src_base + src_off + idx, mask=mask, other=0)
+            tl.store(dst_base + dst_off + idx, data, mask=mask)
+
+        job_id += num_ctas
 
 
 def build_launch_params(
-    src_caches: dict[str, torch.Tensor], dst_caches: dict[str, torch.Tensor]
+    src_caches: dict[str, torch.Tensor],
+    dst_caches: dict[str, torch.Tensor],
+    num_sms: int = DEFAULT_COPY_NUM_SMS,
 ) -> LaunchParams:
     """
     Pre-compute launch parameters for copy_blocks.
 
     Call once at init time and pass the results to copy_blocks
     to avoid per-call overhead of pointer table construction.
+
+    Args:
+        src_caches: Dict mapping layer name to source KV cache tensor.
+        dst_caches: Dict mapping layer name to destination KV cache tensor.
+        num_sms: Number of SMs (CTAs) to use for the persistent kernel.
+            Limits SM occupancy so compute kernels can run concurrently.
 
     Returns:
         LaunchParams with pointer tables, layer count, and
@@ -132,6 +157,7 @@ def build_launch_params(
         words_per_block=words_per_block,
         block_size=block_size,
         num_warps=num_warps,
+        num_sms=num_sms,
     )
 
 
@@ -164,13 +190,16 @@ def copy_blocks(
     # Flatten mapping (already int64 contiguous from caller)
     mapping_flat = block_mapping.view(-1)
 
-    # Launch kernel with grid (num_pairs, num_layers)
     num_pairs = block_mapping.shape[0]
+    total_jobs = num_pairs * launch_params.num_layers
+    grid_size = min(launch_params.num_sms, total_jobs)
 
-    _copy_blocks_kernel[(num_pairs, launch_params.num_layers)](
+    _copy_blocks_kernel[(grid_size,)](
         launch_params.src_ptr_table,
         launch_params.dst_ptr_table,
         mapping_flat,
+        total_jobs,
+        num_pairs,
         launch_params.words_per_block,
         BLOCK_SIZE=launch_params.block_size,
         num_warps=launch_params.num_warps,
