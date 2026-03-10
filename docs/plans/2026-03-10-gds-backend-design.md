@@ -1,7 +1,7 @@
 # GDS Transfer Backend: GPUDirect Storage for KV Cache Offloading
 
 **Date**: 2026-03-10
-**Status**: Approved
+**Status**: Implemented
 
 ## Problem
 
