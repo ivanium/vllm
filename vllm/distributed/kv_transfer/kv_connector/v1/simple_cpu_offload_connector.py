@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.backends import (
     CudaTransferBackend,
     DiskTransferBackend,
+    TransferBackend,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.manager import (
     SimpleCPUOffloadScheduler,
@@ -49,8 +50,9 @@ DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
 class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     """KV cache offloading with configurable transfer backend.
 
-    Supports GPU↔CPU (CudaTransferBackend, default) and GPU↔Disk
-    (DiskTransferBackend, via backend_type="disk" config).
+    Supports GPU↔CPU (CudaTransferBackend, default), GPU↔Disk
+    (DiskTransferBackend, via backend_type="disk"), and GPU↔NVMe
+    (GDSTransferBackend, via backend_type="gds").
     """
 
     def __init__(
@@ -68,11 +70,19 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Backend selection
         backend_type = str(extra_config.get("backend_type", "cuda"))
-        backend: CudaTransferBackend | DiskTransferBackend
+        backend: TransferBackend
         if backend_type == "disk":
             capacity_bytes = int(extra_config.get("disk_bytes_to_use", 0))
             disk_path = str(extra_config.get("disk_path", "/tmp/vllm_kv_cache"))
             backend = DiskTransferBackend(disk_path=disk_path)
+        elif backend_type == "gds":
+            from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.backends import (  # noqa: E501
+                GDSTransferBackend,
+            )
+
+            capacity_bytes = int(extra_config.get("disk_bytes_to_use", 0))
+            disk_path = str(extra_config.get("disk_path", "/tmp/vllm_kv_cache"))
+            backend = GDSTransferBackend(disk_path=disk_path)
         else:
             capacity_bytes = int(
                 extra_config.get("cpu_bytes_to_use", DEFAULT_CPU_CAPACITY_BYTES)

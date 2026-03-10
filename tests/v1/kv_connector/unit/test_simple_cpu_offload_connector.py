@@ -5,6 +5,7 @@
 import os
 import tempfile
 import time
+import unittest.mock
 
 import pytest
 import torch
@@ -1070,3 +1071,104 @@ class TestDiskTransferBackend:
             assert torch.equal(original_0, src_caches["layer.0"][2])
             assert torch.equal(original_1, src_caches["layer.0"][3])
             backend.shutdown()
+
+
+class TestGDSTransferBackend:
+    """Tests for GDSTransferBackend using mocked kvikio."""
+
+    @staticmethod
+    def _mock_kvikio():
+        """Create a mock kvikio module with CuFile that tracks calls."""
+        mock_kvikio = unittest.mock.MagicMock()
+        mock_cufile = unittest.mock.MagicMock()
+        mock_kvikio.CuFile.return_value = mock_cufile
+
+        def _make_future():
+            f = unittest.mock.MagicMock()
+            f.done.return_value = True
+            f.get.return_value = 0
+            return f
+
+        mock_cufile.pread.side_effect = lambda *a, **kw: _make_future()
+        mock_cufile.pwrite.side_effect = lambda *a, **kw: _make_future()
+        return mock_kvikio, mock_cufile
+
+    def _make_backend(self, tmpdir, mock_kvikio, src_caches):
+        """Helper: create and set up a GDSTransferBackend."""
+        with unittest.mock.patch.dict("sys.modules", {"kvikio": mock_kvikio}):
+            from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload.backends.gds import (  # noqa: E501
+                GDSTransferBackend,
+            )
+
+            path = os.path.join(tmpdir, "kv_cache")
+            backend = GDSTransferBackend(disk_path=path)
+            first = next(iter(src_caches.values()))
+            cap = first.shape[0] * first.stride(0) * first.element_size()
+            cap *= len(src_caches)
+            backend.setup(src_caches, capacity_bytes=cap, kv_cache_config=None)
+            return backend, path
+
+    def test_setup_creates_file(self):
+        mock_kvikio, mock_cufile = self._mock_kvikio()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = {"layer.0": torch.zeros(10, 64, dtype=torch.float16)}
+            backend, path = self._make_backend(tmpdir, mock_kvikio, src)
+            assert backend.is_initialized
+            assert os.path.exists(path)
+            mock_kvikio.CuFile.assert_called_once_with(path, "r+")
+            backend.shutdown()
+
+    def test_store_calls_pwrite(self):
+        mock_kvikio, mock_cufile = self._mock_kvikio()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = {
+                "layer.0": torch.zeros(8, 64, dtype=torch.float16),
+                "layer.1": torch.zeros(8, 64, dtype=torch.float16),
+            }
+            backend, _ = self._make_backend(tmpdir, mock_kvikio, src)
+            backend.copy_blocks([0, 1], [0, 1], is_store=True)
+            event = backend.record_event()
+            event.wait()
+            # 2 layers x 2 blocks = 4 pwrite calls
+            assert mock_cufile.pwrite.call_count == 4
+            assert mock_cufile.pread.call_count == 0
+            backend.shutdown()
+
+    def test_load_calls_pread(self):
+        mock_kvikio, mock_cufile = self._mock_kvikio()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = {"layer.0": torch.zeros(8, 64, dtype=torch.float16)}
+            backend, _ = self._make_backend(tmpdir, mock_kvikio, src)
+            backend.copy_blocks([0], [1], is_store=False)
+            event = backend.record_event()
+            assert event.query() is True
+            assert mock_cufile.pread.call_count == 1
+            backend.shutdown()
+
+    def test_empty_copy_blocks(self):
+        mock_kvikio, mock_cufile = self._mock_kvikio()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = {"layer.0": torch.zeros(4, 16, dtype=torch.float16)}
+            backend, _ = self._make_backend(tmpdir, mock_kvikio, src)
+            backend.copy_blocks([], [], is_store=True)
+            event = backend.record_event()
+            assert event.query() is True
+            backend.shutdown()
+
+    def test_unaligned_warns_compat_mode(self):
+        mock_kvikio, _ = self._mock_kvikio()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 10 elements * 2 bytes = 20 bytes/block (not 4KB-aligned)
+            src = {"layer.0": torch.zeros(4, 10, dtype=torch.float16)}
+            self._make_backend(tmpdir, mock_kvikio, src)
+            mock_kvikio.defaults.compat_mode_set.assert_called_once_with(True)
+
+    def test_shutdown_cleans_up_file(self):
+        mock_kvikio, mock_cufile = self._mock_kvikio()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = {"layer.0": torch.zeros(4, 16, dtype=torch.float16)}
+            backend, path = self._make_backend(tmpdir, mock_kvikio, src)
+            assert os.path.exists(path)
+            backend.shutdown()
+            assert not os.path.exists(path)
+            mock_cufile.close.assert_called_once()

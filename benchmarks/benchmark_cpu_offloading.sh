@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Benchmark CPU KV cache offloading overhead.
+# Benchmark KV cache offloading overhead (CPU, Disk, or Tiered).
 # Launches a vllm server, runs `vllm bench serve` against it, then
 # repeats with offloading enabled. Uses random (unique) prompts so
 # no offloaded prefix is ever hit — isolating the pure store overhead.
@@ -8,13 +8,16 @@
 #   bash benchmarks/benchmark_cpu_offloading.sh [MODEL] [INPUT_LEN] [OUTPUT_LEN] [NUM_PROMPTS]
 #
 # Environment variables:
-#   KV_OFFLOAD_GIB  - CPU offload buffer in GiB   (default: 40)
-#   REQUEST_RATE    - Requests/s to the server     (default: 8)
-#   PORT            - Server port                  (default: 8192)
-#   RESULT_DIR      - Output directory             (default: ./bench_results)
-#   OFFLOAD_BACKEND - Offloading backend            (default: native)
-#   RUN_BASELINE    - Run baseline phase (1/0)      (default: 1)
-#   RUN_OFFLOADING  - Run offloading phase (1/0)    (default: 1)
+#   KV_OFFLOAD_GIB   - CPU offload buffer in GiB     (default: 80)
+#   DISK_OFFLOAD_GIB - Disk offload buffer in GiB    (default: 100)
+#   DISK_PATH        - Disk backing file path         (default: /tmp/vllm_kv_cache)
+#   REQUEST_RATE     - Requests/s to the server       (default: 3)
+#   PORT             - Server port                    (default: 8192)
+#   RESULT_DIR       - Output directory               (default: ./bench_results)
+#   OFFLOAD_BACKEND  - Offloading backend             (default: simple)
+#   OFFLOAD_MODE     - cpu, disk, or tiered           (default: cpu)
+#   RUN_BASELINE     - Run baseline phase (1/0)       (default: 1)
+#   RUN_OFFLOADING   - Run offloading phase (1/0)     (default: 1)
 
 set -euo pipefail
 
@@ -24,10 +27,13 @@ INPUT_LEN="${2:-8192}"
 OUTPUT_LEN="${3:-1024}"
 NUM_PROMPTS="${4:-500}"
 KV_OFFLOAD_GIB="${KV_OFFLOAD_GIB:-80}"
+DISK_OFFLOAD_GIB="${DISK_OFFLOAD_GIB:-100}"
+DISK_PATH="${DISK_PATH:-/tmp/vllm_kv_cache}"
 REQUEST_RATE="${REQUEST_RATE:-3}"
 PORT="${PORT:-8192}"
 RESULT_DIR="${RESULT_DIR:-./bench_results}"
 OFFLOAD_BACKEND="${OFFLOAD_BACKEND:-simple}"
+OFFLOAD_MODE="${OFFLOAD_MODE:-cpu}"
 RUN_BASELINE="${RUN_BASELINE:-1}"
 RUN_OFFLOADING="${RUN_OFFLOADING:-1}"
 
@@ -118,25 +124,65 @@ run_one() {
 }
 
 echo "============================================"
-echo "  CPU Offloading Overhead Benchmark"
+echo "  KV Cache Offloading Overhead Benchmark"
 echo "============================================"
 echo "  Model:         $MODEL"
 echo "  Input len:     $INPUT_LEN"
 echo "  Output len:    $OUTPUT_LEN"
 echo "  Num prompts:   $NUM_PROMPTS"
 echo "  Request rate:  $REQUEST_RATE req/s"
-echo "  Offload size:  ${KV_OFFLOAD_GIB} GiB"
+echo "  Offload mode:  $OFFLOAD_MODE"
+echo "  CPU offload:   ${KV_OFFLOAD_GIB} GiB"
+if [[ "$OFFLOAD_MODE" == "disk" || "$OFFLOAD_MODE" == "tiered" ]]; then
+echo "  Disk offload:  ${DISK_OFFLOAD_GIB} GiB"
+echo "  Disk path:     $DISK_PATH"
+fi
 echo "============================================"
+
+# ── Build offloading server args based on OFFLOAD_MODE ──────────
+build_offload_args() {
+    local cpu_bytes disk_bytes
+    cpu_bytes=$(python3 -c "print(int($KV_OFFLOAD_GIB * (1 << 30)))")
+    disk_bytes=$(python3 -c "print(int($DISK_OFFLOAD_GIB * (1 << 30)))")
+
+    case "$OFFLOAD_MODE" in
+        cpu)
+            # Use the simple CLI flags for CPU-only offloading
+            echo "--kv-offloading-size $KV_OFFLOAD_GIB --kv-offloading-backend $OFFLOAD_BACKEND"
+            ;;
+        disk)
+            # Disk-only: SimpleCPUOffloadConnector with backend_type=disk
+            cat <<JSONEOF
+--kv-transfer-config {"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend_type":"disk","disk_bytes_to_use":${disk_bytes},"disk_path":"${DISK_PATH}"}}
+JSONEOF
+            ;;
+        gds)
+            # GDS: SimpleCPUOffloadConnector with backend_type=gds (GPUDirect Storage)
+            cat <<JSONEOF
+--kv-transfer-config {"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend_type":"gds","disk_bytes_to_use":${disk_bytes},"disk_path":"${DISK_PATH}"}}
+JSONEOF
+            ;;
+        tiered)
+            # Tiered: MultiConnector composing CPU + Disk connectors
+            cat <<JSONEOF
+--kv-transfer-config {"kv_connector":"MultiConnector","kv_role":"kv_both","kv_connector_extra_config":{"connectors":[{"kv_connector":"SimpleCPUOffloadConnector","kv_connector_extra_config":{"cpu_bytes_to_use":${cpu_bytes},"lazy_offload":true}},{"kv_connector":"SimpleCPUOffloadConnector","kv_connector_extra_config":{"backend_type":"disk","disk_bytes_to_use":${disk_bytes},"disk_path":"${DISK_PATH}","lazy_offload":true}}]}}
+JSONEOF
+            ;;
+        *)
+            echo "ERROR: Unknown OFFLOAD_MODE=$OFFLOAD_MODE (use cpu, disk, gds, or tiered)" >&2
+            exit 1
+            ;;
+    esac
+}
 
 if [[ "$RUN_BASELINE" == "1" ]]; then
     run_one "Baseline (no offloading)" "baseline.json"
 fi
 
-        # --no-disable-hybrid-kv-cache-manager \
 if [[ "$RUN_OFFLOADING" == "1" ]]; then
-    run_one "With CPU offloading" "offloading.json" \
-        --kv-offloading-size "$KV_OFFLOAD_GIB" \
-        --kv-offloading-backend "$OFFLOAD_BACKEND"
+    # shellcheck disable=SC2046
+    run_one "With ${OFFLOAD_MODE} offloading" "offloading.json" \
+        $(build_offload_args)
 fi
 
 # ── Compare results ──────────────────────────────────────────────

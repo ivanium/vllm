@@ -5,9 +5,11 @@
 from .base import TransferBackend
 from .cuda import CudaTransferBackend
 from .disk import DiskTransferBackend
+from .gds import GDSTransferBackend
 
 __all__ = [
     "TransferBackend",
     "CudaTransferBackend",
     "DiskTransferBackend",
+    "GDSTransferBackend",
 ]
