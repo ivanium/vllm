@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
@@ -102,7 +103,7 @@ class MultiKVConnectorPromMetrics(KVConnectorPromMetrics):
             self._prom_metrics[connector_id].observe(stats_data["data"], engine_idx)
 
 
-class MultiConnector(KVConnectorBase_V1):
+class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     """
     A wrapper for using multiple KVConnectors at the same time.
 
@@ -171,12 +172,16 @@ class MultiConnector(KVConnectorBase_V1):
         )
         assert ktcs is not None
         ret: list[tuple[type[KVConnectorBaseType], VllmConfig]] = []
+        parent_ktc = vllm_config.kv_transfer_config
         for ktc in ktcs:
             temp_config = copy.copy(vllm_config)
-            engine_id = ktc.get("engine_id", vllm_config.kv_transfer_config.engine_id)
-            temp_config.kv_transfer_config = KVTransferConfig(
-                **ktc, engine_id=engine_id
-            )
+            # Inherit engine_id and kv_role from parent if not specified.
+            child_ktc = {
+                "engine_id": parent_ktc.engine_id,
+                "kv_role": parent_ktc.kv_role,
+                **ktc,
+            }
+            temp_config.kv_transfer_config = KVTransferConfig(**child_ktc)
             ret.append(
                 (
                     KVConnectorFactory.get_connector_class(
@@ -412,6 +417,38 @@ class MultiConnector(KVConnectorBase_V1):
             self._extra_async_saves[request.request_id] = async_saves - 1
 
         # Clean up other state for this request.
+        self._requests_to_connector.pop(request.request_id, None)
+
+        return async_saves > 0, kv_txfer_params
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        async_saves = 0
+        kv_txfer_params = None
+        for c in self._connectors:
+            if isinstance(c, SupportsHMA):
+                async_save, txfer_params = c.request_finished_all_groups(
+                    request, block_ids
+                )
+            else:
+                # Fall back to per-group request_finished for the first group.
+                async_save, txfer_params = c.request_finished(
+                    request, block_ids[0] if block_ids else []
+                )
+            if async_save:
+                async_saves += 1
+            if txfer_params is not None:
+                if kv_txfer_params is not None:
+                    raise RuntimeError(
+                        "Only one connector can produce KV transfer params"
+                    )
+                kv_txfer_params = txfer_params
+        if async_saves > 1:
+            self._extra_async_saves[request.request_id] = async_saves - 1
+
         self._requests_to_connector.pop(request.request_id, None)
 
         return async_saves > 0, kv_txfer_params
