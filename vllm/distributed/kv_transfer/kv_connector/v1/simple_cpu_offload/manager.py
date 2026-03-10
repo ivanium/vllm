@@ -627,9 +627,9 @@ class SimpleCPUOffloadScheduler:
                 else:
                     self._cleanup_store_request(req_id)
 
-            # FIXME (yifan): remove this after the connector API is modified.
-            if req_id in self._req_local_computed:
-                del self._req_local_computed[req_id]
+        # FIXME (yifan): remove this after the connector API is modified.
+        if req_id in self._req_local_computed:
+            del self._req_local_computed[req_id]
 
         return False, None
 
