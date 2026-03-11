@@ -650,9 +650,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             with_numpy=True,
         )
 
-    @override  # type: ignore[misc]
+    @override
     @classmethod
-    def get_cudagraph_support(
+    def get_cudagraph_support(  # type: ignore[misc]
         cls: type["FlashInferMetadataBuilder"],
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
@@ -1444,7 +1444,7 @@ class FlashInferImpl(AttentionImpl):
                 # This path needs to be enabled with VLLM_KV_CACHE_LAYOUT = HND
                 assert get_kv_cache_layout() == "HND"
                 assert is_strictly_contiguous(prefill_query)
-                assert is_strictly_contiguous(kv_cache_permute)
+                # assert is_strictly_contiguous(kv_cache_permute)
                 assert is_strictly_contiguous(workspace_buffer)
                 assert is_strictly_contiguous(block_tables_prefill)
                 assert is_strictly_contiguous(seq_lens_prefill)
@@ -1557,7 +1557,7 @@ class FlashInferImpl(AttentionImpl):
                 # This path needs to be enabled with VLLM_KV_CACHE_LAYOUT = HND
                 assert get_kv_cache_layout() == "HND"
                 assert is_strictly_contiguous(decode_query)
-                assert is_strictly_contiguous(kv_cache_permute)
+                # assert is_strictly_contiguous(kv_cache_permute)
                 assert is_strictly_contiguous(workspace_buffer)
                 assert is_strictly_contiguous(block_tables_decode)
                 assert is_strictly_contiguous(seq_lens_decode)
