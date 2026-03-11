@@ -82,6 +82,18 @@ class SampleRequest:
     request_id: str | None = None
 
 
+@dataclass
+class ConversationSpec:
+    """Specification for a multi-turn conversation."""
+
+    conversation_id: str
+    num_turns: int
+    system_prefix_tokens: list[int]
+    turn_input_lens: list[int]
+    turn_output_lens: list[int]
+    reoccurrence_delay: int
+
+
 # -----------------------------------------------------------------------------
 # Benchmark Dataset Base Class
 # -----------------------------------------------------------------------------
@@ -1363,6 +1375,7 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
             "custom_mm",
             "prefix_repetition",
             "spec_bench",
+            "multi_turn",
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -1545,6 +1558,46 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         default=128,
         help="Number of output tokens per request, used only for prefix "
         "repetition dataset.",
+    )
+
+    mt_group = parser.add_argument_group("multi-turn dataset options")
+    mt_group.add_argument(
+        "--mt-num-conversations",
+        type=int,
+        default=50,
+        help="Number of conversations to simulate.",
+    )
+    mt_group.add_argument(
+        "--mt-num-turns-min",
+        type=int,
+        default=3,
+        help="Minimum number of turns per conversation.",
+    )
+    mt_group.add_argument(
+        "--mt-num-turns-max",
+        type=int,
+        default=10,
+        help="Maximum number of turns per conversation.",
+    )
+    mt_group.add_argument(
+        "--mt-reoccurrence-delay-min",
+        type=int,
+        default=1,
+        help="Minimum number of other requests between turns of the same conversation.",
+    )
+    mt_group.add_argument(
+        "--mt-reoccurrence-delay-max",
+        type=int,
+        default=5,
+        help="Maximum number of other requests between turns of the same conversation.",
+    )
+    mt_group.add_argument(
+        "--mt-distribution",
+        type=str,
+        default="uniform",
+        choices=["uniform", "gamma"],
+        help="Distribution for sampling turn counts and lengths. When "
+        "'gamma', --burstiness is used as the coefficient of variation.",
     )
 
 
@@ -3301,6 +3354,116 @@ class MLPerfDataset(HuggingFaceDataset):
             sampled_requests, num_requests, request_id_prefix, no_oversample
         )
         return sampled_requests
+
+
+# -----------------------------------------------------------------------------
+# Multi-Turn Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class MultiTurnDataset:
+    """Dataset that generates multi-turn conversation specifications.
+
+    Produces ConversationSpec objects (not SampleRequest) describing
+    conversations with configurable turn counts, input/output lengths,
+    and reoccurrence delays. The benchmark loop uses these specs to
+    build prompts from accumulated conversation history.
+
+    This is intentionally NOT a BenchmarkDataset subclass because it
+    returns list[ConversationSpec], not list[SampleRequest].
+    """
+
+    def __init__(self, random_seed: int = 0) -> None:
+        self._rng = np.random.default_rng(random_seed)
+
+    def _sample_from_distribution(
+        self,
+        low: int,
+        high: int,
+        size: int,
+        distribution: str,
+        burstiness: float,
+    ) -> list[int]:
+        """Sample integers from [low, high] using uniform or gamma
+        distribution."""
+        if low == high:
+            return [low] * size
+        if distribution == "uniform":
+            return self._rng.integers(low, high + 1, size=size).tolist()
+        elif distribution == "gamma":
+            mean = (low + high) / 2.0
+            std = mean * burstiness if burstiness > 0 else 0.001
+            shape = (mean / std) ** 2
+            scale = std**2 / mean
+            samples = self._rng.gamma(shape, scale, size=size)
+            return [int(np.clip(round(s), low, high)) for s in samples]
+        else:
+            raise ValueError(f"Unknown distribution: {distribution}")
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike,
+        num_conversations: int,
+        num_turns_min: int,
+        num_turns_max: int,
+        input_len: int,
+        output_len: int,
+        range_ratio: float,
+        prefix_len: int,
+        reoccurrence_delay_min: int,
+        reoccurrence_delay_max: int,
+        burstiness: float,
+        distribution: str = "uniform",
+        **kwargs,
+    ) -> list[ConversationSpec]:
+        # Generate system prefix tokens (shared across all conversations)
+        if prefix_len > 0:
+            prefix_tokens = self._rng.integers(
+                0, tokenizer.vocab_size, size=prefix_len
+            ).tolist()
+        else:
+            prefix_tokens = []
+
+        # Sample num_turns, delays, input/output lens using distribution
+        turns_per_conv = self._sample_from_distribution(
+            num_turns_min, num_turns_max, num_conversations, distribution, burstiness
+        )
+        delays = self._sample_from_distribution(
+            reoccurrence_delay_min,
+            reoccurrence_delay_max,
+            num_conversations,
+            distribution,
+            burstiness,
+        )
+
+        total_turns = sum(turns_per_conv)
+        input_low = max(1, int(input_len * (1 - range_ratio)))
+        input_high = max(1, int(input_len * (1 + range_ratio)))
+        output_low = max(1, int(output_len * (1 - range_ratio)))
+        output_high = max(1, int(output_len * (1 + range_ratio)))
+
+        all_input_lens = self._sample_from_distribution(
+            input_low, input_high, total_turns, distribution, burstiness
+        )
+        all_output_lens = self._sample_from_distribution(
+            output_low, output_high, total_turns, distribution, burstiness
+        )
+
+        specs = []
+        offset = 0
+        for i, n_turns in enumerate(turns_per_conv):
+            specs.append(
+                ConversationSpec(
+                    conversation_id=str(i),
+                    num_turns=n_turns,
+                    system_prefix_tokens=prefix_tokens,
+                    turn_input_lens=all_input_lens[offset : offset + n_turns],
+                    turn_output_lens=all_output_lens[offset : offset + n_turns],
+                    reoccurrence_delay=delays[i],
+                )
+            )
+            offset += n_turns
+        return specs
 
 
 # -----------------------------------------------------------------------------

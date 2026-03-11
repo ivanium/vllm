@@ -30,6 +30,7 @@ import ssl
 import time
 import uuid
 import warnings
+from collections import deque
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,7 +42,12 @@ import aiohttp
 import numpy as np
 from tqdm.asyncio import tqdm
 
-from vllm.benchmarks.datasets import SampleRequest, add_dataset_parser, get_samples
+from vllm.benchmarks.datasets import (
+    ConversationSpec,
+    SampleRequest,
+    add_dataset_parser,
+    get_samples,
+)
 from vllm.benchmarks.lib.endpoint_request_func import (
     ASYNC_REQUEST_FUNCS,
     OPENAI_COMPATIBLE_BACKENDS,
@@ -340,6 +346,169 @@ async def get_request(
         yield request, request_rates[request_index]
 
 
+@dataclass
+class _ConversationState:
+    """Runtime state for an active multi-turn conversation."""
+
+    spec: ConversationSpec
+    current_turn: int
+    history: str  # accumulated prompt text
+    pending_user_text: str = ""  # stored by next_request for complete_turn
+
+    @property
+    def done(self) -> bool:
+        return self.current_turn >= self.spec.num_turns
+
+
+@dataclass
+class _PendingTurn:
+    """A conversation turn waiting to be dispatched."""
+
+    conversation_id: str
+    ready_after: int  # global request counter threshold
+
+
+class MultiTurnScheduler:
+    """Schedules multi-turn conversation requests with interleaving.
+
+    Pull-based state machine: caller calls next_request() to get the
+    next dispatchable turn, and complete_turn() when a response arrives.
+    A turn becomes eligible when global_counter >= ready_after.
+    Among eligible turns, FIFO order is used.
+    """
+
+    def __init__(
+        self,
+        specs: list[ConversationSpec],
+        tokenizer,
+        random_seed: int = 0,
+    ) -> None:
+        self._tokenizer = tokenizer
+        self._states: dict[str, _ConversationState] = {}
+        self._ready_queue: deque[_PendingTurn] = deque()
+        self._pending: list[_PendingTurn] = []
+        self._global_counter = 0
+        self._in_flight = 0
+        self._total_remaining = 0
+        self._rng = np.random.default_rng(random_seed)
+
+        for spec in specs:
+            self._states[spec.conversation_id] = _ConversationState(
+                spec=spec,
+                current_turn=0,
+                history=(
+                    self._tokenizer.decode(spec.system_prefix_tokens)
+                    if spec.system_prefix_tokens
+                    else ""
+                ),
+            )
+            self._ready_queue.append(_PendingTurn(spec.conversation_id, ready_after=0))
+            self._total_remaining += spec.num_turns
+
+    @property
+    def is_done(self) -> bool:
+        """True when all turns are completed (none remaining or in-flight)."""
+        return self._total_remaining <= 0 and self._in_flight <= 0
+
+    @property
+    def has_ready(self) -> bool:
+        """True if there is a request ready to dispatch now."""
+        self._promote_pending()
+        if self._ready_queue:
+            return True
+        # There are pending turns but none promoted yet — they will be
+        # force-advanced when next_request() is called.
+        return bool(self._pending)
+
+    def _promote_pending(self) -> None:
+        """Move pending turns that are now eligible to the ready queue."""
+        still_pending = []
+        for pt in self._pending:
+            if pt.ready_after <= self._global_counter:
+                self._ready_queue.append(pt)
+            else:
+                still_pending.append(pt)
+        self._pending = still_pending
+
+    def next_request(self) -> tuple[SampleRequest, str, int] | None:
+        """Get the next dispatchable request, or None if nothing is ready.
+
+        Returns (request, conversation_id, turn_index) or None.
+        """
+        self._promote_pending()
+
+        if not self._ready_queue and self._pending:
+            self._pending.sort(key=lambda p: p.ready_after)
+            # Advance the global counter to the earliest pending turn so
+            # conversations are not stuck waiting forever when all pending
+            # turns have ready_after > global_counter.
+            earliest = self._pending[0]
+            if earliest.ready_after > self._global_counter:
+                self._global_counter = earliest.ready_after
+            self._pending.pop(0)
+            self._ready_queue.append(earliest)
+            self._promote_pending()
+
+        if not self._ready_queue:
+            return None
+
+        pt = self._ready_queue.popleft()
+        state = self._states[pt.conversation_id]
+        turn_idx = state.current_turn
+
+        req = self._build_turn_request(pt.conversation_id)
+        self._global_counter += 1
+        self._total_remaining -= 1
+        self._in_flight += 1
+
+        return req, pt.conversation_id, turn_idx
+
+    def _build_turn_request(self, conv_id: str) -> SampleRequest:
+        """Build a SampleRequest for the current turn of a conversation."""
+        state = self._states[conv_id]
+        spec = state.spec
+        turn = state.current_turn
+
+        # Generate random tokens for this turn's user message
+        input_len = spec.turn_input_lens[turn]
+        user_tokens = self._rng.integers(
+            0, self._tokenizer.vocab_size, size=input_len
+        ).tolist()
+        user_text = self._tokenizer.decode(user_tokens)
+
+        # Store user text for complete_turn (avoid RNG desync)
+        state.pending_user_text = user_text
+
+        # Build full prompt: history + user message
+        prompt = state.history + user_text
+        prompt_len = len(self._tokenizer.encode(prompt))
+
+        return SampleRequest(
+            prompt=prompt,
+            prompt_len=prompt_len,
+            expected_output_len=spec.turn_output_lens[turn],
+            request_id=f"mt-{conv_id}-turn{turn}",
+        )
+
+    def complete_turn(self, conversation_id: str, response_text: str) -> None:
+        """Record the model response and schedule the next turn if any."""
+        state = self._states[conversation_id]
+        self._in_flight -= 1
+
+        # Use stored user text (set by _build_turn_request)
+        state.history += state.pending_user_text + response_text
+        state.pending_user_text = ""
+        state.current_turn += 1
+
+        if not state.done:
+            self._pending.append(
+                _PendingTurn(
+                    conversation_id=conversation_id,
+                    ready_after=self._global_counter + state.spec.reoccurrence_delay,
+                )
+            )
+
+
 def calculate_metrics_for_embeddings(
     outputs: list[RequestFuncOutput],
     dur_s: float,
@@ -629,6 +798,7 @@ async def benchmark(
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
+    mt_specs: list[ConversationSpec] | None = None,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -656,12 +826,23 @@ async def benchmark(
     )
 
     print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len, test_mm_content = (
-        input_requests[0].prompt,
-        input_requests[0].prompt_len,
-        input_requests[0].expected_output_len,
-        input_requests[0].multi_modal_data,
-    )
+    if mt_specs is not None:
+        # Build a test request from the first conversation spec
+        test_scheduler = MultiTurnScheduler(mt_specs[:1], tokenizer)
+        result = test_scheduler.next_request()
+        assert result is not None, "Failed to generate test request from mt_specs"
+        test_req, _, _ = result
+        test_prompt = test_req.prompt
+        test_prompt_len = test_req.prompt_len
+        test_output_len = test_req.expected_output_len
+        test_mm_content = None
+    else:
+        test_prompt, test_prompt_len, test_output_len, test_mm_content = (
+            input_requests[0].prompt,
+            input_requests[0].prompt_len,
+            input_requests[0].expected_output_len,
+            input_requests[0].multi_modal_data,
+        )
 
     assert (
         test_mm_content is None
@@ -773,7 +954,11 @@ async def benchmark(
 
     spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
 
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    if mt_specs is not None:
+        total_requests = sum(s.num_turns for s in mt_specs)
+    else:
+        total_requests = len(input_requests)
+    pbar = None if disable_tqdm else tqdm(total=total_requests)
 
     semaphore = (
         asyncio.Semaphore(max_concurrency)
@@ -801,55 +986,142 @@ async def benchmark(
             }
         )
 
-    async for request, current_request_rate in get_request(
-        input_requests,
-        request_rate,
-        burstiness,
-        ramp_up_strategy,
-        ramp_up_start_rps,
-        ramp_up_end_rps,
-    ):
-        if ramp_up_strategy is not None:
-            current_int_rps = int(current_request_rate)
-            if current_int_rps > last_int_rps:
-                timestamp = datetime.now().isoformat()
-                for rps_val in range(last_int_rps + 1, current_int_rps + 1):
-                    rps_change_events.append({"rps": rps_val, "timestamp": timestamp})
-                last_int_rps = current_int_rps
-        prompt, prompt_len, output_len, mm_content, request_id = (
-            request.prompt,
-            request.prompt_len,
-            request.expected_output_len,
-            request.multi_modal_data,
-            request.request_id,
-        )
-        req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
-            req_model_id, req_model_name = req_lora_module, req_lora_module
+    if mt_specs is not None:
+        # Multi-turn mode: pull-based scheduler manages conversation
+        # state and interleaving. We must wait for in-flight responses
+        # before scheduling subsequent turns of the same conversation.
+        scheduler = MultiTurnScheduler(mt_specs, tokenizer)
+        pending_tasks: dict[asyncio.Task, str] = {}  # task -> conv_id
+        all_outputs: list[RequestFuncOutput] = []
+        mt_input_requests: list[SampleRequest] = []
 
-        request_func_input = RequestFuncInput(
-            model=req_model_id,
-            model_name=req_model_name,
-            prompt=prompt,
-            api_url=api_url,
-            prompt_len=prompt_len,
-            output_len=output_len,
-            logprobs=logprobs,
-            multi_modal_content=mm_content,
-            ignore_eos=ignore_eos,
-            extra_headers=extra_headers,
-            extra_body=extra_body,
-            request_id=request_id,
-        )
-        tasks.append(
-            asyncio.create_task(
+        def _collect_done_tasks():
+            """Harvest completed tasks and feed responses to scheduler."""
+            done_ids = [t for t in pending_tasks if t.done()]
+            for t in done_ids:
+                cid = pending_tasks.pop(t)
+                result = t.result()
+                all_outputs.append(result)
+                scheduler.complete_turn(
+                    cid, result.generated_text if result.success else ""
+                )
+
+        while not scheduler.is_done:
+            _collect_done_tasks()
+
+            result = scheduler.next_request()
+            if result is None:
+                # Nothing ready yet — wait for at least one in-flight
+                # request to complete so complete_turn can schedule
+                # subsequent turns.
+                if pending_tasks:
+                    done, _ = await asyncio.wait(
+                        pending_tasks.keys(),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    _collect_done_tasks()
+                    continue
+                else:
+                    break  # nothing in-flight, nothing pending — done
+
+            request, conv_id, turn_idx = result
+
+            # Rate limiting
+            if request_rate != float("inf"):
+                if burstiness == float("inf"):
+                    delay = 1.0 / request_rate
+                else:
+                    theta = 1.0 / (request_rate * burstiness)
+                    delay = np.random.gamma(shape=burstiness, scale=theta)
+                await asyncio.sleep(delay)
+
+            mt_input_requests.append(request)
+            request_func_input = RequestFuncInput(
+                model=model_id,
+                model_name=model_name,
+                prompt=request.prompt,
+                api_url=api_url,
+                prompt_len=request.prompt_len,
+                output_len=request.expected_output_len,
+                logprobs=logprobs,
+                ignore_eos=ignore_eos,
+                extra_headers=extra_headers,
+                extra_body=extra_body,
+                request_id=request.request_id,
+            )
+
+            task = asyncio.create_task(
                 limited_request_func(
-                    request_func_input=request_func_input, session=session, pbar=pbar
+                    request_func_input=request_func_input,
+                    session=session,
+                    pbar=pbar,
                 )
             )
-        )
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+            pending_tasks[task] = conv_id
+
+        # Wait for final in-flight tasks
+        if pending_tasks:
+            await asyncio.wait(pending_tasks.keys())
+            _collect_done_tasks()
+
+        outputs = all_outputs
+        input_requests = mt_input_requests
+
+    else:
+        # Existing flat request loop (unchanged)
+        async for request, current_request_rate in get_request(
+            input_requests,
+            request_rate,
+            burstiness,
+            ramp_up_strategy,
+            ramp_up_start_rps,
+            ramp_up_end_rps,
+        ):
+            if ramp_up_strategy is not None:
+                current_int_rps = int(current_request_rate)
+                if current_int_rps > last_int_rps:
+                    timestamp = datetime.now().isoformat()
+                    for rps_val in range(last_int_rps + 1, current_int_rps + 1):
+                        rps_change_events.append(
+                            {"rps": rps_val, "timestamp": timestamp}
+                        )
+                    last_int_rps = current_int_rps
+            prompt, prompt_len, output_len, mm_content, request_id = (
+                request.prompt,
+                request.prompt_len,
+                request.expected_output_len,
+                request.multi_modal_data,
+                request.request_id,
+            )
+            req_model_id, req_model_name = model_id, model_name
+            if lora_modules:
+                req_lora_module = next(lora_modules)
+                req_model_id, req_model_name = req_lora_module, req_lora_module
+
+            request_func_input = RequestFuncInput(
+                model=req_model_id,
+                model_name=req_model_name,
+                prompt=prompt,
+                api_url=api_url,
+                prompt_len=prompt_len,
+                output_len=output_len,
+                logprobs=logprobs,
+                multi_modal_content=mm_content,
+                ignore_eos=ignore_eos,
+                extra_headers=extra_headers,
+                extra_body=extra_body,
+                request_id=request_id,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(
+                        request_func_input=request_func_input,
+                        session=session,
+                        pbar=pbar,
+                    )
+                )
+            )
+        outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if pbar is not None:
         pbar.close()
@@ -1718,7 +1990,73 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         args.ignore_eos = True
 
     # Load the dataset.
-    input_requests = get_samples(args, tokenizer)
+    if args.dataset_name == "multi_turn":
+        import math
+
+        from vllm.benchmarks.datasets import MultiTurnDataset
+
+        # Derive num_conversations so we generate enough to fill
+        # num_prompts total turns, then cap at num_prompts.
+        avg_turns = (args.mt_num_turns_min + args.mt_num_turns_max) / 2
+        num_conversations = max(
+            args.mt_num_conversations,
+            math.ceil(args.num_prompts / avg_turns),
+        )
+
+        mt_specs = MultiTurnDataset(random_seed=args.seed).sample(
+            tokenizer=tokenizer,
+            num_conversations=num_conversations,
+            num_turns_min=args.mt_num_turns_min,
+            num_turns_max=args.mt_num_turns_max,
+            input_len=args.input_len or 256,
+            output_len=args.output_len or 128,
+            range_ratio=args.random_range_ratio,
+            prefix_len=getattr(args, "random_prefix_len", 0) or 0,
+            reoccurrence_delay_min=args.mt_reoccurrence_delay_min,
+            reoccurrence_delay_max=args.mt_reoccurrence_delay_max,
+            burstiness=args.burstiness,
+            distribution=args.mt_distribution,
+        )
+
+        # Cap total turns at num_prompts by truncating conversations.
+        capped_specs = []
+        remaining = args.num_prompts
+        for spec in mt_specs:
+            if remaining <= 0:
+                break
+            if spec.num_turns <= remaining:
+                capped_specs.append(spec)
+                remaining -= spec.num_turns
+            else:
+                # Truncate this conversation to fit the budget.
+                capped_specs.append(
+                    ConversationSpec(
+                        conversation_id=spec.conversation_id,
+                        num_turns=remaining,
+                        system_prefix_tokens=spec.system_prefix_tokens,
+                        turn_input_lens=spec.turn_input_lens[:remaining],
+                        turn_output_lens=spec.turn_output_lens[:remaining],
+                        reoccurrence_delay=spec.reoccurrence_delay,
+                    )
+                )
+                remaining = 0
+        mt_specs = capped_specs
+
+        # For multi_turn with random content, ignore EOS
+        if args.backend in OPENAI_COMPATIBLE_BACKENDS:
+            args.ignore_eos = True
+
+        total_turns = sum(s.num_turns for s in mt_specs)
+        print(
+            f"Multi-turn benchmark: {len(mt_specs)} conversations, "
+            f"{total_turns} total turns (capped by --num-prompts={args.num_prompts})"
+        )
+        args.num_prompts = total_turns
+        input_requests = []  # empty, benchmark uses mt_specs instead
+    else:
+        mt_specs = None
+        input_requests = get_samples(args, tokenizer)
+
     goodput_config_dict = check_goodput_args(args)
 
     backend = args.backend
@@ -1795,6 +2133,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
         ssl_context=ssl_context,
+        mt_specs=mt_specs,
     )
 
     # Save config and results to json
