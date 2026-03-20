@@ -1652,6 +1652,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
     ),
+    # Enable simple KV offload.
+    "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
+        int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
+    ),
 }
 
 
