@@ -1,10 +1,24 @@
 # prometheus.yaml
+# Adapted for GB200 NVL72 cluster: PD disaggregated vLLM + Mooncake Store
 global:
   scrape_interval: 5s
   evaluation_interval: 30s
 
 scrape_configs:
-  - job_name: vllm
+  # PD disaggregated vLLM instances
+  # Update IPs after vigil allocates slurm nodes
+  - job_name: vllm-prefill
     static_configs:
-      - targets:
-          - 'host.docker.internal:8000'
+      - targets: ['192.168.0.114:8000']
+        labels:
+          role: prefill
+  - job_name: vllm-decode
+    static_configs:
+      - targets: ['192.168.0.115:8000']
+        labels:
+          role: decode
+
+  # Mooncake Master — native Prometheus format at :9003/metrics
+  - job_name: mooncake-master
+    static_configs:
+      - targets: ['192.168.0.101:9003']
