@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Scheduler-side logic for MooncakeStoreConnector."""
 
+import os
 from typing import Any
 
 import zmq
@@ -399,5 +400,6 @@ def get_zmq_rpc_path_lookup(vllm_config: VllmConfig) -> str:
     extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
     if "lookup_rpc_port" in extra_config:
         rpc_port = extra_config["lookup_rpc_port"]
-    logger.debug("Base URL: %s, RPC Port: %s", base_url, rpc_port)
-    return f"ipc://{base_url}/lookup_rpc_port_{rpc_port}_dp_rank{dp_rank}"
+    uid = os.getuid()
+    logger.debug("Base URL: %s, RPC Port: %s, UID: %s", base_url, rpc_port, uid)
+    return f"ipc://{base_url}/lookup_rpc_port_{rpc_port}_uid{uid}_dp_rank{dp_rank}"

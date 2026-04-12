@@ -1026,6 +1026,9 @@ class LookupKeyServer:
         self.decoder = MsgpackDecoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         socket_path = get_zmq_rpc_path_lookup(vllm_config)
+        self._ipc_path = socket_path.removeprefix("ipc://")
+        if os.path.exists(self._ipc_path):
+            os.unlink(self._ipc_path)
         self.socket = make_zmq_socket(
             self.ctx,
             socket_path,
@@ -1051,3 +1054,5 @@ class LookupKeyServer:
 
     def close(self):
         self.socket.close(linger=0)
+        if os.path.exists(self._ipc_path):
+            os.unlink(self._ipc_path)
