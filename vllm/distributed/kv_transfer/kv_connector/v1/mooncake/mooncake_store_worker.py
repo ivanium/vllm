@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+
 """Worker-side logic for MooncakeStoreConnector.
 
 Includes the store worker, transfer threads, lookup server,
@@ -10,6 +12,7 @@ import json
 import os
 import queue
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
@@ -31,6 +34,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data i
     KeyMetadata,
     MooncakeStoreConnectorMetadata,
     ReqMeta,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_metrics import (  # noqa: E501
+    MooncakeStoreConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_scheduler import (  # noqa: E501
     get_zmq_rpc_path_lookup,
@@ -282,6 +288,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         kv_role: str,
         ready_event: threading.Event,
         enable_kv_event: bool = False,
+        xfer_stats: MooncakeStoreConnectorStats | None = None,
+        stats_lock: threading.Lock | None = None,
     ):
         super().__init__(
             store,
@@ -295,6 +303,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.kv_role = kv_role
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
         self.enable_kv_event = enable_kv_event
+        self.xfer_stats = xfer_stats
+        self._stats_lock = stats_lock
 
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
@@ -432,7 +442,17 @@ class KVCacheStoreSendingThread(KVTransferThread):
             current_event.synchronize()
 
         try:
+            _t0 = time.perf_counter()
             res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes)
+            _elapsed = time.perf_counter() - _t0
+            _ok_bytes = sum(
+                (sum(s) if isinstance(s, list) else s)
+                for s, r in zip(sizes, res)
+                if r >= 0
+            )
+            if _ok_bytes > 0 and self.xfer_stats is not None:
+                with self._stats_lock:
+                    self.xfer_stats.record_put(_ok_bytes, _elapsed)
             failed = [i for i, v in enumerate(res) if v < 0]
             if failed:
                 # Compute total bytes attempted for this batch
@@ -486,6 +506,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         tp_rank: int,
         ready_event: threading.Event,
         disk_offload_buffer_budget_bytes: int | None = None,
+        xfer_stats: MooncakeStoreConnectorStats | None = None,
+        stats_lock: threading.Lock | None = None,
     ):
         super().__init__(
             store,
@@ -495,6 +517,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             ready_event,
             name="KVCacheStoreRecvingThread",
         )
+        self.xfer_stats = xfer_stats
+        self._stats_lock = stats_lock
         self.disk_offload_buffer_budget_bytes = disk_offload_buffer_budget_bytes
         self.usable_disk_offload_buffer_budget_bytes = (
             None
@@ -581,9 +605,19 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         try:
             for batch_keys, batch_addrs, batch_sizes in load_batches:
                 current_batch_keys = batch_keys
+                _t0 = time.perf_counter()
                 res = self.store.batch_get_into_multi_buffers(
                     batch_keys, batch_addrs, batch_sizes
                 )
+                _elapsed = time.perf_counter() - _t0
+                _ok_bytes = sum(
+                    (sum(s) if isinstance(s, list) else s)
+                    for s, r in zip(batch_sizes, res)
+                    if r >= 0
+                )
+                if _ok_bytes > 0 and self.xfer_stats is not None:
+                    with self._stats_lock:
+                        self.xfer_stats.record_get(_ok_bytes, _elapsed)
                 failed = [
                     (key, value)
                     for key, value in zip(batch_keys, res, strict=True)
@@ -717,6 +751,14 @@ class MooncakeStoreWorker:
         self.kv_send_thread: KVCacheStoreSendingThread | None = None
         self.kv_recv_thread: KVCacheStoreRecvingThread | None = None
         self.finished_store_req: set[str] = set()
+        self.xfer_stats = MooncakeStoreConnectorStats()
+        self._stats_lock = threading.Lock()
+
+    def get_kv_connector_stats(self) -> MooncakeStoreConnectorStats | None:
+        with self._stats_lock:
+            if self.xfer_stats.is_empty():
+                return None
+            return self.xfer_stats.clone_and_reset()
 
     def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
         """Register a cross-layers KV cache tensor.
@@ -820,6 +862,8 @@ class MooncakeStoreWorker:
                 self.kv_role,
                 ready_event_sending,
                 self.enable_kv_events,
+                xfer_stats=self.xfer_stats,
+                stats_lock=self._stats_lock,
             )
             self.kv_send_thread.start()
 
@@ -831,6 +875,8 @@ class MooncakeStoreWorker:
             self.tp_rank,
             ready_event_recving,
             disk_offload_buffer_budget_bytes=self.disk_offload_buffer_budget_bytes,
+            xfer_stats=self.xfer_stats,
+            stats_lock=self._stats_lock,
         )
         self.kv_recv_thread.start()
         ready_event_recving.wait()

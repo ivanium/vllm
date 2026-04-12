@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_metrics import (
+    SimpleCPUOffloadConnectorStats,
+)
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
@@ -62,6 +65,21 @@ class SimpleCPUOffloadWorker:
         self._pending_store_event_indices: set[int] = set()
         # Completed store events to report via build_connector_worker_meta
         self._completed_store_events: dict[int, int] = {}
+
+    def get_kv_connector_stats(
+        self,
+    ) -> SimpleCPUOffloadConnectorStats | None:
+        """Drain transfer stats from the copy backend."""
+        raw = self._backend.drain_transfer_stats()
+        if not raw:
+            return None
+        stats = SimpleCPUOffloadConnectorStats()
+        for num_bytes, duration, is_store in raw:
+            if is_store:
+                stats.record_store(num_bytes, duration)
+            else:
+                stats.record_load(num_bytes, duration)
+        return stats
 
     def register_kv_caches(
         self,
