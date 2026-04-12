@@ -128,6 +128,9 @@ class SimpleCPUOffloadScheduler:
         # the worker reports completions by event index, not request id.
         self._load_event_to_reqs: dict[int, list[str]] = {}
 
+        # CPU eviction tracking
+        self.cpu_eviction_count = 0
+
         # Store metadata
         self._lazy_mode = lazy_offload
         # Lazy mode: use a cursor to track the last scanned block in the GPU free queue.
@@ -429,7 +432,14 @@ class SimpleCPUOffloadScheduler:
 
         # Batch-allocate CPU blocks and stamp hashes.
         if gpu_ids:
+            cached_before = len(cpu_pool.cached_block_hash_to_block)
             cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
+            evicted = cached_before - len(cpu_pool.cached_block_hash_to_block)
+            if evicted > 0:
+                self.cpu_eviction_count += evicted
+                logger.info(
+                    "SimpleCPUOffload: evicted %d cached CPU blocks "
+                    "(total: %d)", evicted, self.cpu_eviction_count)
             cpu_ids = [blk.block_id for blk in cpu_blocks]
             for cpu_blk, bhash in zip(cpu_blocks, block_hashes):  # type: ignore[assignment]
                 cpu_blk._block_hash = bhash  # type: ignore[assignment]
@@ -547,7 +557,16 @@ class SimpleCPUOffloadScheduler:
             # --- Phase 2: Batch allocate CPU blocks and stamp hashes ---
             n_to_alloc = len(gpu_block_ids)
             if n_to_alloc > 0:
+                cached_before = len(
+                    cpu_block_pool.cached_block_hash_to_block)
                 cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
+                evicted = cached_before - len(
+                    cpu_block_pool.cached_block_hash_to_block)
+                if evicted > 0:
+                    self.cpu_eviction_count += evicted
+                    logger.info(
+                        "SimpleCPUOffload: evicted %d cached CPU blocks "
+                        "(total: %d)", evicted, self.cpu_eviction_count)
                 cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
                 for cpu_blk, bhash in zip(cpu_blocks_alloc, block_hashes_to_store):
                     cpu_blk._block_hash = bhash  # type: ignore[assignment]
