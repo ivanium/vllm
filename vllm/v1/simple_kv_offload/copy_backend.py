@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
 
 import torch
 
@@ -32,9 +31,6 @@ class DmaCopyBackend:
         self._queue: queue.SimpleQueue | None = None
         self._thread: threading.Thread | None = None
         self._shutdown: bool = False
-        # Transfer stats: list of (num_bytes, duration_s, is_store)
-        self._transfer_stats: list[tuple[int, float, bool]] = []
-        self._stats_lock = threading.Lock()
 
     def init(
         self,
@@ -53,18 +49,10 @@ class DmaCopyBackend:
         self._queue = queue.SimpleQueue()
         self._thread = threading.Thread(
             target=self._copy_loop,
-            args=(self._queue, device, load_stream, store_stream,
-                  self._transfer_stats, self._stats_lock),
+            args=(self._queue, device, load_stream, store_stream),
             daemon=True,
         )
         self._thread.start()
-
-    def drain_transfer_stats(self) -> list[tuple[int, float, bool]]:
-        """Return and clear collected transfer stats."""
-        with self._stats_lock:
-            stats = self._transfer_stats
-            self._transfer_stats = []
-            return stats
 
     def launch_copy(
         self,
@@ -95,8 +83,6 @@ class DmaCopyBackend:
         device: torch.device,
         load_stream: torch.cuda.Stream,
         store_stream: torch.cuda.Stream,
-        transfer_stats: list[tuple[int, float, bool]],
-        stats_lock: threading.Lock,
     ) -> None:
         current_platform.set_device(device)
         while True:
@@ -104,12 +90,7 @@ class DmaCopyBackend:
             if item is None:
                 return
             src_blocks, dst_blocks, params, is_store, event_idx, events_list = item
-            num_bytes = int(sum(params.bpb)) * len(src_blocks)
-            t0 = time.perf_counter()
             copy_blocks(src_blocks, dst_blocks, params)
-            elapsed = time.perf_counter() - t0
-            with stats_lock:
-                transfer_stats.append((num_bytes, elapsed, is_store))
             stream = store_stream if is_store else load_stream
             event = torch.Event()
             event.record(stream)

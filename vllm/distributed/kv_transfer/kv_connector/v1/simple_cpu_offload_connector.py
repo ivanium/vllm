@@ -15,16 +15,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
-    KVConnectorPromMetrics,
-    KVConnectorStats,
-    PromMetric,
-    PromMetricT,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_metrics import (
-    SimpleCPUOffloadConnectorStats,
-    SimpleCPUOffloadPromMetrics,
-)
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
@@ -247,31 +237,6 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self.scheduler_manager is not None:
             return self.scheduler_manager.take_events()
         return []
-
-    def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        if self.connector_worker is None:
-            return None
-        return self.connector_worker.get_kv_connector_stats()
-
-    @classmethod
-    def build_kv_connector_stats(
-        cls, data: dict[str, Any] | None = None
-    ) -> KVConnectorStats | None:
-        if data is not None:
-            return SimpleCPUOffloadConnectorStats(data=data)
-        return SimpleCPUOffloadConnectorStats()
-
-    @classmethod
-    def build_prom_metrics(
-        cls,
-        vllm_config: Any,
-        metric_types: dict[type[PromMetric], type[PromMetricT]],
-        labelnames: list[str],
-        per_engine_labelvalues: dict[int, list[object]],
-    ) -> KVConnectorPromMetrics | None:
-        return SimpleCPUOffloadPromMetrics(
-            vllm_config, metric_types, labelnames, per_engine_labelvalues
-        )
 
     def reset_cache(self) -> bool | None:
         raise NotImplementedError(

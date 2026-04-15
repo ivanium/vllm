@@ -19,22 +19,23 @@ _BYTES_PER_MIB = 2**20
 
 @dataclass
 class MooncakeStoreConnectorStats(KVConnectorStats):
-    """Transfer stats for MooncakeStoreConnector.
-
-    Records per-transfer (bytes, duration, transfer_type) tuples.
-    transfer_type is either "mooncake_store_put" or "mooncake_store_get".
-    """
+    """Transfer stats for MooncakeStoreConnector."""
 
     def __post_init__(self):
         if not self.data:
             self.reset()
 
     def reset(self):
-        self.data: dict[str, list] = {
+        self.data = {
             "mooncake_store_put_bytes": [],
             "mooncake_store_put_duration": [],
             "mooncake_store_get_bytes": [],
             "mooncake_store_get_duration": [],
+            "mooncake_store_put_failed_batches": [],
+            "mooncake_store_put_failed_keys": [],
+            "mooncake_store_put_transfer_fail_keys": [],
+            "mooncake_store_put_no_available_handle_keys": [],
+            "mooncake_store_put_other_failed_keys": [],
         }
 
     def record_put(self, num_bytes: int, time_s: float):
@@ -45,14 +46,30 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
         self.data["mooncake_store_get_bytes"].append(num_bytes)
         self.data["mooncake_store_get_duration"].append(time_s)
 
+    def record_put_failures(
+        self,
+        failed_batches: int,
+        failed_keys: int,
+        transfer_fail_keys: int,
+        no_available_handle_keys: int,
+        other_failed_keys: int,
+    ):
+        self.data["mooncake_store_put_failed_batches"].append(failed_batches)
+        self.data["mooncake_store_put_failed_keys"].append(failed_keys)
+        self.data["mooncake_store_put_transfer_fail_keys"].append(
+            transfer_fail_keys
+        )
+        self.data["mooncake_store_put_no_available_handle_keys"].append(
+            no_available_handle_keys
+        )
+        self.data["mooncake_store_put_other_failed_keys"].append(other_failed_keys)
+
     def clone_and_reset(self) -> MooncakeStoreConnectorStats:
         snapshot = MooncakeStoreConnectorStats(data=copy.deepcopy(self.data))
         self.reset()
         return snapshot
 
-    def aggregate(
-        self, other: KVConnectorStats
-    ) -> MooncakeStoreConnectorStats:
+    def aggregate(self, other: KVConnectorStats) -> MooncakeStoreConnectorStats:
         if other.is_empty():
             return self
         for key in self.data:
@@ -67,8 +84,7 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
     def _percentile(sorted_vals: list[float], p: float) -> float:
         if not sorted_vals:
             return 0.0
-        idx = int(len(sorted_vals) * p / 100)
-        idx = min(idx, len(sorted_vals) - 1)
+        idx = min(int(len(sorted_vals) * p / 100), len(sorted_vals) - 1)
         return sorted_vals[idx]
 
     def reduce(self) -> dict[str, int | float]:
@@ -99,7 +115,6 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
                 total_mib / total_time if total_time > 0 else 0.0, 3
             )
 
-            # Per-transfer throughput percentiles (MiB/s)
             per_xfer_tp = sorted(
                 (b / _BYTES_PER_MIB) / t if t > 0 else 0.0
                 for b, t in zip(bytes_list, dur_list)
@@ -114,7 +129,6 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
                 self._percentile(per_xfer_tp, 99), 3
             )
 
-            # Per-transfer latency percentiles (ms)
             sorted_dur_ms = sorted(t * 1e3 for t in dur_list)
             reduced[f"mooncake_store_{direction}_lat_p50_ms"] = round(
                 self._percentile(sorted_dur_ms, 50), 3
@@ -125,11 +139,23 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
             reduced[f"mooncake_store_{direction}_lat_p99_ms"] = round(
                 self._percentile(sorted_dur_ms, 99), 3
             )
+
+        for key in (
+            "mooncake_store_put_failed_batches",
+            "mooncake_store_put_failed_keys",
+            "mooncake_store_put_transfer_fail_keys",
+            "mooncake_store_put_no_available_handle_keys",
+            "mooncake_store_put_other_failed_keys",
+        ):
+            values = self.data.get(key, [])
+            if values:
+                reduced[key] = sum(values)
+
         return reduced
 
 
 class MooncakeStorePromMetrics(KVConnectorPromMetrics):
-    """Prometheus metrics for MooncakeStoreConnector put/get transfers."""
+    """Prometheus metrics for MooncakeStoreConnector transfers."""
 
     def __init__(
         self,
@@ -143,8 +169,18 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         )
 
         duration_buckets = [
-            0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
-            1.0, 5.0,
+            0.0005,
+            0.001,
+            0.002,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            5.0,
         ]
         bytes_buckets = [2 ** (10 + i) for i in range(1, 25, 2)]
 
@@ -152,8 +188,8 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
             hist_dur = self._histogram_cls(
                 name=f"vllm:mooncake_store_{direction}_duration_seconds",
                 documentation=(
-                    f"Histogram of Mooncake Store {direction} transfer "
-                    f"duration in seconds."
+                    f"Histogram of Mooncake Store {direction} transfer duration "
+                    "in seconds."
                 ),
                 buckets=duration_buckets,
                 labelnames=labelnames,
@@ -176,14 +212,43 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
             setattr(
                 self,
                 f"hist_{direction}_bytes",
-                create_metric_per_engine(
-                    hist_bytes, self.per_engine_labelvalues
-                ),
+                create_metric_per_engine(hist_bytes, self.per_engine_labelvalues),
             )
 
-    def observe(
-        self, transfer_stats_data: dict[str, Any], engine_idx: int = 0
-    ):
+        for counter_name, doc in (
+            (
+                "put_failed_batches",
+                "Number of Mooncake Store put batches with at least one failed key.",
+            ),
+            (
+                "put_failed_keys",
+                "Number of failed Mooncake Store put keys.",
+            ),
+            (
+                "put_transfer_fail_keys",
+                "Number of Mooncake Store put keys failed by transfer errors.",
+            ),
+            (
+                "put_no_available_handle_keys",
+                "Number of Mooncake Store put keys failed by NO_AVAILABLE_HANDLE.",
+            ),
+            (
+                "put_other_failed_keys",
+                "Number of Mooncake Store put keys failed by other errors.",
+            ),
+        ):
+            counter = self._counter_cls(
+                name=f"vllm:mooncake_store_{counter_name}",
+                documentation=doc,
+                labelnames=labelnames,
+            )
+            setattr(
+                self,
+                f"counter_{counter_name}",
+                create_metric_per_engine(counter, self.per_engine_labelvalues),
+            )
+
+    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         for direction in ("put", "get"):
             dur_key = f"mooncake_store_{direction}_duration"
             bytes_key = f"mooncake_store_{direction}_bytes"
@@ -194,3 +259,15 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
                 dur_hist[engine_idx].observe(val)
             for val in transfer_stats_data.get(bytes_key, []):
                 bytes_hist[engine_idx].observe(val)
+
+        for metric_name in (
+            "put_failed_batches",
+            "put_failed_keys",
+            "put_transfer_fail_keys",
+            "put_no_available_handle_keys",
+            "put_other_failed_keys",
+        ):
+            data_key = f"mooncake_store_{metric_name}"
+            counter = getattr(self, f"counter_{metric_name}")
+            for val in transfer_stats_data.get(data_key, []):
+                counter[engine_idx].inc(val)
