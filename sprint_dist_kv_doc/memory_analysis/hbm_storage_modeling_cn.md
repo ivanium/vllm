@@ -1,4 +1,4 @@
-# Kimi-K2.5-NVFP4 推理系统 HBM 存储建模
+# HBM Storage Modeling for the Kimi K2.5 NVFP4 Inference System
 
 > 基于实验 `pd_kimi_bench_a_70k` (2026-04-11 01:24) 的实际配置和日志数据
 

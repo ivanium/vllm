@@ -1,100 +1,95 @@
-# Kimi-K2.5-NVFP4 主模型 Roofline 建模
+# Kimi K2.5 NVFP4 Main Model Roofline Modeling
 
-> 目标: 从主模型 `nvidia/Kimi-K2.5-NVFP4` 出发，估算它在当前 `GB200/B200 + TP=4` 机器上的理论计算强度，判断在什么 batch 规模下会从 HBM 带宽受限切到算力受限，并把这个结论映射到当前 `pd_kimi_bench_a_70k` 的 `prefill/decode` 配置。
-
----
-
-## 1. 结论先看
-
-先给出这次最重要的几个结论:
-
-- **机器 roofline**: 按当前机器文档和 NVIDIA 官方 `GB200 NVL72` 规格页，单 GPU 取 **`HBM = 8 TB/s`**、**`BF16 dense = 2.5 PFLOPS`**，所以 **ridge point = `312.5 FLOP/B`**。
-- **主模型结构**: `Kimi-K2.5-NVFP4` 的主干是 **`61` 层**，其中 **第 `0` 层是 dense FFN**，其余 **`60` 层是 MoE**。`self_attn` 权重保持 **BF16**，MoE/FFN Linear 权重走 **NVFP4**。
-- **单层 matmul FLOPs 很整齐**: 在 `TP=4` 下，
-  - attention 投影部分约 **`73.27M FLOPs/token/GPU`**
-  - dense FFN 约 **`198.18M FLOPs/token/GPU`**
-  - MoE 层里 `8 routed + 1 shared` 合起来也约 **`198.18M FLOPs/token/GPU`**
-  - 所以任意一层的 matmul 总量都约 **`271.45M FLOPs/token/GPU`**
-- **如果只看 dense first layer**，整体 AI 在 **`M ~= 170`** 左右就能摸到 BF16 roofline。
-- **但如果看真实的整模型**，MoE token 会分散到很多 expert，导致 decode 时专家 GEMM 很难做大。用 occupancy 近似后，**全模型的 ridge crossing 在 `M ~= 4554 tokens/step`**，远大于 decode 现实可达范围。
-- **当前 benchmark 的 operating point**:
-  - decode: `max_num_seqs = 16`，全模型 AI 只有 **`~5.8 FLOP/B`**
-  - prefill: `max_num_batched_tokens = 8192`，全模型 AI 约 **`429 FLOP/B`**
-  - 也就是说，**当前 Kimi 主模型 decode 明显是 HBM/权重流量主导，而 prefill 大 chunk 已经进入 compute-bound 区间附近甚至之上**
-
-换句话说:
-
-- 如果目标是优化 **decode**，主矛盾不是“batch 再加一点就能吃满算力”，而是 **MoE 小 GEMM + weight traffic + routing 分散**。
-- 如果目标是优化 **prefill**，`8192` 这个 chunk size 从纯 roofline 看已经不低了，再增大 batch 的边际收益更多会体现在 **减少 chunk 数和调度开销**，而不是继续提升主 GEMM 的算术强度。
+> Goal: Starting from the main model `nvidia/Kimi-K2.5-NVFP4`, estimate its theoretical computing intensity on the current `GB200/B200 + TP=4` machine, determine at what batch size it will switch from HBM bandwidth limited to computing power limited, and map this conclusion to the `prefill/decode` configuration of the current `pd_kimi_bench_a_70k`.
 
 ---
 
-## 2. 机器 Roofline 参数
+## 1. Let’s look at the conclusion first
 
-### 2.1 HBM 带宽
+Let’s first give some of the most important conclusions this time:
 
-本地机器文档中已经记录:
+- **Machine roofline**: According to the current machine documentation and NVIDIA official `GB200 NVL72` specification page, for a single GPU, **`HBM = 8 TB/s`**, **`BF16 dense = 2.5 PFLOPS`**, so **ridge point = `312.5 FLOP/B`**.
+- **Main model structure**: The backbone of `Kimi-K2.5-NVFP4` is **`61` layer**, of which **the `0` layer is dense FFN**, and the remaining **`60` layers are MoE**. `self_attn` weight remains **BF16**, MoE/FFN Linear weight goes **NVFP4**.
+- **Single layer matmul FLOPs are neat**: under `TP=4`,
+  - The attention projection part is about **`73.27M FLOPs/token/GPU`**
+  - dense FFN about **`198.18M FLOPs/token/GPU`**
+  - `8 routed + 1 shared` in the MoE layer adds up to about **`198.18M FLOPs/token/GPU`**
+  - So the total amount of matmul in any layer is about **`271.45M FLOPs/token/GPU`**
+- **If you only look at the dense first layer**, the overall AI can touch the BF16 roofline at around **`M ~= 170`**.
+- **But if you look at the real whole model**, the MoE token will be dispersed to many experts, making it difficult for the expert GEMM to grow during decoding. After approximating with occupancy, the ridge crossing of the full model is at `M ~= 4554 tokens/step`**, which is much larger than the realistic reachable range of decode.
+- **Operating point of current benchmark**:
+  - decode: `max_num_seqs = 16`, the full model AI is only **`~5.8 FLOP/B`**
+  - prefill: `max_num_batched_tokens = 8192`, the full model AI is about **`429 FLOP/B`**
+  - In other words, **The current Kimi main model decode is obviously dominated by HBM/weight traffic, and the prefill large chunk has entered near or even above the compute-bound interval**
 
-- 机型: `NVIDIA GB200 NVL72`
-- 单 GPU HBM: `192 GB HBM3e`
-- 单 GPU HBM 带宽按 **`8 TB/s`** 建模
+In other words:
 
-本地参考:
+- If the goal is to optimize **decode**, the main contradiction is not "adding a little bit to batch can fully consume the computing power", but **MoE small GEMM + weight traffic + routing dispersion**.
+- If the goal is to optimize **prefill**, the chunk size of `8192` is already not low from a pure roofline perspective. The marginal benefit of increasing the batch size will be more reflected in **reducing the number of chunks and scheduling overhead**, rather than continuing to increase the arithmetic intensity of the main GEMM.
 
-- `vllm/sprint_dist_kv_docs/doc.md`
+---
 
-### 2.2 GB200/B200 理论算力
+## 2. Machine Roofline parameters
 
-NVIDIA 官方 `GB200 NVL72` 页面给出的 `GB200 Grace Blackwell Superchip` 规格是:
+### 2.1 HBM bandwidth
+
+It is documented in the local machine documentation:
+
+- Model: `NVIDIA GB200 NVL72`
+- Single GPU HBM: `192 GB HBM3e`
+- Single GPU HBM bandwidth modeled at **`8 TB/s`**
+
+Local reference:- `vllm/sprint_dist_kv_doc/machine_doc.md`
+
+### 2.2 GB200/B200 theoretical computing power
+
+The `GB200 Grace Blackwell Superchip` specifications given on NVIDIA’s official `GB200 NVL72` page are:
 
 - `FP16/BF16 Tensor Core = 10 PFLOPS`
 - `GPU Memory Bandwidth = 16 TB/s`
 
-同页脚注说明:
+Footnote on the same page:
 
 - `Specification in sparse. Dense is one-half sparse spec shown.`
 
-因此换算成 **dense**，再除以 **`2 GPU / superchip`**，得到单 GPU:
+Therefore, converted to **dense** and divided by **`2 GPU / superchip`**, we get single GPU:
 
-| 指标 | 每 Superchip 标称 | dense 每 Superchip | dense 每 GPU |
-|------|-------------------|--------------------|--------------|
+| Metrics | Nominal per Superchip | dense per Superchip | dense per GPU |
+|------|-------------------|--------------------|-----------------|
 | BF16 Tensor | `10 PFLOPS` | `5 PFLOPS` | **`2.5 PFLOPS`** |
-| HBM 带宽 | `16 TB/s` | `16 TB/s` | **`8.0 TB/s`** |
+| HBM Bandwidth | `16 TB/s` | `16 TB/s` | **`8.0 TB/s`** |
 
-官方来源:
+Official source:
 
 - https://www.nvidia.com/en-us/data-center/gb200-nvl72/
 
 ### 2.3 Ridge Point
 
-按 roofline 定义:
-
-```text
+Defined by roofline:```text
 ridge_point = peak_compute / peak_bandwidth
             = 2.5e15 / 8.0e12
             = 312.5 FLOP/B
 ```
-
-所以本文统一采用:
+Therefore, this article adopts uniformly:
 
 - **`BF16 ridge = 312.5 FLOP/B`**
 
 ---
 
-## 3. 主模型结构与 TP4 本地形状
+## 3. Main model structure and TP4 local shape
 
-这次建模的对象是:
+The objects of this modeling are:
 
 - `/mnt/lustre/hf-models/hub/models--nvidia--Kimi-K2.5-NVFP4/snapshots/c0285e649c34d4386b01e38abca642c06cbe014e`
 
-配置来自:
+Configuration from:
 
 - `config.json`
 - `vllm/model_executor/models/deepseek_v2.py`
 
-### 3.1 关键模型参数
+### 3.1 Key model parameters
 
-| 参数 | 值 |
+| Parameter | Value |
 |------|----|
 | `hidden_size` | `7168` |
 | `num_hidden_layers` | `61` |
@@ -111,55 +106,48 @@ ridge_point = peak_compute / peak_bandwidth
 | `n_shared_experts` | `1` |
 | `first_k_dense_replace` | `1` |
 
-### 3.2 结构解释
+### 3.2 Structure explanation
 
-从 `DeepseekV2DecoderLayer` 可以直接看出:
+It can be seen directly from `DeepseekV2DecoderLayer`:
 
-- 第 `0` 层使用 `DeepseekV2MLP(intermediate_size=18432)`，是 **dense FFN**
-- 第 `1~60` 层使用 `DeepseekV2MoE`
-- `DeepseekV2MoE` 里:
-  - routed expert 的 `intermediate_size = moe_intermediate_size = 2048`
-  - shared expert 的 `intermediate_size = moe_intermediate_size * n_shared_experts = 2048`
+- Layer `0` uses `DeepseekV2MLP(intermediate_size=18432)`, which is **dense FFN**
+- Layers `1~60` use `DeepseekV2MoE`
+- In `DeepseekV2MoE`:
+  - routed expert's `intermediate_size = moe_intermediate_size = 2048`
+  - `intermediate_size = moe_intermediate_size * n_shared_experts = 2048` for shared expert
 
-这点很重要，因为它意味着 **shared expert 不是 `18432` 宽，而是也只有 `2048` 宽**。
+This is important because it means that shared expert is not 18432 wide, but only 2048 wide.
 
-### 3.3 TP=4 下每 GPU 的主要 GEMM 形状
+### 3.3 Main GEMM shapes per GPU under TP=4
 
-对当前 `TP=4`，每 GPU 上主模型的主要 matmul 可近似写成:
+For the current `TP=4`, the main matmul of the main model on each GPU can be approximately written as:
 
-| 模块 | 本地 `K x N` | 权重类型 | 备注 |
+| Module | Local `K x N` | Weight type | Remarks |
 |------|--------------|----------|------|
 | `fused_qkv_a_proj` | `7168 x 2112` | BF16 | replicated |
 | `q_b_proj` | `1536 x 3072` | BF16 | column parallel |
 | `kv_b_proj` | `512 x 4096` | BF16 | column parallel |
 | `o_proj` | `2048 x 7168` | BF16 | row parallel |
 | `dense gate_up_proj` | `7168 x 9216` | NVFP4 | `2 * 18432 / 4` |
-| `dense down_proj` | `4608 x 7168` | NVFP4 | `18432 / 4` |
+| `dense down_proj` | `4608 x 7168` | NVFP4 | `18432/4` |
 | `expert gate_up_proj` | `7168 x 1024` | NVFP4 | `2 * 2048 / 4` |
-| `expert down_proj` | `512 x 7168` | NVFP4 | `2048 / 4` |
+| `expert down_proj` | `512 x 7168` | NVFP4 | `2048/4` |Among them:
 
-其中:
-
-- attention 权重未量化，所以按 **BF16 weight traffic**
-- FFN/MoE 权重是 NVFP4，本文采用 **`0.5625 B/param`** 的近似权重字节成本
+-The attention weight is not quantized, so press **BF16 weight traffic**
+- FFN/MoE weight is NVFP4, this article uses an approximate weight byte cost of **`0.5625 B/param`**
 
 ---
 
-## 4. 每个模块的理论 FLOPs
+## 4. Theoretical FLOPs for each module
 
-对 GEMM `A[M,K] x B[K,N]`，按最常见近似:
-
-```text
+For GEMM `A[M,K] x B[K,N]`, according to the most common approximation:```text
 FLOPs = 2 * M * K * N
 ```
+Let’s first look at the matmul FLOPs of **per token/per GPU**, that is, let `M = 1`.
 
-这里先看 **每 token / 每 GPU** 的 matmul FLOPs，也就是令 `M = 1`。
+### 4.1 Attention projection
 
-### 4.1 Attention 投影
-
-四个主投影合起来:
-
-```text
+The four main projections combined:```text
 fused_qkv_a_proj = 2 * 7168 * 2112   = 30,261,248
 q_b_proj         = 2 * 1536 * 3072   =  9,437,184
 kv_b_proj        = 2 *  512 * 4096   =  4,194,304
@@ -167,98 +155,79 @@ o_proj           = 2 * 2048 * 7168   = 29,376,512
 ---------------------------------------------------
 attention total                        73,269,248 FLOPs/token/GPU
 ```
-
-### 4.2 第 0 层 dense FFN
-
-```text
+### 4.2 Layer 0 dense FFN```text
 gate_up = 2 * 7168 * 9216 = 132,120,576
 down    = 2 * 4608 * 7168 =  66,060,288
 ----------------------------------------
 dense FFN                  198,180,864 FLOPs/token/GPU
 ```
-
-### 4.3 单个 routed/shared expert
-
-```text
+### 4.3 Single routed/shared expert```text
 gate_up = 2 * 7168 * 1024 = 14,680,064
 down    = 2 *  512 * 7168 =  7,340,032
 ---------------------------------------
 one expert                 22,020,096 FLOPs/token/GPU
 ```
+Currently activated per token:
 
-当前每个 token 激活:
+- `8` routed experts
+- `1` shared expert
 
-- `8` 个 routed experts
-- `1` 个 shared expert
-
-所以单个 MoE 层的 FFN matmul 总量是:
-
-```text
+So the total FFN matmul for a single MoE layer is:```text
 9 * 22,020,096 = 198,180,864 FLOPs/token/GPU
 ```
+This is exactly the same as dense FFN.
 
-这和 dense FFN 完全相同。
+### 4.4 Total FLOPs of single layer and whole model
 
-### 4.4 单层与整模型总 FLOPs
-
-因此:
-
-```text
+Therefore:```text
 per-layer total
 = attention + FFN
 = 73,269,248 + 198,180,864
 = 271,450,112 FLOPs/token/GPU
 ```
-
-整模型 `61` 层:
-
-```text
+Full model `61` layers:```text
 61 * 271,450,112
 = 16,558,456,832 FLOPs/token/GPU
 = 0.01656 TFLOP/token/GPU
 ```
-
-这只是主干 matmul 的理论量，**尚未计入**:
+This is just the theoretical amount of backbone matmul, **not yet taken into account**:
 
 - attention score/value kernel
-- softmax
-- RMSNorm
+-softmax
+-RMSNorm
 - routing/topk
-- all-reduce / all-to-all / 其他通信
-- KV cache 读写
+- all-reduce / all-to-all / other communications
+- KV cache read and write
 
 ---
 
-## 5. Arithmetic Intensity 建模方法
+## 5. Arithmetic Intensity modeling method
 
-### 5.1 单个 GEMM 的 AI
+### 5.1 AI of a single GEMM
 
-对一个 `A[M,K] x B[K,N]`，本文采用最简单的 roofline 近似:
-
-```text
+For an `A[M,K] x B[K,N]`, this article uses the simplest roofline approximation:```text
 FLOPs = 2 * M * K * N
 Bytes = a * (M*K + M*N) + w * (K*N)
 AI    = FLOPs / Bytes
 ```
+Among them:
 
-其中:
+- `a = 2 B` means activation is calculated in BF16
+- `w = 2 B` means BF16 weight
+- `w = 0.5625 B` means NVFP4 weight approximation
 
-- `a = 2 B` 表示 activation 用 BF16 计
-- `w = 2 B` 表示 BF16 权重
-- `w = 0.5625 B` 表示 NVFP4 权重近似
+### 5.2 Critical batch `M*`
 
-### 5.2 临界 batch `M*`
-
-当 `AI(M*) = 312.5 FLOP/B` 时，可以把 `M*` 看成该模块从 bandwidth-bound 切到 compute-bound 的理论拐点。
+When `AI(M*) = 312.5 FLOP/B`, `M*` can be regarded as the theoretical inflection point when the module switches from bandwidth-bound to compute-bound.
 
 ---
 
-## 6. 每个模块的理论计算强度
+## 6. Theoretical calculation intensity of each module
 
-### 6.1 单个 kernel 的 `M*`
+### 6.1 `M*` of a single kernel
 
-| 模块 | `AI(∞)` | `M*_BF16-ridge` |
-|------|---------|-----------------|
+| Module | `AI(∞)` | `M*_BF16-ridge` |
+|------|---------|------------------|
 | `fused_qkv_a_proj` | `1631.34` | `386.55` |
 | `q_b_proj` | `1024.00` | `449.75` |
 | `kv_b_proj` | `455.11` | `997.27` |
@@ -268,81 +237,70 @@ AI    = FLOPs / Bytes
 | `expert gate_up_proj` | `896.00` | `134.96` |
 | `expert down_proj` | `477.87` | `253.98` |
 
-这里可以直接看到:
+You can see it directly here:
 
-- **最难吃满的 attention kernel 是 `kv_b_proj`**
-- **最难吃满的 expert kernel 是 `expert_down_proj`**
-- NVFP4 FFN 的两个 dense GEMM 都比较容易进入 compute-bound
+- **The most difficult attention kernel to fill is `kv_b_proj`**
+- **The most difficult expert kernel to fill up is `expert_down_proj`**
+- Both dense GEMMs of NVFP4 FFN are relatively easy to enter compute-bound
 
-### 6.2 按模块聚合后的 AI
+### 6.2 AI aggregated by module
 
-更接近系统建模的口径，是把多个 kernel 按模块合起来看:
+A closer approach to system modeling is to combine multiple kernels by module:
 
-| 模块 | `M=1` | `M=8` | `M=16` | `M=32` | `M=64` | `M=128` | `M=256` | `M*=312.5` |
+| Module | `M=1` | `M=8` | `M=16` | `M=32` | `M=64` | `M=128` | `M=256` | `M*=312.5` |
 |------|-------|-------|--------|--------|--------|---------|---------|------------|
-| Attention 投影总和 | `1.00` | `7.95` | `15.81` | `31.24` | `61.04` | `116.70` | `214.47` | **`409.24`** |
-| Dense FFN 总和 | `3.55` | `28.22` | `55.98` | `110.21` | `213.73` | `402.99` | `718.95` | **`96.46`** |
-| 单个 expert 总和 | `3.54` | `27.32` | `52.58` | `97.75` | `171.35` | `274.81` | `393.67` | **`159.95`** |
-| 第 0 层整体 | `2.10` | `16.72` | `33.21` | `65.52` | `127.59` | `242.45` | `440.89` | **`170.44`** |
+| Attention projection sum | `1.00` | `7.95` | `15.81` | `31.24` | `61.04` | `116.70` | `214.47` | **`409.24`** |
+| Dense FFN sum | `3.55` | `28.22` | `55.98` | `110.21` | `213.73` | `402.99` | `718.95` | **`96.46`** |
+| Sum of individual expert | `3.54` | `27.32` | `52.58` | `97.75` | `171.35` | `274.81` | `393.67` | **`159.95`** |
+| Tier 0 overall | `2.10` | `16.72` | `33.21` | `65.52` | `127.59` | `242.45` | `440.89` | **`170.44`** |
 
-这个表的解释是:
+The explanation of this table is:
 
-- **如果只看第 0 层 dense layer**，大概 `M ~= 170` 就会碰到 BF16 ridge
-- **attention 投影本身更难吃满**，需要 `M ~= 409`
-- 单个 expert GEMM 也需要 `M ~= 160`
+- **If you only look at the 0th dense layer**, you will encounter the BF16 ridge at about `M ~= 170`
+- **attention projection itself is more difficult to fill** and requires `M ~= 409`
+- A single expert GEMM also requires `M ~= 160`
 
-但 Kimi 的真实瓶颈不在“一个 expert 的 GEMM 太小”，而在于:
+But Kimi’s real bottleneck is not that “an expert’s GEMM is too small”, but rather:
 
-- decode 时一个 batch 里的 token 被分散到很多 expert
-- 每个 expert 实际吃到的 `M_expert` 往往接近 `1`
-
-所以还需要单独建模 MoE occupancy。
+- During decoding, tokens in a batch are dispersed to many experts
+- The actual `M_expert` received by each expert is often close to `1`So MoE occupancy also needs to be modeled separately.
 
 ---
 
-## 7. MoE Occupancy 建模
+## 7. MoE Occupancy Modeling
 
-### 7.1 为什么 MoE 需要单独算
+### 7.1 Why MoE needs to be calculated separately
 
-虽然一个 token 理论上会经过 `8 routed + 1 shared` 个 expert，总 FLOPs 看起来和 dense FFN 一样，但 decode 时真正执行的不是“一个大 FFN GEMM”，而是:
+Although a token will theoretically go through 8 routed + 1 shared experts, and the total FLOPs look the same as dense FFN, what is actually executed during decoding is not "a large FFN GEMM", but:
 
-- 先做 routing
-- 再把 batch 内 token 分发到不同 expert
-- 每个 expert 各自做一个更小的 GEMM
+- Do routing first
+- Then distribute the tokens in the batch to different experts
+- Each expert makes a smaller GEMM
 
-如果 batch 内 token 被分散到很多 expert，那么单 expert 的 `M` 会很小，算术强度就上不去。
+If the tokens in the batch are dispersed to many experts, then the `M` of a single expert will be very small, and the arithmetic strength will not increase.
 
-### 7.2 简化 occupancy 模型
+### 7.2 Simplified occupancy model
 
-对一个全局 batch `M`，当前配置中 routed expert 的总 token slot 数是:
-
-```text
+For a global batch `M`, the total number of token slots of routed expert in the current configuration is:```text
 slots = 8 * M
 ```
-
-对 `384` 个 expert，采用独立均匀落点近似，可得活跃 expert 数:
-
-```text
+For `384` experts, using independent uniform landing point approximation, the number of active experts can be obtained:```text
 E_active(M) ~= 384 * ( 1 - (1 - 1/384)^(8M) )
 ```
-
-那么单个活跃 expert 的平均 token 数就是:
-
-```text
+Then the average number of tokens for a single active expert is:```text
 m_expert(M) ~= 8M / E_active(M)
 ```
-
-于是 MoE 层的 AI 不能再用“一个大 FFN”去估，而要用:
+Therefore, the AI of the MoE layer can no longer be estimated using "a large FFN", but must be estimated using:
 
 - `attention(M)`
-- `E_active` 个 routed expert 小 GEMM
-- `1` 个 shared expert GEMM
+- `E_active` routed expert small GEMM
+- `1` shared expert GEMM
 
-一起求总 `FLOPs / Bytes`。
+Together we find the total `FLOPs / Bytes`.
 
-### 7.3 MoE 层与整模型的 AI
+### 7.3 AI of MoE layer and whole model
 
-| `M` | `E_active` | 平均 `m_expert` | MoE layer AI | Full model AI |
+| `M` | `E_active` | Average `m_expert` | MoE layer AI | Full model AI |
 |-----|------------|------------------|--------------|---------------|
 | `1` | `7.9` | `1.01` | `2.11` | `2.11` |
 | `4` | `30.7` | `1.04` | `4.00` | `4.04` |
@@ -355,144 +313,139 @@ m_expert(M) ~= 8M / E_active(M)
 | `512` | `384.0` | `10.67` | `52.80` | `53.62` |
 | `8192` | `384.0` | `170.67` | `423.40` | `429.03` |
 
-用同样的方法求 ridge crossing，可得:
+Using the same method to find ridge crossing, we can get:
 
 - **MoE layer**: `M ~= 4659`
 - **Full model**: `M ~= 4554`
 
-这个结果其实就是本文最核心的结论:
+This result is actually the core conclusion of this article:
 
-- **Kimi 的 dense first layer 并不难吃满**
-- **真正把整模型一直拖在 memory-bound 区间里的，是 decode 时 MoE expert occupancy 太碎**
+- **Kimi’s dense first layer is not difficult to eat**
+- **What really keeps the entire model in the memory-bound range is that MoE expert occupancy is too broken during decoding**
 
 ---
 
-## 8. 映射到当前 `pd_kimi_bench_a_70k`
+## 8. Map to current `pd_kimi_bench_a_70k`
 
-本 benchmark 的关键调度参数来自:
+The key scheduling parameters of this benchmark come from:
 
 - `vigil/examples/pd_kimi_bench_a_70k.yaml`
-- `workload_analysis_pd_kimi_70k.md`
-- 2026-04-11 的 prefill / decode 实际日志
+- `workload_analysis/workload_analysis_pd_kimi_70k.md`
+- Actual prefill/decode logs from 2026-04-11
 
-### 8.1 当前配置
+### 8.1 Current configuration
 
-| 侧 | 关键参数 | 值 |
+| Side | Key Parameters | Value |
 |----|----------|----|
 | Prefill | `max_num_batched_tokens` | `8192` |
 | Prefill | `max_num_seqs` | `16` |
 | Decode | `max_num_batched_tokens` | `8192` |
 | Decode | `max_num_seqs` | `16` |
-| 两侧 | `tensor_parallel_size` | `4` |
-| 两侧 | `pipeline_parallel_size` | `1` |
+| Both sides | `tensor_parallel_size` | `4` |
+| Both sides | `pipeline_parallel_size` | `1` |
 
-其中:
+Among them:
 
-- prefill 侧日志可以直接看到 `BatchDescriptor(num_tokens=8192, ...)`
-- decode 侧是 token 级 step，理论上限主要受 `max_num_seqs = 16` 约束
+- The prefill side log can directly see `BatchDescriptor(num_tokens=8192, ...)`
+- The decode side is a token-level step, and the theoretical upper limit is mainly constrained by `max_num_seqs = 16`
 
-### 8.2 当前 operating point
+### 8.2 Current operating point
 
-把这些 batch 点投到上面的 AI 曲线上:
+Plot these batch points onto the AI curve above:
 
-| 场景 | 代表 `M` | Full model AI | 与 ridge `312.5` 的关系 |
+| Scenario | Represents `M` | Full model AI | Relationship with ridge `312.5` |
 |------|----------|---------------|--------------------------|
-| 小 decode | `4` | `4.04` | **远低于 ridge** |
-| decode 上限 | `16` | `5.79` | **远低于 ridge** |
-| 中等 prefill | `128` | `15.10` | **远低于 ridge** |
-| 当前 prefill chunk | `8192` | `429.03` | **高于 ridge** |
+| small decode | `4` | `4.04` | **much lower than ridge** |
+| decode upper limit | `16` | `5.79` | **much lower than ridge** |
+| Medium prefill | `128` | `15.10` | **much lower than ridge** |
+| Current prefill chunk | `8192` | `429.03` | **Above ridge** |So you can get it directly:
 
-于是可以直接得到:
+1. **Decode is almost impossible to enter compute-bound based on the current batch**
+   Even if `max_num_seqs` is raised from `16` to `64`, full-model AI is only `9.52 FLOP/B`; raising `128` is only `15.10 FLOP/B`. It is still more than an order of magnitude away from `312.5`.
 
-1. **Decode 几乎不可能靠当前 batch 进入 compute-bound**  
-   即使把 `max_num_seqs` 从 `16` 提到 `64`，full-model AI 也只有 `9.52 FLOP/B`；提到 `128` 也才 `15.10 FLOP/B`。离 `312.5` 还差一个数量级以上。
+2. **Prefill’s large chunk is already large enough**
+   When `M = 8192`, the main model has entered the compute-bound region from the pure GEMM roofline. Continuing to increase the prefill batch will not significantly increase the arithmetic intensity like a small batch.
 
-2. **Prefill 的大 chunk 已经足够大**  
-   `M = 8192` 时，主模型从纯 GEMM roofline 看已经进入 compute-bound 区域。继续增大 prefill batch，不会像小 batch 那样显著提升算术强度。
-
-3. **因此 prefill 和 decode 的优化方向应该分开**  
-   - prefill 更像是 **chunk 数、调度、KV/activation/编译开销** 问题  
-   - decode 更像是 **MoE 小 GEMM、权重复用差、HBM traffic** 问题
+3. **Therefore the optimization directions of prefill and decode should be separated**
+   - prefill is more like **chunk number, scheduling, KV/activation/compilation overhead** issues
+   - decode is more like **MoE small GEMM, poor weight reuse, HBM traffic** problems
 
 ---
 
-## 9. 对当前系统的直接启发
+## 9. Direct inspiration for current systems
 
-### 9.1 Decode 侧
+### 9.1 Decode side
 
-如果问题是 decode 慢，那么从这份建模看:
+If the problem is slow decoding, then look at this modeling:
 
-- **单纯调大 `max_num_seqs` 不会让 Kimi decode 很快撞上算力墙**
-- 当前 decode 仍然深处 **memory-bound**
-- 主矛盾更可能是:
-  - MoE expert occupancy 碎片化
-  - NVFP4 权重流量
-  - attention / MoE kernel launch 与调度开销
-  - 通信与 KV 读写
+- **Simply increasing `max_num_seqs` will not make Kimi decode hit the computing power wall quickly**
+- The current decode is still deeply **memory-bound**
+- The main contradiction is more likely to be:
+  - MoE expert occupancy fragmentation
+  - NVFP4 weighted traffic
+  - attention / MoE kernel launch and scheduling overhead
+  - Communication and KV reading and writing
 
-因此 decode 侧更值得看的方向是:
+Therefore, the direction worth looking at on the decode side is:
 
-- expert packing / grouped dispatch
-- 更高 expert occupancy
-- 更少的 MoE launch/dispatch overhead
-- speculative decode 是否真的提升了 target-side 有效 occupancy
+- expert packing/grouped dispatch
+- Higher expert occupancy
+- Less MoE launch/dispatch overhead
+- Whether speculative decode really improves target-side effective occupancy
 
-### 9.2 Prefill 侧
+### 9.2 Prefill side
 
-如果问题是 prefill 慢，那么从 roofline 看:
+If the problem is that prefill is slow, then look at the roofline:
 
-- `8192` 已经足够大
-- 再往上增大 `max_num_batched_tokens` 的收益，更多可能来自:
-  - 更少的 chunk 数
-  - 更少的 scheduler 轮转
-  - 更低的 per-chunk 固定开销
+- `8192` is big enough
+- Further increase the income of `max_num_batched_tokens`, more may come from:
+  - Fewer chunks
+  - Fewer scheduler rotations
+  - Lower per-chunk fixed overhead
 
-而不是继续通过提高 AI 去吃满更多算力。
+Instead of continuing to improve AI to gain more computing power.
 
-这和你们前面的 workload 分析是对得上的:
+This is consistent with your previous workload analysis:
 
-- `70K` tokens/turn 在 `8192` chunk 下需要大约 `9` 个 prefill chunk
-- 所以 prefill 的瓶颈很可能已经从“算强不够”转移到了“chunk 太多”
+- `70K` tokens/turn requires about `9` prefill chunks under `8192` chunk
+- So the bottleneck of prefill has probably shifted from "not strong enough" to "too many chunks"
 
 ---
 
-## 10. 建模边界与注意事项
+## 10. Modeling boundaries and considerations
 
-这份文档是一个 **主干 GEMM + HBM roofline** 模型，故意忽略了很多真实系统因素。下面这些开销都还没有算进去:
+This document is a **backbone GEMM + HBM roofline** model that deliberately ignores many real system factors. The following expenses have not yet been taken into account:
 
-- attention score / value kernel
-- softmax / norm / activation
-- MoE routing 和 topk
+-attention score / value kernel
+- softmax/norm/activation
+- MoE routing and topk
 - TP all-reduce
-- expert parallel / all-to-all
-- KV cache 读写
-- CUDA Graph / compile 形状约束
-- kernel fusion 和 launch overhead
+- expert parallel/all-to-all
+- KV cache read and write
+- CUDA Graph / compile shape constraints
+- kernel fusion and launch overhead
 
-因此:
+Therefore:
 
-- 这里的 `M*` 应该理解为 **“纯 roofline 意义上的第一拐点”**
-- 不应被理解为“真实系统到这个 batch 一定不再涨速”
-- 特别是 decode 场景，真实瓶颈通常会比这份模型更偏 memory-bound
+- `M*` here should be understood as **"the first turning point in the pure roofline sense"**
+- It should not be understood as "the real system will definitely no longer increase in speed by this batch"
+- Especially in decoding scenarios, the real bottleneck is usually more memory-bound than this model.
 
 ---
 
-## 11. 最终总结
+## 11. Final summaryFor the current `Kimi-K2.5-NVFP4` main model on `GB200/B200 + TP=4`:
 
-对当前 `Kimi-K2.5-NVFP4` 主模型在 `GB200/B200 + TP=4` 上:
+- Single GPU machine roofline takes **`2.5 PFLOPS BF16 dense`** and **`8 TB/s HBM`**
+- Corresponding to **ridge point = `312.5 FLOP/B`**
+- The overall roofline inflection point of **layer 0 dense layer** is at **`M ~= 170`**
+- The inflection point of **attention projection sum** is at **`M ~= 409`**
+- **Real Whole Model** Because of MoE expert occupancy dispersion, the inflection point is postponed to **`M ~= 4554`**
 
-- 单 GPU 机器 roofline 取 **`2.5 PFLOPS BF16 dense`** 和 **`8 TB/s HBM`**
-- 对应 **ridge point = `312.5 FLOP/B`**
-- **第 0 层 dense layer** 的整体 roofline 拐点在 **`M ~= 170`**
-- **attention 投影总和** 的拐点在 **`M ~= 409`**
-- **真实整模型** 因为 MoE expert occupancy 分散，拐点被推迟到 **`M ~= 4554`**
+Map to current benchmark:
 
-映射到当前 benchmark:
+- **decode (`M <= 16`) obviously memory-bound**
+- **prefill (`M = 8192`) has entered the compute-bound area**
 
-- **decode (`M <= 16`) 明显深处 memory-bound**
-- **prefill (`M = 8192`) 已经进入 compute-bound 区域**
+Therefore, one of the most practical judgments is:
 
-因此一个最实用的判断是:
-
-- **Kimi 主模型当前不缺 prefill batch 强度，缺的是 decode 侧的有效 expert occupancy 和更低的 memory traffic**
-
+- **Kimi’s main model currently does not lack prefill batch strength, but what it lacks is effective expert occupancy and lower memory traffic on the decode side**

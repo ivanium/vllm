@@ -1,4 +1,4 @@
-# 实验结果：Kimi NVFP4 PD 1P1D TP4 — 70K 长上下文多轮对话 Benchmark
+# Experiment Results: Kimi NVFP4 PD 1P1D TP4 - 70K Long-Context Multi-Turn Benchmark
 
 ## 实验概要
 

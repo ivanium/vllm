@@ -1,4 +1,4 @@
-# NVL72 GB200 集群存储与 KV Cache 分层缓存架构文档
+# NVL72 GB200 Cluster Storage and Layered KV Cache Architecture
 
 ## 1. 集群概览
 

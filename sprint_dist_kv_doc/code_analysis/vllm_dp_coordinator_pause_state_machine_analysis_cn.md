@@ -1,8 +1,8 @@
-# vLLM 中 DP>1 的 DPCoordinator / pause-start-wait 状态机分析
+# DPCoordinator Pause-Start-Wait State Machine Analysis for DP>1 in vLLM
 
 基于当前工作区代码：
 
-- `/home/aoshen/setup_new_cluster/vllm`
+- `<repo-root>`
 - 重点分析 `vllm/v1/engine/*`、`vllm/v1/core/sched/*`
 
 ---

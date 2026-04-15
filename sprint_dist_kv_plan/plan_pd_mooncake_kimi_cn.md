@@ -1,4 +1,4 @@
-# PD 分离 + Mooncake CPU Offload + Kimi NVFP4 实施计划
+# Implementation Plan for PD Disaggregation + Mooncake CPU Offload + Kimi NVFP4
 
 ## 最终目标
 
@@ -30,7 +30,7 @@ KV Transfer metrics: Num successful transfers=463, Avg xfer time (ms)=70.583,
 
 ### 1.1 理解数据通路
 
-当前 MooncakeStoreConnector 的 CPU offload 物理路径（参考 `sprint_dist_kv_docs/mooncake_store_cpu_offload_full_stack.md`）：
+当前 MooncakeStoreConnector 的 CPU offload 物理路径（参考 `sprint_dist_kv_doc/mooncake/mooncake_store_cpu_offload_full_stack_cn.md`）：
 
 ```
 GPU→CPU offload:  GPU VRAM → ibv_reg_dmabuf_mr → IBV_WR_RDMA_WRITE → RNIC loopback → CPU Host DRAM
@@ -172,7 +172,7 @@ Master 还有 `/metrics/summary`（人类可读）和 `/health`（JSON 健康检
 **已创建**: `monitoring/` 目录，`docker compose up -d` 即可使用。
 
 ```bash
-cd /home/aoshen/setup_new_cluster/monitoring/
+cd <monitoring-repo-root>/
 docker compose up -d
 
 # 访问：
@@ -631,10 +631,10 @@ Kimi 模型的 KV cache 比 Qwen3-0.6B 大得多，需要增大 Mooncake CPU 内
 
 | 文档 | 内容 |
 |------|------|
-| [`experiment_results_70k_benchmark.md`](vllm/sprint_dist_kv_docs/experiment_results_70k_benchmark.md) | 70K benchmark 三组对比：Mooncake vs SimpleCPU vs Native，含性能表格、缓存命中率、传输带宽、decode 负载分析 |
-| [`profiling_plan.md`](vllm/sprint_dist_kv_docs/profiling_plan.md) | 深度 Profiling 计划：需要明确的指标、nsys/pytorch profiler 方案、问题澄清（offload 配置正确性、external cache hit 含义、RDMA 本地/远程比例） |
-| [`kv_cache_data_paths_nvl72.md`](vllm/sprint_dist_kv_docs/kv_cache_data_paths_nvl72.md) | KV Cache 数据路径全解析：6 种来源、replica 选择、RDMA 批量机制、数据放置随机性 |
-| [`mooncake_store_cpu_offload_full_stack.md`](vllm/sprint_dist_kv_docs/mooncake_store_cpu_offload_full_stack.md) | Mooncake Store CPU offload 完整调用栈 |
+| [`experiment_results_70k_benchmark_cn.md`](../sprint_dist_kv_results/experiment_results_70k_benchmark_cn.md) | 70K benchmark 三组对比：Mooncake vs SimpleCPU vs Native，含性能表格、缓存命中率、传输带宽、decode 负载分析 |
+| [`profiling_plan_cn.md`](profiling_plan_cn.md) | 深度 Profiling 计划：需要明确的指标、nsys/pytorch profiler 方案、问题澄清（offload 配置正确性、external cache hit 含义、RDMA 本地/远程比例） |
+| [`kv_cache_data_paths_nvl72.md`](../sprint_dist_kv_doc/kv_cache_data_paths_nvl72_cn.md) | KV Cache 数据路径全解析：6 种来源、replica 选择、RDMA 批量机制、数据放置随机性 |
+| [`mooncake_store_cpu_offload_full_stack.md`](../sprint_dist_kv_doc/mooncake/mooncake_store_cpu_offload_full_stack_cn.md) | Mooncake Store CPU offload 完整调用栈 |
 
 ---
 
@@ -652,8 +652,8 @@ Kimi 模型的 KV cache 比 Qwen3-0.6B 大得多，需要增大 Mooncake CPU 内
 | `vigil/recipes/crusoe/kimik25/low_latency/pd_tp_offload_fa4.yaml` | PD + SimpleCPUOffload (Nixl 传输) |
 | `vigil/recipes/crusoe/kimik25/low_latency/pd_tp_offload_fa4_mooncake.yaml` | PD + SimpleCPUOffload (Mooncake 传输) |
 | `vigil/recipes/crusoe/kimik25/low_latency/dev/tp4_eagle_fa4_mooncake_c8.yaml` | Non-PD + MooncakeStore (disk offload) |
-| `vllm/sprint_dist_kv_docs/mooncake_store_cpu_offload_full_stack.md` | Mooncake CPU offload 调用栈分析 |
-| `vllm/sprint_dist_kv_docs/doc.md` | GB200 集群架构与 KV cache 分层文档 |
+| `sprint_dist_kv_doc/mooncake/mooncake_store_cpu_offload_full_stack_cn.md` | Mooncake CPU offload 调用栈分析 |
+| `sprint_dist_kv_doc/machine_doc_cn.md` | GB200 集群架构与 KV cache 分层文档 |
 | `vllm/scripts/mooncake/mooncake_config_gb200_rack1_01.json` | Mooncake 配置文件 |
 | `vllm/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_store_metrics.py` | Python 层 metrics |
 | `vllm/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_store_worker.py` | Worker 核心逻辑 |

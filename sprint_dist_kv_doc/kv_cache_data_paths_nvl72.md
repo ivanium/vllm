@@ -1,323 +1,290 @@
-# NVL72 GB200 KV Cache 数据路径全解析
+# Complete Analysis of KV Cache Data Paths on NVL72 GB200
 
-## 1. 概述
+## 1. Overview
 
-在 NVL72 GB200 上，vLLM + Mooncake（L2 CPU Memory + L3 NVMe SSD）场景下，GPU 需要的 KV Cache block 可能来自 **6 种位置**。本文自上而下拆解：每条路径的物理 datapath、Mooncake 内部的 replica 选择逻辑、RDMA 批量调用机制、以及数据放置的随机性问题。
-
----
-
-## 2. 数据来源总览
-
-```
-请求方 GPU 需要一个 KV block，可能来自：
-
-  ① 本地 GPU HBM     不经过 Mooncake，vLLM prefix caching 直接复用
-  ② 本地 CPU Memory   Mooncake MEMORY replica，RDMA loopback
-  ③ 本地 NVMe SSD     Mooncake LOCAL_DISK replica，io_uring + RDMA loopback
-  ④ 远程 CPU Memory   Mooncake 远程 MEMORY replica，RDMA 或 NVLink 中转
-  ⑤ 远程 NVMe SSD     远端 FileStorage RPC + RDMA
-  ⑥ 远程 GPU HBM      P2P connector (NixlConnector / MooncakeConnector)，不经过 Store
-```
-
-| # | 来源 | Connector | Transport | 典型带宽 |
-|---|------|-----------|-----------|---------|
-| ① | 本地 GPU HBM | vLLM 自管 | — | 8 TB/s |
-| ② | 本地 CPU Memory | MooncakeStoreConnector | RDMA loopback | RNIC 依赖 |
-| ③ | 本地 SSD | MooncakeStoreConnector | io_uring + RDMA | ~25 GB/s (SSD 瓶颈) |
-| ④ | 远程 CPU Memory | MooncakeStoreConnector | RDMA (RoCE) / NVLink 中转 | 50 / 450 GB/s |
-| ⑤ | 远程 SSD | MooncakeStoreConnector | FileStorage RPC + RDMA | SSD+网络 |
-| ⑥ | 远程 GPU HBM | NixlConnector / MooncakeConnector | UCX cuda_ipc / RDMA GPUDirect | NVLink ~900 GB/s |
+On NVL72 GB200, in the vLLM + Mooncake (L2 CPU Memory + L3 NVMe SSD) scenario, the KV Cache block required by the GPU may come from **6 locations**. This article dismantles from top to bottom: the physical datapath of each path, the replica selection logic inside Mooncake, the RDMA batch calling mechanism, and the randomness of data placement.
 
 ---
 
-## 3. 两种 Mooncake Connector
+## 2. Overview of data sources
+```
+The requesting GPU requires a KV block, which may come from:
+
+① Local GPU HBM is reused directly without going through Mooncake and vLLM prefix caching.
+② Local CPU Memory Mooncake MEMORY replica, RDMA loopback
+③ Local NVMe SSD Mooncake LOCAL_DISK replica, io_uring + RDMA loopback
+④ Remote CPU Memory Mooncake remote MEMORY replica, RDMA or NVLink transfer
+⑤ Remote NVMe SSD remote FileStorage RPC + RDMA
+⑥ Remote GPU HBM P2P connector (NixlConnector / MooncakeConnector), without going through Store
+```
+| # | Source | Connector | Transport | Typical Bandwidth |
+|---|------|-----------|-----------|----------|
+| ① | Local GPU HBM | vLLM self-managed | — | 8 TB/s |
+| ② | Local CPU Memory | MooncakeStoreConnector | RDMA loopback | RNIC dependency |
+| ③ | Local SSD | MooncakeStoreConnector | io_uring + RDMA | ~25 GB/s (SSD bottleneck) |
+| ④ | Remote CPU Memory | MooncakeStoreConnector | RDMA (RoCE) / NVLink Transit | 50 / 450 GB/s |
+| ⑤ | Remote SSD | MooncakeStoreConnector | FileStorage RPC + RDMA | SSD+Network |
+| ⑥ | Remote GPU HBM | NixlConnector / MooncakeConnector | UCX cuda_ipc / RDMA GPUDirect | NVLink ~900 GB/s |
+
+---
+
+## 3. Two types of Mooncake Connector
 
 | | MooncakeConnector | MooncakeStoreConnector |
 |---|---|---|
-| 角色 | 跨实例 P→D KV 直传（替代 NixlConnector） | KV Cache 分层缓存（CPU/SSD offload + 跨节点复用） |
-| 底层 | TransferEngine 直接 P2P | MooncakeDistributedStore（Master 协调） |
-| 数据流 | Prefill GPU → RDMA → Decode GPU | GPU ↔ CPU Memory Pool ↔ SSD |
-| 缓存 | 不做缓存 | 支持 prefix caching（hash 去重） |
+| Role | Cross-instance P→D KV direct transfer (replaces NixlConnector) | KV Cache hierarchical cache (CPU/SSD offload + cross-node reuse) |
+| Bottom layer | TransferEngine direct P2P | MooncakeDistributedStore (Master coordination) |
+| Data flow | Prefill GPU → RDMA → Decode GPU | GPU ↔ CPU Memory Pool ↔ SSD |
+| Caching | No caching | Support prefix caching (hash deduplication) |
 
-生产配置用 MultiConnector 组合：save 时写入所有 sub-connector，load 时按顺序尝试。
+Production configuration uses MultiConnector combination: all sub-connectors are written when saving, and tried in order when loading.
 
 ---
 
-## 4. 注册拓扑：谁在 Master 的分配池中
+## 4. Registration topology: who is in the Master’s allocation pool
 
-每个 vLLM GPU worker 进程独立初始化，向 Master 注册两类内存：
-
+Each vLLM GPU worker process is initialized independently and registers two types of memory with the Master:
 ```
 GPU VRAM:  register_buffer() → RegisterLocalMemory(remote_accessible=false)
-           → 只注册到 Transfer Engine（使 RDMA 可访问）
-           → 不上报 Master，不进入 allocator pool
+→ Only register to Transfer Engine (make RDMA accessible)
+→ Do not report to Master, do not enter allocator pool
 
 CPU Mem:   setup() → allocate_buffer_*() → MountSegment()
-           → 上报 Master，addAllocator() 进入分配池
-           → segment.name = local_hostname_（同节点 worker 共享同一 name）
+→ Report to Master, addAllocator() enters the allocation pool
+→ segment.name = local_hostname_ (workers on the same node share the same name)
 ```
+**Master is only allocated from CPU global_segment. GPU VRAM is not in the allocation pool. **GPU VRAM only serves as the source (put)/destination (get) endpoint for RDMA transfers.
 
-**Master 只从 CPU global_segment 中分配。GPU VRAM 不在分配池中。** GPU VRAM 仅作为 RDMA 传输的源（put）/ 目的（get）端点。
-
-2 节点 TP4 的完整拓扑：
-
+Complete topology of 2-node TP4:
 ```
 Master Server
   │
   │  AllocatorManager.names_ = ["10.x.x.11", "10.x.x.14"]
   │  allocators_ = {
-  │    "10.x.x.11": [CPU_seg_5GB × 4],   ← Node A 的 4 个 worker 各 5GB
-  │    "10.x.x.14": [CPU_seg_5GB × 4],   ← Node B 的 4 个 worker 各 5GB
+│ "10.x.x.11": [CPU_seg_5GB × 4], ← Node A's 4 workers are 5GB each
+│ "10.x.x.14": [CPU_seg_5GB × 4], ← Node B's 4 workers are 5GB each
   │  }
   │
   ├─ Node A (10.x.x.11), Prefill, TP=4
-  │   Worker 0~3: 各自 GPU VRAM (仅 Transfer Engine) + CPU 5GB (Master pool)
+│ Worker 0~3: Each GPU VRAM (Transfer Engine only) + CPU 5GB (Master pool)
   │
   └─ Node B (10.x.x.14), Decode, TP=4
-      Worker 0~3: 各自 GPU VRAM (仅 Transfer Engine) + CPU 5GB (Master pool)
+Worker 0~3: Each GPU VRAM (Transfer Engine only) + CPU 5GB (Master pool)
 ```
-
 ---
 
-## 5. 数据放置：Put 时写到哪
+## 5. Data placement: where to write when putting
 
-### 5.1 分配策略：随机，不感知本地性
+### 5.1 Allocation strategy: random, not aware of locality
 
-vLLM 调用 `batch_put_from_multi_buffers(keys, addrs, sizes)` 时不传 `ReplicateConfig`，使用默认值：`replica_num=1`，`preferred_segments=[]`。
+When vLLM calls `batch_put_from_multi_buffers(keys, addrs, sizes)`, `ReplicateConfig` is not passed and the default values are used: `replica_num=1`, `preferred_segments=[]`.
 
-Master 的 `RandomAllocationStrategy::Allocate()`（allocation_strategy.h:271-297）：
-1. 从 `names_` 中随机选一个起点（`std::uniform_int_distribution`）
-2. 顺序扫描直到找到有空间的 segment
-3. **不感知调用者在哪个节点** — Master 只知道有哪些 segment，不知道 put 来自哪里
+Master's `RandomAllocationStrategy::Allocate()` (allocation_strategy.h:271-297):
+1. Randomly select a starting point from `names_` (`std::uniform_int_distribution`)
+2. Scan sequentially until a segment with space is found.
+3. **Not aware of which node the caller is on** — Master only knows which segments there are, but does not know where the put comes from.
 
-**结论：数据可能被写到任何节点的 CPU memory。** Prefill 在 Node A 产出 KV → Master 可能把 replica 分配到 Node B 的 CPU segment → RDMA 跨节点写入 Node B。
+**Conclusion: Data may be written to the CPU memory of any node. ** Prefill generates KV in Node A → Master may allocate replica to Node B’s CPU segment → RDMA writes to Node B across nodes.
 
-### 5.2 举例
-
+### 5.2 Example
 ```
-Prefill (Node A) 写 100 个 KV block:
-  → Master 对每个 key 随机分配: ~50 个在 Node A CPU，~50 个在 Node B CPU
-  → 50 个 RDMA loopback 写本地，50 个 RDMA 远程写到 Node B
+Prefill (Node A) writes 100 KV blocks:
+→ Master randomly allocates each key: ~50 in Node A CPU, ~50 in Node B CPU
+→ 50 RDMA loopbacks write locally, and 50 RDMA loopbacks write remotely to Node B
 ```
-
-### 5.3 物理数据流
-
+### 5.3 Physical data flow
 ```
-Put:  GPU VRAM (源) ──RDMA Write──→ CPU global_segment (目标, Master 分配)
-                                    ├─ 可能在本地 (loopback)
-                                    └─ 可能在远端 (跨节点 RDMA)
+Put: GPU VRAM (source) ──RDMA Write──→ CPU global_segment (destination, Master allocation)
+├─ May be local (loopback)
+└─ Possibly at the remote end (cross-node RDMA)
 ```
-
 ---
 
-## 6. 数据读取：Get 时从哪拿
+## 6. Data reading: where to get it from when getting
 
-### 6.1 Replica 选择优先级
+### 6.1 Replica select priority
 
-Master 返回 replica 列表按插入顺序：**MEMORY 在前，DISK/LOCAL_DISK 在后**。
+Master returns the replica list in insertion order: **MEMORY first, DISK/LOCAL_DISK last**.
 
-vLLM 的 `batch_get_into_multi_buffers` 只传 3 个参数，`prefer_alloc_in_same_node` 默认 `false`（store_py.cpp:2226），走 `FindFirstCompleteReplica`——**取列表中第一个 COMPLETE 状态的 replica，不检查本地性**。
-
+vLLM's `batch_get_into_multi_buffers` only passes 3 parameters, `prefer_alloc_in_same_node` defaults to `false` (store_py.cpp:2226), use `FindFirstCompleteReplica` - **Get the first replica in the COMPLETE state in the list, without checking locality**.
 ```
-实际优先级：
-  1. 第一个 COMPLETE 的 MEMORY replica（不区分本地/远程，取决于 Master 列表顺序）
-  2. DISK replica（所有 MEMORY 都不可用时）
-  3. LOCAL_DISK replica（仅当只剩 LOCAL_DISK 时，走 FileStorage RPC 专用路径）
+Actual priority:
+1. The MEMORY replica of the first COMPLETE (does not differentiate between local/remote, depends on the order of the Master list)
+2. DISK replica (when all MEMORY is unavailable)
+3. LOCAL_DISK replica (only when there is only LOCAL_DISK left, take the FileStorage RPC dedicated path)
 ```
+**There is no priority between local CPU and remote CPU. ** Which one you get depends on which node is randomly assigned during PutStart.
 
-**本地 CPU 和远程 CPU 之间没有优先级。** 拿到哪个取决于 PutStart 时随机分配到了哪个节点。
+### 6.2 Will it be obtained from the CPU Memory of other nodes?
 
-### 6.2 会从别的节点的 CPU Memory 拿吗？
-
-**会。** 因为 put 和 get 两端都没有本地性偏好：
-
+**meeting. ** Because neither put nor get has locality preference:
 ```
-场景：Decode 在 Node B，需要一个 KV block
+Scenario: Decode is in Node B and requires a KV block
 
-如果 PutStart 时这个 key 被随机分配到 Node A 的 CPU segment：
-  → Master 返回 replica: MEMORY on Node A
-  → Node B batch_get → FindFirstCompleteReplica → 选到 Node A 的 MEMORY
-  → RDMA 远程读: Node A CPU → RoCE → Node B GPU
+If this key is randomly assigned to the CPU segment of Node A during PutStart:
+→ Master returns replica: MEMORY on Node A
+→ Node B batch_get → FindFirstCompleteReplica → Select the MEMORY of Node A
+→ RDMA remote read: Node A CPU → RoCE → Node B GPU
 
-如果 PutStart 时这个 key 被分配到 Node B 的 CPU segment：
-  → Master 返回 replica: MEMORY on Node B
-  → Node B batch_get → 选到 Node B 的 MEMORY
+If this key is assigned to the CPU segment of Node B during PutStart:
+→ Master returns replica: MEMORY on Node B
+→ Node B batch_get → Select the MEMORY of Node B
   → RDMA loopback: Node B CPU → Node B GPU
 
-哪种情况发生完全取决于 PutStart 的随机分配结果。
+Which happens depends entirely on PutStart's random assignment.
 ```
-
-### 6.3 MEMORY 和 DISK replica 的共存
-
+### 6.3 Coexistence of MEMORY and DISK replica
 ```
-场景 1: CPU 没满 → MEMORY(COMPLETE) 在前，DISK(COMPLETE) 在后 → 选 MEMORY
-场景 2: CPU 满，MEMORY 被驱逐 → 只剩 LOCAL_DISK(COMPLETE) → 走 SSD 路径
-场景 3: 多节点，Node A MEMORY 被驱逐但 Node B MEMORY 还在
-       → [MEMORY_B(COMPLETE), LOCAL_DISK_A(COMPLETE)] → 选远程 MEMORY_B
-       → 远程 CPU memory 优先于本地 SSD
+Scenario 1: CPU is not full → MEMORY(COMPLETE) first, DISK(COMPLETE) second → select MEMORY
+Scenario 2: CPU is full, MEMORY is evicted → only LOCAL_DISK(COMPLETE) remains → take the SSD path
+Scenario 3: Multiple nodes, Node A MEMORY is evicted but Node B MEMORY is still there
+→ [MEMORY_B(COMPLETE), LOCAL_DISK_A(COMPLETE)] → Select remote MEMORY_B
+→ Remote CPU memory takes priority over local SSD
 ```
-
 ---
 
-## 7. RDMA 批量调用机制
+## 7. RDMA batch calling mechanism
 
-**不是每个 key 一次 RDMA，也不是每个远程节点一次 RDMA。** 是 Slice 级别批量 + watermark 流控。
+**Not one RDMA per key, nor one RDMA per remote node. ** It is Slice level batching + watermark flow control.
 
-### 7.1 调用链
-
+### 7.1 Call chain
 ```
 vLLM batch_get_into_multi_buffers(100 keys)
   │
-  ├─ LOCAL_DISK keys → FileStorage RPC 专用路径（串行两阶段）
+├─ LOCAL_DISK keys → FileStorage RPC private path (serial two-phase)
   │
   └─ MEMORY keys → Client::BatchGet()
-       │ 对每个 key 独立提交 async transfer（不等完成）
+│ Submit async transfer independently for each key (not waiting for completion)
        ▼
-     TransferSubmitter → 每个 key 拆成 64KB Slice
+TransferSubmitter → Split each key into 64KB Slices
        ▼
      RdmaTransport::submitTransferTask()
-       │ 按 RdmaContext 分组: slices_to_post[context].push_back(slice)
-       │ 累积到 watermark (~512 slice) → 一次 ibv_post_send() 批量提交
-       │ 不同远端节点的 slice 混在同一个 post_send 中
+│ Group by RdmaContext: slices_to_post[context].push_back(slice)
+│ Accumulated to watermark (~512 slice) → One ibv_post_send() batch submission
+│ Slices from different remote nodes are mixed in the same post_send
        ▼
-     RNIC DMA engine 按 QP 并行执行
+RNIC DMA engine executes in parallel according to QP
 ```
-
-### 7.2 具体例子
-
+### 7.2 Specific examples
 ```
-100 个 MEMORY keys: 40 在 Node A CPU, 30 在 Node B CPU, 30 在本地 CPU
-  → 每个 key 256KB → 每个 key 4 个 64KB slice → 共 400 slice
-  → 400 < watermark(512) → 一次 ibv_post_send()
-  → RNIC 内部并行处理去 3 个目标的 slice
+100 MEMORY keys: 40 in Node A CPU, 30 in Node B CPU, 30 in local CPU
+→ 256KB per key → 4 64KB slices per key → 400 slices in total
+→ 400 < watermark(512) → one ibv_post_send()
+→ RNIC internally processes slices to 3 targets in parallel
 ```
-
-| 参数 | 默认值 | 含义 |
+| Parameters | Default value | Meaning |
 |------|--------|------|
-| Slice 大小 | 64 KB (`MC_SLICE_SIZE`) | 每个 RDMA 请求粒度 |
-| Watermark | ~512 (`max_wr × num_qp_per_ep`) | 累积多少 slice 后批量提交 |
+| Slice size | 64 KB (`MC_SLICE_SIZE`) | Per RDMA request granularity |
+| Watermark | ~512 (`max_wr × num_qp_per_ep`) | How many slices to accumulate before batch submission |
 
 ---
 
-## 8. 每条数据路径的物理 Datapath
+## 8. Physical Datapath of each data path
 
-### 路径 ②：本地 CPU Memory → 本地 GPU
-
+### Path ②: Local CPU Memory → Local GPU
 ```
 GPU→CPU offload: GPU VRAM → IBV_WR_RDMA_WRITE → RNIC loopback → CPU global_segment
 CPU→GPU load:    CPU global_segment → IBV_WR_RDMA_READ → RNIC loopback → GPU VRAM
 
-带宽: RNIC loopback 能力（非 NVLink-C2C — Mooncake 默认 protocol="rdma"）
-延迟: sub-ms（RDMA bucket 125-1000 μs）
-开销: 零 CPU/GPU SM 占用（DMA engine 驱动）
+Bandwidth: RNIC loopback capability (non-NVLink-C2C — Mooncake default protocol="rdma")
+Latency: sub-ms (RDMA bucket 125-1000 μs)
+Overhead: Zero CPU/GPU SM usage (DMA engine driver)
 ```
-
-### 路径 ③：本地 SSD → 本地 CPU → 本地 GPU
-
+### Path ③: Local SSD → Local CPU → Local GPU
 ```
 NVMe SSD → io_uring (O_DIRECT) → ClientBuffer (CPU staging ~1GiB) → RDMA loopback → GPU VRAM
 
-SSD 带宽: ~25+ GB/s (RAID0 4盘)
-限制: 单节点多 GPU 场景 disk offload 当前不工作（Kimi TP4 受影响）
+SSD bandwidth: ~25+ GB/s (RAID0 4 drives)
+Limitation: disk offload currently does not work in single-node multi-GPU scenarios (Kimi TP4 is affected)
 ```
-
-### 路径 ④：远程 CPU Memory → 本地 GPU
-
+### Path ④: Remote CPU Memory → Local GPU
 ```
-方案 A（当前默认）: 远端 CPU → RNIC → RoCE 网络 → 本地 RNIC → 本地 GPU   (~50 GB/s)
-方案 B（柜内可选）: 远端 CPU → C2C → 远端 GPU → NVLink → 本地 GPU        (~450 GB/s)
-  前提: protocol="nvlink" + USE_MNNVL 编译 flag + 同一 NVL72 柜内
-  限制: protocol 是全局配置，改了 nvlink 跨柜会 break
+Scenario A (current default): Remote CPU → RNIC → RoCE network → Local RNIC → Local GPU (~50 GB/s)
+Solution B (optional in the cabinet): Remote CPU → C2C → Remote GPU → NVLink → Local GPU (~450 GB/s)
+Prerequisite: protocol="nvlink" + USE_MNNVL compilation flag + the same NVL72 cabinet
+Limitation: protocol is a global configuration. If nvlink is changed, it will break across cabinets.
 ```
-
-### 路径 ⑤：远程 SSD → 远程 CPU → 本地 GPU
-
+### Path ⑤: Remote SSD → Remote CPU → Local GPU
 ```
-远端 NVMe → io_uring → 远端 ClientBuffer → (RDMA/NVLink) → 本地 GPU
+Remote NVMe → io_uring → Remote ClientBuffer → (RDMA/NVLink) → Local GPU
 
-实现: FileStorage RPC 两阶段
-  1. RPC: batch_get_offload_object → 远端读 SSD 到 ClientBuffer
-  2. Transfer Engine: RDMA 从远端 ClientBuffer 拉到本地 GPU
-  两阶段串行，ClientBuffer 是有限资源（~1GiB）
+Implementation: FileStorage RPC two-phase
+1. RPC: batch_get_offload_object → read SSD remotely to ClientBuffer
+2. Transfer Engine: RDMA pulls from the remote ClientBuffer to the local GPU
+Two-stage serialization, ClientBuffer is a limited resource (~1GiB)
 ```
-
-### 路径 ⑥：远程 GPU → 本地 GPU（P2P 直传，不经过 Store）
-
+### Path ⑥: Remote GPU → Local GPU (P2P direct transmission, without going through the Store)
 ```
-NixlConnector:      UCX cuda_ipc (MNNVL NVLink 直通, 柜内 ~900 GB/s)
-                    UCX cuda_copy+tcp (跨柜 ~50 GB/s)
-MooncakeConnector:  RDMA GPUDirect Write (~50 GB/s) 或 NVLink
+NixlConnector: UCX cuda_ipc (MNNVL NVLink passthrough, in-cabinet ~900 GB/s)
+UCX cuda_copy+tcp (cross-cabinet ~50 GB/s)
+MooncakeConnector: RDMA GPUDirect Write (~50 GB/s) or NVLink
 ```
-
 ---
 
-## 9. 判断流程图
-
+## 9. Judgment flow chart
 ```
-GPU 需要 KV block
+GPU requires KV block
   │
-  ├─ vLLM prefix caching 命中本地 GPU HBM?
-  │   └─ YES → 路径 ① 直接复用，不经过 Mooncake
+├─ vLLM prefix caching hits local GPU HBM?
+│ └─ YES → Path ① Directly reuse without going through Mooncake
   │
   └─ NO → batch_get_into_multi_buffers(key)
        │
        ▼
-     Master BatchQuery(key) → replica 列表
+Master BatchQuery(key) → replica list
        │
-       ├─ 仅有 LOCAL_DISK replica?
-       │   └─ YES → FileStorage RPC → SSD → staging → RDMA → GPU (路径 ③/⑤)
+├─ Only LOCAL_DISK replica?
+│ └─ YES → FileStorage RPC → SSD → staging → RDMA → GPU (path ③/⑤)
        │
-       └─ NO → FindFirstCompleteReplica → 第一个 COMPLETE 的 (通常 MEMORY)
+└─ NO → FindFirstCompleteReplica → first COMPLETE (usually MEMORY)
             │
-            ├─ replica 在本地节点 CPU? → RDMA loopback (路径 ②)
-            └─ replica 在远程节点 CPU? → RDMA 远程读 (路径 ④)
-                                         ↑ 本地/远程由 PutStart 随机分配决定
+├─ replica on local node CPU? → RDMA loopback (path ②)
+└─ replica in remote node CPU? → RDMA remote read (path ④)
+↑ Local/remote is randomly assigned by PutStart
 ```
-
 ---
 
-## 10. 当前局限与优化方向
+## 10. Current limitations and optimization directions
 
-| 问题 | 现状 | 潜在优化 |
+| Problem | Current Situation | Potential Optimizations |
 |------|------|---------|
-| Put 随机分配，数据可能跨节点 | `preferred_segments=[]`, Master 随机选 | vLLM 传 `preferred_segments=[local_hostname]` |
-| Get 不区分本地/远程 | `prefer_alloc_in_same_node=false` | vLLM 传 `true`，启用 endpoint 分组批量 |
-| 柜内走 RDMA 而非 NVLink | `protocol="rdma"` 全局配置 | 改为 `"nvlink"` (但跨柜会 break) |
-| Disk offload 多 GPU 不可用 | Mooncake 当前实现限制 | 等上游修复 |
-| 无 NUMA / 拓扑感知 | replica 选择不考虑距离 | 需 Mooncake 侧改造 |
-| `GetPreferredReplica` 不用于 BatchGet | 只有单 key Get 有本地优先 | 需 Mooncake 或 vLLM 侧改造 |
+| Put is randomly allocated, data may span nodes | `preferred_segments=[]`, Master is randomly selected | vLLM passes `preferred_segments=[local_hostname]` |
+| Get does not distinguish between local/remote | `prefer_alloc_in_same_node=false` | vLLM passes `true` to enable endpoint grouping batching |
+| Use RDMA instead of NVLink in the cabinet | `protocol="rdma"` global configuration | Change to `"nvlink"` (but it will break across cabinets) |
+| Disk offload is not available for multiple GPUs | Mooncake’s current implementation limitations | Waiting for upstream fixes |
+| No NUMA/topology awareness | Replica selection does not consider distance | Mooncake side modification required |
+| `GetPreferredReplica` is not used for BatchGet | Only single key Get has local priority | Requires Mooncake or vLLM side modification |
 
 ---
 
-## 附录 A：关键源码文件
+## Appendix A: Key source code files
 
-| 文件 | 内容 |
+| Documentation | Content |
 |------|------|
 | `vllm/.../mooncake_store_worker.py` | vLLM Worker: send/recv thread, register_kv_caches, lookup |
 | `vllm/.../mooncake_store_connector.py` | vLLM Scheduler: build_connector_meta |
-| `vllm/.../mooncake_connector.py` | P2P connector: ZMQ 握手 + TransferEngine |
+| `vllm/.../mooncake_connector.py` | P2P connector: ZMQ handshake + TransferEngine |
 | `Mooncake/.../real_client.cpp` | C++ Client: batch_get/put, replica query |
 | `Mooncake/.../client_service.cpp` | Client: BatchGet, GetPreferredReplica, MountSegment |
-| `Mooncake/.../replica.h` | Replica 类型: MEMORY, DISK, LOCAL_DISK |
-| `Mooncake/.../allocation_strategy.h` | 分配策略: RandomAllocationStrategy |
+| `Mooncake/.../replica.h` | Replica type: MEMORY, DISK, LOCAL_DISK |
+| `Mooncake/.../allocation_strategy.h` | Allocation strategy: RandomAllocationStrategy |
 | `Mooncake/.../segment.cpp` | Master: MountSegment → addAllocator |
-| `Mooncake/.../multi_transport.cpp` | Transport 选择: selectTransport() |
-| `Mooncake/.../rdma_transport.cpp` | RDMA 批量: Slice + watermark |
-| `Mooncake/.../store_py.cpp` | Python binding: 默认参数 |
+| `Mooncake/.../multi_transport.cpp` | Transport selection: selectTransport() |
+| `Mooncake/.../rdma_transport.cpp` | RDMA batch: Slice + watermark |
+| `Mooncake/.../store_py.cpp` | Python binding: default parameters |
 
-## 附录 B：NVL72 柜内互联拓扑
-
+## Appendix B: NVL72 in-cabinet interconnection topology
 ```
-┌──────────────── NVL72 柜 ────────────────────┐
-│  9 × NVLink Switch Tray, 72 GPU 全互联        │
+┌───────────────── NVL72 cabinet ────────────────────┐
+│ 9 × NVLink Switch Tray, 72 GPU fully interconnected │
 │                                                │
 │  Node (Compute Tray):                          │
 │    GPU0 ←(C2C 900GB/s)→ Grace CPU0 ←(C2C)→ GPU1   │
 │    GPU2 ←(C2C 900GB/s)→ Grace CPU1 ←(C2C)→ GPU3   │
 │                                                │
-│  GPU↔GPU (柜内):  NVLink 1.8 TB/s per GPU     │
-│  GPU↔CPU (同 SC):  NVLink-C2C 900 GB/s 双向   │
-│  CPU↔CPU (跨 SC):  无直连，需 GPU 或 RDMA 中转  │
-│  Node↔Node (跨柜): RoCE RDMA                  │
+│ GPU↔GPU (inside the cabinet): NVLink 1.8 TB/s per GPU │
+│ GPU↔CPU (same as SC): NVLink-C2C 900 GB/s bidirectional │
+│CPU↔CPU (cross-SC): No direct connection, requires GPU or RDMA transfer │
+│ Node↔Node (cross-counter): RoCE RDMA │
 └────────────────────────────────────────────────┘
 ```

@@ -1,16 +1,16 @@
-# Kimi K2.5 Thinking-Eagle3 Roofline 建模
+# Kimi K2.5 Thinking-Eagle3 Roofline Modeling
 
-> 目标: 估算在当前 GB200/B200 机器上，`Thinking-Eagle3` draft/MTP 计算在多大 batch size 下会从 HBM 带宽受限切换到算力受限，也就是“继续增大 batch 基本没有 roofline 意义上的收益”的理论上限。
+> Goal: Estimate the batch size at which `Thinking-Eagle3` draft/MTP calculations will switch from HBM bandwidth limited to computing power limited on the current GB200/B200 machine, which is the theoretical upper limit of "continuing to increase the batch size will basically have no roofline benefits".
 
 ---
 
-## 1. 建模对象与结论先看
+## 1. Let’s look at the modeling objects and conclusions first.
 
-这次我们参考的 draft checkpoint 是:
+The draft checkpoint we are referring to this time is:
 
 - `/mnt/lustre/hf-models/hub/models--nvidia--Kimi-K2.5-Thinking-Eagle3/snapshots/0b0c6ac039089ad2c2418c91c039553381a302d9`
 
-从 `config.json` 可以直接读到:
+From `config.json` you can read directly:
 
 - `architectures = Eagle3DeepseekV2ForCausalLM`
 - `torch_dtype = bfloat16`
@@ -25,117 +25,109 @@
 - `num_attention_heads = 64`
 - `eagle_aux_hidden_state_layer_ids = [1, 29, 57]`
 
-在当前 `TP=4`、`B200 HBM≈8 TB/s`、`BF16 dense tensor≈2.5 PFLOPS/GPU` 的假设下:
+Under the current assumptions of `TP=4`, `B200 HBM≈8 TB/s`, `BF16 dense tensor≈2.5 PFLOPS/GPU`:
 
-- **整体 Eagle3 step 的 roofline 拐点**大约在 **`M ~= 360 tokens`**
-- 如果把 `fc(aux hidden state combine)` 也算进第一次 draft 启动，则拐点大约在 **`M ~= 345 tokens`**
-- 如果要求**每个主 GEMM 都 individually 到达 ridge point**，最保守瓶颈是 `kv_b_proj`，需要 **`M ~= 998 tokens`**
+- **The overall roofline inflection point of Eagle3 step** is approximately **`M ~= 360 tokens`**
+- If `fc(aux hidden state combine)` is also included in the first draft start, the inflection point is approximately **`M ~= 345 tokens`**
+- If **each master GEMM is required to reach the ridge point** individually, the most conservative bottleneck is `kv_b_proj`, which requires **`M ~= 998 tokens`**
 
-所以一个比较实用的结论是:
+So a more practical conclusion is:
 
-- **乐观口径**: `MTP batch size` 到 **`~350`** 左右后，整体算强基本摸到 BF16 roofline
-- **保守口径**: 要到 **`~1000`** 左右，连最难吃满的 `kv_b_proj` 也才到 ridge point
+- **Optimistic**: After `MTP batch size` reaches around **`~350`**, the overall calculation will be as strong as BF16 roofline
+- **Conservative**: It needs to be around **`~1000`**, even the most difficult `kv_b_proj` has only reached the ridge point
 
-而当前实验配置里:
+In the current experimental configuration:
 
 - `max_num_seqs = 16`
 - `num_speculative_tokens = 3`
-- `parallel_drafting = False`（vLLM 默认值，且当前配置没有显式打开）
+- `parallel_drafting = False` (vLLM default and not explicitly turned on for the current configuration)
 
-所以当前 Eagle3 draft GEMM 的**实际 batch 上限基本只有 `16`**；即使未来把 speculative positions 完全并起来看成 `16 × 3 = 48`，也还远低于 `~350`。也就是说，**当前配置下 Thinking-Eagle3 的主 GEMM 明显仍处在 HBM 带宽主导区间**。
+Therefore, the actual batch limit of the current Eagle3 draft GEMM is basically only `16`**; even if the speculative positions are completely combined into `16 × 3 = 48` in the future, it is still far lower than `~350`. In other words, **the main GEMM of Thinking-Eagle3 under the current configuration is obviously still in the HBM bandwidth dominant range**.
 
 ---
 
-## 2. 机器 Roofline 参数
+## 2. Machine Roofline parameters
 
-### 2.1 HBM 带宽
+### 2.1 HBM bandwidth
 
-本地机器文档里已经记录:
+It has been recorded in the local machine documentation:
 
-- 单 GPU HBM 带宽按 **`8 TB/s`** 建模
+- Single GPU HBM bandwidth modeled at **`8 TB/s`**
 
-参考:
+Reference:
 
-- `vllm/sprint_dist_kv_docs/doc.md`
+- `vllm/sprint_dist_kv_doc/machine_doc.md`
 
-### 2.2 B200 理论算力
+### 2.2 B200 theoretical computing power
 
-NVIDIA 官方 `GB200 NVL72` 页面给出的 `GB200 Grace Blackwell Superchip` 规格是:
-
-- `FP16/BF16 Tensor Core: 10 PFLOPS`
+The `GB200 Grace Blackwell Superchip` specifications given on NVIDIA’s official `GB200 NVL72` page are:- `FP16/BF16 Tensor Core: 10 PFLOPS`
 - `FP8/FP6 Tensor Core: 20 PFLOPS`
 - `GPU Memory Bandwidth: 16 TB/s`
 
-但页面脚注说明:
+But the footer on the page states:
 
 - `Specification in sparse. Dense is one-half sparse spec shown.`
 
-因此换算到 **dense** 且再除以 **2 GPU / superchip**，得到每 GPU:
+So scaling to **dense** and dividing by **2 GPU / superchip**, we get per GPU:
 
-| 指标 | 每 Superchip | dense 每 Superchip | dense 每 GPU |
+| Metrics | per Superchip | dense per Superchip | dense per GPU |
 |------|--------------|--------------------|--------------|
 | BF16 Tensor | 10 PFLOPS | 5 PFLOPS | **2.5 PFLOPS** |
 | FP8 Tensor | 20 PFLOPS | 10 PFLOPS | **5.0 PFLOPS** |
-| HBM 带宽 | 16 TB/s | 16 TB/s | **8.0 TB/s** |
+| HBM Bandwidth | 16 TB/s | 16 TB/s | **8.0 TB/s** |
 
-官方来源:
+Official source:
 
 - https://www.nvidia.com/en-us/data-center/gb200-nvl72/
 
 ### 2.3 Ridge Point
 
-按 roofline 定义:
-
-```text
+Defined by roofline:```text
 ridge_point = peak_compute / peak_bandwidth
 ```
+Get:
 
-得到:
-
-| 精度 | 峰值算力 | HBM 带宽 | ridge point |
+| Accuracy | Peak computing power | HBM bandwidth | ridge point |
 |------|----------|----------|-------------|
 | BF16 dense | 2.5e15 FLOP/s | 8.0e12 B/s | **312.5 FLOP/B** |
 | FP8 dense | 5.0e15 FLOP/s | 8.0e12 B/s | **625 FLOP/B** |
 
-因为 `Thinking-Eagle3` 的 checkpoint 配置是 `torch_dtype=bfloat16`，且没有量化配置，所以本文主分析以 **BF16 ridge = 312.5 FLOP/B** 为准。
+Because the checkpoint configuration of `Thinking-Eagle3` is `torch_dtype=bfloat16` and there is no quantitative configuration, the main analysis of this article is based on **BF16 ridge = 312.5 FLOP/B**.
 
 ---
 
-## 3. Draft Layer 结构与 TP4 下的 GEMM 形状
+## 3. Draft Layer structure and GEMM shape under TP4
 
-### 3.1 为什么这是 “1 层 Eagle3”
+### 3.1 Why is this “1-layer Eagle3”
 
-`Thinking-Eagle3` 的 `config.json` 里:
+In `config.json` of `Thinking-Eagle3`:
 
 - `num_hidden_layers = 1`
 
-同时 vLLM 的 `DeepseekV2Eagle3DecoderLayer` 使用:
+At the same time vLLM's `DeepseekV2Eagle3DecoderLayer` uses:
 
-- 第一层 attention 输入维度是 `2 * hidden_size`，因为会把 `embed + hidden_state` 拼起来
-- MLP 仍然是 dense `DeepseekV2MLP`
-- 额外还有一个 `fc`，把 target model 返回的 3 个 aux hidden states 拼接后压回 draft hidden size
+- The input dimension of the first layer of attention is `2 * hidden_size`, because `embed + hidden_state` will be put together
+- MLP is still dense `DeepseekV2MLP`
+- There is an additional `fc`, which concatenates the three aux hidden states returned by the target model and presses them back to the draft hidden size
 
-### 3.2 当前 draft/MTP 的 batch 定义
+### 3.2 Current draft/MTP batch definition
 
-这里的 `MTP batch size = M`，指的是**一次 draft GEMM 实际同时处理的 token 行数**。
+The `MTP batch size = M` here refers to the number of token rows actually processed simultaneously by **one draft GEMM**.
 
-在当前配置下:
+Under current configuration:
 
 - `parallel_drafting = False`
-- 所以每个 speculative step 里，draft model 每次只处理“当前活跃请求数”个 token
-- 因此当前实验的有效 `M` 上限基本就是 `max_num_seqs = 16`
+- So in each speculative step, the draft model only processes the "current number of active requests" tokens each time
+- Therefore, the effective upper limit of `M` in the current experiment is basically `max_num_seqs = 16`
 
-如果未来改成 parallel drafting，才更接近:
-
-```text
+If it is changed to parallel drafting in the future, it will be closer:```text
 M_effective ~= active_requests × num_speculative_tokens
 ```
-
 ---
 
-## 4. TP4 下的主 GEMM 列表
+## 4. Main GEMM list under TP4
 
-基于 vLLM 源码:
+Based on vLLM source code:
 
 - `DeepSeekV2FusedQkvAProjLinear(..., disable_tp=True)` → replicated
 - `q_b_proj`, `kv_b_proj` → column parallel
@@ -143,72 +135,57 @@ M_effective ~= active_requests × num_speculative_tokens
 - `gate_up_proj` → merged column parallel
 - `fc` → replicated
 
-对当前 `TP=4`，每 GPU 上的主要 GEMM 可近似写成:
+For the current `TP=4`, the main GEMM on each GPU can be approximately written as:
 
-| 模块 | 本地 GEMM 形状 (K x N) | 备注 |
+| Module | Local GEMM Shape (K x N) | Notes |
 |------|------------------------|------|
-| `fused_qkv_a_proj` | `14336 x 2112` | 第一层输入是 `2 * hidden_size`，replicated |
+| `fused_qkv_a_proj` | `14336 x 2112` | The first layer input is `2 * hidden_size`, replicated |
 | `q_b_proj` | `1536 x 3072` | `64 * 192 / 4` |
 | `kv_b_proj` | `512 x 4096` | `64 * (128+128) / 4` |
 | `o_proj` | `2048 x 7168` | `64 * 128 / 4 = 2048` |
-| `gate_up_proj` | `7168 x 9216` | merged 后本地输出 `2 * 18432 / 4` |
+| `gate_up_proj` | `7168 x 9216` | local output after merged `2 * 18432 / 4` |
 | `down_proj` | `4608 x 7168` | `18432 / 4 = 4608` |
-| `fc(aux combine)` | `21504 x 7168` | `3 * target_hidden_size -> hidden_size`，replicated |
+| `fc(aux combine)` | `21504 x 7168` | `3 * target_hidden_size -> hidden_size`, replicated |
 
-把这些 GEMM 全部加总后，每 GPU 每 token 的总 GEMM 计算量约为:
-
-```text
+After adding up all these GEMMs, the total GEMM calculation amount per GPU per token is approximately:```text
 F_token ~= 610,009,088 FLOPs / token / GPU
 ```
-
-对应总权重读取量约为:
-
-```text
+The corresponding total weight reading volume is approximately:```text
 W_bytes ~= 610,009,088 bytes / GPU
         ~= 0.568 GiB / GPU
 ```
-
-所以在 `M=1` 时，整体 AI 非常接近 `1 FLOP/B`，这也是小 batch draft 很容易强 memory-bound 的根本原因。
+Therefore, when `M=1`, the overall AI is very close to `1 FLOP/B`, which is also the fundamental reason why small batch drafts are easily memory-bound.
 
 ---
 
-## 5. Arithmetic Intensity 公式
+## 5. Arithmetic Intensity formula
 
-对任意一个 GEMM:
-
-```text
+For any GEMM:```text
 A: [M, K]
 B: [K, N]
 C: [M, N]
 ```
-
-采用最简单的 roofline 近似:
+Using the simplest roofline approximation:
 
 - FLOPs: `2 * M * K * N`
 - Bytes: `s * (M*K + K*N + M*N)`
-- 其中 `s = 2 bytes`（BF16）
+- where `s = 2 bytes` (BF16)
 
-则:
-
-```text
+Then:```text
 AI(M) = 2 M K N / ( s (M K + K N + M N) )
 ```
-
-当 `AI(M) = ridge_point` 时，可以解出临界 batch:
-
-```text
+When `AI(M) = ridge_point`, the critical batch can be solved:```text
 M* = ridge * s * K * N / ( 2 K N - ridge * s * (K + N) )
 ```
-
-若分母小于等于 0，则说明该模块即使 `M -> inf` 也碰不到该 ridge point。
+If the denominator is less than or equal to 0, it means that the module cannot touch the ridge point even if `M -> inf`.
 
 ---
 
-## 6. 各主模块的 `M*`
+## 6. `M*` of each main module
 
 ### 6.1 BF16 ridge: `312.5 FLOP/B`
 
-| 模块 | `AI(∞)` | `M*_BF16` |
+| Module | `AI(∞)` | `M*_BF16` |
 |------|---------|-----------|
 | `fused_qkv_a_proj` | 1840.8 | **376** |
 | `q_b_proj` | 1024.0 | **450** |
@@ -218,32 +195,32 @@ M* = ridge * s * K * N / ( 2 K N - ridge * s * (K + N) )
 | `down_proj` | 2804.9 | **352** |
 | `fc(aux combine)` | 5376.0 | **332** |
 
-结论:
+Conclusion:
 
-- 从**单模块最保守**口径看，瓶颈是 `kv_b_proj`
-- 所以要让所有主 GEMM 都达到 BF16 ridge，batch 至少需要 **`~1000`**
+- From the most conservative perspective of a single module, the bottleneck is `kv_b_proj`
+- So in order for all main GEMMs to reach the BF16 ridge, the batch size needs to be at least **`~1000`**
 
 ### 6.2 FP8 ridge: `625 FLOP/B`
 
-| 模块 | `M*_FP8` |
+| Module | `M*_FP8` |
 |------|----------|
 | `fused_qkv_a_proj` | **946** |
 | `q_b_proj` | **1604** |
-| `kv_b_proj` | **无法达到** (`AI(∞)=455.1 < 625`) |
+| `kv_b_proj` | **Unreachable** (`AI(∞)=455.1 < 625`) |
 | `o_proj` | **1029** |
 | `gate_up_proj` | **740** |
 | `down_proj` | **804** |
 | `fc(aux combine)` | **707** |
 
-这说明如果将来把 roofline 提升到 FP8 档位，那么单看这些 GEMM，`kv_b_proj` 永远还是 memory-bound。
+This shows that if roofline is upgraded to the FP8 level in the future, then just looking at these GEMMs, `kv_b_proj` will always be memory-bound.
 
 ---
 
-## 7. 整体 Step 的 Roofline 拐点
+## 7. Roofline inflection point of the overall Step
 
-### 7.1 把 `fc` 也算入第一次 draft 启动
+### 7.1 Count `fc` into the first draft start
 
-把上面的 7 个 GEMM 全部相加，整体 AI 近似为:
+Adding up all the above 7 GEMMs, the overall AI is approximately:
 
 | `M` | `AI_total(M)` |
 |-----|---------------|
@@ -256,13 +233,13 @@ M* = ridge * s * K * N / ( 2 K N - ridge * s * (K + N) )
 | 345 | **312.57** |
 | 512 | 443.69 |
 
-因此:
+Therefore:
 
-- **整体首次 draft 启动的拐点约为 `M ~= 345`**
+- **The overall inflection point for the first draft is about `M ~= 345`**
 
-### 7.2 只看 recurrent Eagle3 draft step（不含 `fc`）
+### 7.2 Only look at recurrent Eagle3 draft step (excluding `fc`)
 
-如果把 `fc(aux combine)` 去掉，只看真正会重复执行的 draft step:
+If you remove `fc(aux combine)`, you only see the draft steps that will actually be executed repeatedly:
 
 | `M` | `AI_step(M)` |
 |-----|--------------|
@@ -274,95 +251,69 @@ M* = ridge * s * K * N / ( 2 K N - ridge * s * (K + N) )
 | 256 | 231.26 |
 | 360 | **312.93** |
 
-因此:
+Therefore:
 
-- **整体 recurrent draft step 的拐点约为 `M ~= 360`**
+- **The inflection point of the overall recurrent draft step is approximately `M ~= 360`**
 
 ---
 
-## 8. 对当前实验配置的含义
+## 8. The meaning of the current experimental configuration
 
-当前 `pd_kimi_bench_a_70k` 配置:
+Current `pd_kimi_bench_a_70k` configuration:
 
 - `TP=4`
 - `max_num_seqs=16`
 - `num_speculative_tokens=3`
-- `parallel_drafting=False`
+- `parallel_drafting=False`So the current judgment closest to the real execution path is:
 
-所以当前最接近真实执行路径的判断是:
+### 8.1 The current actual draft batch is very small
 
-### 8.1 当前实际 draft batch 很小
-
-因为 `parallel_drafting=False`，每个 speculative step 的有效 batch 基本就是:
-
-```text
+Because `parallel_drafting=False`, the effective batch of each speculative step is basically:```text
 M_actual <= active_decode_requests <= max_num_seqs = 16
 ```
-
-这时整体 AI 只有:
-
-```text
+At this time, the overall AI is only:```text
 AI_total(16) ~= 15.9 FLOP/B
 ```
-
-相对 BF16 ridge:
-
-```text
+Relative to BF16 ridge:```text
 15.9 / 312.5 ~= 5.1%
 ```
+In other words, the main GEMM of the current Eagle3 draft is still far from being "full of computing power", and it is obviously dominated by HBM/weight traffic**.
 
-也就是说，**当前 Eagle3 draft 的主 GEMM 离“算力吃满”还差得很远，明显是 HBM/weight traffic 主导**。
+### 8.2 Even the complete merging of speculative positions is not enough
 
-### 8.2 即使把 speculative positions 完全并起来也不够
-
-如果未来把 3 个 speculative positions 完全并起来，理想化地近似成:
-
-```text
+If the three speculative positions are completely combined in the future, the ideal approximation will be:```text
 M_effective ~= 16 * 3 = 48
 ```
-
-那么:
-
-```text
+So:```text
 AI_total(48) ~= 47.3 FLOP/B
 ```
-
-也只达到 BF16 ridge 的:
-
-```text
+It only reaches BF16 ridge:```text
 47.3 / 312.5 ~= 15.1%
 ```
-
-所以从 roofline 视角看，**当前这套配置离“batch 再增大就没收益”的区间还非常远**。
+Therefore, from a roofline perspective, the current configuration is still very far from the range of "there will be no benefit if the batch is increased further"**.
 
 ---
 
-## 9. 理论吞吐上限
+## 9. Theoretical throughput upper limit
 
-如果仍只看这 7 个主 GEMM，忽略 attention/KV 读写、norm、softmax、collective、kernel launch 等开销，则:
+If we still only look at these 7 main GEMMs and ignore overheads such as attention/KV reading and writing, norm, softmax, collective, kernel launch, etc., then:
 
-### 9.1 Compute ceiling
-
-```text
+### 9.1 Compute ceiling```text
 tokens/s_compute_ceiling
   = peak_compute / FLOPs_per_token
   = 2.5e15 / 610,009,088
   ≈ 4.10e6 tokens/s/GPU
 ```
-
-这只是一个**极松的 roofline 上界**，不应当被当作真实可达值。
+This is just a very loose upper bound on the roofline and should not be taken as a true reachability value.
 
 ### 9.2 Roofline lower bound on time
 
-对 batch `M`:
-
-```text
+For batch `M`:```text
 t_min(M) = max( FLOPs(M) / P_peak, Bytes(M) / BW_peak )
 ```
+Under this simplified model:
 
-在这个简化模型下:
-
-| `M` | 主导项 | roofline 吞吐上界 |
+| `M` | Dominant term | roofline throughput upper bound |
 |-----|--------|-------------------|
 | 1 | memory | ~13.1 K tok/s/GPU |
 | 16 | memory | ~208.8 K tok/s/GPU |
@@ -371,57 +322,56 @@ t_min(M) = max( FLOPs(M) / P_peak, Bytes(M) / BW_peak )
 | 345 | compute | ~4.10 M tok/s/GPU |
 | 512 | compute | ~4.10 M tok/s/GPU |
 
-所以从这个近似模型可以很直观看到:
+So it can be seen intuitively from this approximate model:
 
-- `M < ~350` 时，增大 batch 主要是在提升权重复用，收益来自 **提升计算强度**
-- `M >= ~350` 后，整体主 GEMM 开始撞上 **BF16 compute roofline**
-- 再往上增大 batch，理论上就不会再给这些主 GEMM 带来同等级别的收益
-
----
-
-## 10. 如何解释 “没有收益”
-
-这里的“没有收益”要分两层理解:
-
-1. **整体层面**
-   当整体 `AI_total(M)` 达到 ridge point 后，继续增大 batch，不再改变 roofline 主导项，收益会明显变小。
-
-2. **逐模块层面**
-   如果要求每个关键 GEMM 都从 bandwidth-bound 变成 compute-bound，则要看最慢模块。
-   在当前 `Thinking-Eagle3` 里，保守瓶颈是 `kv_b_proj`，大约要到 `M ~= 998`。
-
-因此更稳妥的表达是:
-
-- **整体意义上的 no-benefit 点**: `M ~= 350`
-- **最保守的 fully-compute-bound 点**: `M ~= 1000`
+- When `M < ~350`, increasing the batch size is mainly to increase weight reuse, and the benefits come from **increasing computing intensity**
+- After `M >= ~350`, the overall main GEMM starts hitting the **BF16 compute roofline**
+- Increasing the batch size further will theoretically not bring the same level of benefits to these main GEMMs.
 
 ---
 
-## 11. 局限性
+## 10. How to explain “no profit”
 
-本文档是一个**偏乐观**的 roofline 建模，尚未计入:
+The "no benefit" here should be understood at two levels:
 
-- MLA attention 本身的 QK/AV kernel
-- KV cache 读写与 HBM 访问
-- CUDA graph / launch / scheduler 开销
-- TP all-reduce / all-gather 通信
-- prefix cache、paged attention、碎片化等运行时因素
+1. **Overall Level**
+   When the overall `AI_total(M)` reaches the ridge point, continue to increase the batch size without changing the roofline dominant term, and the benefits will become significantly smaller.
 
-因此:
+2. **Module-by-module level**
+   If you require every critical GEMM to go from bandwidth-bound to compute-bound, look at the slowest module.
+   In the current `Thinking-Eagle3`, the conservative bottleneck is `kv_b_proj`, which is about `M ~= 998`.
 
-- 这里给出的 `M ~= 350` 应更像是**主 GEMM 开始撞到 BF16 ridge 的 optimistic lower bound**
-- 真正系统级的“batch 再加大没有收益”的点，通常只会 **更大，不会更小**
+Therefore, a more secure expression is:
+
+- **Overall no-benefit point**: `M ~= 350`
+- **The most conservative fully-compute-bound point**: `M ~= 1000`
 
 ---
 
-## 12. 最终结论
+## 11. Limitations
 
-对当前 `Kimi-K2.5-Thinking-Eagle3` 在 `GB200/B200 + TP4` 上:
+This document is an **optimistic** roofline modeling that has not yet taken into account:
 
-- **推荐把 `M ~= 350` 视为整体 GEMM roofline 的第一拐点**
-- **推荐把 `M ~= 1000` 视为保守上限**
-- 当前实验配置下实际 `M <= 16`，即使理想化并 speculative positions 也只有 `M ~= 48`
-- 所以 **当前 Eagle3/MTP 远没有达到“batch 再增大就没收益”的区间**
+- MLA attention's own QK/AV kernel
+- KV cache read and write and HBM access
+- CUDA graph/launch/scheduler overhead
+- TP all-reduce / all-gather communication
+- Runtime factors such as prefix cache, paged attention, fragmentation, etc.
 
-换句话说，单从 roofline 看，**当前 MTP/Eagle3 仍然深处 memory-bound 区间**。
+Therefore:
 
+- The `M ~= 350` given here should be more like the optimistic lower bound where the main GEMM starts to hit the BF16 ridge**
+- The true system-level point of "there is no benefit in increasing the batch size" is usually **bigger, not smaller**
+
+---
+
+## 12. Final Conclusion
+
+For current `Kimi-K2.5-Thinking-Eagle3` on `GB200/B200 + TP4`:
+
+- **It is recommended to regard `M ~= 350` as the first inflection point of the overall GEMM roofline**
+- **It is recommended to consider `M ~= 1000` as a conservative upper limit**
+- The actual `M <= 16` under the current experimental configuration, even if idealized and speculative positions are only `M ~= 48`
+- So **The current Eagle3/MTP is far from reaching the range of "there will be no profit if the batch is increased"**
+
+In other words, looking at the roofline alone, the current MTP/Eagle3 is still deep in the memory-bound range.
