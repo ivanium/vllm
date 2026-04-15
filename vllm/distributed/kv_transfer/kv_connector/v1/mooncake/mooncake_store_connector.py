@@ -24,6 +24,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -34,6 +40,10 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 from .mooncake_store_data import MooncakeStoreConnectorMetadata
+from .mooncake_store_metrics import (
+    MooncakeStoreConnectorStats,
+    MooncakeStorePromMetrics,
+)
 from .mooncake_store_scheduler import MooncakeStoreScheduler
 from .mooncake_store_worker import LookupKeyServer, MooncakeStoreWorker
 
@@ -75,14 +85,6 @@ class MooncakeStoreKVEvents(KVConnectorKVEvents):
 
 class MooncakeStoreConnector(KVConnectorBase_V1):
     """KV connector using MooncakeDistributedStore as shared KV pool."""
-
-    @property
-    def prefer_cross_layer_blocks(self) -> bool:
-        extra_config = self._kv_transfer_config.kv_connector_extra_config
-        return (
-            str(extra_config.get("enable_cross_layers_blocks", "False")).lower()
-            == "true"
-        )
 
     def __init__(
         self,
@@ -178,12 +180,6 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
-    def register_cross_layers_kv_cache(
-        self, kv_cache: torch.Tensor, attn_backend: type
-    ):
-        assert self.connector_worker is not None
-        self.connector_worker.register_cross_layers_kv_caches(kv_cache)
-
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         # No-op: loads are issued in get_finished() for compute overlap.
         pass
@@ -225,3 +221,28 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
         kv_events = MooncakeStoreKVEvents(num_workers=1)
         kv_events.add_events(events)
         return kv_events
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if self.connector_worker is None:
+            return None
+        return self.connector_worker.get_kv_connector_stats()
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        if data is not None:
+            return MooncakeStoreConnectorStats(data=data)
+        return MooncakeStoreConnectorStats()
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: Any,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics | None:
+        return MooncakeStorePromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
