@@ -22,6 +22,7 @@
 #   --protocol <name>     Transport protocol (default: MOONCAKE_PROTOCOL or rdma)
 #   --device <names>      RDMA device name(s) (default: MC_OWNER_DEVICE)
 #   --threads <n>         Owner RPC worker threads (default: 1)
+#   --tent                Enable TENT SHM transport for same-node GPU↔CPU transfers
 #   --bg                  Run in background
 #   --stop                Stop the backgrounded owner launched by this script
 #
@@ -41,6 +42,7 @@ LOG_FILE="${SCRIPT_DIR}/mooncake_owner.${HOST_TAG}.log"
 
 OPT_BG=false
 OPT_STOP=false
+OPT_TENT=false
 CPU_MEM_GB=""
 DISK_GB=""
 DISK_PATH="/mnt/data/mooncake_offload"
@@ -77,6 +79,8 @@ while [[ $# -gt 0 ]]; do
             DEVICE_NAME="$2"; shift 2 ;;
         --threads)
             THREADS="$2"; shift 2 ;;
+        --tent)
+            OPT_TENT=true; shift ;;
         --bg)
             OPT_BG=true; shift ;;
         --stop)
@@ -229,6 +233,11 @@ if [[ -n "$DISK_GB" ]]; then
     mkdir -p "$MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"
 fi
 
+if $OPT_TENT; then
+    export MC_USE_TENT=1
+    export MC_STORE_SHM_SEGMENTS=1
+fi
+
 CMD=(
     mooncake_client
     --master_server_address="$MASTER_SERVER"
@@ -253,6 +262,7 @@ echo "  RPC:           127.0.0.1:${RPC_PORT}"
 echo "  Protocol:      $PROTOCOL"
 echo "  Device:        ${DEVICE_NAME:-<none>}"
 echo "  CPU memory:    ${CPU_MEM_GB} GB"
+echo "  TENT SHM:      $($OPT_TENT && echo ON || echo OFF)"
 if [[ -n "$DISK_GB" ]]; then
     echo "  Disk offload:  ON (${DISK_GB} GB at ${MOONCAKE_OFFLOAD_FILE_STORAGE_PATH})"
 else

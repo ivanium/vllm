@@ -375,6 +375,10 @@ if [[ -n "$OWNER_DEVICE" ]]; then
     export MC_OWNER_DEVICE="$OWNER_DEVICE"
     OWNER_CMD+=(--device "$OWNER_DEVICE")
 fi
+# Enable TENT SHM for same-node GPU↔CPU transfers when requested.
+if [[ "${MC_USE_TENT:-}" == "1" ]]; then
+    OWNER_CMD+=(--tent)
+fi
 if [[ -n "$OWNER_HOST" ]]; then
     OWNER_CMD+=(--host "$OWNER_HOST")
 fi
