@@ -276,21 +276,62 @@ class KVTransferThread(threading.Thread):
                 logger.error("Error in %s: %s", self.name, e)
 
     def _try_bind_numa(self):
-        """Best-effort: bind this thread to the current GPU's NUMA node."""
+        """Best-effort: bind this thread to the current GPU's NUMA node.
+
+        Queries the GPU's NUMA node from sysfs and binds to the last 2
+        CPU cores on that node to avoid contention with compute threads.
+        Silently skips if the platform doesn't support sched_setaffinity
+        or if NUMA info is unavailable.
+        """
         try:
             if not hasattr(os, "sched_setaffinity"):
                 return
+            if not torch.cuda.is_available():
+                return
+
             from vllm.platforms import current_platform
 
-            numa_topology = current_platform.discover_numa_topology()
-            if not numa_topology:
-                return
             device_idx = torch.cuda.current_device()
             physical_id = current_platform.device_id_to_physical_device_id(
                 device_idx
             )
-            numa_node = int(physical_id) % len(numa_topology)
-            cores = numa_topology[numa_node]
+
+            # Read NUMA node from sysfs — this is the authoritative source,
+            # unlike guessing from physical GPU index.
+            numa_path = f"/sys/bus/pci/devices/0000:{physical_id:02x}:00.0/numa_node"
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(physical_id)
+                pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
+                bus_id = pci_info.busId.decode("utf-8").lower()
+                numa_path = f"/sys/bus/pci/devices/{bus_id}/numa_node"
+            except Exception:
+                pass  # fallback to simple path above
+
+            if not os.path.exists(numa_path):
+                return
+            with open(numa_path) as f:
+                numa_node = int(f.read().strip())
+            if numa_node < 0:
+                return  # -1 means NUMA info unavailable
+
+            # Get CPU cores for this NUMA node
+            cpulist_path = f"/sys/devices/system/node/node{numa_node}/cpulist"
+            if not os.path.exists(cpulist_path):
+                return
+            with open(cpulist_path) as f:
+                cpulist_str = f.read().strip()
+
+            # Parse "0-15,32-47" format
+            cores: list[int] = []
+            for part in cpulist_str.split(","):
+                if "-" in part:
+                    lo, hi = part.split("-", 1)
+                    cores.extend(range(int(lo), int(hi) + 1))
+                else:
+                    cores.append(int(part))
+
             if not cores:
                 return
             # Reserve the last 2 cores to avoid contention with compute.
