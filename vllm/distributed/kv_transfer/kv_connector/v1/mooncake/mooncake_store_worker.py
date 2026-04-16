@@ -275,13 +275,76 @@ class KVTransferThread(threading.Thread):
             except Exception as e:
                 logger.error("Error in %s: %s", self.name, e)
 
+    @staticmethod
+    def _normalize_pci_bus_id(bus_id: str) -> str:
+        """Normalize PCI bus ID to sysfs format (4-digit domain, lowercase).
+
+        pynvml / nvidia-smi may return '00000000:89:00.0' (8-digit domain)
+        or uppercase hex. sysfs expects '0000:89:00.0' (4-digit, lowercase).
+        """
+        bus_id = bus_id.strip().lower()
+        # "00000000:89:00.0" → "0000:89:00.0"
+        parts = bus_id.split(":")
+        if len(parts) >= 2 and len(parts[0]) > 4:
+            parts[0] = parts[0][-4:]
+            bus_id = ":".join(parts)
+        return bus_id
+
+    @staticmethod
+    def _get_gpu_pci_bus_id(physical_gpu_id: int) -> str | None:
+        """Get PCI bus ID for a physical GPU via pynvml or nvidia-smi."""
+        # Method 1: pynvml (fast, in-process)
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_id)
+            pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
+            bus_id = pci_info.busId
+            if isinstance(bus_id, bytes):
+                bus_id = bus_id.decode("utf-8")
+            return KVTransferThread._normalize_pci_bus_id(bus_id)
+        except Exception:
+            pass
+
+        # Method 2: nvidia-smi (subprocess, slower but always works)
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=pci.bus_id",
+                 "--format=csv,noheader",
+                 f"--id={physical_gpu_id}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return KVTransferThread._normalize_pci_bus_id(
+                    result.stdout.strip()
+                )
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def _parse_cpulist(cpulist_str: str) -> list[int]:
+        """Parse '0-15,32-47' format into a sorted list of CPU IDs."""
+        cores: list[int] = []
+        for part in cpulist_str.split(","):
+            part = part.strip()
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                cores.extend(range(int(lo), int(hi) + 1))
+            elif part:
+                cores.append(int(part))
+        return sorted(cores)
+
     def _try_bind_numa(self):
         """Best-effort: bind this thread to the current GPU's NUMA node.
 
-        Queries the GPU's NUMA node from sysfs and binds to the last 2
-        CPU cores on that node to avoid contention with compute threads.
-        Silently skips if the platform doesn't support sched_setaffinity
-        or if NUMA info is unavailable.
+        Queries the GPU's NUMA node from sysfs via its PCI bus ID and
+        binds to the last 2 CPU cores on that node to avoid contention
+        with compute threads. Silently skips if the platform doesn't
+        support sched_setaffinity or if NUMA info is unavailable.
         """
         try:
             if not hasattr(os, "sched_setaffinity"):
@@ -296,19 +359,11 @@ class KVTransferThread(threading.Thread):
                 device_idx
             )
 
-            # Read NUMA node from sysfs — this is the authoritative source,
-            # unlike guessing from physical GPU index.
-            numa_path = f"/sys/bus/pci/devices/0000:{physical_id:02x}:00.0/numa_node"
-            try:
-                import pynvml
-                pynvml.nvmlInit()
-                handle = pynvml.nvmlDeviceGetHandleByIndex(physical_id)
-                pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
-                bus_id = pci_info.busId.decode("utf-8").lower()
-                numa_path = f"/sys/bus/pci/devices/{bus_id}/numa_node"
-            except Exception:
-                pass  # fallback to simple path above
+            bus_id = self._get_gpu_pci_bus_id(physical_id)
+            if bus_id is None:
+                return
 
+            numa_path = f"/sys/bus/pci/devices/{bus_id}/numa_node"
             if not os.path.exists(numa_path):
                 return
             with open(numa_path) as f:
@@ -316,21 +371,13 @@ class KVTransferThread(threading.Thread):
             if numa_node < 0:
                 return  # -1 means NUMA info unavailable
 
-            # Get CPU cores for this NUMA node
-            cpulist_path = f"/sys/devices/system/node/node{numa_node}/cpulist"
+            cpulist_path = (
+                f"/sys/devices/system/node/node{numa_node}/cpulist"
+            )
             if not os.path.exists(cpulist_path):
                 return
             with open(cpulist_path) as f:
-                cpulist_str = f.read().strip()
-
-            # Parse "0-15,32-47" format
-            cores: list[int] = []
-            for part in cpulist_str.split(","):
-                if "-" in part:
-                    lo, hi = part.split("-", 1)
-                    cores.extend(range(int(lo), int(hi) + 1))
-                else:
-                    cores.append(int(part))
+                cores = self._parse_cpulist(f.read().strip())
 
             if not cores:
                 return
@@ -338,8 +385,8 @@ class KVTransferThread(threading.Thread):
             reserved = cores[-2:] if len(cores) > 2 else cores
             os.sched_setaffinity(0, reserved)
             logger.info(
-                "Bound %s to NUMA %d cores %s (GPU %d)",
-                self.name, numa_node, reserved, device_idx,
+                "Bound %s to NUMA %d cores %s (GPU phys=%d, bus=%s)",
+                self.name, numa_node, reserved, physical_id, bus_id,
             )
         except Exception:
             logger.debug(
