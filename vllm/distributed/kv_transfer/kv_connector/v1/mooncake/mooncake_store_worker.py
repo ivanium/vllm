@@ -262,6 +262,7 @@ class KVTransferThread(threading.Thread):
             self.finished_requests.add(req_id)
 
     def run(self):
+        self._try_bind_numa()
         self.ready_event.set()
         while True:
             try:
@@ -273,6 +274,37 @@ class KVTransferThread(threading.Thread):
                 self._handle_request(request_data)
             except Exception as e:
                 logger.error("Error in %s: %s", self.name, e)
+
+    def _try_bind_numa(self):
+        """Best-effort: bind this thread to the current GPU's NUMA node."""
+        try:
+            if not hasattr(os, "sched_setaffinity"):
+                return
+            from vllm.platforms import current_platform
+
+            numa_topology = current_platform.discover_numa_topology()
+            if not numa_topology:
+                return
+            device_idx = torch.cuda.current_device()
+            physical_id = current_platform.device_id_to_physical_device_id(
+                device_idx
+            )
+            numa_node = int(physical_id) % len(numa_topology)
+            cores = numa_topology[numa_node]
+            if not cores:
+                return
+            # Reserve the last 2 cores to avoid contention with compute.
+            reserved = cores[-2:] if len(cores) > 2 else cores
+            os.sched_setaffinity(0, reserved)
+            logger.info(
+                "Bound %s to NUMA %d cores %s (GPU %d)",
+                self.name, numa_node, reserved, device_idx,
+            )
+        except Exception:
+            logger.debug(
+                "NUMA binding not available for %s, continuing without",
+                self.name,
+            )
 
     def _handle_request(self, req_meta: Any):
         pass
