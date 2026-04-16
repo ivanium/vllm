@@ -9,7 +9,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, NewType, TypeAlias, overload
+from typing import TYPE_CHECKING, Any, NewType, TypeAlias, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -29,6 +29,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
+
+if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_config_builder import KVCacheConfigBuilder
 
 # BlockHash represents the hash of a single KV-cache block used for
 # prefix caching.  Treating it as a distinct type from `bytes` helps
@@ -1406,6 +1409,7 @@ def _auto_fit_max_model_len(
     vllm_config: VllmConfig,
     projected_groups_per_worker: list[list[KVCacheGroupSpec]],
     available_memory: list[int],
+    builder: "KVCacheConfigBuilder | None" = None,
 ) -> None:
     """
     When max_model_len is set to -1, this function estimates the largest
@@ -1437,7 +1441,14 @@ def _auto_fit_max_model_len(
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
             continue
-        worker_max = _estimate_max_model_len_from_groups(vllm_config, groups, avail_mem)
+        if builder is not None:
+            worker_max = builder.estimate_max_model_len_from_groups(
+                vllm_config, groups, avail_mem
+            )
+        else:
+            worker_max = _estimate_max_model_len_from_groups(
+                vllm_config, groups, avail_mem
+            )
         if worker_max < auto_fit_max:
             auto_fit_max = worker_max
             limiting_worker_mem = avail_mem
@@ -1554,10 +1565,17 @@ def get_kv_cache_configs(
                     "across workers. This is not supported yet."
                 )
 
+    # Resolve the builder for this model/platform combination.
+    from vllm.v1.core.kv_cache_config_builder import resolve_builder
+
+    builder = resolve_builder(vllm_config)
+
     # Get global KV cache groups. This also handles spec unification for
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
-    global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
+    global_kv_cache_groups = builder.get_kv_cache_groups(
+        vllm_config, merged_kv_cache_specs
+    )
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
@@ -1569,7 +1587,10 @@ def get_kv_cache_configs(
 
     if vllm_config.model_config.original_max_model_len == -1:
         _auto_fit_max_model_len(
-            vllm_config, projected_groups_per_worker, available_memory
+            vllm_config,
+            projected_groups_per_worker,
+            available_memory,
+            builder,
         )
 
     # Check if the available memory is enough per worker.
@@ -1578,9 +1599,17 @@ def get_kv_cache_configs(
             continue
         _check_enough_kv_cache_memory(
             avail_mem,
-            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
+            partial(
+                builder.max_memory_usage_bytes_from_groups,
+                vllm_config,
+                groups,
+            ),
             vllm_config.model_config.max_model_len,
-            partial(_estimate_max_model_len_from_groups, vllm_config, groups),
+            partial(
+                builder.estimate_max_model_len_from_groups,
+                vllm_config,
+                groups,
+            ),
         )
 
     kv_cache_configs: list[KVCacheConfig] = []
@@ -1591,7 +1620,7 @@ def get_kv_cache_configs(
             kv_cache_spec_one_worker
         ), "Some layers are not assigned to any group."
         kv_cache_configs.append(
-            get_kv_cache_config_from_groups(
+            builder.get_kv_cache_config_from_groups(
                 vllm_config, projected_groups, available_memory_one_worker
             )
         )

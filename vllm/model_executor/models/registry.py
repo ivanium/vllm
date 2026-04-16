@@ -703,6 +703,7 @@ class _ModelInfo:
     supports_mamba_prefix_caching: bool
     supports_transcription: bool
     supports_transcription_only: bool
+    kv_cache_config_builder_cls: str | None
 
     @staticmethod
     def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
@@ -732,6 +733,9 @@ class _ModelInfo:
                 supports_transcription(model) and model.supports_transcription_only
             ),
             has_noops=has_noops(model),
+            kv_cache_config_builder_cls=getattr(
+                model, "kv_cache_config_builder_cls", None
+            ),
         )
 
 
