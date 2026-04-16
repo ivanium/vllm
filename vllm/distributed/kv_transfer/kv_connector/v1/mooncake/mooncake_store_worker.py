@@ -49,7 +49,6 @@ logger = init_logger(__name__)
 
 DEFAULT_REQUESTER_LOCAL_BUFFER_SIZE = 1024 * 1024 * 1024  # 1 GiB
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
-MOONCAKE_INTERNAL_ERROR = -1
 DEFAULT_MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE = 1280 * 1024 * 1024
 DISK_OFFLOAD_USABLE_BUDGET_RATIO = 0.9
 _DIRECT_IO_ALIGNMENT = 4096
@@ -378,10 +377,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     except queue.Empty:
                         break
 
-                if len(batch) == 1:
-                    self._handle_request(batch[0])
-                else:
-                    self._handle_batch(batch)
+                self._handle_batch(batch)
             except Exception as e:
                 logger.error("Error in %s: %s", self.name, e)
 
@@ -516,11 +512,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if not merged_keys:
             return
 
-        # --- Phase D: CUDA event sync (once for entire batch) ---
+        # --- Phase D: CUDA event sync ---
+        # Requests from different scheduler steps may carry different
+        # events, so we must synchronize every distinct event.
+        synced_events: set[int] = set()
         for p in prepared:
-            if p.req_meta.current_event is not None:
-                p.req_meta.current_event.synchronize()
-                break
+            ev = p.req_meta.current_event
+            if ev is not None and id(ev) not in synced_events:
+                ev.synchronize()
+                synced_events.add(id(ev))
 
         # --- Phase E: Merged batch_put ---
         try:
@@ -538,7 +538,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 "Merged batch_put exception: %s (num_keys=%d)", e,
                 len(merged_keys),
             )
-            res = [MOONCAKE_INTERNAL_ERROR] * len(merged_keys)
+            res = [-1] * len(merged_keys)
 
         # --- Phase F: Per-request result attribution ---
         per_req_failed: dict[int, list[int]] = defaultdict(list)
