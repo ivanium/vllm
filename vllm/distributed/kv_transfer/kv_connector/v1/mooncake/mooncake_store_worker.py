@@ -300,7 +300,7 @@ class KVTransferThread(threading.Thread):
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_id)
 
-        # Method 1: direct NVML query (may raise NotSupported on ARM)
+        # Method 1: direct NVML query (raises NotSupported on ARM)
         try:
             numa_node = pynvml.nvmlDeviceGetNumaNodeId(handle)
             if numa_node >= 0:
@@ -309,62 +309,45 @@ class KVTransferThread(threading.Thread):
             pass
 
         # Method 2: PCI bus ID → sysfs numa_node
-        try:
-            pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
-            bus_id = pci_info.busId
-            if isinstance(bus_id, bytes):
-                bus_id = bus_id.decode("utf-8")
-            bus_id = bus_id.strip().lower()
-            # Normalize 8-digit domain to 4-digit: "00000000:89:00.0" → "0000:89:00.0"
-            parts = bus_id.split(":")
-            if len(parts) >= 2 and len(parts[0]) > 4:
-                parts[0] = parts[0][-4:]
-                bus_id = ":".join(parts)
+        pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
+        bus_id = pci_info.busId
+        if isinstance(bus_id, bytes):
+            bus_id = bus_id.decode("utf-8")
+        bus_id = bus_id.strip().lower()
+        # Normalize 8-digit domain to 4-digit: "00000000:89:00.0" → "0000:89:00.0"
+        parts = bus_id.split(":")
+        if len(parts) >= 2 and len(parts[0]) > 4:
+            parts[0] = parts[0][-4:]
+            bus_id = ":".join(parts)
 
-            numa_path = f"/sys/bus/pci/devices/{bus_id}/numa_node"
-            if os.path.exists(numa_path):
-                with open(numa_path) as f:
-                    val = int(f.read().strip())
-                if val >= 0:
-                    return val
-        except Exception:
-            pass
-
-        return None
+        numa_path = f"/sys/bus/pci/devices/{bus_id}/numa_node"
+        with open(numa_path) as f:
+            val = int(f.read().strip())
+        return val if val >= 0 else None
 
     def _try_bind_numa(self):
-        """Best-effort: bind this thread to the current GPU's NUMA node.
-
-        Silently skips if the platform doesn't support sched_setaffinity
-        or NUMA info is unavailable.
-        """
+        """Best-effort: bind this thread to the current GPU's NUMA node."""
+        if not hasattr(os, "sched_setaffinity") or not torch.cuda.is_available():
+            return
         try:
-            if not hasattr(os, "sched_setaffinity"):
-                return
-            if not torch.cuda.is_available():
-                return
-
             from vllm.platforms import current_platform
 
             device_idx = torch.cuda.current_device()
             physical_id = current_platform.device_id_to_physical_device_id(
                 device_idx
             )
-
             numa_node = self._get_gpu_numa_node(physical_id)
             if numa_node is None:
+                logger.warning(
+                    "Could not determine NUMA node for GPU %d", device_idx)
                 return
 
             cpulist_path = (
                 f"/sys/devices/system/node/node{numa_node}/cpulist"
             )
-            if not os.path.exists(cpulist_path):
-                return
             with open(cpulist_path) as f:
                 cores = self._parse_cpulist(f.read().strip())
 
-            if not cores:
-                return
             reserved = cores[-2:] if len(cores) > 2 else cores
             os.sched_setaffinity(0, reserved)
             logger.info(
@@ -372,9 +355,9 @@ class KVTransferThread(threading.Thread):
                 self.name, numa_node, reserved, device_idx,
             )
         except Exception:
-            logger.debug(
-                "NUMA binding not available for %s, continuing without",
-                self.name,
+            logger.warning(
+                "NUMA binding failed for %s, continuing without",
+                self.name, exc_info=True,
             )
 
     def _handle_request(self, req_meta: Any):
