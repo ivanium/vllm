@@ -533,9 +533,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     merged_keys, merged_addrs, merged_sizes,
                     self.replicate_config,
                 )
-        except Exception as e:
-            logger.error(
-                "Merged batch_put exception: %s (num_keys=%d)", e,
+        except Exception:
+            logger.exception(
+                "Merged batch_put exception (num_keys=%d)",
                 len(merged_keys),
             )
             res = [-1] * len(merged_keys)
