@@ -247,6 +247,11 @@ class KVTransferThread(threading.Thread):
         self.finished_requests: set[str] = set()
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
+        self.device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else None
+        )
 
     def add_request(self, request: ReqMeta) -> None:
         self.request_queue.put(request)
@@ -327,15 +332,19 @@ class KVTransferThread(threading.Thread):
 
     def _try_bind_numa(self):
         """Best-effort: bind this thread to the current GPU's NUMA node."""
-        if not hasattr(os, "sched_setaffinity") or not torch.cuda.is_available():
+        if (
+            not hasattr(os, "sched_setaffinity")
+            or not torch.cuda.is_available()
+            or self.device is None
+        ):
             return
         try:
             from vllm.platforms import current_platform
 
-            device_idx = torch.cuda.current_device()
-            physical_id = current_platform.device_id_to_physical_device_id(
-                device_idx
-            )
+            current_platform.set_device(self.device)
+            device_idx = self.device.index
+            assert device_idx is not None
+            physical_id = current_platform.device_id_to_physical_device_id(device_idx)
             numa_node = self._get_gpu_numa_node(physical_id)
             if numa_node is None:
                 logger.warning(
