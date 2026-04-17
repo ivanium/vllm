@@ -22,6 +22,8 @@ from vllm.distributed.kv_events import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
+    KVMatchQuery,
+    KVMatchResult,
     KVConnectorRole,
 )
 from vllm.forward_context import ForwardContext
@@ -121,6 +123,13 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
         return self.connector_scheduler.get_num_new_matched_tokens(
             request, num_computed_tokens
         )
+
+    def get_num_new_matched_tokens_batch(
+        self,
+        queries: list[KVMatchQuery],
+    ) -> list[KVMatchResult]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_num_new_matched_tokens_batch(queries)
 
     def update_state_after_alloc(
         self,

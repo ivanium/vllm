@@ -24,7 +24,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorRole,
     SupportsHMA,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVMatchQuery,
+    KVMatchResult,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -345,6 +349,67 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _prepare_waiting_connector_matches(
+        self,
+    ) -> tuple[dict[str, tuple[KVCacheBlocks, int]], dict[str, KVMatchResult]]:
+        """Batch connector prefix-cache lookups for eligible waiting requests.
+
+        Requests that become eligible later in the same step continue to use
+        the per-request fallback path in the main waiting-loop. Only
+        connectors that override the batched lookup hook opt into this
+        prepass so existing per-request connectors preserve their current
+        timing and side effects.
+        """
+        if not isinstance(self.connector, KVConnectorBase_V1) or (
+            type(self.connector).get_num_new_matched_tokens_batch
+            is KVConnectorBase_V1.get_num_new_matched_tokens_batch
+        ):
+            return {}, {}
+
+        local_matches: dict[str, tuple[KVCacheBlocks, int]] = {}
+        queries: list[KVMatchQuery] = []
+        seen_req_ids: set[str] = set()
+
+        for request in itertools.chain(self.waiting, self.skipped_waiting):
+            req_id = request.request_id
+            if (
+                req_id in seen_req_ids
+                or request.num_computed_tokens != 0
+                or self._is_blocked_waiting_status(request.status)
+            ):
+                continue
+
+            seen_req_ids.add(req_id)
+            new_computed_blocks, num_new_local_computed_tokens = (
+                self.kv_cache_manager.get_computed_blocks(request)
+            )
+            local_matches[req_id] = (
+                new_computed_blocks,
+                num_new_local_computed_tokens,
+            )
+            queries.append(
+                KVMatchQuery(
+                    request=request,
+                    num_computed_tokens=num_new_local_computed_tokens,
+                )
+            )
+
+        if not queries:
+            return local_matches, {}
+
+        results = self.connector.get_num_new_matched_tokens_batch(queries)
+        if len(results) != len(queries):
+            raise ValueError(
+                "Connector returned mismatched batched lookup results: "
+                f"{len(results)} for {len(queries)} queries"
+            )
+
+        remote_matches = {
+            query.request.request_id: result
+            for query, result in zip(queries, results, strict=True)
+        }
+        return local_matches, remote_matches
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -563,6 +628,12 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            waiting_local_matches: dict[str, tuple[KVCacheBlocks, int]] = {}
+            waiting_remote_matches: dict[str, KVMatchResult] = {}
+            if self.connector is not None:
+                waiting_local_matches, waiting_remote_matches = (
+                    self._prepare_waiting_connector_matches()
+                )
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -609,17 +680,28 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
+                    local_match = waiting_local_matches.get(request_id)
+                    if local_match is None:
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            self.kv_cache_manager.get_computed_blocks(request)
+                        )
+                    else:
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            local_match
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, num_new_local_computed_tokens
+                        batched_match = waiting_remote_matches.get(request_id)
+                        if batched_match is None:
+                            ext_tokens, load_kv_async = (
+                                self.connector.get_num_new_matched_tokens(
+                                    request, num_new_local_computed_tokens
+                                )
                             )
-                        )
+                        else:
+                            ext_tokens = batched_match.num_external_tokens
+                            load_kv_async = batched_match.load_async
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because

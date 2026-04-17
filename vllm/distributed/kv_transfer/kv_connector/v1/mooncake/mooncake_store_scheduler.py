@@ -11,6 +11,8 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
+    KVMatchQuery,
+    KVMatchResult,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (
     LoadSpec,
@@ -27,7 +29,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
-from vllm.v1.serial_utils import MsgpackEncoder
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 logger = init_logger(__name__)
 
@@ -68,18 +70,67 @@ class MooncakeStoreScheduler:
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         """Check for external KV cache hit."""
-        if self._discard_partial_chunks:
-            token_len = (
-                len(request.prompt_token_ids) // self._block_size * self._block_size
-            )
-        else:
-            token_len = len(request.prompt_token_ids)
+        token_len = self._get_lookup_token_len(request)
 
         if token_len < self._block_size:
             return 0, False
 
         num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
+        result = self._build_kv_match_result(
+            request, num_computed_tokens, num_external_hit_tokens
+        )
+        return result.num_external_tokens or 0, result.load_async
 
+    def get_num_new_matched_tokens_batch(
+        self,
+        queries: list[KVMatchQuery],
+    ) -> list[KVMatchResult]:
+        """Check external KV cache hit for many requests in one RPC."""
+        results: list[KVMatchResult] = [
+            KVMatchResult(num_external_tokens=0, load_async=False)
+            for _ in queries
+        ]
+        lookup_requests: list[tuple[str, int, list[BlockHash]]] = []
+        query_indices: list[int] = []
+
+        for i, query in enumerate(queries):
+            token_len = self._get_lookup_token_len(query.request)
+            if token_len < self._block_size:
+                continue
+
+            lookup_requests.append(
+                (query.request.request_id, token_len, query.request.block_hashes)
+            )
+            query_indices.append(i)
+
+        if not lookup_requests:
+            return results
+
+        lookup_results = self.client.lookup_many(lookup_requests)
+        for i, (req_id, _, _) in zip(query_indices, lookup_requests, strict=True):
+            query = queries[i]
+            num_external_hit_tokens = lookup_results.get(req_id, 0)
+            results[i] = self._build_kv_match_result(
+                query.request,
+                query.num_computed_tokens,
+                num_external_hit_tokens,
+            )
+
+        return results
+
+    def _get_lookup_token_len(self, request: Request) -> int:
+        prompt_token_ids = request.prompt_token_ids
+        assert prompt_token_ids is not None
+        if self._discard_partial_chunks:
+            return len(prompt_token_ids) // self._block_size * self._block_size
+        return len(prompt_token_ids)
+
+    def _build_kv_match_result(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_external_hit_tokens: int,
+    ) -> KVMatchResult:
         if num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
 
@@ -97,7 +148,7 @@ class MooncakeStoreScheduler:
         )
 
         if need_to_allocate <= 0:
-            return 0, False
+            return KVMatchResult(num_external_tokens=0, load_async=False)
 
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
@@ -105,7 +156,10 @@ class MooncakeStoreScheduler:
             can_load=False,
         )
 
-        return need_to_allocate, self.load_async
+        return KVMatchResult(
+            num_external_tokens=need_to_allocate,
+            load_async=self.load_async,
+        )
 
     def update_state_after_alloc(
         self,
@@ -369,6 +423,7 @@ class LookupKeyClient:
 
     def __init__(self, vllm_config: VllmConfig):
         self.encoder = MsgpackEncoder()
+        self.decoder = MsgpackDecoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         socket_path = get_zmq_rpc_path_lookup(vllm_config)
         self.socket = make_zmq_socket(
@@ -379,14 +434,22 @@ class LookupKeyClient:
         )
 
     def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
-        hash_strs = [h.hex() for h in block_hashes]
-        hash_frames = self.encoder.encode(hash_strs)
-        token_len_bytes = token_len.to_bytes(4, byteorder="big")
-        all_frames = [token_len_bytes] + list(hash_frames)
-        self.socket.send_multipart(all_frames, copy=False)
-        resp = self.socket.recv()
-        result = int.from_bytes(resp, "big")
-        return result
+        return self.lookup_many([("__single_lookup__", token_len, block_hashes)])[
+            "__single_lookup__"
+        ]
+
+    def lookup_many(
+        self,
+        requests: list[tuple[str, int, list[BlockHash]]],
+    ) -> dict[str, int]:
+        payload = [
+            (req_id, token_len, [block_hash.hex() for block_hash in block_hashes])
+            for req_id, token_len, block_hashes in requests
+        ]
+        self.socket.send_multipart(self.encoder.encode(payload), copy=False)
+        response = self.decoder.decode(self.socket.recv_multipart(copy=False))
+        assert isinstance(response, dict)
+        return {str(req_id): int(result) for req_id, result in response.items()}
 
     def close(self):
         self.socket.close(linger=0)

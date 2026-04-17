@@ -14,7 +14,11 @@ from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    KVMatchQuery,
+    KVMatchResult,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
@@ -219,7 +223,6 @@ def test_multi_example_connector_consistency():
             f"Contents differ for cache directory '{subdir_name}' between "
             f"{storage_1_path} and {storage_2_path}"
         )
-
     events = get_connector_events()
     # First event is set_xfer_handshake_metadata from initialization, then
     # get_num_new_matched_tokens and update_state_after_alloc from generate().
@@ -310,6 +313,47 @@ def test_multi_example_connector_consistency():
     # Clean up
     shutil.rmtree(storage_1_path)
     shutil.rmtree(storage_2_path)
+
+
+def test_multi_connector_batch_match_prefers_first_hit_and_batches_fallback(mc):
+    req_a = MagicMock()
+    req_a.request_id = "req-a"
+    req_b = MagicMock()
+    req_b.request_id = "req-b"
+    req_c = MagicMock()
+    req_c.request_id = "req-c"
+    queries = [
+        KVMatchQuery(request=req_a, num_computed_tokens=0),
+        KVMatchQuery(request=req_b, num_computed_tokens=2),
+        KVMatchQuery(request=req_c, num_computed_tokens=4),
+    ]
+
+    mc._connectors[0].get_num_new_matched_tokens_batch.return_value = [
+        KVMatchResult(num_external_tokens=6, load_async=True),
+        KVMatchResult(num_external_tokens=0, load_async=False),
+        KVMatchResult(num_external_tokens=None, load_async=False),
+    ]
+    mc._connectors[1].get_num_new_matched_tokens_batch.return_value = [
+        KVMatchResult(num_external_tokens=8, load_async=True),
+    ]
+
+    results = mc.get_num_new_matched_tokens_batch(queries)
+
+    assert results == [
+        KVMatchResult(num_external_tokens=6, load_async=True),
+        KVMatchResult(num_external_tokens=8, load_async=True),
+        KVMatchResult(num_external_tokens=None, load_async=False),
+    ]
+    mc._connectors[0].get_num_new_matched_tokens_batch.assert_called_once_with(
+        queries
+    )
+    mc._connectors[1].get_num_new_matched_tokens_batch.assert_called_once_with(
+        [queries[1]]
+    )
+    assert mc._requests_to_connector == {
+        "req-a": 0,
+        "req-b": 1,
+    }
 
 
 def get_connector_events() -> dict[str, list[str]]:
