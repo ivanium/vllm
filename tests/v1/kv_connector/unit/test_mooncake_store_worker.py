@@ -16,6 +16,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data i
     LoadSpec,
     ReqMeta,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_metrics import (  # noqa: E501
+    MooncakeStoreConnectorStats,
+)
 
 
 def _make_store_sending_thread(
@@ -163,6 +166,24 @@ def test_store_sending_thread_only_skips_on_no_available_handle():
     assert store.batch_put_from_multi_buffers.call_count == 2
 
 
+def test_store_sending_thread_records_mooncake_metrics():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    thread = _make_store_sending_thread(store)
+    stats = MooncakeStoreConnectorStats()
+    thread._record_operation_cb = stats.record_operation
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
+
+    assert len(stats.data["save_exists"]) == 1
+    assert stats.data["save_exists"][0]["num_keys"] == 2
+    assert len(stats.data["save_put"]) == 1
+    assert stats.data["save_put"][0]["num_bytes"] == 512
+    assert stats.data["save_put"][0]["status"] == "ok"
+
+
 def test_get_disk_offload_buffer_budget_bytes_uses_effective_offload_flag(
     monkeypatch,
 ):
@@ -208,6 +229,28 @@ def test_recv_thread_uses_single_batch_when_no_disk_offload_budget():
         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6132",
     ]
     assert sizes == [[256], [256], [256]]
+
+
+def test_recv_thread_records_partial_failure_metrics():
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, -10]
+    thread = _make_store_recving_thread(store, disk_offload_buffer_budget_bytes=None)
+    stats = MooncakeStoreConnectorStats()
+    thread._record_operation_cb = stats.record_operation
+
+    req = _make_load_req(
+        "req-a",
+        [b"a0", b"a1"],
+        token_len=32,
+    )
+
+    thread._handle_request(req)
+
+    assert len(stats.data["load_get"]) == 1
+    assert stats.data["load_get"][0]["num_keys"] == 2
+    assert stats.data["load_get"][0]["num_bytes"] == 512
+    assert stats.data["load_get"][0]["status"] == "partial_failure"
+    assert stats.data["load_get"][0]["num_failed_keys"] == 1
 
 
 def test_recv_thread_uses_ratio_scaled_budget_for_first_pass_split():
@@ -394,7 +437,63 @@ def _make_bare_worker(
     worker.disk_offload_buffer_budget_bytes = None
     worker.kv_send_thread = None
     worker.kv_recv_thread = None
+    worker._kv_connector_stats_lock = threading.Lock()
+    worker.kv_connector_stats = MooncakeStoreConnectorStats()
+    worker.tp_size = 1
+    worker.num_kv_head = 1
+    worker.pp_size = 1
     return worker
+
+
+def test_mooncake_store_stats_aggregate_reduce():
+    stats = MooncakeStoreConnectorStats()
+    stats.record_operation("save_put", 0.01, 2, num_bytes=128)
+    other = MooncakeStoreConnectorStats()
+    other.record_operation(
+        "save_put",
+        0.03,
+        1,
+        num_bytes=64,
+        status="error",
+        num_failed_keys=1,
+    )
+
+    reduced = stats.aggregate(other).reduce()
+
+    assert reduced["save_put_count"] == 2
+    assert reduced["save_put_total_keys"] == 3
+    assert reduced["save_put_total_bytes"] == 192
+    assert reduced["save_put_failed_keys"] == 1
+    assert reduced["save_put_error_count"] == 1
+
+
+def test_worker_get_kv_connector_stats_resets_after_read():
+    worker = _make_bare_worker()
+    worker._record_kv_connector_operation(
+        "save_put",
+        0.01,
+        2,
+        num_bytes=128,
+    )
+
+    stats = worker.get_kv_connector_stats()
+
+    assert isinstance(stats, MooncakeStoreConnectorStats)
+    assert stats.data["save_put"][0]["num_bytes"] == 128
+    assert worker.get_kv_connector_stats() is None
+
+
+def test_lookup_records_mooncake_metrics():
+    worker = _make_bare_worker()
+    worker.store.batch_is_exist.return_value = [1, 1]
+
+    result = worker.lookup(32, [b"a0", b"a1"])
+    stats = worker.get_kv_connector_stats()
+
+    assert result == 32
+    assert isinstance(stats, MooncakeStoreConnectorStats)
+    assert len(stats.data["lookup_exists"]) == 1
+    assert stats.data["lookup_exists"][0]["num_keys"] == 2
 
 
 # ---------------------------------------------------------------------------
