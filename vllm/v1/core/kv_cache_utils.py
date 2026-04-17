@@ -1374,18 +1374,24 @@ def _estimate_max_model_len_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
+    max_memory_usage_bytes_fn: Callable[
+        [VllmConfig, list[KVCacheGroupSpec]], int
+    ] = _max_memory_usage_bytes_from_groups,
 ) -> int:
     """
     Binary search for the maximum model length that fits in available memory.
     Returns 0 if even 1 token doesn't fit.
+
+    ``max_memory_usage_bytes_fn`` is the per-builder memory-usage function;
+    passing ``builder.max_memory_usage_bytes_from_groups`` ensures the binary
+    search uses the same memory model as actual allocation.
     """
     original_max = vllm_config.model_config.max_model_len
 
     def fits(model_len: int) -> bool:
         vllm_config.model_config.max_model_len = model_len
         return (
-            _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
-            <= available_memory
+            max_memory_usage_bytes_fn(vllm_config, kv_cache_groups) <= available_memory
         )
 
     try:
@@ -1409,7 +1415,7 @@ def _auto_fit_max_model_len(
     vllm_config: VllmConfig,
     projected_groups_per_worker: list[list[KVCacheGroupSpec]],
     available_memory: list[int],
-    builder: "KVCacheConfigBuilder | None" = None,
+    builder: "KVCacheConfigBuilder",
 ) -> None:
     """
     When max_model_len is set to -1, this function estimates the largest
@@ -1441,14 +1447,12 @@ def _auto_fit_max_model_len(
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
             continue
-        if builder is not None:
-            worker_max = builder.estimate_max_model_len_from_groups(
-                vllm_config, groups, avail_mem
-            )
-        else:
-            worker_max = _estimate_max_model_len_from_groups(
-                vllm_config, groups, avail_mem
-            )
+        worker_max = _estimate_max_model_len_from_groups(
+            vllm_config,
+            groups,
+            avail_mem,
+            builder.max_memory_usage_bytes_from_groups,
+        )
         if worker_max < auto_fit_max:
             auto_fit_max = worker_max
             limiting_worker_mem = avail_mem
@@ -1606,9 +1610,10 @@ def get_kv_cache_configs(
             ),
             vllm_config.model_config.max_model_len,
             partial(
-                builder.estimate_max_model_len_from_groups,
+                _estimate_max_model_len_from_groups,
                 vllm_config,
                 groups,
+                max_memory_usage_bytes_fn=builder.max_memory_usage_bytes_from_groups,
             ),
         )
 

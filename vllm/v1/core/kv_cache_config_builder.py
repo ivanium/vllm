@@ -63,21 +63,6 @@ class KVCacheConfigBuilder:
 
         return _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
 
-    def estimate_max_model_len_from_groups(
-        self,
-        vllm_config: "VllmConfig",
-        kv_cache_groups: list[KVCacheGroupSpec],
-        available_memory: int,
-    ) -> int:
-        """Binary-search for largest max_model_len that fits."""
-        from vllm.v1.core.kv_cache_utils import (
-            _estimate_max_model_len_from_groups,
-        )
-
-        return _estimate_max_model_len_from_groups(
-            vllm_config, kv_cache_groups, available_memory
-        )
-
 
 def _load_builder(cls_path: str) -> KVCacheConfigBuilder:
     """Import and instantiate a builder from its fully-qualified class path."""
