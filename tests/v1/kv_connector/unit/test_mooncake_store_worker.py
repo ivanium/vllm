@@ -28,6 +28,7 @@ def _make_store_sending_thread(
     store: MagicMock,
     *,
     replicate_config: object | None = None,
+    enable_kv_event: bool = False,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     token_database = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0), block_size=16
@@ -42,6 +43,7 @@ def _make_store_sending_thread(
         put_step=1,
         kv_role="kv_producer",
         ready_event=threading.Event(),
+        enable_kv_event=enable_kv_event,
         replicate_config=replicate_config,
     )
     thread.request_queue.task_done = MagicMock()
@@ -380,6 +382,40 @@ def test_store_sending_thread_uses_default_write_path_without_preferred_segment(
     assert store.batch_put_from_multi_buffers.call_count == 1
     call_args = store.batch_put_from_multi_buffers.call_args.args
     assert len(call_args) == 3
+
+
+def test_store_sending_thread_batch_events_only_include_missing_blocks():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [1, 0, 0, 1]
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    thread = _make_store_sending_thread(store, enable_kv_event=True)
+
+    req_a = _make_store_req("req-a", [b"a0", b"a1"])
+    req_a.token_ids = list(range(32))
+    req_b = _make_store_req("req-b", [b"b0", b"b1"])
+    req_b.token_ids = list(range(100, 132))
+
+    thread.add_stored_request("req-a")
+    thread.add_stored_request("req-b")
+    thread._handle_batch([req_a, req_b])
+
+    assert store.batch_put_from_multi_buffers.call_count == 1
+    call_args = store.batch_put_from_multi_buffers.call_args.args
+    assert call_args[0] == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6230",
+    ]
+
+    events = thread.get_kv_events()
+    assert len(events) == 2
+    assert [event.block_hashes[0] for event in events] == [
+        mooncake_store_worker.maybe_convert_block_hash(b"a1"),
+        mooncake_store_worker.maybe_convert_block_hash(b"b0"),
+    ]
+    assert events[0].parent_block_hash is None
+    assert events[1].parent_block_hash is None
+    assert events[0].token_ids == req_a.token_ids[16:32]
+    assert events[1].token_ids == req_b.token_ids[0:16]
 
 
 def test_get_disk_offload_buffer_budget_bytes_uses_requester_budget_override(

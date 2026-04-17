@@ -388,11 +388,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
         @dataclass
         class _Prepared:
             req_meta: ReqMeta
+            starts: list[int]
+            ends: list[int]
             keys: list[str]
             addrs: list[list[int]]
             sizes: list[list[int]]
-            block_hashes: list[BlockHash]
-            stored_events: list[BlockStored]
+            converted_block_hashes: list[Any]
 
         prepared: list[_Prepared] = []
 
@@ -437,37 +438,23 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # Build addrs/sizes and KV events
             addrs = []
             sizes = []
-            stored_events: list[BlockStored] = []
-            prev_key = None
-            new_bh = [maybe_convert_block_hash(bh) for bh in block_hashes]
             for idx, start in enumerate(starts):
                 addr, size, _ = self.token_database.prepare_value(
                     start, ends[idx], req_meta.block_ids
                 )
                 addrs.append(addr)
                 sizes.append(size)
-                if self.enable_kv_event:
-                    token_ids = (
-                        req_meta.token_ids[start : ends[idx]]
-                        if req_meta.token_ids is not None
-                        else None
-                    )
-                    stored_events.append(
-                        BlockStored(
-                            block_hashes=[new_bh[idx]],
-                            parent_block_hash=prev_key,
-                            token_ids=token_ids,
-                            block_size=req_meta.original_block_size,
-                            lora_id=None,
-                            medium="cpu",
-                            lora_name=None,
-                        )
-                    )
-                    prev_key = new_bh[idx]
 
             prepared.append(
-                _Prepared(req_meta, keys, addrs, sizes, block_hashes,
-                          stored_events)
+                _Prepared(
+                    req_meta,
+                    starts,
+                    ends,
+                    keys,
+                    addrs,
+                    sizes,
+                    [maybe_convert_block_hash(bh) for bh in block_hashes],
+                )
             )
 
         if not prepared:
@@ -488,6 +475,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         merged_sizes: list[list[int]] = []
         merged_req_indices: list[int] = []
         active_prepared: list[int] = []
+        stored_events_by_req: dict[int, list[BlockStored]] = {}
 
         for pi, (p, (off_start, off_end)) in enumerate(
             zip(prepared, offsets, strict=True)
@@ -507,6 +495,29 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 merged_addrs.append(p.addrs[i])
                 merged_sizes.append(p.sizes[i])
                 merged_req_indices.append(pi)
+
+            if self.enable_kv_event:
+                prev_key = None
+                stored_events: list[BlockStored] = []
+                for i in missing:
+                    token_ids = (
+                        p.req_meta.token_ids[p.starts[i] : p.ends[i]]
+                        if p.req_meta.token_ids is not None
+                        else None
+                    )
+                    stored_events.append(
+                        BlockStored(
+                            block_hashes=[p.converted_block_hashes[i]],
+                            parent_block_hash=prev_key,
+                            token_ids=token_ids,
+                            block_size=p.req_meta.original_block_size,
+                            lora_id=None,
+                            medium="cpu",
+                            lora_name=None,
+                        )
+                    )
+                    prev_key = p.converted_block_hashes[i]
+                stored_events_by_req[pi] = stored_events
             active_prepared.append(pi)
 
         if not merged_keys:
@@ -576,8 +587,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         req_id,
                     )
 
-            if self.enable_kv_event and p.stored_events:
-                self.update_kv_event(p.stored_events)
+            stored_events = stored_events_by_req.get(pi, [])
+            if self.enable_kv_event and stored_events:
+                self.update_kv_event(stored_events)
 
             self.dec_stored_request(req_id)
             self.request_queue.task_done()
