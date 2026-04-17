@@ -228,6 +228,11 @@ class KVTransferThread(threading.Thread):
         self.finished_requests: set[str] = set()
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
+        self.device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else None
+        )
 
     def add_request(self, request: ReqMeta) -> None:
         self.request_queue.put(request)
@@ -243,6 +248,7 @@ class KVTransferThread(threading.Thread):
             self.finished_requests.add(req_id)
 
     def run(self):
+        self._try_bind_numa()
         self.ready_event.set()
         while True:
             try:
@@ -254,6 +260,186 @@ class KVTransferThread(threading.Thread):
                 self._handle_request(request_data)
             except Exception as e:
                 logger.error("Error in %s: %s", self.name, e)
+
+    @staticmethod
+    def _parse_cpulist(cpulist_str: str) -> list[int]:
+        """Parse Linux cpulist syntax like ``0-15,32-47`` into CPU IDs."""
+        cores: list[int] = []
+        for part in cpulist_str.split(","):
+            part = part.strip()
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                cores.extend(range(int(lo), int(hi) + 1))
+            elif part:
+                cores.append(int(part))
+        return sorted(cores)
+
+    @staticmethod
+    def _decode_nvml_cpu_affinity(affinity_words: Any) -> list[int]:
+        """Expand NVML's 64-bit affinity words into sorted CPU IDs."""
+        cores: list[int] = []
+        for word_index, word in enumerate(affinity_words):
+            mask = int(word)
+            for bit_index in range(64):
+                if mask & (1 << bit_index):
+                    cores.append(word_index * 64 + bit_index)
+        return cores
+
+    @classmethod
+    def _get_gpu_affinity_cores(cls, physical_gpu_id: int) -> list[int] | None:
+        """Return ideal CPUs for one GPU if NVML exposes them.
+
+        This is the preferred path for GB200/GH200-style systems where the
+        ideal CPUs for a GPU can be narrower than the full CPU NUMA node.
+        Falling back to NUMA-node cores keeps the behavior correct on older
+        platforms that only expose GPU↔NUMA-node locality.
+        """
+        from vllm.third_party import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_id)
+        affinity_word_count = max(1, ((os.cpu_count() or 1) + 63) // 64)
+
+        try:
+            affinity_words = pynvml.nvmlDeviceGetCpuAffinityWithinScope(
+                handle,
+                affinity_word_count,
+                pynvml.NVML_AFFINITY_SCOPE_NODE,
+            )
+        except Exception:
+            try:
+                affinity_words = pynvml.nvmlDeviceGetCpuAffinity(
+                    handle,
+                    affinity_word_count,
+                )
+            except Exception:
+                return None
+
+        cores = cls._decode_nvml_cpu_affinity(affinity_words)
+        return cores or None
+
+    @staticmethod
+    def _get_gpu_numa_node(physical_gpu_id: int) -> int | None:
+        """Get the CPU NUMA node nearest to a physical GPU."""
+        from vllm.third_party import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_id)
+
+        try:
+            numa_node = pynvml.nvmlDeviceGetNumaNodeId(handle)
+            if numa_node >= 0:
+                return numa_node
+        except Exception:
+            pass
+
+        pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
+        bus_id = pci_info.busId
+        if isinstance(bus_id, bytes):
+            bus_id = bus_id.decode("utf-8")
+        bus_id = bus_id.strip().lower()
+        parts = bus_id.split(":")
+        if len(parts) >= 2 and len(parts[0]) > 4:
+            parts[0] = parts[0][-4:]
+            bus_id = ":".join(parts)
+
+        numa_path = f"/sys/bus/pci/devices/{bus_id}/numa_node"
+        with open(numa_path) as f:
+            val = int(f.read().strip())
+        return val if val >= 0 else None
+
+    @staticmethod
+    def _select_transfer_cores(cores: list[int]) -> list[int]:
+        """Reserve a tiny housekeeping slice from the local CPU set."""
+        return cores[-2:] if len(cores) > 2 else cores
+
+    def _try_bind_numa(self):
+        """Best-effort binding for Mooncake transfer threads.
+
+        Preferred path:
+        Use NVML's per-GPU CPU affinity when available. This keeps GB200-style
+        systems on the CPU subset local to one GPU, instead of treating the
+        whole Grace socket as interchangeable.
+
+        Fallback path:
+        Resolve the GPU's CPU NUMA node and use the CPU list for that node.
+        This preserves the original NUMA-local behavior on platforms that do
+        not expose a narrower per-GPU CPU affinity mask.
+        """
+        if (
+            not hasattr(os, "sched_setaffinity")
+            or not torch.cuda.is_available()
+            or self.device is None
+        ):
+            return
+
+        try:
+            from vllm.platforms import current_platform
+
+            current_platform.set_device(self.device)
+            device_idx = self.device.index
+            assert device_idx is not None
+            physical_id = current_platform.device_id_to_physical_device_id(device_idx)
+
+            allowed_cores = (
+                set(os.sched_getaffinity(0))
+                if hasattr(os, "sched_getaffinity")
+                else None
+            )
+
+            affinity_cores = self._get_gpu_affinity_cores(physical_id)
+            if affinity_cores is not None:
+                if allowed_cores is not None:
+                    affinity_cores = [
+                        core for core in affinity_cores if core in allowed_cores
+                    ]
+                if affinity_cores:
+                    reserved = self._select_transfer_cores(affinity_cores)
+                    os.sched_setaffinity(0, reserved)
+                    logger.info(
+                        "Bound %s to per-GPU CPU affinity cores %s (GPU %d)",
+                        self.name,
+                        reserved,
+                        device_idx,
+                    )
+                    return
+
+            numa_node = self._get_gpu_numa_node(physical_id)
+            if numa_node is None:
+                logger.warning(
+                    "Could not determine affinity CPUs or NUMA node for GPU %d",
+                    device_idx,
+                )
+                return
+
+            cpulist_path = f"/sys/devices/system/node/node{numa_node}/cpulist"
+            with open(cpulist_path) as f:
+                numa_cores = self._parse_cpulist(f.read().strip())
+            if allowed_cores is not None:
+                numa_cores = [core for core in numa_cores if core in allowed_cores]
+            if not numa_cores:
+                logger.warning(
+                    "No allowed CPU cores remain on NUMA node %d for GPU %d",
+                    numa_node,
+                    device_idx,
+                )
+                return
+
+            reserved = self._select_transfer_cores(numa_cores)
+            os.sched_setaffinity(0, reserved)
+            logger.info(
+                "Bound %s to NUMA node %d fallback cores %s (GPU %d)",
+                self.name,
+                numa_node,
+                reserved,
+                device_idx,
+            )
+        except Exception:
+            logger.warning(
+                "NUMA binding failed for %s, continuing without",
+                self.name,
+                exc_info=True,
+            )
 
     def _handle_request(self, req_meta: Any):
         pass

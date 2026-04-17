@@ -3,7 +3,7 @@
 
 import math
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import torch
 
@@ -104,6 +104,80 @@ _DISK_OFFLOAD_BUDGET_FOR_SPLIT = math.ceil(
 _DISK_OFFLOAD_BUDGET_TOO_SMALL = (
     _DISK_OFFLOAD_SINGLE_KEY_BYTES - 1
 )  # Smaller than a single 256-byte chunk.
+
+
+def test_transfer_thread_prefers_per_gpu_affinity_path():
+    store = MagicMock()
+    thread = _make_store_sending_thread(store)
+    thread.device = torch.device("cuda", 3)
+
+    fake_platform = MagicMock()
+    fake_platform.device_id_to_physical_device_id.return_value = 7
+
+    with (
+        patch.object(
+            mooncake_store_worker.torch.cuda, "is_available", return_value=True
+        ),
+        patch.object(
+            mooncake_store_worker.torch.cuda,
+            "current_device",
+            side_effect=AssertionError("thread should use the captured device"),
+        ),
+        patch("vllm.platforms.current_platform", fake_platform),
+        patch.object(thread, "_get_gpu_affinity_cores", return_value=[4, 5, 8, 9]),
+        patch.object(
+            thread,
+            "_get_gpu_numa_node",
+            side_effect=AssertionError("fallback should not be used"),
+        ),
+        patch.object(
+            mooncake_store_worker.os,
+            "sched_getaffinity",
+            return_value={0, 1, 4, 5, 8, 9},
+            create=True,
+        ),
+        patch.object(
+            mooncake_store_worker.os, "sched_setaffinity", create=True
+        ) as mock_affinity,
+    ):
+        thread._try_bind_numa()
+
+    fake_platform.set_device.assert_called_once_with(thread.device)
+    fake_platform.device_id_to_physical_device_id.assert_called_once_with(3)
+    mock_affinity.assert_called_once_with(0, [8, 9])
+
+
+def test_transfer_thread_falls_back_to_numa_node_cores():
+    store = MagicMock()
+    thread = _make_store_sending_thread(store)
+    thread.device = torch.device("cuda", 1)
+
+    fake_platform = MagicMock()
+    fake_platform.device_id_to_physical_device_id.return_value = 5
+
+    with (
+        patch.object(
+            mooncake_store_worker.torch.cuda, "is_available", return_value=True
+        ),
+        patch("vllm.platforms.current_platform", fake_platform),
+        patch.object(thread, "_get_gpu_affinity_cores", return_value=None),
+        patch.object(thread, "_get_gpu_numa_node", return_value=1),
+        patch.object(
+            mooncake_store_worker.os,
+            "sched_getaffinity",
+            return_value=set(range(16)),
+            create=True,
+        ),
+        patch("builtins.open", mock_open(read_data="0-3,8-9")),
+        patch.object(
+            mooncake_store_worker.os, "sched_setaffinity", create=True
+        ) as mock_affinity,
+    ):
+        thread._try_bind_numa()
+
+    fake_platform.set_device.assert_called_once_with(thread.device)
+    fake_platform.device_id_to_physical_device_id.assert_called_once_with(1)
+    mock_affinity.assert_called_once_with(0, [8, 9])
 
 
 def test_store_sending_thread_skips_request_during_cpu_pressure():
