@@ -15,6 +15,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (
     MooncakeStoreConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_metrics import (  # noqa: E501
+    MooncakeStoreConnectorStats,
+)
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import create_vllm_config
@@ -194,6 +197,52 @@ def test_get_kv_connector_kv_cache_events_returns_none_when_empty():
 
     mock_worker_cls.return_value.get_kv_events.return_value = []
     assert connector.get_kv_connector_kv_cache_events() is None
+
+
+def test_get_kv_connector_stats_delegates_to_worker():
+    vllm_config = _make_vllm_config()
+    expected_stats = MooncakeStoreConnectorStats()
+    expected_stats.record_operation("save_put", 0.01, 2, num_bytes=1024)
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_connector.MooncakeStoreWorker"
+        ) as mock_worker_cls,
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_connector.LookupKeyServer"
+        ),
+    ):
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.WORKER
+        )
+
+    mock_worker_cls.return_value.get_kv_connector_stats.return_value = expected_stats
+    stats = connector.get_kv_connector_stats()
+
+    assert stats is expected_stats
+    mock_worker_cls.return_value.get_kv_connector_stats.assert_called_once_with()
+
+
+def test_build_kv_connector_stats_reconstructs_mooncake_stats():
+    stats = mooncake_store_connector.MooncakeStoreConnector.build_kv_connector_stats(
+        {
+            "save_put": [
+                {
+                    "duration_seconds": 0.02,
+                    "num_keys": 4,
+                    "num_bytes": 2048,
+                    "status": "ok",
+                    "num_failed_keys": 0,
+                }
+            ]
+        }
+    )
+
+    assert isinstance(stats, MooncakeStoreConnectorStats)
+    assert stats.data["save_put"][0]["num_bytes"] == 2048
 
 
 def test_get_kv_connector_kv_cache_events_wraps_worker_events():
