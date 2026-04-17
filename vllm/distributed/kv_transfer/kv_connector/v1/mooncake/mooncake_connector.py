@@ -27,6 +27,8 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
+    KVMatchQuery,
+    KVMatchResult,
     KVConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
@@ -380,6 +382,13 @@ class MooncakeConnector(KVConnectorBase_V1):
             request, num_computed_tokens
         )
 
+    def get_num_new_matched_tokens_batch(
+        self,
+        queries: list[KVMatchQuery],
+    ) -> list[KVMatchResult]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_num_new_matched_tokens_batch(queries)
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -503,6 +512,23 @@ class MooncakeConnectorScheduler:
 
         # No remote prefill for this request.
         return 0, False
+
+    def get_num_new_matched_tokens_batch(
+        self,
+        queries: list[KVMatchQuery],
+    ) -> list[KVMatchResult]:
+        return [
+            KVMatchResult(
+                num_external_tokens=num_external_tokens,
+                load_async=load_async,
+            )
+            for query in queries
+            for num_external_tokens, load_async in [
+                self.get_num_new_matched_tokens(
+                    query.request, query.num_computed_tokens
+                )
+            ]
+        ]
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

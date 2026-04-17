@@ -10,6 +10,9 @@ The class provides the following primitives:
         get_num_new_matched_tokens() - get number of new tokens
             that exist in the remote KV cache. Might be called multiple
             times for a given request and should be side-effect free.
+        get_num_new_matched_tokens_batch() - batched variant of
+            get_num_new_matched_tokens() for connectors that can coalesce
+            remote prefix-cache lookups.
         update_state_after_alloc() - update KVConnector state after
             temporary buffer alloc by the CacheManager.
         update_connector_output() - update KVConnector state after
@@ -43,6 +46,7 @@ The class provides the following primitives:
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -165,6 +169,22 @@ class KVConnectorWorkerMetadata(ABC):
         Aggregate metadata with another `KVConnectorWorkerMetadata` object.
         """
         pass
+
+
+@dataclass(frozen=True)
+class KVMatchQuery:
+    """Single request lookup input for batched prefix-cache matching."""
+
+    request: "Request"
+    num_computed_tokens: int
+
+
+@dataclass(frozen=True)
+class KVMatchResult:
+    """Single request lookup result for batched prefix-cache matching."""
+
+    num_external_tokens: int | None
+    load_async: bool
 
 
 class KVConnectorBase_V1(ABC):
@@ -480,6 +500,30 @@ class KVConnectorBase_V1(ABC):
             into account.
         """
         pass
+
+    def get_num_new_matched_tokens_batch(
+        self,
+        queries: list[KVMatchQuery],
+    ) -> list[KVMatchResult]:
+        """Batched variant of ``get_num_new_matched_tokens``.
+
+        Connectors can override this to coalesce remote lookups. The default
+        implementation preserves existing semantics, including any side
+        effects in ``get_num_new_matched_tokens``, by calling it once per
+        query.
+        """
+        return [
+            KVMatchResult(
+                num_external_tokens=num_external_tokens,
+                load_async=load_async,
+            )
+            for query in queries
+            for num_external_tokens, load_async in [
+                self.get_num_new_matched_tokens(
+                    query.request, query.num_computed_tokens
+                )
+            ]
+        ]
 
     @abstractmethod
     def update_state_after_alloc(

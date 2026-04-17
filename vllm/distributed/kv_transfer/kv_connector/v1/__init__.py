@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVMatchQuery,
+    KVMatchResult,
     KVConnectorRole,
     SupportsHMA,
     supports_hma,
@@ -13,6 +15,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import 
 __all__ = [
     "KVConnectorRole",
     "KVConnectorBase_V1",
+    "KVMatchQuery",
+    "KVMatchResult",
     "supports_hma",
     "SupportsHMA",
     "DecodeBenchConnector",

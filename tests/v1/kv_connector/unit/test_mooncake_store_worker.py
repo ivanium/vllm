@@ -397,6 +397,18 @@ def _make_bare_worker(
     return worker
 
 
+def _make_lookup_worker(store: MagicMock) -> mooncake_store_worker.MooncakeStoreWorker:
+    worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
+    worker.store = store
+    worker.token_database = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0), block_size=16
+    )
+    worker.tp_size = 1
+    worker.num_kv_head = 1
+    worker.pp_size = 1
+    return worker
+
+
 # ---------------------------------------------------------------------------
 # register_kv_caches tests
 # ---------------------------------------------------------------------------
@@ -543,3 +555,28 @@ def test_register_kv_caches_cross_layer_single_segment():
 
     assert worker2.kv_caches_base_addr == worker.kv_caches_base_addr
     assert worker2.block_len == worker.block_len
+
+
+def test_lookup_many_merges_requests_into_single_batch_is_exist():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [1, 0, 1]
+    worker = _make_lookup_worker(store)
+
+    results = worker.lookup_many(
+        [
+            ("req-a", 32, [b"a0", b"a1"]),
+            ("req-b", 16, [b"b0"]),
+        ]
+    )
+
+    assert results == {
+        "req-a": 16,
+        "req-b": 16,
+    }
+    store.batch_is_exist.assert_called_once_with(
+        [
+            "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6130",
+            "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6131",
+            "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6230",
+        ]
+    )

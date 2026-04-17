@@ -41,7 +41,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
-from vllm.v1.serial_utils import MsgpackDecoder
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 logger = init_logger(__name__)
 
@@ -952,48 +952,74 @@ class MooncakeStoreWorker:
         token_len: int,
         block_hashes: list[BlockHash],
     ) -> int:
+        return self.lookup_many(
+            [("__single_lookup__", token_len, block_hashes)]
+        ).get("__single_lookup__", 0)
+
+    def lookup_many(
+        self,
+        requests: list[tuple[str, int, list[BlockHash] | list[str]]],
+    ) -> dict[str, int]:
         """Check how many prefix tokens exist in the store.
 
         Checks across all TP ranks and PP ranks.
         """
-        end = 0
-        keys: list[str] = []
+        num_lookup_ranks = min(self.tp_size, self.num_kv_head) * self.pp_size
+        flat_keys: list[str] = []
+        lookup_meta: list[tuple[str, list[int], int, int]] = []
+        results: dict[str, int] = {}
+
         try:
-            starts: list[int] = []
-            for start, end, key in self.token_database.process_tokens(
-                token_len, block_hashes
-            ):
-                keys.append(key.to_string())
-                starts.append(start)
+            for req_id, token_len, block_hashes in requests:
+                end = 0
+                starts: list[int] = []
+                keys: list[str] = []
+                for start, end, key in self.token_database.process_tokens(
+                    token_len, block_hashes
+                ):
+                    keys.append(key.to_string())
+                    starts.append(start)
 
-            # Expand keys for all TP ranks
-            multi_tp_keys = keys[:]
-            for i in range(1, min(self.tp_size, self.num_kv_head)):
-                for item in keys:
-                    new_str = item.replace("@tp_rank:0", f"@tp_rank:{i}", 1)
-                    multi_tp_keys.append(new_str)
+                if not keys:
+                    results[req_id] = end
+                    continue
 
-            # Expand keys for all PP ranks
-            pp_base_keys = multi_tp_keys.copy()
-            for i in range(1, self.pp_size):
-                for item in pp_base_keys:
-                    new_str = item.replace("@pp_rank:0", f"@pp_rank:{i}", 1)
-                    multi_tp_keys.append(new_str)
+                expanded_keys = keys[:]
+                for i in range(1, min(self.tp_size, self.num_kv_head)):
+                    for item in keys:
+                        expanded_keys.append(
+                            item.replace("@tp_rank:0", f"@tp_rank:{i}", 1)
+                        )
 
-            res = self.store.batch_is_exist(multi_tp_keys)
+                pp_base_keys = expanded_keys.copy()
+                for i in range(1, self.pp_size):
+                    for item in pp_base_keys:
+                        expanded_keys.append(
+                            item.replace("@pp_rank:0", f"@pp_rank:{i}", 1)
+                        )
 
-            num_block = len(keys)
-            multi_tp_values = [
-                res[i * num_block : (i + 1) * num_block]
-                for i in range(min(self.tp_size, self.num_kv_head) * self.pp_size)
-            ]
-            index = self._find_min_first_non_one_index(multi_tp_values)
-            if index != -1:
-                return starts[index]
+                offset = len(flat_keys)
+                flat_keys.extend(expanded_keys)
+                lookup_meta.append((req_id, starts, end, offset))
+
+            if not flat_keys:
+                return results
+
+            exists = self.store.batch_is_exist(flat_keys)
+
+            for req_id, starts, end, offset in lookup_meta:
+                num_blocks = len(starts)
+                req_exists = exists[offset : offset + num_blocks * num_lookup_ranks]
+                index = self._find_min_first_non_one_index_flat(
+                    req_exists,
+                    num_blocks=num_blocks,
+                    num_ranks=num_lookup_ranks,
+                )
+                results[req_id] = starts[index] if index != -1 else end
         except Exception as e:
             logger.error("Remote connection failed in lookup: %s", e)
-            return 0
-        return end
+            return {req_id: 0 for req_id, _, _ in requests}
+        return results
 
     @staticmethod
     def _find_min_first_non_one_index(
@@ -1003,6 +1029,24 @@ class MooncakeStoreWorker:
             return min(idx for row in arr for idx, val in enumerate(row) if val != 1)
         except ValueError:
             return -1
+
+    @staticmethod
+    def _find_min_first_non_one_index_flat(
+        arr: list[int],
+        *,
+        num_blocks: int,
+        num_ranks: int,
+    ) -> int:
+        first_miss = num_blocks
+        found = False
+        for rank in range(num_ranks):
+            row_start = rank * num_blocks
+            for idx in range(num_blocks):
+                if arr[row_start + idx] != 1:
+                    first_miss = min(first_miss, idx)
+                    found = True
+                    break
+        return first_miss if found else -1
 
     def get_kv_events(self) -> list[BlockStored]:
         if self.enable_kv_events and self.kv_send_thread is not None:
@@ -1023,6 +1067,7 @@ class LookupKeyServer:
         store_worker: MooncakeStoreWorker,
         vllm_config: VllmConfig,
     ):
+        self.encoder = MsgpackEncoder()
         self.decoder = MsgpackDecoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         socket_path = get_zmq_rpc_path_lookup(vllm_config)
@@ -1042,12 +1087,9 @@ class LookupKeyServer:
         def process_request():
             while self.running:
                 all_frames = self.socket.recv_multipart(copy=False)
-                token_len = int.from_bytes(all_frames[0], byteorder="big")
-                hash_frames = all_frames[1:]
-                hashes_str = self.decoder.decode(hash_frames)
-                result = self.store_worker.lookup(token_len, hashes_str)
-                response = result.to_bytes(4, "big")
-                self.socket.send(response)
+                requests = self.decoder.decode(all_frames)
+                result = self.store_worker.lookup_many(requests)
+                self.socket.send_multipart(self.encoder.encode(result), copy=False)
 
         self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()

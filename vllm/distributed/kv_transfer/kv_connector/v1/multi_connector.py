@@ -16,6 +16,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
+    KVMatchQuery,
+    KVMatchResult,
     KVConnectorRole,
     KVConnectorWorkerMetadata,
 )
@@ -373,6 +375,53 @@ class MultiConnector(KVConnectorBase_V1):
                 self._requests_to_connector[request.request_id] = i
                 to_return = (toks, load_async)
         return to_return
+
+    def get_num_new_matched_tokens_batch(
+        self,
+        queries: list[KVMatchQuery],
+    ) -> list[KVMatchResult]:
+        results = [
+            KVMatchResult(num_external_tokens=0, load_async=False)
+            for _ in queries
+        ]
+        pending_indices = list(range(len(queries)))
+
+        for connector_idx, connector in enumerate(self._connectors):
+            if not pending_indices:
+                break
+
+            pending_queries = [queries[i] for i in pending_indices]
+            pending_results = connector.get_num_new_matched_tokens_batch(
+                pending_queries
+            )
+            if len(pending_results) != len(pending_queries):
+                raise ValueError(
+                    "Connector returned mismatched batched lookup results: "
+                    f"{len(pending_results)} for {len(pending_queries)} queries"
+                )
+
+            next_pending_indices: list[int] = []
+            for query_idx, result in zip(
+                pending_indices, pending_results, strict=True
+            ):
+                if result.num_external_tokens is None:
+                    results[query_idx] = KVMatchResult(
+                        num_external_tokens=None,
+                        load_async=False,
+                    )
+                    continue
+
+                if result.num_external_tokens > 0:
+                    request_id = queries[query_idx].request.request_id
+                    self._requests_to_connector[request_id] = connector_idx
+                    results[query_idx] = result
+                    continue
+
+                next_pending_indices.append(query_idx)
+
+            pending_indices = next_pending_indices
+
+        return results
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

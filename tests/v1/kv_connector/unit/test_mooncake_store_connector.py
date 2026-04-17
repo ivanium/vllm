@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVMatchQuery,
+    KVMatchResult,
     KVConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
@@ -172,6 +174,32 @@ def test_worker_methods_delegate_to_store_worker():
     worker.register_kv_caches.assert_called_once_with(kv_caches)
     worker.get_finished.assert_called_once_with(finished_req_ids, metadata)
     assert result == ({"req-1"}, {"req-2"})
+
+
+def test_scheduler_batch_match_queries_delegate_to_store_scheduler():
+    vllm_config = _make_vllm_config()
+    query = KVMatchQuery(request=MagicMock(), num_computed_tokens=4)
+    expected = [KVMatchResult(num_external_tokens=8, load_async=True)]
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_connector.MooncakeStoreScheduler"
+        ) as mock_scheduler_cls,
+    ):
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER
+        )
+
+    mock_scheduler_cls.return_value.get_num_new_matched_tokens_batch.return_value = (
+        expected
+    )
+
+    assert connector.get_num_new_matched_tokens_batch([query]) == expected
+    mock_scheduler_cls.return_value.get_num_new_matched_tokens_batch.assert_called_once_with(  # noqa: E501
+        [query]
+    )
 
 
 def test_get_kv_connector_kv_cache_events_returns_none_when_empty():
