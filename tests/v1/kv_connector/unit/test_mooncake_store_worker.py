@@ -202,6 +202,14 @@ def test_get_disk_offload_buffer_budget_bytes_uses_effective_offload_flag(
     )
 
 
+def test_get_mooncake_load_thread_count_honors_env(monkeypatch):
+    monkeypatch.setenv("VLLM_MOONCAKE_LOAD_THREADS", "3")
+    assert mooncake_store_worker._get_mooncake_load_thread_count() == 3
+
+    monkeypatch.setenv("VLLM_MOONCAKE_LOAD_THREADS", "0")
+    assert mooncake_store_worker._get_mooncake_load_thread_count() == 1
+
+
 def test_estimate_disk_offload_staging_bytes_sums_multi_segment_sizes():
     assert (
         mooncake_store_worker._estimate_disk_offload_staging_bytes([256, 512]) == 12288
@@ -435,13 +443,17 @@ def _make_bare_worker(
     worker.put_step = 1
     worker.enable_kv_events = False
     worker.disk_offload_buffer_budget_bytes = None
+    worker.load_thread_count = 1
     worker.kv_send_thread = None
     worker.kv_recv_thread = None
+    worker.kv_recv_threads = []
+    worker._next_recv_thread_idx = 0
     worker._kv_connector_stats_lock = threading.Lock()
     worker.kv_connector_stats = MooncakeStoreConnectorStats()
     worker.tp_size = 1
     worker.num_kv_head = 1
     worker.pp_size = 1
+    worker.load_async = True
     return worker
 
 
@@ -642,3 +654,56 @@ def test_register_kv_caches_cross_layer_single_segment():
 
     assert worker2.kv_caches_base_addr == worker.kv_caches_base_addr
     assert worker2.block_len == worker.block_len
+
+
+def test_register_kv_caches_starts_configured_recv_threads():
+    worker = _make_bare_worker(kv_role="kv_consumer")
+    worker.load_thread_count = 3
+    tensor = torch.zeros(10, 64, dtype=torch.float16)
+
+    recv_threads = [MagicMock(name=f"recv-{idx}") for idx in range(3)]
+    recv_thread_iter = iter(recv_threads)
+
+    def _make_recv_thread(*args, **kwargs):
+        thread = next(recv_thread_iter)
+        for arg in args:
+            if isinstance(arg, threading.Event):
+                arg.set()
+        for value in kwargs.values():
+            if isinstance(value, threading.Event):
+                value.set()
+        return thread
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+        "mooncake_store_worker.KVCacheStoreRecvingThread",
+        side_effect=_make_recv_thread,
+    ):
+        worker.register_kv_caches({"layer0": tensor})
+
+    assert worker.kv_recv_threads == recv_threads
+    assert worker.kv_recv_thread is recv_threads[0]
+    for recv_thread in recv_threads:
+        recv_thread.start.assert_called_once()
+
+
+def test_get_finished_round_robins_recv_threads_and_aggregates_completion():
+    worker = _make_bare_worker(kv_role="kv_consumer")
+    recv_thread_0 = MagicMock()
+    recv_thread_1 = MagicMock()
+    recv_thread_0.get_and_clear_finished_requests.return_value = {"req-a"}
+    recv_thread_1.get_and_clear_finished_requests.return_value = {"req-b"}
+    worker.kv_recv_thread = recv_thread_0
+    worker.kv_recv_threads = [recv_thread_0, recv_thread_1]
+
+    req_a = _make_load_req("req-a", [b"a0"], token_len=16)
+    req_b = _make_load_req("req-b", [b"b0"], token_len=16)
+    meta = MagicMock()
+    meta.requests = [req_a, req_b]
+
+    done_sending, done_recving = worker.get_finished(set(), meta)
+
+    assert done_sending == set()
+    assert done_recving == {"req-a", "req-b"}
+    recv_thread_0.add_request.assert_called_once_with(req_a)
+    recv_thread_1.add_request.assert_called_once_with(req_b)
