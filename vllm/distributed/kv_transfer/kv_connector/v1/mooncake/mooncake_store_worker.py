@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -49,7 +50,53 @@ logger = init_logger(__name__)
 
 DEFAULT_REQUESTER_LOCAL_BUFFER_SIZE = 1024 * 1024 * 1024  # 1 GiB
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
+MOONCAKE_TRANSFER_FAIL = -800
+MOONCAKE_INTERNAL_ERROR = -1
 DEFAULT_MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE = 1280 * 1024 * 1024
+
+# Human-readable names for Mooncake C++ ErrorCode enum
+# (Mooncake/mooncake-store/include/types.h:208-280). Keep this in sync with
+# any new enum values added upstream; unknown codes fall back to the raw
+# integer string, which makes root-cause analysis strictly harder.
+_MOONCAKE_ERROR_NAMES: dict[int, str] = {
+    0: "OK",
+    -1: "INTERNAL_ERROR",
+    -10: "BUFFER_OVERFLOW",
+    -100: "SHARD_INDEX_OUT_OF_RANGE",
+    -101: "SEGMENT_NOT_FOUND",
+    -102: "SEGMENT_ALREADY_EXISTS",
+    -103: "CLIENT_NOT_FOUND",
+    -200: "NO_AVAILABLE_HANDLE",
+    -300: "INVALID_VERSION",
+    -400: "INVALID_KEY",
+    -500: "WRITE_FAIL",
+    -600: "INVALID_PARAMS",
+    -601: "ILLEGAL_CLIENT",
+    -700: "INVALID_WRITE",
+    -701: "INVALID_READ",
+    -702: "INVALID_REPLICA",
+    -703: "REPLICA_IS_NOT_READY",
+    -704: "OBJECT_NOT_FOUND",
+    -705: "OBJECT_ALREADY_EXISTS",
+    -706: "OBJECT_HAS_LEASE",
+    -707: "LEASE_EXPIRED",
+    -708: "OBJECT_HAS_REPLICATION_TASK",
+    -709: "OBJECT_NO_REPLICATION_TASK",
+    -710: "REPLICA_NOT_FOUND",
+    -711: "REPLICA_ALREADY_EXISTS",
+    -712: "REPLICA_IS_GONE",
+    -713: "REPLICA_NOT_IN_LOCAL_MEMORY",
+    -714: "OBJECT_REPLICA_BUSY",
+    -800: "TRANSFER_FAIL",
+    -900: "RPC_FAIL",
+    -1000: "ETCD_OPERATION_ERROR",
+    -1001: "ETCD_KEY_NOT_EXIST",
+    -1002: "ETCD_TRANSACTION_FAIL",
+    -1003: "ETCD_CTX_CANCELLED",
+    -1004: "OPLOG_ENTRY_NOT_FOUND",
+    -1010: "UNAVAILABLE_IN_CURRENT_STATUS",
+    -1011: "UNAVAILABLE_IN_CURRENT_MODE",
+}
 DISK_OFFLOAD_USABLE_BUDGET_RATIO = 0.9
 _DIRECT_IO_ALIGNMENT = 4096
 _DIRECT_IO_PADDING_BYTES = 2 * _DIRECT_IO_ALIGNMENT
@@ -453,6 +500,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             current_event.synchronize()
 
         try:
+            t0 = time.perf_counter()
             if self.replicate_config is None:
                 res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes)
             else:
@@ -462,21 +510,45 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     sizes,
                     self.replicate_config,
                 )
+            elapsed = time.perf_counter() - t0
             failed = [i for i, v in enumerate(res) if v < 0]
             if failed:
-                # Compute total bytes attempted for this batch
                 total_bytes = sum(sum(s) if isinstance(s, list) else s for s in sizes)
                 failed_codes = set(res[i] for i in failed)
+                transfer_fail_keys = sum(
+                    1 for i in failed if res[i] == MOONCAKE_TRANSFER_FAIL
+                )
+                no_handle_keys = sum(
+                    1 for i in failed if res[i] == MOONCAKE_NO_AVAILABLE_HANDLE
+                )
+                other_keys = len(failed) - transfer_fail_keys - no_handle_keys
+                # Up to 3 failed key examples with human-readable codes
+                failed_samples = [
+                    (keys[i], _MOONCAKE_ERROR_NAMES.get(res[i], str(res[i])))
+                    for i in failed[:3]
+                ]
+                named_codes = {
+                    _MOONCAKE_ERROR_NAMES.get(c, str(c)): sum(
+                        1 for i in failed if res[i] == c
+                    )
+                    for c in failed_codes
+                }
                 logger.warning(
-                    "batch_put failed: %d/%d keys failed "
-                    "(codes=%s, batch_bytes=%d, num_keys=%d), "
-                    "first_key=%s",
+                    "batch_put failed: %d/%d keys failed for req %s "
+                    "(tp_rank=%d, elapsed=%.3fs, codes=%s, "
+                    "transfer_fail=%d, no_handle=%d, other=%d, "
+                    "batch_bytes=%d), failed_samples=%s",
                     len(failed),
                     len(keys),
-                    failed_codes,
+                    req_id,
+                    self.tp_rank,
+                    elapsed,
+                    named_codes,
+                    transfer_fail_keys,
+                    no_handle_keys,
+                    other_keys,
                     total_bytes,
-                    len(keys),
-                    keys[0] if keys else "N/A",
+                    failed_samples,
                 )
                 if (
                     MOONCAKE_NO_AVAILABLE_HANDLE in failed_codes
@@ -494,8 +566,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     "Mooncake CPU/offload pressure cleared after a "
                     "successful store batch"
                 )
-        except Exception as e:
-            logger.error("Failed to put key %s, error: %s", keys, e)
+        except Exception:
+            logger.exception(
+                "batch_put exception for req %s "
+                "(tp_rank=%d, num_keys=%d, first_key=%s)",
+                req_id,
+                self.tp_rank,
+                len(keys),
+                keys[0] if keys else "N/A",
+            )
 
         if self.enable_kv_event and stored_events:
             self.update_kv_event(stored_events)
@@ -610,28 +689,41 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         try:
             for batch_keys, batch_addrs, batch_sizes in load_batches:
                 current_batch_keys = batch_keys
+                t0 = time.perf_counter()
                 res = self.store.batch_get_into_multi_buffers(
                     batch_keys, batch_addrs, batch_sizes
                 )
+                elapsed = time.perf_counter() - t0
                 failed = [
                     (key, value)
                     for key, value in zip(batch_keys, res, strict=True)
                     if value < 0
                 ]
                 if failed:
+                    named_failures = [
+                        (k, _MOONCAKE_ERROR_NAMES.get(v, str(v))) for k, v in failed[:3]
+                    ]
                     logger.warning(
-                        "Failed to get %d Mooncake keys from sub-batch "
-                        "(batch_keys=%d, first_failures=%s)",
+                        "batch_get failed: %d/%d keys failed for req %s "
+                        "(tp_rank=%d, elapsed=%.3fs), "
+                        "first_failures=%s",
                         len(failed),
                         len(batch_keys),
-                        failed[:3],
+                        req_id,
+                        self.tp_rank,
+                        elapsed,
+                        named_failures,
                     )
                     break
-        except Exception as e:
+        except Exception:
             logger.warning(
-                "Failed to get Mooncake sub-batch %s, error: %s",
+                "batch_get exception for req %s "
+                "(tp_rank=%d, batch_keys=%d, first_keys=%s)",
+                req_id,
+                self.tp_rank,
+                len(current_batch_keys),
                 current_batch_keys[:3],
-                e,
+                exc_info=True,
             )
 
         self.set_finished_request(req_id)

@@ -1,0 +1,15 @@
+# Update this file for each benchmark run.
+# Prometheus file_sd format: list of target groups.
+# Example:
+# - targets:
+#     - 192.168.0.114:8000
+#     - 192.168.0.116:8000
+#   labels:
+#     service: vllm
+#     role: prefill
+#     benchmark_scope: pd-debug
+- targets: []
+  labels:
+    service: vllm
+    role: prefill
+    benchmark_scope: pd-debug

@@ -1,57 +1,71 @@
-# Prometheus and Grafana
+# Prometheus/Grafana for Mooncake Debugging
 
-This is a simple example that shows you how to connect vLLM metric logging to the Prometheus/Grafana stack. For this example, we launch Prometheus and Grafana via Docker. You can checkout other methods through [Prometheus](https://prometheus.io/) and [Grafana](https://grafana.com/) websites.
+This is a minimal Prometheus + Grafana stack for P/D benchmark debugging. It
+adds:
 
-Install:
+- file-based scrape target lists under `targets/*.yml`
+- one provisioned Prometheus datasource
+- one provisioned dashboard: `Mooncake Debug Overview`
+- one self-check script: `check_stack.sh`
 
-- [`docker`](https://docs.docker.com/engine/install/)
-- [`docker compose`](https://docs.docker.com/compose/install/linux/#install-using-the-repository)
+## 1. Update Targets
 
-## Launch
+Before each benchmark run, edit:
 
-Prometheus metric logging is enabled by default in the OpenAI-compatible server. Launch via the entrypoint:
+- `targets/vllm-prefill.yml`
+- `targets/vllm-decode.yml`
+- `targets/mooncake-master.yml`
 
-```bash
-vllm serve mistralai/Mistral-7B-v0.1 \
-    --max-model-len 2048
-```
+The checked-in defaults are intentionally empty so old IPs do not silently stay
+in effect.
 
-Launch Prometheus and Grafana servers with `docker compose`:
-
-```bash
-docker compose up
-```
-
-Submit some sample requests to the server:
+## 2. Start the Stack
 
 ```bash
-wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
-
-vllm bench serve \
-    --model mistralai/Mistral-7B-v0.1 \
-    --tokenizer mistralai/Mistral-7B-v0.1 \
-    --endpoint /v1/completions \
-    --dataset-name sharegpt \
-    --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json \
-    --request-rate 3.0
+docker compose up -d --force-recreate
 ```
 
-Navigating to [`http://localhost:8000/metrics`](http://localhost:8000/metrics) will show the raw Prometheus metrics being exposed by vLLM.
+If your Docker setup needs it, run the same command with `sudo`.
 
-## Grafana Dashboard
+Use `--force-recreate` whenever datasource or provisioning files change.
 
-Navigate to [`http://localhost:3000`](http://localhost:3000). Log in with the default username (`admin`) and password (`admin`).
+## 3. Run the Self-check
 
-### Add Prometheus Data Source
+```bash
+./check_stack.sh
+```
 
-Navigate to [`http://localhost:3000/connections/datasources/new`](http://localhost:3000/connections/datasources/new) and select Prometheus.
+This verifies:
 
-On Prometheus configuration page, we need to add the `Prometheus Server URL` in `Connection`. For this setup, Grafana and Prometheus are running in separate containers, but Docker creates DNS name for each container. You can just use `http://prometheus:9090`.
+- Grafana health
+- Prometheus health
+- the provisioned `Prometheus` datasource
+- the provisioned `Mooncake Debug Overview` dashboard
+- the Prometheus target API
 
-Click `Save & Test`. You should get a green check saying "Successfully queried the Prometheus API.".
+## 4. Open Grafana
 
-### Import Dashboard
+Open [`http://127.0.0.1:3000`](http://127.0.0.1:3000).
 
-Navigate to [`http://localhost:3000/dashboard/import`](http://localhost:3000/dashboard/import), upload `grafana.json`, and select the `prometheus` datasource. You should see a screen that looks like the following:
+- username: `admin`
+- password: `admin`
+- anonymous viewer access is also enabled
 
-![Grafana Dashboard Image](https://i.imgur.com/R2vH9VW.png)
+The home dashboard is `Mooncake Debug Overview`.
+
+## 5. What the Dashboard Covers
+
+The dashboard is organized around the failure chain from this incident:
+
+- stack baseline: datasource and scrape target health
+- vLLM failure counters: `failed_batches`, `failed_keys`,
+  `transfer_fail_keys`, `no_available_handle_keys`, `other_failed_keys`
+- business impact: TTFT, E2E, request rate, token throughput
+- triage runbook: embedded `rg` commands for handshake / transfer / batch logs
+
+## 6. Troubleshooting
+
+- If Grafana is up but the dashboard is missing, recreate the stack and rerun
+  `./check_stack.sh`.
+- If panels are empty, check `targets/*.yml` first, then inspect
+  `http://127.0.0.1:9090/api/v1/targets`.

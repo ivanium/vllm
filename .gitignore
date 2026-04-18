@@ -239,5 +239,12 @@ vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
 
-# Ignore generated cpu headers 
+# Ignore generated cpu headers
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# vllm-knowledge base (separate git repo)
+vllm-knowledge/
+
+# vllm-infra-skills (symlink to external repo)
+vllm-infra-skills
+bench_results*

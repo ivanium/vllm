@@ -18,6 +18,15 @@ gh pr list --repo vllm-project/vllm --state open --search "<short area keywords>
 - If an open PR already addresses the same fix, do not open another.
 - If your approach is materially different, explain the difference in the issue.
 
+### Cross-framework reuse check
+
+Before adding a net-new feature, first inspect
+`third_partys/vllm-agent-infra/INDEX.md` and route into the relevant knowledge
+or skill docs to see whether one of the tracked AI infra frameworks already
+supports the capability or an adjacent design. Prefer adapting documented
+support over building a duplicate implementation. If vLLM still needs a new
+approach, explain why the existing support is insufficient.
+
 ### No low-value busywork PRs
 
 Do not open one-off PRs for tiny edits (single typo, isolated style change, one mutable default, etc.). Mechanical cleanups are acceptable only when bundled with substantive work.
@@ -113,6 +122,27 @@ Co-authored-by: Claude
 Co-authored-by: gemini-code-assist
 Signed-off-by: Your Name <your.email@example.com>
 ```
+
+---
+
+## 3. Codex Bootstrap
+
+Codex sessions reliably receive this `AGENTS.md`, but may not automatically load
+repo-local `CLAUDE.md` or `.claude/*` assets. Before planning or editing code:
+
+1. Read `CLAUDE.md`.
+1. If the task is about vLLM internals, debugging, how-to guidance, or request
+   lifecycle behavior, read `vllm-knowledge/CLAUDE.md`.
+1. If the task is about infra, distributed systems, kernels, serving,
+   profiling, cluster workflows, or CI triage, read
+   `third_partys/vllm-agent-infra/INDEX.md`.
+
+Treat `third_partys/vllm-agent-infra/.claude/skills/*/SKILL.md` and
+`third_partys/vllm-agent-infra/.claude/agents/*.md` as reference workflows and
+expert guides. Do not assume Codex will auto-register them as native skills.
+
+Temporary session-open prompt template:
+`Read CLAUDE.md, vllm-knowledge/CLAUDE.md, and third_partys/vllm-agent-infra/INDEX.md before analysis, planning, or implementation.`
 
 ---
 

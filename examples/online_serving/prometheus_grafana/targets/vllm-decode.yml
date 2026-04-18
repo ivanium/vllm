@@ -1,0 +1,13 @@
+# Update this file for each benchmark run.
+# Example:
+# - targets:
+#     - 192.168.0.115:8000
+#   labels:
+#     service: vllm
+#     role: decode
+#     benchmark_scope: pd-debug
+- targets: []
+  labels:
+    service: vllm
+    role: decode
+    benchmark_scope: pd-debug
