@@ -496,6 +496,66 @@ def test_lookup_records_mooncake_metrics():
     assert stats.data["lookup_exists"][0]["num_keys"] == 2
 
 
+def test_lookup_skips_locally_cached_blocks():
+    """Blocks below ``num_computed_tokens`` must not be probed externally."""
+    worker = _make_bare_worker()
+    worker.store.batch_is_exist.return_value = [1]
+
+    result = worker.lookup(32, [b"a0", b"a1"], num_computed_tokens=16)
+    stats = worker.get_kv_connector_stats()
+
+    assert result == 32
+    worker.store.batch_is_exist.assert_called_once()
+    probed_keys = worker.store.batch_is_exist.call_args[0][0]
+    assert len(probed_keys) == 1
+    assert stats.data["lookup_exists"][0]["num_keys"] == 1
+
+
+def test_lookup_all_cached_locally_skips_store():
+    """If the local prefix already covers the prompt, skip the store entirely."""
+    worker = _make_bare_worker()
+
+    result = worker.lookup(32, [b"a0", b"a1"], num_computed_tokens=32)
+
+    assert result == 32
+    worker.store.batch_is_exist.assert_not_called()
+
+
+def test_lookup_miss_returns_absolute_offset_when_masked():
+    """A miss at a masked-offset must return the absolute token offset.
+
+    Locks in the invariant that ``starts`` holds absolute offsets even when
+    the leading blocks are skipped via ``num_computed_tokens``.
+    """
+    worker = _make_bare_worker()
+    # 4 blocks of 16 tokens; skip first block (locally cached).
+    # Probed relative indices: 0, 1, 2 -> absolute blocks 1, 2, 3.
+    # First probed block hits, second misses -> absolute offset = 2 * 16 = 32.
+    worker.store.batch_is_exist.return_value = [1, 0, 1]
+
+    result = worker.lookup(
+        64, [b"a0", b"a1", b"a2", b"a3"], num_computed_tokens=16
+    )
+
+    assert result == 32
+
+
+def test_lookup_unaligned_num_computed_tokens_is_rounded_down():
+    """Non-block-aligned num_computed_tokens should round down to a block."""
+    worker = _make_bare_worker()
+    # block_size=16, unaligned num_computed_tokens=20 -> mask_num=16.
+    # Probed blocks: starting at 16, 32 -> 2 keys.
+    worker.store.batch_is_exist.return_value = [1, 1]
+
+    result = worker.lookup(
+        48, [b"a0", b"a1", b"a2"], num_computed_tokens=20
+    )
+
+    probed_keys = worker.store.batch_is_exist.call_args[0][0]
+    assert len(probed_keys) == 2
+    assert result == 48
+
+
 # ---------------------------------------------------------------------------
 # register_kv_caches tests
 # ---------------------------------------------------------------------------

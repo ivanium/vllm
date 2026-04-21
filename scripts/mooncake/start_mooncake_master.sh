@@ -128,6 +128,7 @@ fi
 
 if $OPT_BG; then
     : > "$LOG_FILE"
+    export export LD_LIBRARY_PATH="/home/inf-daole/.local/lib:/home/inf-daole/.local/mooncake-deps/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     nohup "${CMD[@]}" > "$LOG_FILE" 2>&1 < /dev/null &
     echo $! > "$PID_FILE"
     sleep 1

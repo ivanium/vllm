@@ -1070,22 +1070,32 @@ class MooncakeStoreWorker:
         self,
         token_len: int,
         block_hashes: list[BlockHash],
+        num_computed_tokens: int = 0,
     ) -> int:
         """Check how many prefix tokens exist in the store.
 
-        Checks across all TP ranks and PP ranks.
+        Checks across all TP ranks and PP ranks. Blocks whose start offset is
+        below ``num_computed_tokens`` are assumed to already be served by
+        vLLM's local prefix cache and are skipped to avoid probing the
+        external store for keys whose results would be subtracted out.
         """
-        end = 0
+        # num_computed_tokens is block-aligned from the local prefix cache and
+        # bounded by the prompt length, so mask_num <= token_len holds.
+        mask_num = num_computed_tokens // self.block_size * self.block_size
+        end = mask_num
         keys: list[str] = []
         multi_tp_keys: list[str] = []
         lookup_start = time.perf_counter()
         try:
             starts: list[int] = []
             for start, end, key in self.token_database.process_tokens(
-                token_len, block_hashes
+                token_len, block_hashes, mask_num=mask_num
             ):
                 keys.append(key.to_string())
                 starts.append(start)
+
+            if not keys:
+                return end
 
             # Expand keys for all TP ranks
             multi_tp_keys = keys[:]
@@ -1176,9 +1186,14 @@ class LookupKeyServer:
             while self.running:
                 all_frames = self.socket.recv_multipart(copy=False)
                 token_len = int.from_bytes(all_frames[0], byteorder="big")
-                hash_frames = all_frames[1:]
+                num_computed_tokens = int.from_bytes(
+                    all_frames[1], byteorder="big"
+                )
+                hash_frames = all_frames[2:]
                 hashes_str = self.decoder.decode(hash_frames)
-                result = self.store_worker.lookup(token_len, hashes_str)
+                result = self.store_worker.lookup(
+                    token_len, hashes_str, num_computed_tokens
+                )
                 response = result.to_bytes(4, "big")
                 self.socket.send(response)
 
