@@ -78,7 +78,9 @@ class MooncakeStoreScheduler:
         if token_len < self._block_size:
             return 0, False
 
-        num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
+        num_external_hit_tokens = self.client.lookup(
+            token_len, request.block_hashes, num_computed_tokens
+        )
 
         if num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
@@ -378,11 +380,21 @@ class LookupKeyClient:
             bind=False,
         )
 
-    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        num_computed_tokens: int = 0,
+    ) -> int:
         hash_strs = [h.hex() for h in block_hashes]
         hash_frames = self.encoder.encode(hash_strs)
         token_len_bytes = token_len.to_bytes(4, byteorder="big")
-        all_frames = [token_len_bytes] + list(hash_frames)
+        num_computed_tokens_bytes = num_computed_tokens.to_bytes(
+            4, byteorder="big"
+        )
+        all_frames = [token_len_bytes, num_computed_tokens_bytes] + list(
+            hash_frames
+        )
         self.socket.send_multipart(all_frames, copy=False)
         resp = self.socket.recv()
         result = int.from_bytes(resp, "big")
