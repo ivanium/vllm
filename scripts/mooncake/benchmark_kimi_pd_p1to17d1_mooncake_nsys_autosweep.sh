@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 PARTITION="${PARTITION:-batch}"
-START_PREFILL_COUNT="${START_PREFILL_COUNT:-2}"
+START_PREFILL_COUNT="${START_PREFILL_COUNT:-7}"
 END_PREFILL_COUNT="${END_PREFILL_COUNT:-17}"
 # Proportional scaling: concurrency = CONCURRENCY_PER_PREFILL * prefill_count.
 # P=2 -> 32, P=17 -> 272. Set CONCURRENCY_PER_PREFILL to adjust.

@@ -54,10 +54,7 @@ MOONCAKE_TRANSFER_FAIL = -800
 MOONCAKE_INTERNAL_ERROR = -1
 DEFAULT_MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE = 1280 * 1024 * 1024
 
-# Human-readable names for Mooncake C++ ErrorCode enum
-# (Mooncake/mooncake-store/include/types.h:208-280). Keep this in sync with
-# any new enum values added upstream; unknown codes fall back to the raw
-# integer string, which makes root-cause analysis strictly harder.
+# (Mooncake/mooncake-store/include/types.h:208-280).
 _MOONCAKE_ERROR_NAMES: dict[int, str] = {
     0: "OK",
     -1: "INTERNAL_ERROR",

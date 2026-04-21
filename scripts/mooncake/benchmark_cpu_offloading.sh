@@ -11,6 +11,7 @@
 #   baseline        - No offloading
 #   native          - Built-in vLLM KV offloading (--kv-offloading-backend native)
 #   simple          - Simple native offload (VLLM_USE_SIMPLE_KV_OFFLOAD=1 + native backend)
+#   mooncake-mem    - MooncakeStoreConnector with CPU memory only (no disk)
 #   mooncake        - MooncakeStoreConnector via --kv-transfer-config
 #
 # Environment variables:
@@ -164,11 +165,15 @@ for backend in "${BACKEND_LIST[@]}"; do
             if [[ -n "$DISK_OFFLOAD_GIB" ]]; then
                 SETUP_ARGS+=(--disk-size "$DISK_OFFLOAD_GIB")
             fi
-            if [[ -n "${DISK_PATH:-}" ]]; then
-                SETUP_ARGS+=(--disk-path "$DISK_PATH")
-            fi
             source "${SCRIPT_DIR}/setup_vllm_env.sh" "${SETUP_ARGS[@]}"
             run_one "With CPU offloading (mooncake)" "mooncake.json" \
+                --kv-transfer-config "{\"kv_connector\":\"MooncakeStoreConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"load_async\":true}}"
+            ;;  
+        mooncake-mem)
+            export VLLM_USE_SIMPLE_KV_OFFLOAD=0
+            SETUP_ARGS=(--cpu-mem-size "$CPU_OFFLOAD_GIB")
+            source "${SCRIPT_DIR}/setup_vllm_env.sh" "${SETUP_ARGS[@]}"
+            run_one "With CPU offloading (mooncake-mem)" "mt_mooncake_mem.json" \
                 --kv-transfer-config "{\"kv_connector\":\"MooncakeStoreConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"load_async\":true}}"
             ;;
         *)
