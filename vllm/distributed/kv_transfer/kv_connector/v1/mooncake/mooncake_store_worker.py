@@ -20,6 +20,7 @@ import regex as re
 import torch
 import zmq
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dcp_group,
@@ -254,6 +255,10 @@ class KVTransferThread(threading.Thread):
 
     def run(self):
         self.ready_event.set()
+        self._worker_loop()
+
+    def _worker_loop(self):
+        thread_name = threading.current_thread().name
         while True:
             try:
                 request_data = self.request_queue.get()
@@ -263,7 +268,7 @@ class KVTransferThread(threading.Thread):
                     continue
                 self._handle_request(request_data)
             except Exception as e:
-                logger.error("Error in %s: %s", self.name, e)
+                logger.error("Error in %s: %s", thread_name, e)
 
     def _handle_request(self, req_meta: Any):
         pass
@@ -314,6 +319,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         ready_event: threading.Event,
         enable_kv_event: bool = False,
         record_operation: Callable[..., None] | None = None,
+        max_pending_saves: int | None = None,
+        num_submit_threads: int = 1,
     ):
         super().__init__(
             store,
@@ -332,6 +339,32 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
+
+        self._max_pending_saves = max_pending_saves
+        self._num_submit_threads = max(1, num_submit_threads)
+        self._extra_submit_threads: list[threading.Thread] = []
+
+    def add_request(self, request: ReqMeta) -> None:
+        # Apply queue-depth backpressure. If the submission queue is at
+        # the configured cap, reuse the existing
+        # _mark_request_skipped_for_pressure path so the worker loop
+        # drops this batch (and any further batches for the same req_id
+        # until pressure clears via _clear_store_pressure). Still enqueue
+        # so the counter drains through _handle_request's skip branch.
+        if self._max_pending_saves is not None:
+            qsize = self.request_queue.qsize()
+            if qsize >= self._max_pending_saves and not (
+                self._mark_request_skipped_for_pressure(request.req_id)
+            ):
+                logger.warning(
+                    "Mooncake save queue depth %d reached cap %d; "
+                    "skipping future store batches for request %s until "
+                    "a later store batch succeeds",
+                    qsize,
+                    self._max_pending_saves,
+                    request.req_id,
+                )
+        super().add_request(request)
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -366,6 +399,31 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._store_pressure_active = False
             self._skip_store_requests.clear()
         return True
+
+    def run(self):
+        # Spawn additional submitter threads that share this thread's
+        # queue before signaling ready. queue.Queue is safe for multiple
+        # consumers; per-request state (stored_requests,
+        # _skip_store_requests, kv_events) is protected by done_task_lock
+        # / kv_event_lock. token_database is frozen after
+        # register_kv_caches, and the Mooncake C++ store is designed for
+        # concurrent submission (MC_WORKERS_PER_CTX poll threads sit
+        # below it).
+        for i in range(self._num_submit_threads - 1):
+            helper = threading.Thread(
+                target=self._worker_loop,
+                name=f"{self.name}-submitter-{i + 1}",
+                daemon=True,
+            )
+            helper.start()
+            self._extra_submit_threads.append(helper)
+        if self._num_submit_threads > 1:
+            logger.info(
+                "KVCacheStoreSendingThread running with %d submitter threads",
+                self._num_submit_threads,
+            )
+        self.ready_event.set()
+        self._worker_loop()
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.token_len_chunk
@@ -807,6 +865,9 @@ class MooncakeStoreWorker:
         self._kv_connector_stats_lock = threading.Lock()
         self.kv_connector_stats = MooncakeStoreConnectorStats()
 
+        self.max_pending_saves = envs.VLLM_MOONCAKE_MAX_PENDING_SAVES
+        self.num_submit_threads = envs.VLLM_MOONCAKE_NUM_SUBMIT_THREADS
+
     def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
         """Register a cross-layers KV cache tensor.
 
@@ -910,6 +971,8 @@ class MooncakeStoreWorker:
                 ready_event_sending,
                 self.enable_kv_events,
                 self._record_kv_connector_operation,
+                max_pending_saves=self.max_pending_saves,
+                num_submit_threads=self.num_submit_threads,
             )
             self.kv_send_thread.start()
 
@@ -1186,9 +1249,7 @@ class LookupKeyServer:
             while self.running:
                 all_frames = self.socket.recv_multipart(copy=False)
                 token_len = int.from_bytes(all_frames[0], byteorder="big")
-                num_computed_tokens = int.from_bytes(
-                    all_frames[1], byteorder="big"
-                )
+                num_computed_tokens = int.from_bytes(all_frames[1], byteorder="big")
                 hash_frames = all_frames[2:]
                 hashes_str = self.decoder.decode(hash_frames)
                 result = self.store_worker.lookup(

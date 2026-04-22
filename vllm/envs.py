@@ -201,6 +201,8 @@ if TYPE_CHECKING:
     VLLM_MORIIO_POST_BATCH_SIZE: int = -1
     VLLM_MORIIO_NUM_WORKERS: int = 1
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
+    VLLM_MOONCAKE_MAX_PENDING_SAVES: int | None = None
+    VLLM_MOONCAKE_NUM_SUBMIT_THREADS: int = 1
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
@@ -1426,6 +1428,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
+    ),
+    # Cap on the MooncakeStoreConnector save-submission queue depth per
+    # (kv_role, tp_rank) sending thread. Prevents unbounded growth when
+    # submission rate exceeds drain rate under sustained load. When the
+    # cap is reached, subsequent save batches for the affected requests
+    # are skipped via the existing _mark_request_skipped_for_pressure
+    # path (the KV entry is simply not written to Mooncake; it will be
+    # recomputed on miss). Unset = unbounded (default, preserves legacy
+    # behavior). Recommended 512-2048 in production.
+    "VLLM_MOONCAKE_MAX_PENDING_SAVES": lambda: (
+        int(os.environ["VLLM_MOONCAKE_MAX_PENDING_SAVES"])
+        if "VLLM_MOONCAKE_MAX_PENDING_SAVES" in os.environ
+        else None
+    ),
+    # Number of parallel save-submitter threads draining the MooncakeStore
+    # send queue. Raises drain-rate ceiling when a single Python submitter
+    # becomes the bottleneck under sustained load. Default 1 preserves
+    # legacy behavior; recommended 2-4 in production (requires the
+    # Mooncake Python bindings to be safe for concurrent
+    # batch_put_from_multi_buffers / batch_is_exist calls).
+    "VLLM_MOONCAKE_NUM_SUBMIT_THREADS": lambda: max(
+        1, int(os.getenv("VLLM_MOONCAKE_NUM_SUBMIT_THREADS", "1"))
     ),
     # If set, it means we pre-downloaded cubin files and flashinfer will
     # read the cubin files directly.
