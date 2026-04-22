@@ -1,0 +1,146 @@
+# MooncakeStoreConnector Usage Guide
+
+MooncakeStoreConnector is a KV cache connector that uses [MooncakeDistributedStore](https://github.com/kvcache-ai/Mooncake) as a shared KV cache pool. Unlike `MooncakeConnector` which does direct point-to-point KV transfer between prefiller and decoder, MooncakeStoreConnector enables KV cache offloading to an external distributed store, supporting:
+
+- **CPU/disk offloading**: Extend effective KV cache capacity by offloading to CPU memory or disk via Mooncake's transfer engine.
+- **Prefix caching across instances**: Hash-based deduplication allows multiple vLLM instances to share cached KV blocks through the store.
+- **Single-node and multi-node deployment**: Works both as a standalone KV cache extension and in disaggregated prefill-decode setups.
+
+## Prerequisites
+
+### Install Mooncake
+
+Install mooncake through pip:
+
+```bash
+uv pip install mooncake-transfer-engine
+```
+
+Refer to the [Mooncake official repository](https://github.com/kvcache-ai/Mooncake) for more installation instructions and building from source.
+
+### Start the Mooncake Master Server
+
+The Mooncake master manages metadata and coordinates the distributed store. Start it before launching vLLM:
+
+```bash
+mooncake_master --port 50051
+```
+
+Default ports:
+
+- RPC: 50051
+- HTTP metadata: 8080
+
+Multiple vLLM instances can share the same master server.
+
+### Configure Mooncake
+
+Create a JSON configuration file (e.g., `mooncake_config.json`):
+
+```json
+{
+  "metadata_server": "http://127.0.0.1:8080/metadata",
+  "master_server_address": "127.0.0.1:50051",
+  "global_segment_size": "80GB",
+  "local_buffer_size": "4GB",
+  "protocol": "rdma",
+  "device_name": ""
+}
+```
+
+- `protocol`: Use `"rdma"` for best performance. `"tcp"` works as a fallback.
+- `global_segment_size`: CPU memory contributed to the distributed pool (per GPU).
+- `local_buffer_size`: Private buffer for this node's own operations (per GPU).
+
+Set the config path via environment variable:
+
+```bash
+export MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json
+```
+
+## Usage
+
+### Single-Node KV Cache Offloading
+
+Use MooncakeStoreConnector to offload KV cache to CPU memory, extending the effective cache size:
+
+```bash
+MOONCAKE_CONFIG_PATH=mooncake_config.json \
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both"}'
+```
+
+### Disaggregated Prefill-Decode (XpYd)
+
+**Prefiller Node:**
+
+```bash
+MOONCAKE_CONFIG_PATH=mooncake_config.json \
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --port 8100 \
+    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_producer"}'
+```
+
+**Decoder Node:**
+
+```bash
+MOONCAKE_CONFIG_PATH=mooncake_config.json \
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --port 8200 \
+    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_consumer"}'
+```
+
+**Proxy:**
+
+Use a disaggregation proxy to route requests between prefiller and decoder nodes.
+
+### Disk Offloading
+
+To enable disk offloading for even larger cache capacity, set the following environment variables:
+
+```bash
+export MOONCAKE_ENABLE_OFFLOAD=1
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/path/to/offload/dir
+```
+
+You can also control the local staging buffer size:
+
+```bash
+export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=1280mb
+```
+
+## Environment Variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `MOONCAKE_CONFIG_PATH` | Path to Mooncake JSON config file | (required) |
+| `MOONCAKE_ENABLE_OFFLOAD` | Enable disk offloading (`1` or `true`) | disabled |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | Directory for disk offload files | — |
+| `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | Local staging buffer size for disk offload | 1280MB |
+
+## KV Transfer Config
+
+### KV Role Options
+
+- **kv_producer**: For prefiller instances that store KV caches to the pool.
+- **kv_consumer**: For decoder instances that load KV caches from the pool.
+- **kv_both**: The instance both stores and loads KV caches. Use this for single-node CPU offloading.
+
+### kv_connector_extra_config
+
+- `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `false`.
+- `enable_cross_layers_blocks` (bool): Enable cross-layer block packing for reduced store operations. Default: `false`.
+- `discard_partial_chunks` (bool): Discard partial block chunks during store. Default: `true`.
+- `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
+
+## Notes
+
+### Cross-DP Prefix Cache Hits
+
+When running with data parallelism, set a fixed `PYTHONHASHSEED` so that block hashes are consistent across DP ranks:
+
+```bash
+PYTHONHASHSEED=0 vllm serve ...
+```
+
+Without this, identical prompts may produce different block hashes on different DP ranks, preventing cross-instance prefix cache hits.
