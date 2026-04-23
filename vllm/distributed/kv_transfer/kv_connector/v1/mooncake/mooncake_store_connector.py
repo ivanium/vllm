@@ -229,6 +229,32 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
             return None
         return self.connector_worker.get_kv_connector_stats()
 
+    def inspect_state(self) -> dict[str, Any] | None:
+        """Snapshot of worker-side counters for diagnosing pinned-block stalls."""
+        if self.connector_worker is None:
+            return None
+        w = self.connector_worker
+        state: dict[str, Any] = {}
+        send = getattr(w, "kv_send_thread", None)
+        if send is not None:
+            state["send_qsize"] = send.request_queue.qsize()
+            with send.done_task_lock:
+                stored = dict(send.stored_requests)
+                skip_n = len(send._skip_store_requests)
+                pressure = send._store_pressure_active
+            state["send_stored_n"] = len(stored)
+            state["send_stored_sum"] = sum(stored.values())
+            state["send_stored_sample"] = list(stored.items())[:5]
+            state["send_skip_n"] = skip_n
+            state["send_pressure"] = pressure
+        recv = getattr(w, "kv_recv_thread", None)
+        if recv is not None:
+            state["recv_qsize"] = recv.request_queue.qsize()
+            with recv.done_task_lock:
+                state["recv_finished_n"] = len(recv.finished_requests)
+        state["finished_store_req_n"] = len(getattr(w, "finished_store_req", ()))
+        return state
+
     @classmethod
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None

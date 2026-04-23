@@ -177,6 +177,85 @@ class MultiConnector(KVConnectorBase_V1):
         # Propagated from scheduler to worker side via the connector metadata.
         self._extra_async_saves: dict[str, int] = {}
 
+        # Debug reporter for stuck-state diagnosis. No-op unless the env var
+        # VLLM_MULTICONNECTOR_DEBUG_INTERVAL_S is set to a positive integer.
+        if role == KVConnectorRole.WORKER:
+            self._maybe_start_debug_reporter()
+            self._register_stack_dump_signal()
+
+    def _register_stack_dump_signal(self) -> None:
+        """Register SIGUSR1 to dump tracebacks of all threads to stderr.
+
+        Lets a user trigger a stack dump without ptrace/py-spy:
+            kill -USR1 <worker_pid>
+        Output goes to stderr (captured in the engine log). Works while the
+        main thread is blocked in a C extension because it runs in a
+        C-level signal handler.
+        """
+        import faulthandler
+        import os
+        import signal
+        import sys
+
+        try:
+            faulthandler.register(
+                signal.SIGUSR1, file=sys.stderr, all_threads=True, chain=False
+            )
+            logger.info(
+                "MultiConnector stack dump on SIGUSR1 enabled (pid=%d)",
+                os.getpid(),
+            )
+        except Exception as e:
+            logger.warning("Failed to register SIGUSR1 stack dump handler: %s", e)
+
+    def _maybe_start_debug_reporter(self) -> None:
+        import os
+        import threading
+        import time
+
+        try:
+            interval = int(os.environ.get("VLLM_MULTICONNECTOR_DEBUG_INTERVAL_S", "0"))
+        except ValueError:
+            interval = 0
+        if interval <= 0:
+            return
+
+        def _loop() -> None:
+            while True:
+                time.sleep(interval)
+                try:
+                    extra = dict(self._extra_async_saves)
+                    subs: list[tuple[str, object]] = []
+                    for c in self._connectors:
+                        fn = getattr(c, "inspect_state", None)
+                        if callable(fn):
+                            try:
+                                subs.append((type(c).__name__, fn()))
+                            except Exception as e:
+                                subs.append((type(c).__name__, {"error": repr(e)}))
+                    nonzero = bool(extra) or any(
+                        any(
+                            (v > 0) if isinstance(v, (int, float)) else bool(v)
+                            for v in (s or {}).values()
+                        )
+                        for _, s in subs
+                        if isinstance(s, dict)
+                    )
+                    if nonzero:
+                        logger.warning(
+                            "[MC-DEBUG] extra_async_saves n=%d sample=%s; subs=%s",
+                            len(extra),
+                            list(extra.items())[:5],
+                            subs,
+                        )
+                except Exception as e:
+                    logger.warning("[MC-DEBUG] reporter error: %s", e)
+
+        t = threading.Thread(
+            target=_loop, name="MultiConnectorDebugReporter", daemon=True
+        )
+        t.start()
+
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         if not self._connectors:

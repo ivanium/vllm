@@ -366,6 +366,70 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_worker = NixlConnectorWorker(
                 vllm_config, self.engine_id, kv_cache_config
             )
+            self._register_stack_dump_signal()
+            self._maybe_start_debug_reporter()
+
+    def _register_stack_dump_signal(self) -> None:
+        """Register SIGUSR1 to dump tracebacks of all threads to stderr.
+
+        Works for both decode-direct and prefill-via-MultiConnector cases,
+        since both paths create a NixlConnector worker. Send
+        `kill -USR1 <worker_pid>` to get an all-threads stack dump in the
+        engine log. No ptrace required.
+        """
+        import faulthandler
+        import signal
+        import sys
+
+        try:
+            faulthandler.register(
+                signal.SIGUSR1, file=sys.stderr, all_threads=True, chain=False
+            )
+            logger.info(
+                "NixlConnector stack dump on SIGUSR1 enabled (pid=%d)",
+                os.getpid(),
+            )
+        except Exception as e:
+            logger.warning("Failed to register SIGUSR1 stack dump handler: %s", e)
+
+    def _maybe_start_debug_reporter(self) -> None:
+        """Daemon thread that logs NixlConnector worker state every N seconds.
+
+        No-op unless VLLM_NIXL_DEBUG_INTERVAL_S is a positive integer. Only
+        emits when there is outstanding state (any non-zero counter) so a
+        healthy steady-state run produces no noise. Use to diagnose stalls
+        when NixlConnector is the top-level connector (no MultiConnector).
+        """
+        import threading
+        import time
+
+        try:
+            interval = int(os.environ.get("VLLM_NIXL_DEBUG_INTERVAL_S", "0"))
+        except ValueError:
+            interval = 0
+        if interval <= 0:
+            return
+
+        def _loop() -> None:
+            while True:
+                time.sleep(interval)
+                try:
+                    state = self.inspect_state()
+                    if not isinstance(state, dict):
+                        continue
+                    nonzero = any(
+                        (v > 0) if isinstance(v, (int, float)) else bool(v)
+                        for v in state.values()
+                    )
+                    if nonzero:
+                        logger.warning("[NIXL-DEBUG] %s", state)
+                except Exception as e:
+                    logger.warning("[NIXL-DEBUG] reporter error: %s", e)
+
+        t = threading.Thread(
+            target=_loop, name="NixlConnectorDebugReporter", daemon=True
+        )
+        t.start()
 
     ############################################################
     # Class Methods
@@ -475,6 +539,74 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker is None:
             return None
         return self.connector_worker.get_kv_connector_stats()
+
+    def inspect_state(self) -> dict[str, Any] | None:
+        """Snapshot of worker-side counters for diagnosing pinned-block stalls."""
+        if self.connector_worker is None:
+            return None
+        w = self.connector_worker
+        state: dict[str, Any] = {}
+        # Prefill-side: requests awaiting consumer (decode) pull.
+        reqs_to_send = getattr(w, "_reqs_to_send", None)
+        if reqs_to_send is not None:
+            state["reqs_to_send_n"] = len(reqs_to_send)
+            state["reqs_to_send_sample"] = list(reqs_to_send.items())[:5]
+        # Prefill-side: every request that has been part of a batch.
+        reqs_to_process = getattr(w, "_reqs_to_process", None)
+        if reqs_to_process is not None:
+            state["reqs_to_process_n"] = len(reqs_to_process)
+        # Decode-side: in-progress recv transfers.
+        recving_meta = getattr(w, "_recving_metadata", None)
+        if recving_meta is not None:
+            state["recving_meta_n"] = len(recving_meta)
+            state["recving_meta_sample"] = list(recving_meta.keys())[:5]
+        recving_xfers = getattr(w, "_recving_transfers", None)
+        if recving_xfers is not None:
+            state["recving_xfers_n"] = len(recving_xfers)
+        recv_deadlines = getattr(w, "_recv_expiration_by_req", None)
+        if recv_deadlines:
+            now = time.perf_counter()
+            oldest_deadline = min(recv_deadlines.values())
+            timeout_s = envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
+            state["recving_oldest_age_s"] = round(
+                max(0.0, timeout_s - max(0.0, oldest_deadline - now)),
+                3,
+            )
+            state["recving_expired_n"] = sum(
+                1 for deadline in recv_deadlines.values() if deadline <= now
+            )
+        # Handshake / ready queue.
+        ready_q = getattr(w, "_ready_requests", None)
+        if ready_q is not None:
+            try:
+                state["ready_requests_qsize"] = ready_q.qsize()
+            except Exception:
+                pass
+        hs_futures = getattr(w, "_handshake_futures", None)
+        if hs_futures is not None:
+            hs_lock = getattr(w, "_handshake_lock", None)
+            if hs_lock is not None:
+                with hs_lock:
+                    hs_items = [
+                        (eid, bool(fut.done())) for eid, fut in hs_futures.items()
+                    ]
+            else:
+                hs_items = [(eid, bool(fut.done())) for eid, fut in hs_futures.items()]
+            state["handshake_futures_n"] = len(hs_items)
+            state["handshake_futures_sample"] = hs_items[:5]
+        # Failure / invalid tracking.
+        failed_recv = getattr(w, "_failed_recv_reqs", None)
+        if failed_recv is not None:
+            state["failed_recv_n"] = len(failed_recv)
+        invalid_blocks = getattr(w, "_invalid_block_ids", None)
+        if invalid_blocks is not None:
+            state["invalid_blocks_n"] = len(invalid_blocks)
+        # Consumer notification state (heterogeneous TP, P waits for D acks).
+        cnt_by_req = getattr(w, "consumer_notification_counts_by_req", None)
+        if cnt_by_req is not None:
+            state["consumer_notif_n"] = len(cnt_by_req)
+            state["consumer_notif_sample"] = list(cnt_by_req.items())[:5]
+        return state
 
     @classmethod
     def build_kv_connector_stats(
@@ -1178,6 +1310,7 @@ class NixlConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
+        self._recv_expiration_by_req: dict[ReqId, float] = {}
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
@@ -2294,6 +2427,7 @@ class NixlConnectorWorker:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
+            self._recv_expiration_by_req.pop(req_id, None)
             assert meta.remote is not None
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
@@ -2371,11 +2505,16 @@ class NixlConnectorWorker:
                 )
 
                 self.consumer_notification_counts_by_req[req_id] += 1
+                count = self.consumer_notification_counts_by_req[req_id]
+                if os.environ.get("VLLM_NIXL_NOTIF_LOG", "0") == "1":
+                    logger.warning(
+                        "[NIXL-NOTIF] recv req=%s count=%d/%d",
+                        req_id,
+                        count,
+                        consumers_per_producer,
+                    )
                 # Wait all consumers (D) to be done reading before freeing.
-                if (
-                    self.consumer_notification_counts_by_req[req_id]
-                    == consumers_per_producer
-                ):
+                if count == consumers_per_producer:
                     notified_req_ids.add(req_id)
                     del self.consumer_notification_counts_by_req[req_id]
                     self._reqs_to_process.remove(req_id)
@@ -2391,6 +2530,7 @@ class NixlConnectorWorker:
             set of req_ids that have all done xfers
         """
         done_req_ids: set[str] = set()
+        now = time.perf_counter()
         for req_id, handles in list(transfers.items()):
             in_progress = []
             for handle in handles:
@@ -2420,6 +2560,19 @@ class NixlConnectorWorker:
                         error=e,
                     )
                     self._handle_failed_transfer(req_id, handle)
+
+            deadline = self._recv_expiration_by_req.get(req_id)
+            if in_progress and deadline is not None and now >= deadline:
+                logger.warning(
+                    "Timing out stalled KV recv for request %s after %d seconds. "
+                    "Marking blocks as invalid and retrying from scheduler.",
+                    req_id,
+                    envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT,
+                )
+                for handle in in_progress:
+                    self._handle_failed_transfer(req_id, handle)
+                self._failed_recv_reqs.add(req_id)
+                in_progress = []
 
             if not in_progress:
                 # Only report request as completed when all transfers are done.
@@ -2499,9 +2652,16 @@ class NixlConnectorWorker:
             assert req_id not in self._reqs_to_send
 
         # Add to requests that are waiting to be read and track expiration.
+        _log_notifs = os.environ.get("VLLM_NIXL_NOTIF_LOG", "0") == "1"
         for req_id, expiration_time in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
+                if _log_notifs:
+                    logger.warning(
+                        "[NIXL-NOTIF] send-ready req=%s expires=%.3f",
+                        req_id,
+                        expiration_time,
+                    )
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.kv_topo is not None
@@ -2622,6 +2782,12 @@ class NixlConnectorWorker:
         if len(local_block_ids) == 0:
             # A full prefix cache hit is indicated with an empty list.
             agent_name = self._remote_agents[dst_engine_id][remote_rank]
+            if os.environ.get("VLLM_NIXL_NOTIF_LOG", "0") == "1":
+                logger.warning(
+                    "[NIXL-NOTIF] send (prefix-cache-hit) req=%s -> agent=%s",
+                    remote_request_id,
+                    agent_name,
+                )
             try:
                 self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
             except Exception as e:
@@ -2686,6 +2852,20 @@ class NixlConnectorWorker:
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
+            self._recv_expiration_by_req.setdefault(
+                request_id,
+                time.perf_counter() + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT,
+            )
+
+            if os.environ.get("VLLM_NIXL_NOTIF_LOG", "0") == "1":
+                logger.warning(
+                    "[NIXL-NOTIF] send (xfer-posted) req=%s remote_req=%s "
+                    "dst_engine=%s remote_rank=%d",
+                    request_id,
+                    remote_request_id,
+                    dst_engine_id,
+                    remote_rank,
+                )
         except Exception as e:
             # mark all (logical) blocks for this request as invalid
             self._log_failure(
@@ -2881,6 +3061,7 @@ class NixlConnectorWorker:
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
+        self._recv_expiration_by_req.clear()
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_block_size.clear()
