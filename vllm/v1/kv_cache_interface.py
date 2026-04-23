@@ -517,6 +517,71 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class SlidingWindowMLASpec(SlidingWindowSpec):
+    """Sliding window attention with MLA cache format."""
+
+    cache_dtype_str: str | None = None
+    # DeepseekV4-only: see MLAAttentionSpec.model_version.
+    alignment: int | None = None  # Default to None for no padding.
+    compress_ratio: int = 1
+    model_version: str | None = None
+
+    def __post_init__(self):
+        _apply_alignment_padding(self)
+
+    @property
+    def storage_block_size(self) -> int:
+        return self.block_size // self.compress_ratio
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.model_version == "deepseek_v4":
+            # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
+            return self.storage_block_size * 584
+        assert self.model_version is None, (
+            f"Unsupported model version: {self.model_version}"
+        )
+        return (
+            self.storage_block_size
+            * self.num_kv_heads
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, SlidingWindowMLASpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be "
+            "SlidingWindowMLASpec."
+        )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        compress_ratio_set = set(spec.compress_ratio for spec in specs)
+        model_version_set = set(spec.model_version for spec in specs)
+        sliding_window_set = set(spec.sliding_window for spec in specs)
+        assert (
+            len(cache_dtype_str_set) == 1
+            and len(compress_ratio_set) == 1
+            and len(model_version_set) == 1
+            and len(sliding_window_set) == 1
+        ), (
+            "All attention layers in the same KV cache group must use the same "
+            "quantization method, compress ratio, model version and sliding "
+            "window size."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=specs[0].dtype,
+            page_size_padded=specs[0].page_size_padded,
+            sliding_window=sliding_window_set.pop(),
+            cache_dtype_str=cache_dtype_str_set.pop(),
+            compress_ratio=compress_ratio_set.pop(),
+            model_version=model_version_set.pop(),
+        )
+
+
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
