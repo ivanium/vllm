@@ -1,0 +1,100 @@
+apiVersion: workloads.x-k8s.io/v1alpha1
+kind: RoleBasedGroup
+metadata:
+  name: mooncake
+  namespace: mooncake
+spec:
+  roles:
+  - minReadySeconds: 0
+    name: master
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          role: master
+      spec:
+        containers:
+        - command:
+          - mooncake_master
+          - --default_kv_lease_ttl=300000
+          env:
+          image: sglang-checkpoint-engine:latest
+          imagePullPolicy: IfNotPresent
+          name: master
+          ports:
+          - containerPort: 50051
+            name: http
+            protocol: TCP
+          - containerPort: 9003
+            name: metrics
+            protocol: TCP
+          readinessProbe:
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            tcpSocket:
+              port: 50051
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9003
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+        hostNetwork: false
+    workload:
+      apiVersion: apps/v1
+      kind: StatefulSet
+  - minReadySeconds: 0
+    name: store
+    replicas: 4
+    template:
+      spec:
+        volumes:
+          - name: dev-infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: Directory
+        containers:
+        - command:
+          - sh
+          - -c
+          - python3 -m mooncake.mooncake_store_service
+          env:
+          - name: MOONCAKE_LOCAL_HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: MOONCAKE_MASTER
+            value: mooncake-master-0.s-mooncake-master:50051
+          - name: MOONCAKE_TE_META_DATA_SERVER
+            value: P2PHANDSHAKE
+          - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+            value: 60gb
+          - name: MOONCAKE_PROTOCOL
+            value: rdma
+          - name: MOONCAKE_DEVICE
+            value: "mlx5_5"
+          - name: MC_ENABLE_DEST_DEVICE_AFFINITY
+            value: "1"
+          image: sglang-checkpoint-engine:latest
+          imagePullPolicy: IfNotPresent
+          name: store
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+              - SYS_RESOURCE
+            privileged: true
+          volumeMounts:
+            - name: dev-infiniband
+              mountPath: /dev/infiniband
+        dnsConfig:
+          nameservers:
+          - 10.60.0.2
+          - 10.60.0.3
+        dnsPolicy: ClusterFirstWithHostNet
+        hostNetwork: true
+    workload:
+      apiVersion: apps/v1
+      kind: StatefulSet

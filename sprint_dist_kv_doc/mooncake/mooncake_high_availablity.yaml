@@ -1,0 +1,523 @@
+kind: RoleBasedGroup
+metadata:
+  name: mooncake-ha
+  namespace: mooncake-ha
+spec:
+  roles:
+  - minReadySeconds: 0
+    name: master
+    replicas: 3
+    template:
+      metadata:
+        labels:
+          role: master
+      spec:
+        # 这里加了 node 亲和性和 pod 之间反亲和性配置，根据 node、pod 的实际 label 调整下就行
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: kvcache.ai/mooncake-master
+                  operator: In
+                  values:
+                  - "true"
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                - key: role
+                  operator: In
+                  values:
+                  - master
+              topologyKey: "kubernetes.io/hostname"
+
+        containers:
+        - command:
+          - sh
+          - -c
+          - |
+            ulimit -n 1048576
+            ulimit -l unlimited
+            echo "Starting mooncake_master with HA enabled..."
+            mooncake_master \
+              --enable_ha=true \
+              --etcd_endpoints=http://etcd-client.mooncake-ha.svc.cluster.local:2379 \
+              --rpc_address=$(POD_IP) \
+              --rpc_port=50051 \
+              --eviction_high_watermark_ratio=0.9 \
+              --default_kv_lease_ttl=10000
+          image: sglang:0314
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add: [ "IPC_LOCK", "SYS_RESOURCE" ]
+          name: master
+          livenessProbe:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - |
+                pgrep -x mooncake_master >/dev/null
+            failureThreshold: 3
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 3
+          ports:
+          - containerPort: 50051
+            name: http
+            protocol: TCP
+          - containerPort: 9003
+            name: metrics
+            protocol: TCP
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+        hostNetwork: false
+    workload:
+      apiVersion: apps/v1
+      kind: StatefulSet
+  - minReadySeconds: 0
+    name: store
+    replicas: 12
+    template:
+      metadata:
+        labels:
+          role: store
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kvcache.ai/mooncake-store
+                      operator: In
+                      values:
+                        - "true"
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - store
+                topologyKey: "kubernetes.io/hostname"
+        containers:
+        - command:
+          - sh
+          - -c
+          - |
+            ulimit -n 1048576
+            ulimit -l unlimited
+            echo "MOONCAKE_GLOBAL_SEGMENT_SIZE: ${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
+            echo "Starting NUMA 0 instance on port 8099..."
+            numactl --membind=0 python3 -m mooncake.mooncake_store_service --port=8099
+          env:
+          - name: MOONCAKE_LOCAL_HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: MOONCAKE_MASTER
+            value: "etcd://etcd-client.mooncake-ha.svc.cluster.local:2379"
+          - name: MOONCAKE_TE_META_DATA_SERVER
+            value: "P2PHANDSHAKE"
+          - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+            value: "1000gb"
+          - name: MOONCAKE_LOCAL_BUFFER_SIZE
+            value: "67108864"
+          - name: MOONCAKE_PROTOCOL
+            value: rdma
+          # 确保 decode 节点上都有下面这些 ib port
+          - name: MOONCAKE_DEVICE
+            value: "mlx5_10,mlx5_11,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17"
+          - name: MC_ENABLE_DEST_DEVICE_AFFINITY
+            value: "1"
+          image: sglang:0314
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add: [ "IPC_LOCK", "SYS_RESOURCE" ]
+          name: store-numa0
+          ports:
+            - containerPort: 8099
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8099"
+            periodSeconds: 10
+            failureThreshold: 90
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8099"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+              - SYS_RESOURCE
+            privileged: true
+        - command:
+          - sh
+          - -c
+          - |
+            ulimit -n 1048576
+            ulimit -l unlimited
+            echo "MOONCAKE_GLOBAL_SEGMENT_SIZE: ${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
+            echo "Starting NUMA 1 instance on port 8100..."
+            numactl --membind=1 python3 -m mooncake.mooncake_store_service --port=8100
+          env:
+          - name: MOONCAKE_LOCAL_HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: MOONCAKE_MASTER
+            value: "etcd://etcd-client.mooncake-ha.svc.cluster.local:2379"
+          - name: MOONCAKE_TE_META_DATA_SERVER
+            value: "P2PHANDSHAKE"
+          - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+            value: "1000gb"
+          - name: MOONCAKE_LOCAL_BUFFER_SIZE
+            value: "67108864"
+          - name: MOONCAKE_PROTOCOL
+            value: rdma
+          # 确保 decode 节点上都有下面这些 ib port
+          - name: MOONCAKE_DEVICE
+            value: "mlx5_10,mlx5_11,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17"
+          - name: MC_ENABLE_DEST_DEVICE_AFFINITY
+            value: "1"
+          image: sglang:0314
+          imagePullPolicy: IfNotPresent
+          securityContext:
+                privileged: true
+                capabilities:
+                  add: [ "IPC_LOCK", "SYS_RESOURCE" ]
+          name: store-numa1
+          ports:
+            - containerPort: 8100
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8100"
+            periodSeconds: 10
+            failureThreshold: 90
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8100"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+              - SYS_RESOURCE
+            privileged: true
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+  - minReadySeconds: 0
+    name: store-prefill
+    replicas: 6
+    template:
+      metadata:
+        labels:
+          role: store-prefill
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kvcache.ai/mooncake-store-prefill
+                      operator: In
+                      values:
+                        - "true"
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - store-prefill
+                topologyKey: "kubernetes.io/hostname"
+        containers:
+        - command:
+          - sh
+          - -c
+          - |
+            ulimit -n 1048576
+            ulimit -l unlimited
+            echo "MOONCAKE_GLOBAL_SEGMENT_SIZE: ${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
+            echo "Starting NUMA 0 instance on port 8099..."
+            exec numactl --membind=0 python3 -m mooncake.mooncake_store_service --port=8099
+          env:
+          - name: MOONCAKE_LOCAL_HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: MOONCAKE_MASTER
+            value: "etcd://etcd-client.mooncake-ha.svc.cluster.local:2379"
+          - name: MOONCAKE_TE_META_DATA_SERVER
+            value: "P2PHANDSHAKE"
+          - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+            value: "500gb"
+          - name: MOONCAKE_LOCAL_BUFFER_SIZE
+            value: "67108864"
+          - name: MOONCAKE_PROTOCOL
+            value: rdma
+          # 确保 decode 节点上都有下面这些 ib port
+          - name: MOONCAKE_DEVICE
+            value: "mlx5_10,mlx5_11,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17"
+          - name: MC_ENABLE_DEST_DEVICE_AFFINITY
+            value: "1"
+          image: sglang:0314
+          imagePullPolicy: IfNotPresent
+          name: store-numa0
+          ports:
+            - containerPort: 8099
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8099"
+            periodSeconds: 10
+            failureThreshold: 90
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8099"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+              - SYS_RESOURCE
+            privileged: true
+        - command:
+          - sh
+          - -c
+          - |
+            ulimit -n 1048576
+            ulimit -l unlimited
+            echo "MOONCAKE_GLOBAL_SEGMENT_SIZE: ${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
+            echo "Starting NUMA 1 instance on port 8100..."
+            exec numactl --membind=1 python3 -m mooncake.mooncake_store_service --port=8100
+          env:
+          - name: MOONCAKE_LOCAL_HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: MOONCAKE_MASTER
+            value: "etcd://etcd-client.mooncake-ha.svc.cluster.local:2379"
+          - name: MOONCAKE_TE_META_DATA_SERVER
+            value: "P2PHANDSHAKE"
+          - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+            value: "500gb"
+          - name: MOONCAKE_LOCAL_BUFFER_SIZE
+            value: "67108864"
+          - name: MOONCAKE_PROTOCOL
+            value: rdma
+          # 确保 decode 节点上都有下面这些 ib port
+          - name: MOONCAKE_DEVICE
+            value: "mlx5_10,mlx5_11,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17"
+          - name: MC_ENABLE_DEST_DEVICE_AFFINITY
+            value: "1"
+          image: sglang:0314
+          imagePullPolicy: IfNotPresent
+          name: store-numa1
+          ports:
+            - containerPort: 8100
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8100"
+            periodSeconds: 10
+            failureThreshold: 90
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8100"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+              - SYS_RESOURCE
+            privileged: true
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+  - minReadySeconds: 0
+    name: store-decode
+    replicas: 2
+    template:
+      metadata:
+        labels:
+          role: store-decode
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kvcache.ai/mooncake-store-decode
+                      operator: In
+                      values:
+                        - "true"
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - store-decode
+                topologyKey: "kubernetes.io/hostname"
+        containers:
+        - command:
+          - sh
+          - -c
+          - |
+            ulimit -n 1048576
+            ulimit -l unlimited
+            echo "MOONCAKE_GLOBAL_SEGMENT_SIZE: ${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
+            echo "Starting NUMA 0 instance on port 8099..."
+            exec numactl --membind=0 python3 -m mooncake.mooncake_store_service --port=8099
+          env:
+          - name: MOONCAKE_LOCAL_HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: MOONCAKE_MASTER
+            value: "etcd://etcd-client.mooncake-ha.svc.cluster.local:2379"
+          - name: MOONCAKE_TE_META_DATA_SERVER
+            value: "P2PHANDSHAKE"
+          - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+            value: "500gb"
+          - name: MOONCAKE_LOCAL_BUFFER_SIZE
+            value: "67108864"
+          - name: MOONCAKE_PROTOCOL
+            value: rdma
+          # 确保 decode 节点上都有下面这些 ib port
+          - name: MOONCAKE_DEVICE
+            value: "mlx5_10,mlx5_11,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17"
+          - name: MC_ENABLE_DEST_DEVICE_AFFINITY
+            value: "1"
+          image: 10.12.11.7:16622/sglang:0314
+          imagePullPolicy: IfNotPresent
+          name: store-numa0
+          ports:
+            - containerPort: 8099
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8099"
+            periodSeconds: 10
+            failureThreshold: 90
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8099"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+              - SYS_RESOURCE
+            privileged: true
+        - command:
+          - sh
+          - -c
+          - |
+            ulimit -n 1048576
+            ulimit -l unlimited
+            echo "MOONCAKE_GLOBAL_SEGMENT_SIZE: ${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
+            echo "Starting NUMA 1 instance on port 8100..."
+            exec numactl --membind=1 python3 -m mooncake.mooncake_store_service --port=8100
+          env:
+          - name: MOONCAKE_LOCAL_HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: MOONCAKE_MASTER
+            value: "etcd://etcd-client.mooncake-ha.svc.cluster.local:2379"
+          - name: MOONCAKE_TE_META_DATA_SERVER
+            value: "P2PHANDSHAKE"
+          - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+            value: "500gb"
+          - name: MOONCAKE_LOCAL_BUFFER_SIZE
+            value: "67108864"
+          - name: MOONCAKE_PROTOCOL
+            value: rdma
+          # 确保 decode 节点上都有下面这些 ib port
+          - name: MOONCAKE_DEVICE
+            value: "mlx5_10,mlx5_11,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17"
+          - name: MC_ENABLE_DEST_DEVICE_AFFINITY
+            value: "1"
+          image: 10.12.11.7:16622/sglang:0314
+          imagePullPolicy: IfNotPresent
+          name: store-numa1
+          ports:
+            - containerPort: 8100
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8100"
+            periodSeconds: 10
+            failureThreshold: 90
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "nc -z 127.0.0.1 8100"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+              - SYS_RESOURCE
+            privileged: true
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+    workload:
+      apiVersion: apps/v1
+      kind: StatefulSet 
