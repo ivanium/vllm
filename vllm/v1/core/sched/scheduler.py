@@ -762,6 +762,12 @@ class Scheduler(SchedulerInterface):
                         len(self.skipped_waiting),
                         len(self.running),
                     )
+                    # [DEBUG STALL round-6] Who owns the pinned blocks?
+                    self._log_block_owners(
+                        reason="reserve_full_isl",
+                        failed_rid=request_id,
+                        needed=None,
+                    )
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
@@ -806,6 +812,12 @@ class Scheduler(SchedulerInterface):
                         len(self.waiting),
                         len(self.skipped_waiting),
                         len(self.running),
+                    )
+                    # [DEBUG STALL round-6] Who owns the pinned blocks?
+                    self._log_block_owners(
+                        reason="allocate_slots",
+                        failed_rid=request_id,
+                        needed=None,
                     )
 
                     # NOTE: we need to untouch the request from the encode cache
@@ -1612,6 +1624,78 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
+        )
+
+    # [DEBUG STALL round-6] When allocate_slots fails despite running=0, the
+    # KV pool is being held by requests outside self.running. Dump who owns
+    # the blocks, their status, and their connector-side signals so we can
+    # tell whether delay-free-blocks (NIXL P->D xfer) or some other path is
+    # pinning the pool. Rate-limited per-scheduler to 1/5s.
+    def _log_block_owners(
+        self,
+        reason: str,
+        failed_rid: str,
+        needed: int | None = None,
+    ) -> None:
+        now = time.monotonic()
+        last = getattr(self, "_debug_block_owners_last_ts", 0.0)
+        if now - last < 5.0:
+            return
+        self._debug_block_owners_last_ts = now
+
+        coord = getattr(self.kv_cache_manager, "coordinator", None)
+        if coord is None:
+            return
+
+        free_blocks = self.kv_cache_manager.get_num_free_blocks()
+        owners: list[tuple[int, str, str, bool, bool, int, int]] = []
+        try:
+            for rid, req in self.requests.items():
+                try:
+                    blocks_by_group = coord.get_blocks(rid)
+                except Exception:
+                    continue
+                n = sum(len(group) for group in blocks_by_group)
+                if n == 0:
+                    continue
+                owners.append(
+                    (
+                        n,
+                        rid,
+                        getattr(req.status, "name", str(req.status)),
+                        rid in self.finished_recving_kv_req_ids,
+                        rid in self.failed_recving_kv_req_ids,
+                        req.num_computed_tokens,
+                        req.num_tokens,
+                    )
+                )
+        except Exception as e:
+            logger.warning("[ALLOC-OWNERS] enumeration failed: %r", e)
+            return
+
+        owners.sort(reverse=True)
+        total_owned = sum(n for n, *_ in owners)
+        top = [
+            {
+                "n": n,
+                "status": st,
+                "in_fin": fin,
+                "in_fail": fail,
+                "nc": nc,
+                "nt": nt,
+                "rid_suffix": rid[-20:],
+            }
+            for n, rid, st, fin, fail, nc, nt in owners[:8]
+        ]
+        logger.warning(
+            "[ALLOC-OWNERS] reason=%s failed_rid_suffix=%s free_blocks=%d "
+            "total_owners=%d total_owned_blocks=%d top=%s",
+            reason,
+            failed_rid[-20:],
+            free_blocks,
+            len(owners),
+            total_owned,
+            top,
         )
 
     def _enqueue_waiting_request(self, request: Request) -> None:

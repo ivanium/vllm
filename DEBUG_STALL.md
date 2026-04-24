@@ -294,3 +294,96 @@ three mechanisms is firing:
 | `[PROMOTE-TRY] in_finished_set=False` repeatedly for a rid whose `[KV-RECV-APPLY]` fired earlier | Key mismatch (e)-1; compare rid strings byte-for-byte |
 | `[PROMOTE-TRY] in_finished_set=True` → `[PROMOTE-OK]` → `[SCHED-ALLOC-BLOCK]` on same rid, repeated | Allocation pressure loop (e)-2 |
 | `[PROMOTE-OK]` then silence (no ALLOC-BLOCK) but rid still stuck | Downstream of allocate — e.g., blocks weren't actually cached, or status reverted somewhere |
+
+## Round 6 — who owns the pinned KV blocks when allocate fails?
+
+Round 5 on run `20260424_165818` (1P2D × 512 conc) resolved candidate (e)
+as **(e)-2**: many `[PROMOTE-OK]` lines paired with many
+`[SCHED-ALLOC-BLOCK]` entries. A representative failure:
+
+```
+[SCHED-ALLOC-BLOCK] branch=reserve_full_isl req_id=...35a16272...
+  status=WAITING needed_blocks=35 free_blocks=9
+  waiting=18 skipped=2 running=0
+```
+
+`running=0` but only 9 blocks free. Something outside `self.running` is
+pinning the rest of the KV pool. The scheduler's own accounting doesn't
+say WHO. This round adds that.
+
+### Changes
+
+`vllm/v1/core/sched/scheduler.py`:
+
+- New `_log_block_owners(reason, failed_rid, needed)` helper. Enumerates
+  `self.requests.items()`, asks the coordinator for each rid's
+  `get_blocks(rid)`, and emits one `[ALLOC-OWNERS]` line with the top-8
+  owners sorted by block count. For each owner: status, in-finished-set,
+  in-failed-set, num_computed, num_tokens, rid suffix.
+- Called from both `[SCHED-ALLOC-BLOCK]` sites (reserve_full_isl and
+  allocate_slots), rate-limited to 1/5s scheduler-wide via
+  `self._debug_block_owners_last_ts`. Happy path stays silent.
+
+### Expected `[ALLOC-OWNERS]` output
+
+```
+[ALLOC-OWNERS] reason=reserve_full_isl failed_rid_suffix=...35a16272 \
+  free_blocks=9 total_owners=N total_owned_blocks=B top=[ \
+    {n=<blocks>, status=<STATE>, in_fin=<T/F>, in_fail=<T/F>, \
+     nc=<computed>, nt=<total>, rid_suffix=...abcd}, ...]
+```
+
+### Discrimination matrix
+
+| Pattern | Interpretation |
+|---|---|
+| `status=WAITING_FOR_REMOTE_KVS` owners, `in_fin=False` | Normal pending loads; more traffic than pool can hold — ran out of blocks before Mooncake completes |
+| `status=WAITING_FOR_REMOTE_KVS` owners, `in_fin=True` | Completion signal delivered but request still owns blocks — delayed release after promote |
+| `status=WAITING` owners | Requests that were promoted but then failed to allocate_slots, still holding earlier computed blocks — (e)-2 feedback loop |
+| `status=FINISHED_*` owners | Blocks pinned post-finish by connector's delay_free_blocks — NIXL/MC release path bug |
+| `status=RUNNING` owners, `len(self.running)==0` | Bookkeeping mismatch: running list out of sync with request statuses |
+| Owners split across decode hosts with one host dominating | Per-peer pile-up — the NIXL P→D xfer to that host is not draining |
+
+After running once with round 6, the `status=` column of the top owners
+identifies the actual fix site.
+
+## Round 6 outcome — root cause identified
+
+Run `20260424_172233` (1P2D × 512 conc) produced a frozen DP1 with
+`free_blocks=13`, `total_owners=2`, `total_owned_blocks=2129` on a
+~2142-block pool:
+
+```
+top=[
+  {n=1072, status=WAITING,              in_fin=False, nc=68608, nt=69521,
+       rid_suffix=880bc4db985-a4968e1c},
+  {n=1057, status=WAITING_FOR_REMOTE_KVS, in_fin=True,  nc=67648, nt=67758,
+       rid_suffix=94a12dc16bc-a20bc39c},
+]
+```
+
+Cross-referenced with `[PROMOTE-TRY]`/`[PROMOTE-OK]` logs: Owner A
+(`880bc4db985`) was promoted successfully at 17:31:34 and began chunked
+prefill, then allocate failed for its next chunk. Owner B
+(`94a12dc16bc`) has `in_fin=True` (completion delivered) but no
+`[PROMOTE-TRY]` lines ever fired for it after 17:31:34. Peek never
+reaches it — the scheduler breaks on Owner A's allocation failure.
+
+**Root cause:** head-of-line blocking in the scheduler's skipped_waiting
+iteration. Details and proposed fix in `ROOT_CAUSE_STALL.md`.
+
+## What each round ruled in/out
+
+| Round | Hypothesis tested | Verdict |
+|---|---|---|
+| 1 | Loop wedged in native call (NCCL/UCX/Mooncake) | Ruled out — DP-HB stays alive, step_counter ticks |
+| 1 | EP-lockstep straggler all-reduce hang | Ruled out — DP-ALLREDUCE all fast |
+| 2 | Completion callback never fires in Mooncake | Ruled out — `[KV-RECV-APPLY]` fires |
+| 3 | `_worker_loop` drops request via bare exception | Ruled out — zero `[KVTHREAD-DROP]` |
+| 3 | `kv_recv_thread` blocked in native Mooncake call | Ruled out — `[KVTHREAD-HB]` stays responsive |
+| 4 | Stuck request churn (round-3 truncation bug) | Ruled out with full-id + dwell tracking |
+| 5 | (e)-1 promote called with wrong key | Ruled out — `in_finished_set=True` on promoted rids |
+| 5 | (e)-3 peek never selects the blocked rid | **Confirmed** for one rid |
+| 5 | (e)-2 promote OK, allocate fails in loop | **Confirmed** for a different rid |
+| 6 | Blocks pinned by finished-but-not-released requests | Ruled out — owners are all live |
+| 6 | Blocks pinned by 2 huge in-flight requests deadlocking | **Confirmed — root cause** |
