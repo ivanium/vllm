@@ -239,6 +239,10 @@ class KVTransferThread(threading.Thread):
         self.finished_requests: set[str] = set()
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
+        # [DEBUG STALL] Counters for drops and heartbeats. See DEBUG_STALL.md.
+        self._dropped_request_ids: set[str] = set()
+        self._total_handled = 0
+        self._total_dropped = 0
 
     def add_request(self, request: ReqMeta) -> None:
         self.request_queue.put(request)
@@ -259,16 +263,53 @@ class KVTransferThread(threading.Thread):
 
     def _worker_loop(self):
         thread_name = threading.current_thread().name
+        # [DEBUG STALL] Periodic self-heartbeat from the transfer thread itself
+        # so we can tell "thread alive but queue empty" from "thread stuck in
+        # a native call" from "thread dead". Logs every ~5 s.
+        last_hb = time.monotonic()
         while True:
+            current_req_id: str | None = None
             try:
+                # Heartbeat check before blocking on queue.get
+                now = time.monotonic()
+                if now - last_hb >= 5.0:
+                    with self.done_task_lock:
+                        finished_now = len(self.finished_requests)
+                    logger.warning(
+                        "[KVTHREAD-HB] name=%s qsize=%d finished=%d "
+                        "total_handled=%d total_dropped=%d dropped_sample=%s",
+                        thread_name,
+                        self.request_queue.qsize(),
+                        finished_now,
+                        self._total_handled,
+                        self._total_dropped,
+                        list(self._dropped_request_ids)[:3] or "-",
+                    )
+                    last_hb = now
                 request_data = self.request_queue.get()
                 if request_data is None:
                     logger.warning("Received a None request!")
                     self.request_queue.task_done()
                     continue
+                # Remember the req_id before dispatch so we can log it on drop.
+                current_req_id = getattr(request_data, "req_id", None)
                 self._handle_request(request_data)
+                self._total_handled += 1
             except Exception as e:
-                logger.error("Error in %s: %s", thread_name, e)
+                # [DEBUG STALL] Surface req_id of dropped request so we can
+                # cross-reference with the scheduler's WAITING_FOR_REMOTE_KVS
+                # heartbeat. Without this, the exception silently leaked the
+                # request (no set_finished_request ever called).
+                self._total_dropped += 1
+                if current_req_id is not None:
+                    self._dropped_request_ids.add(current_req_id)
+                logger.error(
+                    "[KVTHREAD-DROP] name=%s req_id=%s err=%r",
+                    thread_name,
+                    current_req_id,
+                    e,
+                    exc_info=True,
+                )
 
     def _handle_request(self, req_meta: Any):
         pass
