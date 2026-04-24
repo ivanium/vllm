@@ -739,6 +739,29 @@ class Scheduler(SchedulerInterface):
                         num_encoder_tokens=num_encoder_tokens,
                     )
                 ):
+                    logger.warning(
+                        "[SCHED-ALLOC-BLOCK] branch=reserve_full_isl "
+                        "req_id=%s status=%s needed_blocks=%d free_blocks=%d "
+                        "req_tokens=%d computed_tokens=%d local_hit_tokens=%d "
+                        "external_hit_tokens=%d waiting=%d skipped=%d running=%d",
+                        request_id,
+                        request.status.name,
+                        self.kv_cache_manager.estimate_full_sequence_blocks_to_allocate(
+                            request,
+                            num_new_computed_tokens=num_new_local_computed_tokens,
+                            new_computed_blocks=new_computed_blocks,
+                            num_external_computed_tokens=num_external_computed_tokens,
+                            num_encoder_tokens=num_encoder_tokens,
+                        ),
+                        self.kv_cache_manager.get_num_free_blocks(),
+                        request.num_tokens,
+                        request.num_computed_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                        len(self.waiting),
+                        len(self.skipped_waiting),
+                        len(self.running),
+                    )
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
@@ -756,6 +779,34 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    logger.warning(
+                        "[SCHED-ALLOC-BLOCK] branch=allocate_slots "
+                        "req_id=%s status=%s needed_blocks=%d free_blocks=%d "
+                        "req_tokens=%d computed_tokens=%d num_new_tokens=%d "
+                        "local_hit_tokens=%d external_hit_tokens=%d "
+                        "lookahead_tokens=%d waiting=%d skipped=%d running=%d",
+                        request_id,
+                        request.status.name,
+                        self.kv_cache_manager.estimate_step_blocks_to_allocate(
+                            request,
+                            num_new_tokens,
+                            num_new_computed_tokens=num_new_local_computed_tokens,
+                            new_computed_blocks=new_computed_blocks,
+                            num_lookahead_tokens=effective_lookahead_tokens,
+                            num_external_computed_tokens=num_external_computed_tokens,
+                            num_encoder_tokens=num_encoder_tokens,
+                        ),
+                        self.kv_cache_manager.get_num_free_blocks(),
+                        request.num_tokens,
+                        request.num_computed_tokens,
+                        num_new_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                        effective_lookahead_tokens,
+                        len(self.waiting),
+                        len(self.skipped_waiting),
+                        len(self.running),
+                    )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -2083,13 +2134,47 @@ class Scheduler(SchedulerInterface):
             # finished_recving_kv_req_ids is populated during
             # update_from_output(), based on worker-side connector signals
             # in KVConnectorOutput.finished_recving
-            if request.request_id not in self.finished_recving_kv_req_ids:
+            in_set = request.request_id in self.finished_recving_kv_req_ids
+            # [DEBUG STALL round-5] Log promote attempts for WAITING_FOR_REMOTE_KVS
+            # so we can tell "promote never called" (queue never peeks this rid)
+            # apart from "promote called but rid missing from finished set" (key
+            # mismatch) apart from "promote OK but allocate fails" (pressure loop).
+            # Rate-limited per rid to 1/5s so the happy path doesn't flood.
+            _tracker = getattr(self, "_debug_promote_tracker", None)
+            if _tracker is None:
+                _tracker = {}
+                self._debug_promote_tracker = _tracker
+            _now = time.monotonic()
+            _last = _tracker.get(request.request_id, 0.0)
+            if _now - _last >= 5.0 or in_set:
+                logger.warning(
+                    "[PROMOTE-TRY] rid=%s in_finished_set=%s set_size=%d "
+                    "failed_set=%d preempts=%d num_computed=%d num_tokens=%d",
+                    request.request_id,
+                    in_set,
+                    len(self.finished_recving_kv_req_ids),
+                    len(self.failed_recving_kv_req_ids),
+                    request.num_preemptions,
+                    request.num_computed_tokens,
+                    request.num_tokens,
+                )
+                _tracker[request.request_id] = _now
+            if not in_set:
                 return False
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
+            # [DEBUG STALL round-5] Promote succeeded — downstream ALLOC-FAIL on
+            # this rid means the pressure loop, not a delivery bug.
+            logger.warning(
+                "[PROMOTE-OK] rid=%s new_status=%s num_computed=%d num_tokens=%d",
+                request.request_id,
+                request.status.name,
+                request.num_computed_tokens,
+                request.num_tokens,
+            )
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:

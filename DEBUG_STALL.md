@@ -254,3 +254,43 @@ so the heartbeat couldn't tell churn from persistence.
 | `stuck_sample` entries with `dwell<heartbeat_period` and different `rid` each heartbeat, `total_skipped_seen` climbing fast | Churn through WAITING_FOR_REMOTE_KVS; not a stall |
 | `[KVTHREAD-HB] handling=<rid>@N.Ns` with N growing across heartbeats | Specific request wedged inside a native Mooncake call |
 | `[KVTHREAD-END-SLOW]` firing | Request completed but took too long — latency regression, not a hang |
+
+## Round 5 — scheduler-side promote/allocate trace for candidate (e)
+
+Round 4 revealed `[KV-RECV-APPLY]` firing for the stuck rid (so the
+completion *was* delivered to the right scheduler) but the request
+staying in `WAITING_FOR_REMOTE_KVS` for 13+ min with `finished_recv_kv=1`
+pinned. No `[SCHED-ALLOC-BLOCK]` entries for the stuck rid either — so
+allocate_slots is never reached for it. This round pinpoints WHICH of
+three mechanisms is firing:
+
+1. **Key mismatch** — `_try_promote_blocked_waiting_request` called,
+   rid is NOT in `finished_recving_kv_req_ids` despite the RECV-APPLY add
+   (impl bug around how the set is keyed).
+2. **Promote OK but allocate fails** — already traced by
+   `[SCHED-ALLOC-BLOCK]`.
+3. **Peek never selects the rid** — the queue never returns this rid
+   from `peek_request()`, so promote is never even attempted.
+
+### Changes
+
+`vllm/v1/core/sched/scheduler.py` — `_try_promote_blocked_waiting_request`:
+
+- `[PROMOTE-TRY] rid=<...> in_finished_set=<bool> set_size=N ...` emitted
+  on every call for a `WAITING_FOR_REMOTE_KVS` request. Rate-limited per
+  rid to 1 line per 5 s to keep the happy path quiet; ALWAYS emits on
+  `in_finished_set=True` so the promote→allocate sequence is never
+  sampled out.
+- `[PROMOTE-OK] rid=<...> new_status=<...> num_computed=X num_tokens=Y`
+  on the return-True path. A `[PROMOTE-OK]` with no matching
+  `[SCHED-ALLOC-BLOCK]` on the same rid means the request was scheduled
+  into `running` and the stall is elsewhere.
+
+### How round-5 output discriminates candidate (e)
+
+| Pattern | Interpretation |
+|---|---|
+| No `[PROMOTE-TRY]` lines for the stuck rid | Peek never selects it — queue-state bug (e)-3 |
+| `[PROMOTE-TRY] in_finished_set=False` repeatedly for a rid whose `[KV-RECV-APPLY]` fired earlier | Key mismatch (e)-1; compare rid strings byte-for-byte |
+| `[PROMOTE-TRY] in_finished_set=True` → `[PROMOTE-OK]` → `[SCHED-ALLOC-BLOCK]` on same rid, repeated | Allocation pressure loop (e)-2 |
+| `[PROMOTE-OK]` then silence (no ALLOC-BLOCK) but rid still stuck | Downstream of allocate — e.g., blocks weren't actually cached, or status reverted somewhere |
