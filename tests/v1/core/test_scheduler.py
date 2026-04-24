@@ -4288,3 +4288,251 @@ def test_eagle3_mm_encoder_cache_with_shift():
         f"shifted_end={scheduled_end_with_shift}) overlapping MM at "
         f"{start_pos}. The fix must schedule encoder inputs."
     )
+
+
+# ==============================================================================
+# Lateral preemption: skipped_waiting head-of-line wedge resolution
+# ==============================================================================
+
+
+def _make_lateral_preempt_scheduler():
+    return create_scheduler(max_num_seqs=4, num_blocks=32)
+
+
+def test_lateral_preempt_candidate_predicate():
+    scheduler = _make_lateral_preempt_scheduler()
+    [r] = create_requests(num_requests=1, req_ids=["r"])
+
+    r.status = RequestStatus.WAITING
+    r.num_computed_tokens = 0
+    assert not scheduler._is_lateral_preempt_candidate(r)
+
+    r.num_computed_tokens = 16
+    assert scheduler._is_lateral_preempt_candidate(r)
+
+    r.status = RequestStatus.PREEMPTED
+    r.num_computed_tokens = 0
+    assert not scheduler._is_lateral_preempt_candidate(r)
+
+    r.num_computed_tokens = 16
+    assert scheduler._is_lateral_preempt_candidate(r)
+
+    r.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert not scheduler._is_lateral_preempt_candidate(r)
+
+    scheduler.finished_recving_kv_req_ids.add(r.request_id)
+    assert scheduler._is_lateral_preempt_candidate(r)
+
+    scheduler.finished_recving_kv_req_ids.discard(r.request_id)
+    r.status = RequestStatus.RUNNING
+    r.num_computed_tokens = 100
+    assert not scheduler._is_lateral_preempt_candidate(r)
+
+    r.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+    assert not scheduler._is_lateral_preempt_candidate(r)
+
+    r.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert not scheduler._is_lateral_preempt_candidate(r)
+
+
+def test_lateral_preempt_find_victim_excludes_target():
+    from vllm.v1.core.sched.request_queue import create_request_queue
+
+    scheduler = _make_lateral_preempt_scheduler()
+    [a] = create_requests(num_requests=1, req_ids=["a"])
+    a.status = RequestStatus.WAITING
+    a.num_computed_tokens = 16
+    scheduler.skipped_waiting.add_request(a)
+
+    step_skipped = create_request_queue(scheduler.policy)
+    assert scheduler._find_lateral_preempt_victim(a, step_skipped) is None
+
+
+def test_lateral_preempt_find_victim_picks_least_progressed():
+    from vllm.v1.core.sched.request_queue import create_request_queue
+
+    scheduler = _make_lateral_preempt_scheduler()
+    target, b, c = create_requests(num_requests=3, req_ids=["target", "b", "c"])
+    target.status = RequestStatus.RUNNING
+
+    b.status = RequestStatus.WAITING
+    b.num_computed_tokens = 100
+    c.status = RequestStatus.WAITING
+    c.num_computed_tokens = 50
+
+    scheduler.skipped_waiting.add_request(b)
+    scheduler.skipped_waiting.add_request(c)
+    step_skipped = create_request_queue(scheduler.policy)
+
+    result = scheduler._find_lateral_preempt_victim(target, step_skipped)
+    assert result is not None
+    victim, queue = result
+    assert victim.request_id == "c"
+    assert queue is scheduler.skipped_waiting
+
+
+def test_lateral_preempt_find_victim_searches_step_queue():
+    from vllm.v1.core.sched.request_queue import create_request_queue
+
+    scheduler = _make_lateral_preempt_scheduler()
+    target, b = create_requests(num_requests=2, req_ids=["target", "b"])
+    target.status = RequestStatus.RUNNING
+
+    b.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    b.num_computed_tokens = 16
+    step_skipped = create_request_queue(scheduler.policy)
+    step_skipped.add_request(b)
+    scheduler.finished_recving_kv_req_ids.add(b.request_id)
+
+    result = scheduler._find_lateral_preempt_victim(target, step_skipped)
+    assert result is not None
+    victim, queue = result
+    assert victim.request_id == "b"
+    assert queue is step_skipped
+
+
+def test_lateral_preempt_does_not_consider_running():
+    from vllm.v1.core.sched.request_queue import create_request_queue
+
+    scheduler = _make_lateral_preempt_scheduler()
+    target, b = create_requests(num_requests=2, req_ids=["target", "b"])
+    target.status = RequestStatus.WAITING
+    target.num_computed_tokens = 0
+
+    b.status = RequestStatus.RUNNING
+    b.num_computed_tokens = 50
+    scheduler.running.append(b)
+
+    step_skipped = create_request_queue(scheduler.policy)
+    assert scheduler._find_lateral_preempt_victim(target, step_skipped) is None
+
+
+def test_lateral_preempt_resolves_wedge_e2e():
+    """Drive a real wedge: A wedged at head of skipped_waiting; B behind A is
+    recv-done. Without F2 the loop would break and stall. With F2, B is
+    preempted and A is admitted in the same schedule() call.
+    """
+    BLOCK_SIZE = 16
+    NUM_TOKENS = 64  # 4 blocks per request
+    MATCHED_TOKENS = 16  # 1 block prefix
+    NUM_BLOCKS = 4  # tight: 2 prefix blocks + 2 free, A needs 3 more
+
+    scheduler = create_scheduler(
+        block_size=BLOCK_SIZE,
+        num_blocks=NUM_BLOCKS,
+        max_num_seqs=4,
+        max_num_batched_tokens=NUM_TOKENS * 4,
+        use_kv_connector=mock_kv(matched_tokens=MATCHED_TOKENS, is_async=True),
+    )
+
+    a, b = create_requests(
+        num_requests=2,
+        num_tokens=NUM_TOKENS,
+        block_size=BLOCK_SIZE,
+        req_ids=["a", "b"],
+    )
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+
+    EMPTY_OUTPUT = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    out1 = scheduler.schedule()
+    assert a.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert b.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert len(scheduler.running) == 0
+    scheduler.update_from_output(out1, EMPTY_OUTPUT)
+
+    out2 = scheduler.schedule()
+    a_finished = dataclasses.replace(
+        EMPTY_OUTPUT,
+        kv_connector_output=KVConnectorOutput(finished_recving=[a.request_id]),
+    )
+    scheduler.update_from_output(out2, a_finished)
+
+    out3 = scheduler.schedule()
+    assert a.status == RequestStatus.WAITING
+    assert a.num_computed_tokens == MATCHED_TOKENS
+    assert a in list(scheduler.skipped_waiting)
+    assert len(scheduler.running) == 0
+    assert len(out3.scheduled_new_reqs) == 0
+
+    b_finished = dataclasses.replace(
+        EMPTY_OUTPUT,
+        kv_connector_output=KVConnectorOutput(finished_recving=[b.request_id]),
+    )
+    scheduler.update_from_output(out3, b_finished)
+
+    out4 = scheduler.schedule()
+
+    assert a.status == RequestStatus.RUNNING
+    assert a in scheduler.running
+
+    assert b.status == RequestStatus.PREEMPTED
+    assert b.num_computed_tokens == 0
+    assert b.num_preemptions == 1
+    assert b in list(scheduler.waiting)
+    assert b.request_id not in scheduler.finished_recving_kv_req_ids
+    assert a.request_id in {req.req_id for req in out4.scheduled_new_reqs}
+
+
+def test_lateral_preempt_holds_when_only_in_flight_recv_behind():
+    """Only an in-flight (recv-not-done) WAITING_FOR_REMOTE_KVS sits behind A.
+    F2 must not preempt it; A waits.
+    """
+    BLOCK_SIZE = 16
+    NUM_TOKENS = 64
+    MATCHED_TOKENS = 16
+    NUM_BLOCKS = 4
+
+    scheduler = create_scheduler(
+        block_size=BLOCK_SIZE,
+        num_blocks=NUM_BLOCKS,
+        max_num_seqs=4,
+        max_num_batched_tokens=NUM_TOKENS * 4,
+        use_kv_connector=mock_kv(matched_tokens=MATCHED_TOKENS, is_async=True),
+    )
+
+    a, b = create_requests(
+        num_requests=2,
+        num_tokens=NUM_TOKENS,
+        block_size=BLOCK_SIZE,
+        req_ids=["a", "b"],
+    )
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+
+    EMPTY_OUTPUT = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    out1 = scheduler.schedule()
+    scheduler.update_from_output(out1, EMPTY_OUTPUT)
+
+    out2 = scheduler.schedule()
+    a_finished = dataclasses.replace(
+        EMPTY_OUTPUT,
+        kv_connector_output=KVConnectorOutput(finished_recving=[a.request_id]),
+    )
+    scheduler.update_from_output(out2, a_finished)
+
+    out3 = scheduler.schedule()
+    assert a.status == RequestStatus.WAITING
+    assert b.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert b.request_id not in scheduler.finished_recving_kv_req_ids
+    assert a in list(scheduler.skipped_waiting)
+    assert b in list(scheduler.skipped_waiting)
+    assert len(scheduler.running) == 0
+    assert len(out3.scheduled_new_reqs) == 0
+    assert b.num_preemptions == 0
