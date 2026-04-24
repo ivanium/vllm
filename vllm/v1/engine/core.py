@@ -1190,9 +1190,115 @@ class EngineCoreProc(EngineCore):
         # background threads (like NIXL handshake) to make progress.
         # Without this, the tight polling loop can starve background threads.
         if not model_executed and self.scheduler.has_unfinished_requests():
+            self._maybe_log_stall_heartbeat()
             time.sleep(0.001)
+        elif model_executed:
+            self._stall_heartbeat_last_ts = 0.0
 
         return model_executed
+
+    def _maybe_log_stall_heartbeat(self) -> None:
+        """Log scheduler + connector state every 5s while the engine is
+        idle-with-unfinished (the stall-prone state).
+
+        Added to diagnose pd-disagg stalls where the engine stops executing
+        model steps but still holds in-flight requests. Silent during healthy
+        operation (only fires when model_executed=False and unfinished>0).
+        """
+        now = time.monotonic()
+        last = getattr(self, "_stall_heartbeat_last_ts", 0.0)
+        if now - last < 5.0:
+            return
+        self._stall_heartbeat_last_ts = now
+
+        sched = self.scheduler
+        try:
+            waiting = len(sched.waiting)
+        except Exception:
+            waiting = -1
+        running = len(getattr(sched, "running", []))
+        unfinished = sched.get_num_unfinished_requests()
+        try:
+            skipped = len(sched.skipped_waiting)
+        except Exception:
+            skipped = -1
+
+        # Per-status histogram across ALL tracked queues (waiting + running +
+        # skipped_waiting). `skipped_waiting` is where requests in
+        # WAITING_FOR_REMOTE_KVS park; missing it hid exactly the stuck reqs.
+        status_counts: dict[str, int] = {}
+        try:
+            for req in (
+                list(getattr(sched, "waiting", []))
+                + list(getattr(sched, "running", []))
+                + list(getattr(sched, "skipped_waiting", []))
+            ):
+                name = getattr(req.status, "name", str(req.status))
+                status_counts[name] = status_counts.get(name, 0) + 1
+        except Exception:
+            pass
+
+        # Scheduler-side KV transfer bookkeeping: these sets drive
+        # _try_promote_blocked_waiting_request. If a request stays in
+        # WAITING_FOR_REMOTE_KVS but never appears in finished_recving_kv_req_ids,
+        # the connector's completion callback never fired.
+        frk = len(getattr(sched, "finished_recving_kv_req_ids", set()))
+        fark = len(getattr(sched, "failed_recving_kv_req_ids", set()))
+
+        # Walk connector(s). For each, surface any attr that looks like it
+        # tracks in-flight transfers. We don't assume attribute names — try
+        # several common ones and report whatever exists.
+        conn_parts: list[str] = []
+        root = getattr(sched, "connector", None)
+        conns: list = []
+        if root is not None:
+            inner = getattr(root, "_connectors", None)
+            conns = list(inner) if inner else [root]
+        for c in conns:
+            name = type(c).__name__
+            attrs = []
+            for attr_name in (
+                "_reqs_need_recv",
+                "_reqs_need_send",
+                "_async_load_tasks",
+                "_pending_loads",
+                "_in_flight_loads",
+                "_async_loads",
+                "pending_requests",
+            ):
+                val = getattr(c, attr_name, None)
+                if val is not None:
+                    try:
+                        attrs.append(f"{attr_name}={len(val)}")
+                    except TypeError:
+                        attrs.append(f"{attr_name}=?")
+            conn_parts.append(f"{name}({','.join(attrs) if attrs else '-'})")
+
+        # Sample a few stuck request IDs so we can cross-reference with NIXL /
+        # Mooncake logs.
+        stuck_ids: list[str] = []
+        try:
+            for req in list(getattr(sched, "skipped_waiting", []))[:3]:
+                rid = getattr(req, "request_id", "?")
+                st = getattr(req.status, "name", str(req.status))
+                stuck_ids.append(f"{rid[:40]}:{st}")
+        except Exception:
+            pass
+
+        logger.warning(
+            "[STALL-HEARTBEAT] waiting=%d running=%d skipped=%d unfinished=%d "
+            "status=%s finished_recv_kv=%d failed_recv_kv=%d "
+            "connectors=[%s] stuck_sample=%s",
+            waiting,
+            running,
+            skipped,
+            unfinished,
+            status_counts or "{}",
+            frk,
+            fark,
+            ", ".join(conn_parts) if conn_parts else "none",
+            stuck_ids or "-",
+        )
 
     def _notify_idle_state_callbacks(self) -> None:
         while self._idle_state_callbacks:
@@ -1617,6 +1723,40 @@ class DPEngineCoreProc(EngineCoreProc):
             tensor_queue=tensor_queue,
         )
 
+        # [DEBUG STALL] Heartbeat thread: independent of the busy loop so we can
+        # distinguish "loop stuck in a native call" from "process dead".
+        # Default 5s; override with VLLM_DP_HEARTBEAT_INTERVAL_S=0 to disable.
+        self._last_step_time = time.monotonic()
+        self._last_model_exec_time = time.monotonic()
+        self._steps_since_exec = 0
+        hb_interval = float(os.environ.get("VLLM_DP_HEARTBEAT_INTERVAL_S", "5"))
+        if hb_interval > 0:
+            def _heartbeat_loop():
+                while True:
+                    time.sleep(hb_interval)
+                    now = time.monotonic()
+                    running, waiting = 0, 0
+                    try:
+                        running, waiting = self.scheduler.get_request_counts()
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "[DP-HB] dp_rank=%d step=%d age_since_step=%.1fs "
+                        "age_since_exec=%.1fs steps_since_exec=%d running=%d "
+                        "waiting=%d engines_running=%s wave=%d",
+                        dp_rank, self.step_counter,
+                        now - self._last_step_time,
+                        now - self._last_model_exec_time,
+                        self._steps_since_exec, running, waiting,
+                        getattr(self, "engines_running", "?"),
+                        self.current_wave,
+                    )
+            threading.Thread(
+                target=_heartbeat_loop,
+                daemon=True,
+                name=f"DPHeartbeat-{dp_rank}",
+            ).start()
+
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.
         parallel_config = vllm_config.parallel_config
@@ -1710,6 +1850,13 @@ class DPEngineCoreProc(EngineCoreProc):
                     self.eep_scaling_state = None
 
             executed = self._process_engine_step()
+            # [DEBUG STALL] Timestamps feed the heartbeat thread.
+            self._last_step_time = time.monotonic()
+            if executed:
+                self._last_model_exec_time = self._last_step_time
+                self._steps_since_exec = 0
+            else:
+                self._steps_since_exec += 1
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
@@ -1755,7 +1902,31 @@ class DPEngineCoreProc(EngineCoreProc):
         if self.step_counter % 32 != 0:
             return True
 
-        return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+        # [DEBUG STALL] Time the DP all-reduce. A hang here with one rank
+        # blocked on another's straggling step is the EP-lockstep stall
+        # signature. Default: log only slow all-reduces (>= threshold seconds).
+        # Set VLLM_DP_LOG_ALLREDUCE_THRESHOLD_S=0 to log every one,
+        # or to a very large number to disable.
+        log_threshold = float(
+            os.environ.get("VLLM_DP_LOG_ALLREDUCE_THRESHOLD_S", "0.5")
+        )
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        if log_threshold == 0.0:
+            logger.warning(
+                "[DP-ALLREDUCE] dp_rank=%d step=%d entering has_unfinished_dp "
+                "local_unfinished=%s",
+                dp_rank, self.step_counter, local_unfinished,
+            )
+        start = time.monotonic()
+        result = ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+        took = time.monotonic() - start
+        if took >= log_threshold:
+            logger.warning(
+                "[DP-ALLREDUCE] dp_rank=%d step=%d returned=%s took=%.3fs "
+                "local_unfinished=%s",
+                dp_rank, self.step_counter, result, took, local_unfinished,
+            )
+        return result
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
