@@ -318,12 +318,130 @@ then head-of-line blocking is structurally impossible because WAITING
 requests never sit in front of blocked-waiting ones.
 Largest surface-area change; most durable.
 
+### Option F2 — lateral preemption for blocked-waiting holders (principled alternative)
+
+Options A/B/C are traversal fixes — they restructure how the queue is
+iterated. F2 fixes the same wedge at a higher level of abstraction:
+**treat block-holding requests without forward-pass progress as
+preemptible the same way `self.running` is already preemptible.**
+
+The observation: Owner B in the trace holds 1057 blocks, its Mooncake
+load has completed, and it has generated zero tokens. A `self.running`
+request mid-decode that needs more blocks can already be preempted by
+[`_preempt_request`](vllm/v1/core/sched/scheduler.py#L1019) (frees
+blocks, resets `num_computed_tokens=0`, re-queues to `self.waiting`).
+Owner B has *less* progress than that running request (pure KV load,
+no forward pass), so if running is preemptible, B should be too. The
+existing valve at [scheduler.py:385](vllm/v1/core/sched/scheduler.py#L385)
+just can't see into `skipped_waiting`.
+
+#### Candidate set
+
+```python
+# Admission target = the request this iteration is trying to schedule
+target = request  # peeked from active queue at top of outer while
+
+# Lateral preemption pool — only requests at the same "tier" as target
+# (block-holding, KV loaded, no forward pass yet). RUNNING is
+# deliberately excluded: running has strictly more sunk work (prefix +
+# generated tokens), and robbing it to admit a zero-compute request is
+# priority inversion.
+candidates = [
+    r for r in self.skipped_waiting
+    if r is not target and (
+        (r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+         and r.request_id in self.finished_recving_kv_req_ids)
+        or (r.status == RequestStatus.WAITING
+            and r.num_computed_tokens > 0)   # promoted-from-remote-kv signature
+    )
+]
+
+# Least-progressed first; ties broken by block count (bigger victim = more relief)
+victim = pick_least_progressed(candidates)
+```
+
+`WAITING + nc>0` identifies a request that was promoted out of
+`WAITING_FOR_REMOTE_KVS` and still holds its prefix blocks.
+`_preempt_request` resets `nc=0` on the way back, and a freshly-admitted
+`WAITING` request has `nc=0` too, so the predicate is a reliable
+signature for "promoted, not yet run."
+
+#### Trace timeline under F2
+
+State at the moment of wedge (from §Concrete trace):
+`free=13`, `skipped_waiting = [A(WAITING, 1072 blk, needs 26),
+B(WAITING_FOR_REMOTE_KVS recv-done, 1057 blk)]`, `running=0`.
+
+1. Outer `while` peeks A → `allocate_slots(26)` fails (13 free < 26 needed).
+2. Today: `break`. Under F2: consult lateral preemption pool.
+3. Candidates = `{B}` (A excluded as target; no other skipped_waiting entries).
+4. Victim = B. `_preempt_request(B)`: free 1057 blocks, `B.nc=0`,
+   `B.status=WAITING_FOR_REMOTE_KVS` re-queued, discard from
+   `finished_recving_kv_req_ids` (will re-fetch on next admission).
+   `free` jumps 13 → 1070.
+5. Retry `allocate_slots(A, 26)` → succeeds. A joins `self.running`.
+6. A prefills, hands off to decode via NIXL, releases 1072 + 26.
+7. B's next admission triggers a fresh Mooncake load (~500ms redundant
+   work; no wedge).
+
+#### Why F2 is sufficient
+
+The wedge *definitionally* requires a recv-done (or promoted-not-run)
+request behind the failing head — that's what makes it a wedge rather
+than normal backpressure. An in-flight-only scenario isn't a wedge: A
+waits for some transfer to finish naturally, at which point F2's
+candidate set becomes non-empty on the next tick. F2 therefore covers
+every wedge state without needing to cancel in-flight transfers or
+touch running.
+
+#### Why RUNNING is excluded
+
+A running request has `prefix + generated_tokens` worth of sunk work; A
+(or any F2 target) has `prefix` only. Preempting running to admit A
+throws away compute to benefit a less-progressed request — priority
+inversion. vLLM's running loop at
+[scheduler.py:385](vllm/v1/core/sched/scheduler.py#L385) already does
+**within-tier** RUNNING-to-RUNNING preemption on its own allocation
+pressure; F2 doesn't extend or interfere with that path. Two clean
+tiers:
+
+| Loop | Victim pool | Beneficiary |
+|---|---|---|
+| Running loop (existing) | RUNNING | RUNNING needing more blocks |
+| Admission loop (F2) | block-holding non-running (recv-done + promoted-not-run) | WAITING-ish admission target |
+
+#### Limitations
+
+- **In-flight transfers are not preempted.** If every block-holder
+  behind A is still receiving, F2 does nothing this tick; A waits for
+  natural completion (~500ms for Mooncake). This is backpressure, not
+  wedge — correctness preserved, latency bump only.
+- **Redundant load on victim re-admission.** B will re-fetch its
+  prefix from Mooncake on next admission. For <500ms transfers this
+  is acceptable; for multi-second transfers F2's advantage over A+B
+  thins out.
+- **Fairness/starvation.** A victim that keeps getting preempted can
+  starve. Standard mitigations apply (FCFS ordering, age-based
+  preemption bias, priority hints); not unique to F2.
+
 ### Recommendation
 
-**Ship option A + option B together.** A costs ~5 lines and defends
-against edge cases that B alone misses; B is the actual fix for the
-observed deadlock. C is the cleaner long-term answer if this class of
-bug reappears in other queue-mixing paths.
+**Short term: ship option A + option B together.** A costs ~5 lines
+and defends against edge cases that B alone misses; B is the actual
+fix for the observed deadlock. This is the minimum viable patch.
+
+**Medium term: replace A + B with option F2.** F2 encodes the right
+invariant — "a request holding blocks without forward-pass progress is
+preemptible the same as a running request" — instead of patching
+queue traversal. It composes cleanly with the existing running-loop
+preemption valve, handles the `free=0` saturation case that A+B
+cannot (A+B walks past the head but still fails to allocate; F2 frees
+blocks directly), and removes head-of-line as a structural concern
+rather than a traversal concern.
+
+**Option C is orthogonal.** Splitting the queue is a separate
+refactor motivated by code clarity; it doesn't subsume F2 and F2
+doesn't need it.
 
 ## Applied fix
 
