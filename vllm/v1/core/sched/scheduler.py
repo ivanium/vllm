@@ -2127,6 +2127,12 @@ class Scheduler(SchedulerInterface):
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
             req = self.requests[req_id]
+            logger.warning(
+                "[KV-RECV-APPLY] req_id=%s status=%s queued_finished_before=%d",
+                req_id,
+                req.status.name,
+                len(self.finished_recving_kv_req_ids),
+            )
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
             else:

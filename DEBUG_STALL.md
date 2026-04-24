@@ -205,3 +205,52 @@ All marked `[DEBUG STALL]`.
 With these in place, a stalled run should surface the exact req_id being
 dropped and the exact traceback (confirming or disproving the zero-keys
 hypothesis above).
+
+## Update (round 4) — fixing the truncation that faked a stall signal
+
+Run 20260424_052821 (1P2D, conc 512, 20 multi-turn convos) showed
+`stuck_sample=['chatcmpl-___prefill_addr_gb200-rack1-16::WAITING_FOR_REMOTE_KVS']`
+appearing in the SAME form across many heartbeats. I initially read that as
+"one request stuck for 60+ s". It isn't — that string is the PD composite
+req_id (`chatcmpl-<uuid>___prefill_addr_<host>:<port>___decode_addr_<host>:<port>_<hash>`)
+truncated to 40 chars, which cuts *before* the distinguishing UUID. Every
+request parked under that prefill node renders identically after the slice,
+so the heartbeat couldn't tell churn from persistence.
+
+### Changes
+
+`vllm/v1/engine/core.py` — `_maybe_log_stall_heartbeat`:
+
+- Drop the `rid[:40]` slice. Log full request IDs.
+- Maintain `self._stall_skipped_first_seen: dict[req_id, monotonic_ts]` and
+  emit `dwell=<seconds>` per stuck entry. A truly stuck request shows
+  `dwell` growing monotonically across heartbeats; churn shows many
+  different req_ids each at low dwell.
+- Cumulative `total_skipped_seen` counter — if this climbs by ~K per
+  heartbeat, K requests are flowing through WAITING_FOR_REMOTE_KVS each
+  window (not stuck).
+- Raise sample cap from 3 → 10 and sort oldest-dwell-first so the worst
+  offender is always at the top.
+
+`vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_store_worker.py`
+— `_worker_loop`:
+
+- Change `self.request_queue.get()` to `get(timeout=1.0)` + `queue.Empty`
+  continue. Heartbeat now fires on schedule whether the queue is busy or
+  idle. Previously the loop could silently block inside `get()` forever,
+  making "silence" ambiguous (idle vs wedged).
+- Track `handling_req_id` and `handling_start` across the `_handle_request`
+  call. Heartbeat reports `handling=<req_id>@<elapsed>s` when a request is
+  currently in flight, so mid-native-call hangs name the victim.
+- Emit `[KVTHREAD-END-SLOW] req_id=... elapsed_s=X.X` at WARNING when a
+  single `_handle_request` takes >=5 s. Normal completions are kept at
+  DEBUG to avoid flooding.
+
+### How round-4 output distinguishes stall from churn
+
+| Pattern | Interpretation |
+|---|---|
+| `stuck_sample` entries with growing `dwell` on the SAME `rid` across heartbeats | Actual stall of that request |
+| `stuck_sample` entries with `dwell<heartbeat_period` and different `rid` each heartbeat, `total_skipped_seen` climbing fast | Churn through WAITING_FOR_REMOTE_KVS; not a stall |
+| `[KVTHREAD-HB] handling=<rid>@N.Ns` with N growing across heartbeats | Specific request wedged inside a native Mooncake call |
+| `[KVTHREAD-END-SLOW]` firing | Request completed but took too long — latency regression, not a hang |

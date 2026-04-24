@@ -265,35 +265,80 @@ class KVTransferThread(threading.Thread):
         thread_name = threading.current_thread().name
         # [DEBUG STALL] Periodic self-heartbeat from the transfer thread itself
         # so we can tell "thread alive but queue empty" from "thread stuck in
-        # a native call" from "thread dead". Logs every ~5 s.
+        # a native call" from "thread dead". Use queue.get(timeout=) so the
+        # heartbeat keeps firing when the queue is empty — otherwise silence
+        # is ambiguous (idle vs wedged).
         last_hb = time.monotonic()
+        handling_req_id: str | None = None
+        handling_start: float = 0.0
         while True:
             current_req_id: str | None = None
             try:
-                # Heartbeat check before blocking on queue.get
+                # Heartbeat every ~5 s regardless of queue state. When handling
+                # a request, surface req_id and elapsed so a mid-request hang
+                # leaves a breadcrumb naming the specific request.
                 now = time.monotonic()
                 if now - last_hb >= 5.0:
                     with self.done_task_lock:
                         finished_now = len(self.finished_requests)
+                    if handling_req_id is not None:
+                        handling_info = (
+                            f"{handling_req_id}@{now - handling_start:.1f}s"
+                        )
+                    else:
+                        handling_info = "-"
                     logger.warning(
                         "[KVTHREAD-HB] name=%s qsize=%d finished=%d "
-                        "total_handled=%d total_dropped=%d dropped_sample=%s",
+                        "total_handled=%d total_dropped=%d handling=%s "
+                        "dropped_sample=%s",
                         thread_name,
                         self.request_queue.qsize(),
                         finished_now,
                         self._total_handled,
                         self._total_dropped,
+                        handling_info,
                         list(self._dropped_request_ids)[:3] or "-",
                     )
                     last_hb = now
-                request_data = self.request_queue.get()
+                try:
+                    request_data = self.request_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
                 if request_data is None:
                     logger.warning("Received a None request!")
                     self.request_queue.task_done()
                     continue
-                # Remember the req_id before dispatch so we can log it on drop.
+                # Remember the req_id before dispatch so we can log it on drop
+                # and so the heartbeat can surface the currently-handling id.
                 current_req_id = getattr(request_data, "req_id", None)
+                handling_req_id = current_req_id
+                handling_start = time.monotonic()
+                logger.debug(
+                    "[KVTHREAD-BEGIN] name=%s req_id=%s qsize_after_get=%d",
+                    thread_name,
+                    current_req_id,
+                    self.request_queue.qsize(),
+                )
                 self._handle_request(request_data)
+                elapsed = time.monotonic() - handling_start
+                # Only log END at WARNING when a single request spent a long
+                # time in native code (>=5 s); otherwise keep it at DEBUG so
+                # normal traffic doesn't flood the log.
+                if elapsed >= 5.0:
+                    logger.warning(
+                        "[KVTHREAD-END-SLOW] name=%s req_id=%s elapsed_s=%.2f",
+                        thread_name,
+                        current_req_id,
+                        elapsed,
+                    )
+                else:
+                    logger.debug(
+                        "[KVTHREAD-END] name=%s req_id=%s elapsed_s=%.3f",
+                        thread_name,
+                        current_req_id,
+                        elapsed,
+                    )
+                handling_req_id = None
                 self._total_handled += 1
             except Exception as e:
                 # [DEBUG STALL] Surface req_id of dropped request so we can
@@ -303,6 +348,7 @@ class KVTransferThread(threading.Thread):
                 self._total_dropped += 1
                 if current_req_id is not None:
                     self._dropped_request_ids.add(current_req_id)
+                handling_req_id = None
                 logger.error(
                     "[KVTHREAD-DROP] name=%s req_id=%s err=%r",
                     thread_name,
@@ -691,6 +737,23 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             key_list.append(key.to_string())
             addr_list.append(addr)
             size_list.append(size)
+
+        # A miscomputed load_spec can still reach the recv thread with
+        # nothing left to fetch after masking locally cached tokens.
+        # Treat that as a completed no-op instead of dying on the
+        # tp_rank % len(key_list) rotation below and leaking the request in
+        # WAITING_FOR_REMOTE_KVS forever.
+        if not key_list:
+            logger.warning(
+                "Mooncake load for request %s produced no remote keys "
+                "(token_len=%d, mask_num=%d); treating as finished no-op",
+                req_id,
+                token_len,
+                mask_num,
+            )
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
 
         # Rotate lists by tp_rank for load balancing
         key_list_c = (
@@ -1103,6 +1166,15 @@ class MooncakeStoreWorker:
             if self.load_async and self.kv_recv_thread is not None
             else set()
         )
+
+        if done_recving:
+            logger.warning(
+                "[KV-RECV-DONE] dp_rank=%d tp_rank=%d n=%d sample=%s",
+                self.dp_rank,
+                self.tp_rank,
+                len(done_recving),
+                sorted(done_recving)[:3],
+            )
 
         logger.debug(
             "Completed send: %d, recv: %d, tp_rank: %d",

@@ -392,6 +392,24 @@ def test_recv_thread_reports_unsplittable_key_larger_than_budget():
     assert store.batch_get_into_multi_buffers.call_count == 0
 
 
+def test_recv_thread_treats_empty_remote_load_as_finished_noop():
+    store = MagicMock()
+    thread = _make_store_recving_thread(store, disk_offload_buffer_budget_bytes=None)
+
+    req = _make_load_req(
+        "req-a",
+        [b"a0"],
+        token_len=16,
+        vllm_cached_tokens=16,
+    )
+
+    thread._handle_request(req)
+
+    assert store.batch_get_into_multi_buffers.call_count == 0
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+    thread.request_queue.task_done.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Helpers for register_kv_caches tests
 # ---------------------------------------------------------------------------

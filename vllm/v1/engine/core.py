@@ -1274,21 +1274,48 @@ class EngineCoreProc(EngineCore):
                         attrs.append(f"{attr_name}=?")
             conn_parts.append(f"{name}({','.join(attrs) if attrs else '-'})")
 
-        # Sample a few stuck request IDs so we can cross-reference with NIXL /
-        # Mooncake logs.
-        stuck_ids: list[str] = []
+        # [DEBUG STALL] Per-request dwell tracking inside skipped_waiting so we
+        # can distinguish ONE stuck request (dwell grows monotonically across
+        # heartbeats) from churn (many different req_ids flow through, each
+        # with small dwell). req_id -> monotonic seconds when first observed.
+        dwell_map = getattr(self, "_stall_skipped_first_seen", None)
+        if dwell_map is None:
+            dwell_map = {}
+            self._stall_skipped_first_seen = dwell_map
+            self._stall_total_skipped_seen = 0
+
+        current_ids: set[str] = set()
+        stuck_entries: list[tuple[float, str, str]] = []  # (dwell_s, full_rid, status)
         try:
-            for req in list(getattr(sched, "skipped_waiting", []))[:3]:
+            for req in list(getattr(sched, "skipped_waiting", [])):
                 rid = getattr(req, "request_id", "?")
                 st = getattr(req.status, "name", str(req.status))
-                stuck_ids.append(f"{rid[:40]}:{st}")
+                current_ids.add(rid)
+                first = dwell_map.get(rid)
+                if first is None:
+                    first = now
+                    dwell_map[rid] = first
+                    self._stall_total_skipped_seen += 1
+                stuck_entries.append((now - first, rid, st))
         except Exception:
             pass
+
+        # Drop bookkeeping for ids that have left skipped_waiting.
+        for rid in list(dwell_map.keys()):
+            if rid not in current_ids:
+                dwell_map.pop(rid, None)
+
+        # Sort oldest-first (largest dwell first) and cap at 10. Full req_ids.
+        stuck_entries.sort(reverse=True)
+        stuck_sample = [
+            f"dwell={d:.1f}s status={st} rid={rid}"
+            for d, rid, st in stuck_entries[:10]
+        ]
 
         logger.warning(
             "[STALL-HEARTBEAT] waiting=%d running=%d skipped=%d unfinished=%d "
             "status=%s finished_recv_kv=%d failed_recv_kv=%d "
-            "connectors=[%s] stuck_sample=%s",
+            "total_skipped_seen=%d connectors=[%s] stuck_sample=%s",
             waiting,
             running,
             skipped,
@@ -1296,8 +1323,9 @@ class EngineCoreProc(EngineCore):
             status_counts or "{}",
             frk,
             fark,
+            self._stall_total_skipped_seen,
             ", ".join(conn_parts) if conn_parts else "none",
-            stuck_ids or "-",
+            stuck_sample or "-",
         )
 
     def _notify_idle_state_callbacks(self) -> None:
