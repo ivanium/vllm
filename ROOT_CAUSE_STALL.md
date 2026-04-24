@@ -235,6 +235,32 @@ against edge cases that B alone misses; B is the actual fix for the
 observed deadlock. C is the cleaner long-term answer if this class of
 bug reappears in other queue-mixing paths.
 
+## Applied fix
+
+Landed in `vllm/v1/core/sched/scheduler.py`, marked
+`# [BUG FIX #headofline]`:
+
+1. [**Pre-pass promoter**](vllm/v1/core/sched/scheduler.py#L567) —
+   before the admission loop, walk `self.skipped_waiting` and call
+   `_try_promote_blocked_waiting_request` for every req whose ID is in
+   `finished_recving_kv_req_ids`. Pure status bookkeeping; consumes no
+   blocks.
+2. [**`reserve_full_isl` break→park**](vllm/v1/core/sched/scheduler.py#L785)
+   — replace `break` with `request_queue.pop_request();
+   step_skipped_waiting.prepend_request(request); continue`. Same
+   pattern as the existing blocked-waiting handler at
+   [scheduler.py:587](vllm/v1/core/sched/scheduler.py#L587).
+3. [**`allocate_slots` break→park**](vllm/v1/core/sched/scheduler.py#L849)
+   — same replacement at the second failure site.
+
+Encoder cleanup (`encoder_cache_manager.free(request)`) is preserved
+before the park, matching the original `break` path. No infinite loop:
+each failed request is popped from the active `request_queue` into
+`step_skipped_waiting`, which merges back to `self.skipped_waiting`
+only at the end of `schedule()` via
+[`prepend_requests`](vllm/v1/core/sched/scheduler.py#L912), so the
+within-call queue is strictly monotonic.
+
 ## What fixed this without a code change
 
 - **Remove Mooncake** (pure NIXL). Works because the collision window
