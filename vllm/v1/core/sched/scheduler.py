@@ -729,32 +729,55 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
-                if (
-                    self.scheduler_reserve_full_isl
-                    and not self.kv_cache_manager.can_fit_full_sequence(
-                        request,
-                        num_new_computed_tokens=num_new_local_computed_tokens,
-                        new_computed_blocks=new_computed_blocks,
-                        num_external_computed_tokens=num_external_computed_tokens,
-                        num_encoder_tokens=num_encoder_tokens,
+                # If admission of `request` fails for lack of blocks, try to
+                # preempt a lateral peer (a block-holder that has not yet
+                # done forward-pass compute) and retry. This breaks the
+                # head-of-line wedge where a WAITING request promoted from
+                # WAITING_FOR_REMOTE_KVS sits in front of a recv-done peer
+                # whose blocks would unblock it. Bounded to avoid pathological
+                # loops; in practice 0-1 retries.
+                MAX_LATERAL_PREEMPT_RETRIES = 16
+                lateral_attempts = 0
+                fits_isl = True
+                new_blocks = None
+                while True:
+                    fits_isl = (
+                        not self.scheduler_reserve_full_isl
+                        or self.kv_cache_manager.can_fit_full_sequence(
+                            request,
+                            num_new_computed_tokens=num_new_local_computed_tokens,
+                            new_computed_blocks=new_computed_blocks,
+                            num_external_computed_tokens=num_external_computed_tokens,
+                            num_encoder_tokens=num_encoder_tokens,
+                        )
                     )
-                ):
-                    if request.has_encoder_inputs:
-                        self.encoder_cache_manager.free(request)
-                    break
+                    if fits_isl:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens,
+                            num_new_computed_tokens=num_new_local_computed_tokens,
+                            new_computed_blocks=new_computed_blocks,
+                            num_lookahead_tokens=effective_lookahead_tokens,
+                            num_external_computed_tokens=num_external_computed_tokens,
+                            delay_cache_blocks=load_kv_async,
+                            num_encoder_tokens=num_encoder_tokens,
+                        )
+                        if new_blocks is not None:
+                            break
+                    if lateral_attempts >= MAX_LATERAL_PREEMPT_RETRIES:
+                        break
+                    victim_pair = self._find_lateral_preempt_victim(
+                        request, step_skipped_waiting
+                    )
+                    if victim_pair is None:
+                        break
+                    victim, victim_queue = victim_pair
+                    self._preempt_blocked_waiting_request(
+                        victim, victim_queue, scheduled_timestamp
+                    )
+                    lateral_attempts += 1
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                )
-
-                if new_blocks is None:
+                if not fits_isl or new_blocks is None:
                     # The request cannot be scheduled.
 
                     # NOTE: we need to untouch the request from the encode cache
@@ -973,6 +996,78 @@ class Scheduler(SchedulerInterface):
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
         # Put the request back to the waiting queue.
+        self.waiting.prepend_request(request)
+
+    def _is_lateral_preempt_candidate(self, request: Request) -> bool:
+        """A request that holds KV blocks but has done no forward-pass compute.
+
+        Eligible for lateral preemption when the admission loop fails to
+        allocate blocks for a higher-priority waiting request:
+        - WAITING_FOR_REMOTE_KVS with the recv already complete.
+        - WAITING / PREEMPTED with num_computed_tokens > 0 (i.e. promoted
+          out of WAITING_FOR_REMOTE_KVS, holding loaded prefix blocks).
+
+        In-flight remote-kv recvs are excluded because preempting them would
+        require canceling the transfer; they become eligible the tick after
+        the recv completes.
+        """
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return request.request_id in self.finished_recving_kv_req_ids
+        if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+            return request.num_computed_tokens > 0
+        return False
+
+    def _find_lateral_preempt_victim(
+        self,
+        target: Request,
+        step_skipped_waiting: RequestQueue,
+    ) -> tuple[Request, RequestQueue] | None:
+        """Pick the least-progressed lateral candidate, excluding `target`.
+
+        Searches both the per-step skipped queue and the carried-over
+        skipped queue. Returns (victim, owning_queue) so the caller can
+        remove the victim from the right queue.
+        """
+        best: Request | None = None
+        best_queue: RequestQueue | None = None
+        for queue in (step_skipped_waiting, self.skipped_waiting):
+            for req in queue:
+                if req.request_id == target.request_id:
+                    continue
+                if not self._is_lateral_preempt_candidate(req):
+                    continue
+                if best is None or req.num_computed_tokens < best.num_computed_tokens:
+                    best, best_queue = req, queue
+        if best is None or best_queue is None:
+            return None
+        return best, best_queue
+
+    def _preempt_blocked_waiting_request(
+        self,
+        request: Request,
+        queue: RequestQueue,
+        timestamp: float,
+    ) -> None:
+        """Preempt a non-RUNNING block-holder and put it back on `self.waiting`.
+
+        Mirrors `_preempt_request` but applies to the lateral-preemption
+        candidate set defined by `_is_lateral_preempt_candidate`.
+        """
+        assert self._is_lateral_preempt_candidate(request)
+        queue.remove_request(request)
+        self.kv_cache_manager.free(request)
+        self.encoder_cache_manager.free(request)
+        # Drop any stale recv bookkeeping so the request doesn't auto-promote
+        # off a leftover entry on its next attempt.
+        self.finished_recving_kv_req_ids.discard(request.request_id)
+        self.failed_recving_kv_req_ids.discard(request.request_id)
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        if request.spec_token_ids:
+            request.spec_token_ids = []
+        request.num_preemptions += 1
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
         self.waiting.prepend_request(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
