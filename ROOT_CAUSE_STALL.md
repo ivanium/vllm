@@ -34,16 +34,29 @@ Both own ~1000 blocks. The pool has ~2150 blocks total. Roughly 13 free.
 skipped_waiting queue (head → tail):
 
   [head]  Owner A   rid=…880bc4db985…
-          status=WAITING  (promoted; mid chunked-prefill)
-          owns 1072 blocks
-          nc=68608, nt=69521   → needs ~26 more blocks to finish
+          status=WAITING  (promoted from WAITING_FOR_REMOTE_KVS;
+                           never reached self.running)
+          owns 1072 blocks (allocated for Mooncake prefix-cache load)
+          nc=68608, nt=69521   → full-ISL estimate needs ~26 more blocks
+                                  to cover the rest of the prompt
 
           Owner B   rid=…94a12dc16bc…
           status=WAITING_FOR_REMOTE_KVS  (Mooncake load done)
           in_finished_recving_kv_req_ids = True
-          owns 1057 blocks
+          owns 1057 blocks (allocated for Mooncake prefix-cache load)
           nc=67648, nt=67758   → would need ~1 more block if promoted
 ```
+
+Both requests got their blocks and `num_computed_tokens` from Mooncake
+prefix-cache loads, not from any forward pass. `num_computed_tokens` is
+set by
+[`_update_waiting_for_remote_kv`](vllm/v1/core/sched/scheduler.py#L2211)
+at promotion time based on how many tokens the connector reported as
+loaded. Neither request has ever been in `self.running`; after promotion
+Owner A's very first admission check fails on
+[`reserve_full_isl`](vllm/v1/core/sched/scheduler.py#L729-L773) because
+its full-sequence estimate doesn't fit in the 13 free blocks, and it's
+been stuck there ever since.
 
 Scheduler loop each iteration — [`Scheduler.schedule()` outer `while`](vllm/v1/core/sched/scheduler.py#L567):
 
@@ -80,6 +93,44 @@ Owner B would unblock itself and Owner A if promoted:
 - Rank recovers fully.
 
 The only thing standing in the way is that `break` in step 3 above.
+
+## Limit case: what if the pool were fully saturated?
+
+The observed trace has `free_blocks=13` — the traversal fix works
+because B only needs 1 more block to succeed and the 13 free slots
+cover it. If the two giants together owned the *entire* pool
+(`free=0`), no scheduler traversal fix resolves the stall, because
+there is no block for B to allocate even after promotion:
+
+1. Option B (`continue` past A): loop walks past A, peeks B, promotes
+   B to `WAITING`, tries to allocate 1 block → **fails (free=0)** →
+   continues past B. Queue exhausted. Same state next step.
+2. Option A (pre-promote pass): same — B is flipped to `WAITING` but
+   still can't allocate.
+3. Option C (separate queue): same — B is reachable but still can't
+   allocate.
+
+This is a different class of failure: a **resource deadlock**, not a
+control-flow deadlock. Two requests each own a non-releasable fraction
+of a shared pool, and each needs a block the other holds. On the
+prefill rank neither is preemptible — A has finished its Mooncake load
+(no safe point to abort), B's blocks are the active target of an
+in-flight NIXL write (freeing them mid-transfer is memory corruption).
+
+The robust fix for this class is **admission-time block reservation**,
+not traversal: refuse to call `_try_promote_blocked_waiting_request`
+(or refuse to start a new prefix-cache load) if the summed full-ISL
+reservation across currently-admitted requests would exceed the pool
+minus a safety margin. Today `reserve_full_isl` checks the current
+single request against current free blocks — it has no notion of
+aggregate commitment. Two requests can each pass independently at
+their own admission moment, each leaving just enough room for itself,
+with no headroom for either to top up later.
+
+This is out of scope for the traversal fix above but is the real
+robustness story. The traversal fix handles the common case (some
+headroom exists); reservation handles the adversarial case (pool
+fully committed).
 
 ## Concrete trace (run 20260424_172233, prefill DP1)
 
@@ -130,11 +181,50 @@ At 2P2D the pool has twice the admission capacity and the two-big-requests
 collision is much rarer, which is why `20260423_224115` (2P2D × 256)
 passed while `20260423_230640` (1P2D × 256) stalled.
 
-Mooncake is *not* the cause. The completion signal flows correctly end
-to end. Removing Mooncake only helps because it reduces per-request
-latency, making the two-concurrent-giants collision less likely. The
-deadlock is a vLLM scheduler property that also bites pure NIXL when the
-timing aligns — it's just much rarer there.
+Mooncake is *not* the cause — the completion signal flows correctly end
+to end. But this deadlock is also not a generic "high-latency connector"
+bug. It specifically needs a connector that plays the **prefill-side
+async prefix-loader role**: one that returns `load_kv_async=True` from
+`get_num_new_matched_tokens()`, causing the scheduler to allocate
+blocks, set `status=WAITING_FOR_REMOTE_KVS`, and park the request in
+`skipped_waiting` with blocks already held. `MultiConnector` with
+Mooncake (or LMCache, or any future L1/L2 prefix cache) fills that
+role.
+
+### Pure NIXL does not hit this exact wedge
+
+On the **prefill rank**, pure NIXL is a sender — it doesn't do prefix
+cache loads. Its
+[`get_num_new_matched_tokens`](vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py)
+returns 0 external tokens, `load_kv_async=False`, and requests never
+enter `WAITING_FOR_REMOTE_KVS`. No Owner-B-shape exists, so this wedge
+cannot form.
+
+On the **decode rank**, pure NIXL does use `WAITING_FOR_REMOTE_KVS`
+(awaiting the prefill rank's push). The same head-of-line traversal bug
+is structurally reachable there. But the self-healing dynamic that
+makes this a *wedge* rather than slow-down breaks down on decode:
+
+- **Promoting B doesn't free blocks on decode.** Decode holds blocks for
+  its whole lifetime and only releases at completion. Promote-and-run
+  converts one pool-holder into another. It does not unblock A.
+- **Decode has a preemption victim pool.** The running loop at
+  [scheduler.py:385](vllm/v1/core/sched/scheduler.py#L385) preempts
+  running requests on allocation failure via
+  [`_preempt_request`](vllm/v1/core/sched/scheduler.py#L1019), which
+  frees blocks and re-queues the victim in `self.waiting` with
+  `num_computed_tokens=0`. Under decode-side concurrency,
+  `self.running` is always large → preemption can always find a victim
+  → pool always has a release valve. On the prefill rank in this trace,
+  `running=0` (every candidate stalled in `skipped_waiting` before ever
+  being admitted), so the valve has no target.
+
+Net: the wedge specifically requires (a) a prefill-side prefix-loader
+connector, (b) two requests whose full-ISL estimates together exceed
+the pool, (c) `running≈0` because post-promote admission keeps failing.
+Pure NIXL fails to meet (a) on the prefill rank and (c) on the decode
+rank. Removing Mooncake "fixes" the stall by removing condition (a);
+2P2D fixes (b); lower concurrency reduces the probability of (b).
 
 ## Fix directions
 
