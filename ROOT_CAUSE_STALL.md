@@ -11,9 +11,13 @@ Two requests, each holding ~50% of the prefill rank's KV cache, deadlock
 the scheduler. One is `WAITING_FOR_REMOTE_KVS` and would complete almost
 instantly if promoted. The other is `WAITING` at the queue head and
 can't allocate blocks. The scheduler's outer `break` on allocation
-failure never lets it peek past the head, so the blocked one never gets
-promoted and never releases its blocks. **Head-of-line blocking in
-`self.skipped_waiting` iteration.**
+failure (in [`Scheduler.schedule()`](vllm/v1/core/sched/scheduler.py#L348),
+at [line 773](vllm/v1/core/sched/scheduler.py#L773) and
+[line 827](vllm/v1/core/sched/scheduler.py#L827)) never lets it peek
+past the head, so the blocked one never gets promoted and never
+releases its blocks. **Head-of-line blocking in
+[`self.skipped_waiting`](vllm/v1/core/sched/scheduler.py#L169)
+iteration.**
 
 ## The deadlock
 
@@ -35,19 +39,28 @@ skipped_waiting queue (head → tail):
           nc=67648, nt=67758   → would need ~1 more block if promoted
 ```
 
-Scheduler loop each iteration:
+Scheduler loop each iteration — [`Scheduler.schedule()` outer `while`](vllm/v1/core/sched/scheduler.py#L567):
 
 1. `peek_request()` returns Owner A.
-2. `_is_blocked_waiting_status(WAITING)` → `False`, **skip promote branch**.
-3. Try `reserve_full_isl` / `allocate_slots` for Owner A → fail (need 26,
-   have 13) → **`break`** exits the outer while loop.
+2. [`_is_blocked_waiting_status(WAITING)`](vllm/v1/core/sched/scheduler.py#L1622)
+   → `False`, **skip the promote branch** (the
+   [promote + move-to-skipped dispatch](vllm/v1/core/sched/scheduler.py#L578)).
+3. Try
+   [`reserve_full_isl`](vllm/v1/core/sched/scheduler.py#L729-L773)
+   then
+   [`allocate_slots`](vllm/v1/core/sched/scheduler.py#L779-L827)
+   for Owner A → fail (need 26, have 13) → **`break`** exits the outer
+   while loop at either
+   [scheduler.py:773](vllm/v1/core/sched/scheduler.py#L773) or
+   [scheduler.py:827](vllm/v1/core/sched/scheduler.py#L827).
 4. Owner B never peeked. Its status-change to `WAITING` (which would
-   happen via `_try_promote_blocked_waiting_request` if called) never
-   fires. Its blocks never release.
+   happen via
+   [`_try_promote_blocked_waiting_request`](vllm/v1/core/sched/scheduler.py#L2213)
+   if called) never fires. Its blocks never release.
 
-Repeat every schedule() call. Neither request moves. System stalls until
-the router's HTTP timeout fires, aborts the requests, and eventually
-frees the blocks by error path.
+Repeat every `schedule()` call. Neither request moves. System stalls
+until the router's HTTP timeout fires, aborts the requests, and
+eventually frees the blocks by error path.
 
 ## Why is this a deadlock and not just a slow scheduler
 
@@ -83,9 +96,14 @@ The only thing standing in the way is that `break` in step 3 above.
 --- repeats every 5 s for the remaining 14+ min of the run ---
 ```
 
-Owner B's ID was added to `finished_recving_kv_req_ids` at 17:31:33
-(`[KV-RECV-APPLY] queued_finished_before=0`) and stayed there. The
-completion path works. The promote path never runs on it again.
+Owner B's ID was added to
+[`finished_recving_kv_req_ids`](vllm/v1/core/sched/scheduler.py#L182)
+at 17:31:33 (`[KV-RECV-APPLY]` logged inside
+[`update_from_output`](vllm/v1/core/sched/scheduler.py#L2300);
+`queued_finished_before=0`) and stayed there. The completion path works.
+The promote path ([`_try_promote_blocked_waiting_request`](vllm/v1/core/sched/scheduler.py#L2213))
+never runs on it again — no subsequent `[PROMOTE-TRY]` line for this
+rid.
 
 ## Why it's concentrated on 1P2D high-concurrency
 
@@ -114,39 +132,54 @@ timing aligns — it's just much rarer there.
 
 ## Fix directions
 
-The bug is the outer `break` on `allocate_slots` failure in
-`vllm/v1/core/sched/scheduler.py`. Three options:
+The bug is the outer `break` on allocation failure in
+[`Scheduler.schedule()`](vllm/v1/core/sched/scheduler.py#L348) at
+[scheduler.py:773](vllm/v1/core/sched/scheduler.py#L773) and
+[scheduler.py:827](vllm/v1/core/sched/scheduler.py#L827).
+Three options:
 
 ### 1. Two-phase schedule loop (preferred)
 
-Before the main admission loop, run one pass that promotes every
-request in `self.skipped_waiting` whose ID is in
-`finished_recving_kv_req_ids`. This is a queue-state update, not a
-scheduling decision — it consumes no blocks. After that pass, the main
-loop's `break` behavior is safe because every ready-to-run request has
-the chance to contribute its blocks back to the pool on completion.
+Before the main admission loop at
+[scheduler.py:567](vllm/v1/core/sched/scheduler.py#L567), run one pass
+that promotes every request in
+[`self.skipped_waiting`](vllm/v1/core/sched/scheduler.py#L169) whose ID
+is in
+[`finished_recving_kv_req_ids`](vllm/v1/core/sched/scheduler.py#L182).
+This is a queue-state update, not a scheduling decision — it consumes
+no blocks. After that pass, the main loop's `break` behavior is safe
+because every ready-to-run request has the chance to contribute its
+blocks back to the pool on completion.
 
 ```python
-# In schedule(), before the main while loop:
+# In schedule(), before the main while loop at scheduler.py:567
 for req in list(self.skipped_waiting):
     if (req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
             and req.request_id in self.finished_recving_kv_req_ids):
         self._try_promote_blocked_waiting_request(req)
 ```
 
-This is minimally invasive and matches the semantic intent.
+Reuses the existing
+[`_try_promote_blocked_waiting_request`](vllm/v1/core/sched/scheduler.py#L2213)
+untouched. Minimally invasive and matches the semantic intent.
 
 ### 2. Replace `break` with `continue`
 
-Walk past the head on allocation failure. Needs a per-iteration
-visited-set to avoid retrying the same rid in the same schedule() call.
-More correct in general but larger behavior change.
+Walk past the head on allocation failure at
+[scheduler.py:773](vllm/v1/core/sched/scheduler.py#L773) and
+[scheduler.py:827](vllm/v1/core/sched/scheduler.py#L827). Needs a
+per-iteration visited-set to avoid retrying the same rid in the same
+`schedule()` call. More correct in general but larger behavior change.
 
 ### 3. Separate queue for blocked-waiting requests
 
 Don't mix `WAITING_FOR_REMOTE_KVS` requests into `skipped_waiting`
-alongside `WAITING` requests. Give blocked-waiting its own queue and
-promote from it separately. Biggest refactor.
+alongside preempted `WAITING` requests. Today they share the queue via
+[`step_skipped_waiting.prepend_request`](vllm/v1/core/sched/scheduler.py#L587)
+and
+[`self.skipped_waiting.prepend_requests`](vllm/v1/core/sched/scheduler.py#L912).
+Give blocked-waiting its own queue and promote from it separately.
+Biggest refactor.
 
 ## What fixed this without a code change
 
@@ -157,3 +190,46 @@ promote from it separately. Biggest refactor.
   Actually still hit the bug in one run at conc 128 — timing-dependent.
 
 All three are workarounds. The real fix is in the scheduler.
+
+## Code reference index
+
+### Scheduler — the deadlock site
+
+- [`Scheduler.schedule()`](vllm/v1/core/sched/scheduler.py#L348) — entry
+- [Outer admission `while`](vllm/v1/core/sched/scheduler.py#L567) — the loop that stalls
+- [Blocked-status dispatch](vllm/v1/core/sched/scheduler.py#L578) — promote-or-skip for `WAITING_FOR_REMOTE_KVS`
+- [`reserve_full_isl` branch](vllm/v1/core/sched/scheduler.py#L729-L773) — fails with too-few-blocks; `break` at [L773](vllm/v1/core/sched/scheduler.py#L773)
+- [`allocate_slots` branch](vllm/v1/core/sched/scheduler.py#L779-L827) — same failure mode; `break` at [L827](vllm/v1/core/sched/scheduler.py#L827)
+- [`step_skipped_waiting.prepend_request`](vllm/v1/core/sched/scheduler.py#L587) — how blocked/preempted reqs end up at the head
+- [`self.skipped_waiting.prepend_requests`](vllm/v1/core/sched/scheduler.py#L912) — merge-back at end of schedule()
+- [`_select_waiting_queue_for_scheduling`](vllm/v1/core/sched/scheduler.py#L1707) — which queue `peek` reads from
+- [`_is_blocked_waiting_status`](vllm/v1/core/sched/scheduler.py#L1622) — returns False for plain `WAITING`, skipping promote
+- [`_try_promote_blocked_waiting_request`](vllm/v1/core/sched/scheduler.py#L2213) — the promotion never called on Owner B
+- [`finished_recving_kv_req_ids`](vllm/v1/core/sched/scheduler.py#L182) and [`failed_recving_kv_req_ids`](vllm/v1/core/sched/scheduler.py#L183) — the sets driving promotion
+- [`[KV-RECV-APPLY]` log](vllm/v1/core/sched/scheduler.py#L2300) — inside `update_from_output`, populates `finished_recving_kv_req_ids`
+
+### Scheduler — diagnostic logs added in rounds 5–6
+
+- [`[SCHED-ALLOC-BLOCK]` reserve_full_isl](vllm/v1/core/sched/scheduler.py#L743)
+- [`[SCHED-ALLOC-BLOCK]` allocate_slots](vllm/v1/core/sched/scheduler.py#L789)
+- [`[PROMOTE-TRY]` / `[PROMOTE-OK]`](vllm/v1/core/sched/scheduler.py#L2213)
+- [`_log_block_owners`](vllm/v1/core/sched/scheduler.py#L1634) → emits `[ALLOC-OWNERS]`
+
+### Engine core — scheduler-state visibility
+
+- [`_maybe_log_stall_heartbeat`](vllm/v1/engine/core.py#L1200) → emits `[STALL-HEARTBEAT]` at [L1316](vllm/v1/engine/core.py#L1316)
+- [DP heartbeat thread `[DP-HB]`](vllm/v1/engine/core.py#L1772)
+- [`DPEngineCoreProc.run_busy_loop`](vllm/v1/engine/core.py#L1864) — where step_counter / exec timestamps are maintained
+
+### MooncakeStoreConnector — proven healthy in this stall
+
+- [`MooncakeStoreConnector`](vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_store_connector.py#L86)
+- [`start_load_kv` is a no-op](vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_store_connector.py#L197) — loads issued in `get_finished()` instead
+- [`MooncakeStoreWorker.get_finished`](vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_store_worker.py#L1110) — enqueues loads, drains finished set
+- [`[KV-RECV-DONE]` log](vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_store_worker.py#L1172) — every non-empty `done_recving`
+- [`KVTransferThread._worker_loop`](vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_store_worker.py#L264) — the background loop; `[KVTHREAD-HB]` at [L291](vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_store_worker.py#L291)
+- [`KVCacheStoreRecvingThread._handle_request`](vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_store_worker.py#L719) — performs the actual Mooncake `batch_get`
+
+### Companion doc
+
+- [`DEBUG_STALL.md`](DEBUG_STALL.md) — chronological rounds 1–6, with the per-round hypothesis/verdict matrix.
