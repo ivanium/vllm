@@ -159,6 +159,14 @@ class Request:
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
 
+        # True once the request has been admitted to self.running at least
+        # once — i.e. workers have seen it as a `scheduled_new_reqs` entry
+        # and created local state for it. Used by the lateral-preempt path
+        # to decide whether a victim should re-enter as RequestStatus.WAITING
+        # (worker recreates state fresh) or PREEMPTED (worker resumes from
+        # cached state).
+        self.has_executed = False
+
         # The number of tokens that have been computed remotely.
         self.num_external_computed_tokens = 0
 
