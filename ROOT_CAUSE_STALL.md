@@ -469,6 +469,56 @@ only at the end of `schedule()` via
 [`prepend_requests`](vllm/v1/core/sched/scheduler.py#L912), so the
 within-call queue is strictly monotonic.
 
+## Follow-up: worker-state mismatch under lateral preemption
+
+After landing the alternative lateral-preemption fix (see
+[`_preempt_blocked_waiting_request`](vllm/v1/core/sched/scheduler.py#L1114)),
+a 2P2D × 4096-concurrency run surfaced a distinct crash: one prefill
+engine died with `KeyError` in
+[`gpu_model_runner._update_states`](vllm/v1/worker/gpu_model_runner.py#L1215)
+at `req_state = self.requests[req_id]`.
+
+### Why it happens
+
+The lateral-preempt path unconditionally sets `status = PREEMPTED` on
+the victim. On re-admission, a `PREEMPTED` request flows through
+`scheduled_resumed_reqs`, which the worker processes by looking up
+pre-existing state (`self.requests[req_id]`). But lateral victims may
+be in `WAITING_FOR_REMOTE_KVS` with `in_fin=True` — they hold KV blocks
+but have **never executed a forward pass**, so no worker has
+`self.requests[req_id]` for them. Result: `KeyError` → `EngineDeadError`
+→ the whole prefill engine process dies → HTTP 500 `Connection refused`
+on that node.
+
+### Fix
+
+Add a per-request flag to track whether a worker has ever seen the
+request:
+
+- [`Request.has_executed = False`](vllm/v1/request.py#L163) in
+  `__init__`.
+- Set `request.has_executed = True` at the
+  [`self.running.append(request)` site](vllm/v1/core/sched/scheduler.py#L900)
+  — the only place requests enter the worker via
+  `scheduled_new_reqs`.
+- In
+  [`_preempt_blocked_waiting_request`](vllm/v1/core/sched/scheduler.py#L1114),
+  branch on the flag:
+  - `has_executed=True`  →  `status = PREEMPTED` (workers resume from
+    cached state, as before).
+  - `has_executed=False` →  `status = WAITING` (workers treat this as
+    a fresh `scheduled_new_reqs` entry and allocate state).
+- `num_preemptions += 1` in **both** branches. The preempt counter is
+  used for scheduler metrics and priority heuristics, and a lateral
+  preemption is a real event regardless of whether the worker saw the
+  victim before — losing this count would silently skew those signals.
+
+The existing
+[`_preempt_request`](vllm/v1/core/sched/scheduler.py#L1053) (for
+running-side preemption) stays unchanged — it asserts
+`status == RUNNING`, and any RUNNING request went through the
+`self.running.append` site where `has_executed` becomes `True`.
+
 ## What fixed this without a code change
 
 - **Remove Mooncake** (pure NIXL). Works because the collision window
