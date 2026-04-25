@@ -2198,7 +2198,16 @@ class Scheduler(SchedulerInterface):
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
             self._update_waiting_for_remote_kv(request)
-            if request.num_preemptions:
+            # Pick status by whether the worker has cached state for this
+            # request. has_executed=True means it has been admitted via
+            # `scheduled_new_reqs` at least once → safe to resume via
+            # PREEMPTED. has_executed=False means worker has no state →
+            # status must be WAITING so re-admission flows through
+            # `scheduled_new_reqs`. Using num_preemptions here is unsafe
+            # because lateral-preempt increments it for never-executed
+            # victims (would route them to scheduled_resumed_reqs and
+            # KeyError in the worker's _update_states).
+            if request.has_executed:
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
