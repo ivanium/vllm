@@ -519,6 +519,60 @@ running-side preemption) stays unchanged — it asserts
 `status == RUNNING`, and any RUNNING request went through the
 `self.running.append` site where `has_executed` becomes `True`.
 
+### Follow-up: same fix needed in `_try_promote_blocked_waiting_request`
+
+Run `20260425_003030` (2P2D × 4096) reproduced the same `KeyError`
+even with the lateral-preempt path patched. Trace for the failing rid
+on cn07 DP1:
+
+```
+00:37:33  [STALL-HEARTBEAT] skipped=2  ←  rid is parked WAITING_FOR_REMOTE_KVS
+00:37:33  [KV-RECV-DONE]   rid          ←  Mooncake load arrives
+00:37:34  [KV-RECV-APPLY]  rid          ←  added to finished_recving_kv_req_ids
+          (lateral-preempt fires — rid is preempted; my fix sets status=WAITING
+           because has_executed=False, but bumps num_preemptions to 1)
+00:37:35  [KV-RECV-DONE]   rid          ←  re-admission, second Mooncake load
+00:37:36  [KV-RECV-APPLY]  rid          ←  re-applied
+00:37:36  [PROMOTE-OK]     rid status=PREEMPTED  ←  bug: chose PREEMPTED
+                                                       because num_preemptions>0
+00:37:36  KeyError: rid in worker._update_states
+```
+
+The new failure point was
+[`_try_promote_blocked_waiting_request`](vllm/v1/core/sched/scheduler.py#L2331),
+which had the same problem in a different decision site:
+
+```python
+# OLD: routes to PREEMPTED any rid that was ever preempted
+if request.num_preemptions:
+    request.status = RequestStatus.PREEMPTED
+else:
+    request.status = RequestStatus.WAITING
+```
+
+For lateral-preempt victims that never executed, `num_preemptions > 0`
+but `has_executed = False`. The worker has no state, so PREEMPTED →
+`scheduled_resumed_reqs` → KeyError.
+
+Fix: switch this decision to `has_executed` too, so both sites use the
+same source of truth for "does the worker have state":
+
+```python
+# NEW: branches on the same flag _preempt_blocked_waiting_request uses
+if request.has_executed:
+    request.status = RequestStatus.PREEMPTED
+else:
+    request.status = RequestStatus.WAITING
+```
+
+Now both
+[`_preempt_blocked_waiting_request`](vllm/v1/core/sched/scheduler.py#L1114)
+and
+[`_try_promote_blocked_waiting_request`](vllm/v1/core/sched/scheduler.py#L2331)
+agree: `has_executed=False` → status `WAITING` → worker creates fresh
+state via `scheduled_new_reqs`. `num_preemptions` keeps incrementing
+for metrics regardless.
+
 ## What fixed this without a code change
 
 - **Remove Mooncake** (pure NIXL). Works because the collision window
