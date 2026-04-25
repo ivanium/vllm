@@ -205,10 +205,15 @@ def _ref_fp8_fp4_paged_mqa_logits(
 @pytest.mark.skipif(
     not current_platform.has_device_capability(90), reason="SM90 and SM100 only"
 )
+<<<<<<< HEAD
 def test_deepgemm_fp8_fp4_paged_mqa_logits():
     # NOTE: clean_logits=True is incompatible with the 2D context_lens
     # required by csrc/apis/attention.hpp; only the False path is exercised.
     clean_logits = False
+=======
+@pytest.mark.parametrize("clean_logits", [True, False])
+def test_deepgemm_fp8_fp4_paged_mqa_logits(clean_logits: bool):
+>>>>>>> 618e3b60d (fix (ci): interface mismatches)
     torch.manual_seed(0)
     random.seed(0)
 
