@@ -841,6 +841,11 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                # Mark that a worker has (or about to have) local state for
+                # this request. Used by lateral-preempt to choose between
+                # WAITING (recreate fresh on worker) vs PREEMPTED (resume
+                # from cached state) on re-admission.
+                request.has_executed = True
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -1070,11 +1075,23 @@ class Scheduler(SchedulerInterface):
         # off a leftover entry on its next attempt.
         self.finished_recving_kv_req_ids.discard(request.request_id)
         self.failed_recving_kv_req_ids.discard(request.request_id)
-        request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
+        # Always count the preemption for metrics/priority heuristics, even
+        # if we reset status to WAITING below.
         request.num_preemptions += 1
+        # Choose status based on whether the worker has ever seen this
+        # request as a `scheduled_new_reqs` entry. If not (e.g., victim was
+        # in WAITING_FOR_REMOTE_KVS without ever being admitted to running),
+        # the worker has no local state, so we must re-admit via the "new"
+        # path — which requires status=WAITING. Using PREEMPTED for a
+        # never-executed victim triggers scheduled_cached_reqs on re-admit
+        # and the worker hits KeyError in _update_states.
+        if request.has_executed:
+            request.status = RequestStatus.PREEMPTED
+        else:
+            request.status = RequestStatus.WAITING
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
         self.waiting.prepend_request(request)
