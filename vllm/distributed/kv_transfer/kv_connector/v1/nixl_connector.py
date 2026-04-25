@@ -606,6 +606,34 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         if cnt_by_req is not None:
             state["consumer_notif_n"] = len(cnt_by_req)
             state["consumer_notif_sample"] = list(cnt_by_req.items())[:5]
+        # [DEBUG_TEP_STALL] dwell + cumulative throughput counters.
+        send_added_at = getattr(w, "_reqs_to_send_added_at", None)
+        if send_added_at:
+            now = time.perf_counter()
+            oldest = min(send_added_at.values())
+            ages = sorted(now - t for t in send_added_at.values())
+            state["send_oldest_dwell_s"] = round(now - oldest, 2)
+            state["send_p50_dwell_s"] = round(ages[len(ages) // 2], 2)
+            state["send_p90_dwell_s"] = round(ages[int(len(ages) * 0.9)], 2)
+        recv_added_at = getattr(w, "_recving_added_at", None)
+        if recv_added_at:
+            now = time.perf_counter()
+            oldest = min(recv_added_at.values())
+            ages = sorted(now - t for t in recv_added_at.values())
+            state["recv_oldest_dwell_s"] = round(now - oldest, 2)
+            state["recv_p50_dwell_s"] = round(ages[len(ages) // 2], 2)
+            state["recv_p90_dwell_s"] = round(ages[int(len(ages) * 0.9)], 2)
+        for attr in (
+            "_dbg_send_added_total",
+            "_dbg_send_completed_via_notif_total",
+            "_dbg_send_completed_via_timeout_total",
+            "_dbg_recv_added_total",
+            "_dbg_recv_completed_total",
+            "_dbg_recv_failed_total",
+        ):
+            val = getattr(w, attr, None)
+            if val is not None:
+                state[attr.lstrip("_")] = val
         return state
 
     @classmethod
@@ -1315,6 +1343,24 @@ class NixlConnectorWorker:
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
         self._reqs_to_process: set[ReqId] = set()
+
+        # [DEBUG_TEP_STALL] Per-request dwell timestamps + cumulative counters
+        # for diagnosing prefill-side KV-retention stalls. Reads zero overhead
+        # at steady state. See DEBUG_TEP_STALL.md.
+        self._reqs_to_send_added_at: dict[ReqId, float] = {}
+        self._recving_added_at: dict[ReqId, float] = {}
+        self._dbg_send_added_total: int = 0
+        self._dbg_send_completed_via_notif_total: int = 0
+        self._dbg_send_completed_via_timeout_total: int = 0
+        self._dbg_recv_added_total: int = 0
+        self._dbg_recv_completed_total: int = 0
+        self._dbg_recv_failed_total: int = 0
+        self._dbg_dwell_log_threshold_s: float = float(
+            os.environ.get("VLLM_NIXL_DWELL_LOG_THRESHOLD_S", "30")
+        )
+        self._dbg_dwell_log_enabled: bool = (
+            os.environ.get("VLLM_NIXL_NOTIF_LOG", "0") == "1"
+        )
 
         # invalid blocks from failed NIXL operations
         self._invalid_block_ids: set[int] = set()
@@ -2410,6 +2456,8 @@ class NixlConnectorWorker:
         done_recving = self._pop_done_transfers(self._recving_transfers)
 
         # add requests that skipped transfer to done_recving
+        # [DEBUG_TEP_STALL] count failed recvs separately before clearing
+        self._dbg_recv_failed_total += len(self._failed_recv_reqs)
         done_recving.update(self._failed_recv_reqs)
         self._failed_recv_reqs.clear()
 
@@ -2423,11 +2471,24 @@ class NixlConnectorWorker:
             )
 
         block_ids_for_blocksize_post_process = defaultdict(list)
+        _now_for_dwell = time.perf_counter()
         for req_id in done_recving:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
             self._recv_expiration_by_req.pop(req_id, None)
+            # [DEBUG_TEP_STALL] log dwell + count successful recv
+            started = self._recving_added_at.pop(req_id, None)
+            if started is not None:
+                self._dbg_recv_completed_total += 1
+                if self._dbg_dwell_log_enabled:
+                    dwell = _now_for_dwell - started
+                    if dwell >= self._dbg_dwell_log_threshold_s:
+                        logger.warning(
+                            "[NIXL-DWELL] recv-done req=%s dwell=%.2fs",
+                            req_id,
+                            dwell,
+                        )
             assert meta.remote is not None
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
@@ -2458,12 +2519,18 @@ class NixlConnectorWorker:
                 break
             count = self.consumer_notification_counts_by_req.pop(req_id, 0)
             self.xfer_stats.record_kv_expired_req()
+            # [DEBUG_TEP_STALL] log dwell + count timeout drains
+            started = self._reqs_to_send_added_at.pop(req_id, None)
+            dwell = (now - started) if started is not None else float("nan")
+            self._dbg_send_completed_via_timeout_total += 1
             logger.warning(
                 "Releasing expired KV blocks for request %s which were "
-                "retrieved by %d decode worker(s) within %d seconds.",
+                "retrieved by %d decode worker(s) within %d seconds. "
+                "dwell=%.2fs",
                 req_id,
                 count,
                 envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT,
+                dwell,
             )
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
@@ -2519,6 +2586,19 @@ class NixlConnectorWorker:
                     del self.consumer_notification_counts_by_req[req_id]
                     self._reqs_to_process.remove(req_id)
                     self._reqs_to_send.pop(req_id, None)
+                    # [DEBUG_TEP_STALL] log dwell + count successful drain
+                    started = self._reqs_to_send_added_at.pop(req_id, None)
+                    if started is not None:
+                        self._dbg_send_completed_via_notif_total += 1
+                        if self._dbg_dwell_log_enabled:
+                            dwell = time.perf_counter() - started
+                            if dwell >= self._dbg_dwell_log_threshold_s:
+                                logger.warning(
+                                    "[NIXL-DWELL] send-via-notif req=%s "
+                                    "dwell=%.2fs",
+                                    req_id,
+                                    dwell,
+                                )
         return notified_req_ids
 
     def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
@@ -2622,6 +2702,10 @@ class NixlConnectorWorker:
             )
             # always store metadata for failure recovery
             self._recving_metadata[req_id] = meta
+            # [DEBUG_TEP_STALL] track decode-side recv start time
+            if req_id not in self._recving_added_at:
+                self._recving_added_at[req_id] = time.perf_counter()
+                self._dbg_recv_added_total += 1
             if remote_engine_id not in self._remote_agents:
                 # Initiate handshake with remote engine to exchange metadata.
                 with self._handshake_lock:
@@ -2656,6 +2740,10 @@ class NixlConnectorWorker:
         for req_id, expiration_time in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
+                # [DEBUG_TEP_STALL] track prefill-side send-ready start time
+                if req_id not in self._reqs_to_send_added_at:
+                    self._reqs_to_send_added_at[req_id] = time.perf_counter()
+                    self._dbg_send_added_total += 1
                 if _log_notifs:
                     logger.warning(
                         "[NIXL-NOTIF] send-ready req=%s expires=%.3f",
@@ -2716,7 +2804,13 @@ class NixlConnectorWorker:
             if self.use_mla and tp_ratio < 0:
                 # ..but we still need to notify the other remote ranks that we
                 # have the blocks we need so they can update the request state.
-                notif_id = f"{req_id}:{self.world_size}".encode()
+                # Note: notif must be keyed by the *remote* (prefill-side)
+                # request id, since that is what the prefill workers store in
+                # `_reqs_to_send`. Using the local `req_id` here causes the
+                # broadcast to be rejected by every prefill rank other than the
+                # one we read from, leaving their `_reqs_to_send` entries to
+                # drain only via the 300s VLLM_NIXL_ABORT_REQUEST_TIMEOUT.
+                notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
                 remote_agents = self._remote_agents[meta.remote.engine_id]
                 for rank_to_notify, agent in remote_agents.items():
                     if rank_to_notify != remote_rank:
