@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.third_party.deep_gemm.utils import per_token_cast_to_fp8
 
 from vllm.model_executor.models.deepseek_v4 import (
     DeepseekV4MegaMoEExperts,
