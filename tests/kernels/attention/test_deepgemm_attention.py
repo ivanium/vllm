@@ -206,14 +206,20 @@ def _ref_fp8_fp4_paged_mqa_logits(
     not current_platform.has_device_capability(90), reason="SM90 and SM100 only"
 )
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> e5108f744 (CI Failure for deep_gemm and layernorm_fp8_quant)
 def test_deepgemm_fp8_fp4_paged_mqa_logits():
     # NOTE: clean_logits=True is incompatible with the 2D context_lens
     # required by csrc/apis/attention.hpp; only the False path is exercised.
     clean_logits = False
+<<<<<<< HEAD
 =======
 @pytest.mark.parametrize("clean_logits", [True, False])
 def test_deepgemm_fp8_fp4_paged_mqa_logits(clean_logits: bool):
 >>>>>>> 618e3b60d (fix (ci): interface mismatches)
+=======
+>>>>>>> e5108f744 (CI Failure for deep_gemm and layernorm_fp8_quant)
     torch.manual_seed(0)
     random.seed(0)
 
