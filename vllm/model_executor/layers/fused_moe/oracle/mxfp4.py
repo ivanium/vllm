@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Static,
     kMxfp8Dynamic,
 )
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.math_utils import round_up

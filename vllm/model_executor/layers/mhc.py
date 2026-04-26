@@ -12,6 +12,8 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # tilelang is only available on CUDA platforms
+# On ROCm, tilelang is still installed but not used.
+# TODO: Move this into vLLM IR Ops
 if TYPE_CHECKING or current_platform.is_cuda_alike():
     if not has_tilelang():
         raise ImportError(

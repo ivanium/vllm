@@ -1494,6 +1494,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
+        # On ROCm, fuse FP8 wo_a.weight + wo_a.scale into a single bf16
+        # wo_a.weight before the hf_to_vllm_mapper renames .scale to
+        # .weight_scale_inv (the ROCm wo_a layer is unquantized and has no
+        # weight_scale_inv parameter). No-op on non-ROCm.
+        weights = _preprocess_wo_a_weights(weights)
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
         return loaded_params
