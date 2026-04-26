@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.third_party.deep_gemm.utils import per_token_cast_to_fp8
 
 from vllm.model_executor.models.deepseek_v4 import (
     DeepseekV4MegaMoEExperts,
@@ -112,6 +111,8 @@ def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
     reason="DeepSeek V4 MegaMoE fused input staging requires CUDA.",
 )
 def test_deepseek_v4_mega_moe_fused_input_staging_is_bitwise_exact():
+    from vllm.third_party.deep_gemm.utils import per_token_cast_to_fp8
+
     device = torch.device("cuda")
     num_tokens = 7
     hidden_size = 256
