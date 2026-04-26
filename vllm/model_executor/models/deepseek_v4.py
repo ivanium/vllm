@@ -64,6 +64,20 @@ from .utils import (
 )
 
 
+SKIP_DEEPSEEK_V4_MOE = True
+SKIP_DEEPSEEK_V4_MHC = True
+
+
+class DeepseekV4MoEBypass(nn.Module):
+    """Debug-only bypass used to isolate the attention path on ROCm."""
+
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        del input_ids
+        return hidden_states
+
+
 class DeepseekV4FP8Config(Fp8Config):
     """FP8 config that routes MoE layers to MXFP4 quantization.
 
@@ -1000,7 +1014,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             if aux_stream_dict is not None
             else None,
         )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        if SKIP_DEEPSEEK_V4_MOE:
+            self.ffn = DeepseekV4MoEBypass()
+        else:
+            self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -1060,6 +1077,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
+        if SKIP_DEEPSEEK_V4_MHC:
+            del hc_fn, hc_scale, hc_base
+            return x.select(dim=-2, index=0).contiguous(), None, None
+
         # Lazy import to avoid top-level tilelang dependency.
         # Registers both torch.ops.vllm.mhc_pre and mhc_post,
         # so hc_post() doesn't need its own import.
@@ -1085,6 +1106,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
+        if SKIP_DEEPSEEK_V4_MHC:
+            del post, comb
+            return x.unsqueeze(-2).expand_as(residual).contiguous()
         return torch.ops.vllm.mhc_post(x, residual, post, comb)
 
     def forward(
@@ -1247,9 +1271,11 @@ class DeepseekV4Model(nn.Module):
         head_rank_end = n_local_head * (tp_rank + 1)
 
         # Pre-compute expert mapping ONCE.
-        expert_mapping = self.get_expert_mapping()
+        expert_mapping = [] if SKIP_DEEPSEEK_V4_MOE else self.get_expert_mapping()
 
         for name, loaded_weight in weights:
+            if SKIP_DEEPSEEK_V4_MOE and ".ffn." in name:
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
@@ -1320,6 +1346,8 @@ class DeepseekV4Model(nn.Module):
         first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
         if first_layer.ffn.use_mega_moe:
             return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
+        if SKIP_DEEPSEEK_V4_MOE:
+            return []
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         return FusedMoE.make_expert_params_mapping(
