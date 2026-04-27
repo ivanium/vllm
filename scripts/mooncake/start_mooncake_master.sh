@@ -89,6 +89,17 @@ fi
 # Ensure no stale instance
 stop_master 2>/dev/null || true
 
+# --- Pre-flight port checks ------------------------------------------------
+for _port_var in MC_RPC_PORT MC_HTTP_PORT MC_METRICS_PORT; do
+    _port="${!_port_var}"
+    if ss -tlnp 2>/dev/null | grep -q ":${_port} "; then
+        _pids=$(ss -tlnp 2>/dev/null | grep ":${_port} " | grep -oP 'pid=\K[0-9]+' 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//' || true)
+        echo "ERROR: Port ${_port} (${_port_var}) is already in use (pid=${_pids:-unknown})" >&2
+        echo "  Free the port or set ${_port_var} to a different value." >&2
+        exit 1
+    fi
+done
+
 # --- Build command ----------------------------------------------------------
 CMD=(
     mooncake_master
@@ -130,11 +141,26 @@ if $OPT_BG; then
     : > "$LOG_FILE"
     nohup "${CMD[@]}" > "$LOG_FILE" 2>&1 < /dev/null &
     echo $! > "$PID_FILE"
-    sleep 1
+    # The master takes ~2s to fully start (or fail); sleep 3 to be safe.
+    sleep 3
     if ! is_our_master "$(cat "$PID_FILE")"; then
         echo "  ERROR: mooncake_master failed to stay running" >&2
         tail -n 50 "$LOG_FILE" >&2 || true
         rm -f "$PID_FILE"
+        exit 1
+    fi
+    # Verify the HTTP metadata endpoint is actually serving.
+    # GET /metadata without ?key=... correctly returns HTTP 400 ("Missing key
+    # parameter"), so -f (fail on 4xx/5xx) is wrong here. We just need
+    # confirmation the server is accepting TCP + responding with *any* HTTP
+    # status: use -o /dev/null -w '%{http_code}' and accept 2xx/4xx.
+    _http_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        "http://localhost:${MC_HTTP_PORT}/metadata" 2>/dev/null || echo 000)"
+    if [[ "$_http_code" == "000" ]]; then
+        echo "  ERROR: mooncake_master PID is alive but HTTP metadata endpoint" >&2
+        echo "         http://localhost:${MC_HTTP_PORT}/metadata is not responding (no TCP)." >&2
+        tail -n 50 "$LOG_FILE" >&2 || true
+        stop_master 2>/dev/null || true
         exit 1
     fi
     echo "  PID:      $(<"$PID_FILE") (written to $PID_FILE)"
