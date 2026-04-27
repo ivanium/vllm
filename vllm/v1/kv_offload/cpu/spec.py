@@ -24,7 +24,6 @@ class CPUOffloadingSpec(OffloadingSpec):
                 "cpu_bytes_to_use must be specified in kv_connector_extra_config"
             )
 
-        # calculate kv_bytes_per_offloaded_block
         assert kv_cache_config is not None
         page_sizes = {
             kv_cache_group.kv_cache_spec.page_size_bytes
@@ -33,9 +32,7 @@ class CPUOffloadingSpec(OffloadingSpec):
         assert len(page_sizes) == 1
         page_size_bytes = page_sizes.pop()
         kv_bytes_per_block = (
-            page_size_bytes
-            * len(kv_cache_config.kv_cache_tensors)
-            * vllm_config.parallel_config.world_size
+            page_size_bytes * vllm_config.parallel_config.world_size
         )
 
         kv_bytes_per_offloaded_block = kv_bytes_per_block * self.block_size_factor
