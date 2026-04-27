@@ -17,6 +17,30 @@
 
 namespace vllm {
 
+// Force a float -> scalar_t -> float round-trip whose intermediate scalar_t
+// value cannot be elided by the compiler. The unfused composite (rms_norm +
+// static_scaled_fp8_quant) writes scalar_t to memory and reloads it, so the
+// fp32 input to the fp8 conversion has been rounded to scalar_t precision.
+// The fused fp8-quant kernel must reproduce that rounding to agree with the
+// composite at exact E4M3 tie boundaries. On ROCm (gfx90a/gfx950 confirmed)
+// the AMDGPU backend folds float<->half conversions away in registers — even
+// the explicit __float2half_rn/__half2float intrinsics and asm "+v" barriers
+// are insufficient under -ffast-math. Emit the AMDGCN conversion instructions
+// directly so the compiler cannot fold the round-trip.
+template <typename scalar_t>
+__device__ __forceinline__ float fp8_quant_round_trip(float v) {
+#if defined(USE_ROCM)
+  if constexpr (std::is_same_v<scalar_t, c10::Half>) {
+    _Float16 h;
+    asm volatile("v_cvt_f16_f32_e32 %0, %1" : "=v"(h) : "v"(v));
+    float r;
+    asm volatile("v_cvt_f32_f16_e32 %0, %1" : "=v"(r) : "v"(h));
+    return r;
+  }
+#endif
+  return static_cast<float>(static_cast<scalar_t>(v));
+}
+
 // TODO(woosuk): Further optimize this kernel.
 template <typename scalar_t, typename fp8_type, int VEC_SIZE>
 __global__ void rms_norm_static_fp8_quant_kernel(
@@ -71,10 +95,24 @@ __global__ void rms_norm_static_fp8_quant_kernel(
       // static_scaled_fp8_quant re-loads it as float before FP8 conversion).
       // Without this round, the fused path is strictly more accurate and
       // disagrees with the composite at exact E4M3 quantization tie boundaries.
+#ifdef USE_ROCM
+      // See fp8_quant_round_trip: only the vectorized path (VEC_SIZE > 1)
+      // exhibits the AMDGPU fast-math elision; the scalar path matches the
+      // unfused generic rms_norm kernel naturally and using the asm helper
+      // there causes tie-boundary divergence.
+      float out_norm_f;
+      if constexpr (VEC_SIZE > 1) {
+        out_norm_f = fp8_quant_round_trip<scalar_t>(x * s_variance * w);
+      } else {
+        scalar_t out_norm = static_cast<scalar_t>(x * s_variance * w);
+        out_norm_f = static_cast<float>(out_norm);
+      }
+#else
       scalar_t out_norm = static_cast<scalar_t>(x * s_variance * w);
+      float const out_norm_f = static_cast<float>(out_norm);
+#endif
       out[blockIdx.x * hidden_size + idx * VEC_SIZE + j] =
-          scaled_fp8_conversion<true, fp8_type>(static_cast<float>(out_norm),
-                                                scale_inv);
+          scaled_fp8_conversion<true, fp8_type>(out_norm_f, scale_inv);
     }
   }
 }
@@ -146,9 +184,18 @@ fused_add_rms_norm_static_fp8_quant_kernel(
       // to match the unfused composite path at FP8 boundaries. We use the
       // backend's hip_type for the intermediate since c10::Half/BFloat16 has
       // ambiguous conversions on CUDA and no implicit conversion on ROCm.
+#ifdef USE_ROCM
+      // See fp8_quant_round_trip: AMDGPU folds float<->half conversions in
+      // registers (even via __float2half_rn/__half2float). Use the
+      // asm-fenced helper to preserve the round-trip.
+      float const out_norm_f =
+          fp8_quant_round_trip<scalar_t>(x * s_variance * wf);
+#else
       HipT out_norm_h = Converter::convert(x * s_variance * wf);
-      out[id * width + i] = scaled_fp8_conversion<true, fp8_type>(
-          Converter::convert(out_norm_h), scale_inv);
+      float const out_norm_f = Converter::convert(out_norm_h);
+#endif
+      out[id * width + i] =
+          scaled_fp8_conversion<true, fp8_type>(out_norm_f, scale_inv);
     }
   }
 }
@@ -193,7 +240,12 @@ fused_add_rms_norm_static_fp8_quant_kernel(
     float x = (float)residual[blockIdx.x * hidden_size + idx];
     float w = (float)weight[idx];
     // See note in rms_norm_static_fp8_quant_kernel: round through scalar_t
-    // to match the unfused composite path at FP8 boundaries.
+    // to match the unfused composite path at FP8 boundaries. The scalar
+    // (width==0) path matches the unfused generic fused_add_rms_norm_kernel
+    // which also computes `(scalar_t)(x * s_variance * w)` and stores it to
+    // memory; the compiler emits the same fp16 rounding here, so the asm
+    // round-trip helper is intentionally not used (using it produced a slight
+    // rounding divergence vs. the composite on gfx950).
     scalar_t out_norm = static_cast<scalar_t>(x * s_variance * w);
     out[blockIdx.x * hidden_size + idx] = scaled_fp8_conversion<true, fp8_type>(
         static_cast<float>(out_norm), scale_inv);
