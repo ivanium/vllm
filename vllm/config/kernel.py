@@ -108,7 +108,6 @@ class IrOpPriorityConfig:
 MoEBackend = Literal[
     "auto",
     "triton",
-    "triton_unfused",
     "deep_gemm",
     "deep_gemm_mega_moe",
     "cutlass",

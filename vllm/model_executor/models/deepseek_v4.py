@@ -3,12 +3,12 @@
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+
 import regex as re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -61,6 +61,7 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
 
 def _should_inline_dequant_wo_a() -> bool:
     return current_platform.is_rocm()
@@ -121,8 +122,9 @@ def _preprocess_wo_a_weights(
 
     for entry in pending.values():
         if "weight_name" in entry and "weight" in entry:
-            yield typing.cast(str, entry["weight_name"]), typing.cast(
-                torch.Tensor, entry["weight"]
+            yield (
+                typing.cast(str, entry["weight_name"]),
+                typing.cast(torch.Tensor, entry["weight"]),
             )
 
 

@@ -25,12 +25,14 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.ops.deepseek_v4_ops.cache_utils import (
+    quantize_and_insert_k_cache,
+)
 from vllm.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_attn,
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
     _fused_kv_compress_norm_rope_insert_sparse_attn,
 )
-from vllm.v1.attention.ops.deepseek_v4_ops.cache_utils import quantize_and_insert_k_cache
 from vllm.v1.attention.ops.deepseek_v4_ops.fused_indexer_q import (
     MXFP4_BLOCK_SIZE,
 )
@@ -369,7 +371,7 @@ class DeepseekCompressor(nn.Module):
         # state_cache from this kernel) but neither emits/waits on PDL grid
         # dependency primitives, so launch_pdl=True caused a read-after-write
         # race and non-deterministic output.
-        _save_partial_states_kernel[(num_actual,)](
+        kernel_args = [
             kv,
             kv.stride(0),
             score,
@@ -382,11 +384,20 @@ class DeepseekCompressor(nn.Module):
             state_cache.stride(1),
             slot_mapping,
             block_size,
+        ]
+
+        kernel_kwargs = dict(
             HEAD_SIZE=kv.shape[-1],
             TRITON_BLOCK_SIZE=triton.next_power_of_2(kv.shape[-1]),
             STATE_WIDTH=state_width,
             COMPRESS_RATIO=self.compress_ratio,
         )
+
+        # CUDA requires launch_pdl=False, ROCm doesn't support the parameter
+        if current_platform.is_cuda():
+            kernel_kwargs["launch_pdl"] = False
+
+        _save_partial_states_kernel[(num_actual,)](*kernel_args, **kernel_kwargs)
 
         # Fused: compress → RMSNorm → RoPE → FP8 quant → KV cache write.
         # RoPE requirements (kernel applies forward GPT-J style rotation):
@@ -399,7 +410,7 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
-        self._fused_kernel[(num_actual,)](
+        kernel_args = [
             # state cache
             state_cache,
             state_cache.stride(0),
@@ -421,6 +432,9 @@ class DeepseekCompressor(nn.Module):
             kv_cache,
             k_cache_metadata.slot_mapping,
             kv_cache.shape[1],  # paged KV cache block size (tokens per block)
+        ]
+
+        kernel_kwargs = dict(
             # constexprs
             HEAD_SIZE=self.head_dim,
             TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
@@ -436,6 +450,12 @@ class DeepseekCompressor(nn.Module):
             num_warps=self._num_warps,
         )
 
+        # CUDA requires launch_pdl=False, ROCm doesn't support the parameter
+        if current_platform.is_cuda():
+            kernel_kwargs["launch_pdl"] = False
+
+        self._fused_kernel[(num_actual,)](*kernel_args, **kernel_kwargs)
+
     @property
     def _state_width(self) -> int:
         return self.coff * self.head_dim
@@ -444,7 +464,9 @@ class DeepseekCompressor(nn.Module):
     def _state_len(self) -> int:
         return self.compress_ratio * self.coff
 
-    def _get_old_state(self, req_id: str, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _get_old_state(
+        self, req_id: str, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         kv_state = self._old_kv_state.get(req_id)
         score_state = self._old_score_state.get(req_id)
         if kv_state is None or score_state is None or kv_state.device != device:
@@ -463,7 +485,9 @@ class DeepseekCompressor(nn.Module):
             self._old_score_state[req_id] = score_state
         return kv_state, score_state
 
-    def _clear_old_state(self, kv_state: torch.Tensor, score_state: torch.Tensor) -> None:
+    def _clear_old_state(
+        self, kv_state: torch.Tensor, score_state: torch.Tensor
+    ) -> None:
         kv_state.zero_()
         score_state.fill_(float("-inf"))
 
@@ -507,10 +531,14 @@ class DeepseekCompressor(nn.Module):
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
         req_ids = forward_context.additional_kwargs.get("req_ids")
         if req_ids is None:
-            max_req_idx = int(token_to_req_indices.max().item()) + 1 if num_tokens > 0 else 0
+            max_req_idx = (
+                int(token_to_req_indices.max().item()) + 1 if num_tokens > 0 else 0
+            )
             req_ids = [str(i) for i in range(max_req_idx)]
 
-        _, counts = torch.unique_consecutive(token_to_req_indices.to(torch.int64), return_counts=True)
+        _, counts = torch.unique_consecutive(
+            token_to_req_indices.to(torch.int64), return_counts=True
+        )
         start = 0
         for req_idx_tensor, count_tensor in zip(
             torch.unique_consecutive(token_to_req_indices.to(torch.int64)), counts
@@ -541,7 +569,9 @@ class DeepseekCompressor(nn.Module):
             temp_score[pre_state_len:] = score[start:end]
 
             post_state_len = self._compute_state_len(valid_kv_len, self.compress_ratio)
-            kv_state[:post_state_len] = temp_kv[valid_kv_len - post_state_len : valid_kv_len]
+            kv_state[:post_state_len] = temp_kv[
+                valid_kv_len - post_state_len : valid_kv_len
+            ]
             score_state[:post_state_len] = temp_score[
                 valid_kv_len - post_state_len : valid_kv_len
             ]
@@ -579,7 +609,9 @@ class DeepseekCompressor(nn.Module):
             kv_compressed = self._ref_rms_norm(kv_compressed)
 
             first_compressed_pos = prefix_len
-            first_compressed_pos += self.compress_ratio - 1 - first_compressed_pos % self.compress_ratio
+            first_compressed_pos += (
+                self.compress_ratio - 1 - first_compressed_pos % self.compress_ratio
+            )
             compressed_positions = torch.arange(
                 first_compressed_pos,
                 prefix_len + query_len,
@@ -594,7 +626,10 @@ class DeepseekCompressor(nn.Module):
                 )
 
             kv_compressed = apply_gptj_rope_ref(
-                kv_compressed, compressed_positions, rotary_emb.cos_sin_cache, self.rope_head_dim
+                kv_compressed,
+                compressed_positions,
+                rotary_emb.cos_sin_cache,
+                self.rope_head_dim,
             ).to(torch.bfloat16)
             if self._old_need_hadamard:
                 kv_compressed = hadamard_transform_ref(kv_compressed)
@@ -602,7 +637,9 @@ class DeepseekCompressor(nn.Module):
             local_output = torch.zeros(
                 (query_len, self.head_dim), dtype=torch.bfloat16, device=x.device
             )
-            local_output[(compressed_positions - prefix_len).to(torch.long)] = kv_compressed
+            local_output[(compressed_positions - prefix_len).to(torch.long)] = (
+                kv_compressed
+            )
 
             if self.head_dim == 512:
                 quantize_and_insert_k_cache(

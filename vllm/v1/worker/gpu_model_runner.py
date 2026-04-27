@@ -4040,7 +4040,9 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
-                    additional_kwargs={"req_ids": self.input_batch.req_ids.copy()},
+                additional_kwargs={"req_ids": self.input_batch.req_ids.copy()}
+                if current_platform.is_rocm()
+                else None,
                 skip_compiled=has_encoder_input,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
@@ -5533,7 +5535,13 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
-                    additional_kwargs={"req_ids": self.input_batch.req_ids.copy()},
+                    # Current reference implementation of compressor for
+                    # ROCm is really naive which uses a python dict to
+                    # store and obtain the kv state for each request.
+                    # That why this is passed into forward context, just for now.
+                    additional_kwargs={"req_ids": self.input_batch.req_ids.copy()}
+                    if current_platform.is_rocm()
+                    else None,
                 ),
             ):
                 outputs = self.model(
