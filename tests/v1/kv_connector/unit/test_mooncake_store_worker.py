@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import math
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
@@ -543,3 +545,177 @@ def test_register_kv_caches_cross_layer_single_segment():
 
     assert worker2.kv_caches_base_addr == worker.kv_caches_base_addr
     assert worker2.block_len == worker.block_len
+
+
+# ---------------------------------------------------------------------------
+# Error code constants and naming
+# ---------------------------------------------------------------------------
+
+
+def test_error_code_constants_match_cpp_enum():
+    """Verify Python constants match C++ ErrorCode enum (types.h)."""
+    assert mooncake_store_worker.MOONCAKE_TRANSFER_FAIL == -800
+    assert mooncake_store_worker.MOONCAKE_INTERNAL_ERROR == -1
+    assert mooncake_store_worker.MOONCAKE_NO_AVAILABLE_HANDLE == -200
+
+
+def test_error_names_cover_common_codes():
+    names = mooncake_store_worker._MOONCAKE_ERROR_NAMES
+    # Originally-covered subset
+    assert names[-800] == "TRANSFER_FAIL"
+    assert names[-1] == "INTERNAL_ERROR"
+    assert names[-200] == "NO_AVAILABLE_HANDLE"
+    assert names[-704] == "OBJECT_NOT_FOUND"
+    assert names[-101] == "SEGMENT_NOT_FOUND"
+    # Codes added from types.h full enumeration; verifying a representative
+    # sample avoids regressing the dict size when new codes are upstreamed.
+    assert names[-103] == "CLIENT_NOT_FOUND"
+    assert names[-601] == "ILLEGAL_CLIENT"
+    assert names[-707] == "LEASE_EXPIRED"
+    assert names[-712] == "REPLICA_IS_GONE"
+    assert names[-900] == "RPC_FAIL"
+    assert names[-1001] == "ETCD_KEY_NOT_EXIST"
+
+
+# ---------------------------------------------------------------------------
+# batch_put / batch_get failure logging
+# ---------------------------------------------------------------------------
+
+
+_LOGGER_NAME = (
+    "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_worker"
+)
+
+
+@pytest.fixture()
+def _enable_propagate():
+    """Temporarily set propagate=True on the vllm logger so caplog works."""
+    vllm_logger = logging.getLogger("vllm")
+    old = vllm_logger.propagate
+    vllm_logger.propagate = True
+    yield
+    vllm_logger.propagate = old
+
+
+@pytest.mark.usefixtures("_enable_propagate")
+def test_batch_put_transfer_fail_logs_req_id_and_tp_rank(caplog):
+    """batch_put returning TRANSFER_FAIL(-800) logs req_id, tp_rank, elapsed,
+    human-readable code, and failed_samples."""
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [256, -800]
+    thread = _make_store_sending_thread(store)
+
+    thread.add_stored_request("req-tf-800")
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        thread._handle_request(_make_store_req("req-tf-800", [b"k0", b"k1"]))
+
+    assert len(caplog.records) >= 1
+    msg = caplog.records[0].message
+    assert "req-tf-800" in msg
+    assert "tp_rank=0" in msg
+    assert "elapsed=" in msg
+    assert "TRANSFER_FAIL" in msg
+    assert "transfer_fail=1" in msg
+    assert "no_handle=0" in msg
+    assert "other=0" in msg
+    assert "failed_samples=" in msg
+
+
+@pytest.mark.usefixtures("_enable_propagate")
+def test_batch_put_internal_error_classified_as_other(caplog):
+    """INTERNAL_ERROR(-1) should NOT be counted as transfer_fail."""
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [-1, -1]
+    thread = _make_store_sending_thread(store)
+
+    thread.add_stored_request("req-ie")
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        thread._handle_request(_make_store_req("req-ie", [b"k0", b"k1"]))
+
+    msg = caplog.records[0].message
+    assert "INTERNAL_ERROR" in msg
+    assert "transfer_fail=0" in msg
+    assert "other=2" in msg
+
+
+@pytest.mark.usefixtures("_enable_propagate")
+def test_batch_put_mixed_error_codes(caplog):
+    """Mix of TRANSFER_FAIL and NO_AVAILABLE_HANDLE in one batch."""
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [-800, -200]
+    thread = _make_store_sending_thread(store)
+
+    thread.add_stored_request("req-mix")
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        thread._handle_request(_make_store_req("req-mix", [b"k0", b"k1"]))
+
+    # Should have 2 warnings: batch_put failed + NO_AVAILABLE_HANDLE pressure
+    assert len(caplog.records) == 2
+    msg = caplog.records[0].message
+    assert "transfer_fail=1" in msg
+    assert "no_handle=1" in msg
+    assert "other=0" in msg
+
+
+@pytest.mark.usefixtures("_enable_propagate")
+def test_batch_put_exception_logs_traceback(caplog):
+    """Exception during batch_put should log req_id, tp_rank, and traceback."""
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = RuntimeError("rdma broke")
+    thread = _make_store_sending_thread(store)
+
+    thread.add_stored_request("req-exc")
+    with caplog.at_level(logging.ERROR, logger=_LOGGER_NAME):
+        thread._handle_request(_make_store_req("req-exc", [b"k0", b"k1"]))
+
+    assert len(caplog.records) == 1
+    rec = caplog.records[0]
+    assert "req-exc" in rec.message
+    assert "tp_rank=0" in rec.message
+    assert rec.exc_info is not None
+    assert "rdma broke" in str(rec.exc_info[1])
+
+
+@pytest.mark.usefixtures("_enable_propagate")
+def test_batch_get_failure_logs_req_id_and_named_codes(caplog):
+    """batch_get returning negative codes logs req_id, tp_rank, elapsed,
+    and human-readable failure codes."""
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [-800, 256, -704]
+    thread = _make_store_recving_thread(store)
+
+    req = _make_load_req("req-get-fail", [b"g0", b"g1", b"g2"], token_len=48)
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        thread._handle_request(req)
+
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].message
+    assert "req-get-fail" in msg
+    assert "tp_rank=0" in msg
+    assert "elapsed=" in msg
+    assert "TRANSFER_FAIL" in msg
+    assert "OBJECT_NOT_FOUND" in msg
+    assert "2/3" in msg
+
+
+@pytest.mark.usefixtures("_enable_propagate")
+def test_batch_get_exception_logs_traceback(caplog):
+    """Exception during batch_get logs req_id and traceback."""
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.side_effect = RuntimeError("get broke")
+    thread = _make_store_recving_thread(store)
+
+    req = _make_load_req("req-get-exc", [b"g0"], token_len=16)
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        thread._handle_request(req)
+
+    assert len(caplog.records) >= 1
+    rec = caplog.records[0]
+    assert "req-get-exc" in rec.message
+    assert "tp_rank=0" in rec.message
+    assert rec.exc_info is not None
+    assert "get broke" in str(rec.exc_info[1])
