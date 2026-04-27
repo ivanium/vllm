@@ -642,8 +642,9 @@ class MooncakeStoreWorker:
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
-        # NOTE(yifan): enforce load_async for now for better compute-I/O overlap.
-        self.load_async = True
+        self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "load_async", True
+        )
         self.cache_config = vllm_config.cache_config
         self.original_block_size = self.cache_config.block_size
         self.block_size = self.cache_config.block_size

@@ -38,7 +38,7 @@ class MooncakeStoreScheduler:
     def __init__(self, vllm_config: VllmConfig):
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-            "load_async", False
+            "load_async", True
         )
         self.client = LookupKeyClient(vllm_config)
 
