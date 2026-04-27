@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     FusedMoEQuantDesc,
+    RoutingMethodType,
     mxfp4_mxfp8_moe_quant_config,
     mxfp4_w4a16_moe_quant_config,
     ocp_mx_moe_quant_config,
@@ -29,7 +30,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Static,
     kMxfp8Dynamic,
 )
-from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.math_utils import round_up
@@ -1237,7 +1237,9 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "
-            f"Expected TRTLLM, Triton, or AITER backend."
+            f"Expected TRTLLM"
+            f"{', Triton, or AITER' if current_platform.is_rocm() else ' or Triton'} "
+            f"backend."
         )
 
 
