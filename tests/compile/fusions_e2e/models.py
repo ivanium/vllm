@@ -110,7 +110,12 @@ llama3_8b_fp4 = ModelFusionInfo(
 
 llama4_scout_fp8 = ModelFusionInfo(
     model_name="nvidia/Llama-4-Scout-17B-16E-Instruct-FP8",
-    hf_overrides=lambda n_layers: {"text_config": {"num_hidden_layers": n_layers}},
+    hf_overrides=lambda n_layers: {
+        "text_config": {
+            "num_hidden_layers": n_layers,
+            "max_position_embeddings": 1024,
+        }
+    },
     matches=lambda n_layers: Matches(
         rms_quant_fusion=n_layers,
         attn_quant_fusion=n_layers,
@@ -122,7 +127,12 @@ llama4_scout_fp8 = ModelFusionInfo(
 
 llama4_scout_fp4 = ModelFusionInfo(
     model_name="nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4",
-    hf_overrides=lambda n_layers: {"text_config": {"num_hidden_layers": n_layers}},
+    hf_overrides=lambda n_layers: {
+        "text_config": {
+            "num_hidden_layers": n_layers,
+            "max_position_embeddings": 1024,
+        }
+    },
     matches=lambda n_layers: Matches(
         attn_quant_fusion=n_layers,
         ar_rms_fusion=n_layers * 2,
