@@ -1,19 +1,32 @@
 # docker-compose.yaml
-version: "3"
+# Adapted for GB200 NVL72 cluster: host network + auto-provisioning
 
 services:
   prometheus:
     image: prom/prometheus:latest
-    extra_hosts:
-      - "host.docker.internal:host-gateway"     # allow a direct connection from container to the local machine
-    ports:
-      - "9090:9090"   # the default port used by Prometheus
     volumes:
-      - ${PWD}/prometheus.yaml:/etc/prometheus/prometheus.yml # mount Prometheus config file
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    network_mode: host
+    restart: unless-stopped
 
   grafana:
     image: grafana/grafana:latest
-    depends_on:
-      - prometheus
-    ports:
-      - "3000:3000" # the default port used by Grafana
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    network_mode: host
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

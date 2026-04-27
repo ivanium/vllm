@@ -1,0 +1,177 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "Cache Keys",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "master_key_count", "legendFormat": "keys", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] } }
+      }
+    },
+    {
+      "title": "Allocated Memory",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "targets": [
+        { "expr": "master_allocated_bytes", "legendFormat": "allocated", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] } }
+      }
+    },
+    {
+      "title": "Total Capacity",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "targets": [
+        { "expr": "master_total_capacity_bytes", "legendFormat": "capacity", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "thresholds": { "mode": "absolute", "steps": [{"color": "blue", "value": null}] } }
+      }
+    },
+    {
+      "title": "Memory Utilization",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "master_allocated_bytes / master_total_capacity_bytes", "legendFormat": "utilization", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit", "min": 0, "max": 1,
+          "thresholds": { "mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "yellow", "value": 0.7},
+            {"color": "red", "value": 0.9}
+          ]}
+        }
+      }
+    },
+    {
+      "title": "Active Clients",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "targets": [
+        { "expr": "master_active_clients", "legendFormat": "clients", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] } }
+      }
+    },
+    {
+      "title": "Soft Pinned Keys",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "targets": [
+        { "expr": "master_soft_pin_key_count", "legendFormat": "pinned", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{"color": "orange", "value": null}] } }
+      }
+    },
+    {
+      "title": "Cache Hit Rate (Memory vs File/SSD)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        { "expr": "rate(mem_cache_hit_nums_[1m])", "legendFormat": "Memory Cache Hits /s", "refId": "A" },
+        { "expr": "rate(file_cache_hit_nums_[1m])", "legendFormat": "File/SSD Cache Hits /s", "refId": "B" },
+        { "expr": "rate(valid_get_nums_[1m])", "legendFormat": "Valid Gets /s", "refId": "C" },
+        { "expr": "rate(total_get_nums_[1m])", "legendFormat": "Total Gets /s", "refId": "D" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "Eviction Activity",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        { "expr": "rate(master_successful_evictions_total[1m])", "legendFormat": "Successful Evictions /s", "refId": "A" },
+        { "expr": "rate(master_attempted_evictions_total[1m])", "legendFormat": "Attempted Evictions /s", "refId": "B" },
+        { "expr": "master_evicted_size_bytes", "legendFormat": "Evicted Size (cumulative)", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "title": "Put/Get Request Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "rate(master_put_start_requests_total[1m])", "legendFormat": "PutStart /s", "refId": "A" },
+        { "expr": "rate(master_put_end_requests_total[1m])", "legendFormat": "PutEnd /s", "refId": "B" },
+        { "expr": "rate(master_get_replica_list_requests_total[1m])", "legendFormat": "GetReplicaList /s", "refId": "C" },
+        { "expr": "rate(master_batch_put_start_requests_total[1m])", "legendFormat": "BatchPutStart /s", "refId": "D" },
+        { "expr": "rate(master_batch_get_replica_list_requests_total[1m])", "legendFormat": "BatchGetReplicaList /s", "refId": "E" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "Failure Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "rate(master_put_start_failures_total[1m])", "legendFormat": "PutStart Failures /s", "refId": "A" },
+        { "expr": "rate(master_put_end_failures_total[1m])", "legendFormat": "PutEnd Failures /s", "refId": "B" },
+        { "expr": "rate(master_get_replica_list_failures_total[1m])", "legendFormat": "GetReplicaList Failures /s", "refId": "C" },
+        { "expr": "rate(master_batch_put_start_failures_total[1m])", "legendFormat": "BatchPutStart Failures /s", "refId": "D" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "Value Size Distribution (Histogram)",
+      "type": "heatmap",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        { "expr": "rate(master_value_size_bytes_bucket[5m])", "legendFormat": "{{le}}", "refId": "A", "format": "heatmap" }
+      ]
+    },
+    {
+      "title": "Per-Segment Allocation",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        { "expr": "segment_allocated_bytes", "legendFormat": "{{segment}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" } }
+    },
+    {
+      "title": "Memory vs File Cache Count",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        { "expr": "mem_cache_nums_", "legendFormat": "In-Memory Cached Objects", "refId": "A" },
+        { "expr": "file_cache_nums_", "legendFormat": "On-SSD Cached Objects", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "title": "Disk Offload Activity",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "targets": [
+        { "expr": "rate(master_evict_disk_replica_requests_total[1m])", "legendFormat": "Disk Replica Evict Requests /s", "refId": "A" },
+        { "expr": "rate(master_evict_disk_replica_failures_total[1m])", "legendFormat": "Disk Replica Evict Failures /s", "refId": "B" },
+        { "expr": "rate(master_put_start_discard_cnt[1m])", "legendFormat": "Discarded PutStart /s (backpressure)", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["mooncake", "kv-cache", "offload"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Mooncake Store Overview",
+  "uid": "mooncake-overview",
+  "version": 1
+}
