@@ -238,8 +238,12 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Whether this output should only run connector worker hooks, without
+    # reconciling worker request state against scheduler state.
+    connector_only: bool = False
+
     @classmethod
-    def make_empty(cls) -> "SchedulerOutput":
+    def make_empty(cls, *, connector_only: bool = False) -> "SchedulerOutput":
         return cls(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
@@ -250,6 +254,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            connector_only=connector_only,
         )
 
 

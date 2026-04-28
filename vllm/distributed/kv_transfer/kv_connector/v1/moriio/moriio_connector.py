@@ -171,6 +171,17 @@ class MoRIIOConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    def request_rejected_before_admission(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_rejected_before_admission(
+            request_id, kv_transfer_params, reason
+        )
+
     ############################################################
     # Worker Side Methods
     ############################################################
@@ -266,7 +277,7 @@ class MoRIIOConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, list[int]]] = {}
+        self._reqs_need_recv: dict[ReqId, tuple[dict[str, Any], list[int]]] = {}
         self._reqs_need_save: dict[ReqId, tuple[Request, list[int]]] = {}
 
         # For chunked prefill, we perform layer-wise access within the final chunk.
@@ -397,7 +408,7 @@ class MoRIIOConnectorScheduler:
                             local_block_ids = remote_block_ids[-len(local_block_ids) :]
 
                         self._reqs_need_recv[request.request_id] = (
-                            request,
+                            params,
                             local_block_ids,
                         )
                     else:
@@ -502,12 +513,11 @@ class MoRIIOConnectorScheduler:
                             del self._reqs_need_pending_save[req_id]
 
         # Loop through scheduled reqs and convert to ReqMeta.
-        for req_id, (req, block_ids) in self._reqs_need_recv.items():
-            assert req.kv_transfer_params is not None
+        for req_id, (kv_transfer_params, block_ids) in self._reqs_need_recv.items():
             meta.add_new_req(
                 request_id=req_id,
                 local_block_ids=block_ids,
-                kv_transfer_params=req.kv_transfer_params,
+                kv_transfer_params=kv_transfer_params,
             )
 
         for req_id, (req, block_ids) in self._reqs_need_save.items():
@@ -531,6 +541,51 @@ class MoRIIOConnectorScheduler:
         self._reqs_need_send = {}
 
         return meta
+
+    def request_rejected_before_admission(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        if (
+            self.is_producer
+            or self.mode != MoRIIOMode.READ
+            or not kv_transfer_params.get("do_remote_prefill")
+        ):
+            return False
+
+        required_params = ("transfer_id", "remote_block_ids", "remote_engine_id")
+        if not all(kv_transfer_params.get(param) for param in required_params):
+            logger.warning(
+                "Cannot clean up rejected MoRIIO remote-prefill request %s; "
+                "missing required KVTransferParams. reason=%s params=%s",
+                request_id,
+                reason,
+                kv_transfer_params,
+            )
+            return False
+
+        try:
+            get_peer_zmq_from_request_id(request_id, is_producer=False)
+        except ValueError:
+            logger.warning(
+                "Cannot clean up rejected MoRIIO remote-prefill request %s; "
+                "request id does not contain peer ZMQ metadata. reason=%s",
+                request_id,
+                reason,
+            )
+            return False
+
+        logger.debug(
+            "Enqueuing MoRIIO cleanup for rejected remote-prefill request %s: %s",
+            request_id,
+            reason,
+        )
+        self.map_request_id(request_id, kv_transfer_params["transfer_id"])
+        self._reqs_need_recv[request_id] = (kv_transfer_params, [])
+        kv_transfer_params["do_remote_prefill"] = False
+        return True
 
     def shutdown(self):
         for path, sock in self.paths.items():
@@ -571,7 +626,7 @@ class MoRIIOConnectorScheduler:
             # To avoid stranding the prefill blocks in the prefill instance,
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
-            self._reqs_need_recv[request.request_id] = (request, [])
+            self._reqs_need_recv[request.request_id] = (params, [])
             params["do_remote_prefill"] = False
             return False, None
 
@@ -602,6 +657,7 @@ class MoRIIOConnectorScheduler:
             remote_engine_id=self.engine_id,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             transfer_id=params["transfer_id"],
+            _kv_connector_name="MoRIIOConnector",
         )
 
 

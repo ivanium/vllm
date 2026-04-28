@@ -353,6 +353,46 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    def notify_kv_transfer_request_rejected(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        """Run connector-side cleanup for a pre-admission KV request rejection."""
+        kv_connector = self.scheduler.get_kv_connector()
+        if kv_connector is None:
+            logger.debug(
+                "Ignoring rejected KV-transfer request %s; no KV connector is "
+                "configured. reason=%s",
+                request_id,
+                reason,
+            )
+            return False
+
+        handled = kv_connector.request_rejected_before_admission(
+            request_id, kv_transfer_params, reason
+        )
+        if not handled:
+            logger.debug(
+                "KV connector did not recognize rejected request %s. reason=%s",
+                request_id,
+                reason,
+            )
+            return False
+
+        scheduler_output = SchedulerOutput.make_empty(connector_only=True)
+        scheduler_output.kv_connector_metadata = kv_connector.build_connector_meta(
+            scheduler_output
+        )
+        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        with self.log_error_detail(scheduler_output):
+            model_output = future.result()
+
+        if model_output is not None:
+            self.scheduler.update_from_output(scheduler_output, model_output)
+        return True
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""

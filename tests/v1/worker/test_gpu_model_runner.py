@@ -457,6 +457,24 @@ def test_update_states_request_unscheduled(model_runner, dist_init):
     assert not _is_req_scheduled(model_runner, req_ids[1])
 
 
+def test_update_states_connector_only_keeps_persistent_batch(model_runner, dist_init):
+    req_id = "req_0"
+
+    scheduler_output = _schedule_new_request(req_id)
+    model_runner._update_states(scheduler_output)
+    assert _is_req_added(model_runner, req_id)
+    assert _is_req_scheduled(model_runner, req_id)
+
+    scheduler_output = SchedulerOutput.make_empty(connector_only=True)
+    metadata_before = model_runner.input_batch.sampling_metadata
+    state_correction = model_runner._update_states(scheduler_output)
+
+    assert state_correction is None
+    assert not _is_sampling_metadata_changed(model_runner, metadata_before)
+    assert _is_req_added(model_runner, req_id)
+    assert _is_req_scheduled(model_runner, req_id)
+
+
 def test_kv_cache_stride_order(monkeypatch, model_runner):
     # This test checks if GPUModelRunner initializes correctly when an attention
     # backend enforces a non-default KV cache stride order.

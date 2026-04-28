@@ -330,6 +330,41 @@ def get_connector_events() -> dict[str, list[str]]:
     return connector_events
 
 
+def test_request_rejected_before_admission_routes_by_connector_tag():
+    mc = object.__new__(MultiConnector)
+    child_1 = MagicMock(spec_set=KVConnectorBase_V1)
+    child_2 = MagicMock(spec_set=KVConnectorBase_V1)
+    child_2.request_rejected_before_admission.return_value = True
+    mc._connectors = [child_1, child_2]
+    mc._connector_names = ["first", "second"]
+
+    params = {"_kv_connector_name": "second", "do_remote_prefill": True}
+
+    assert mc.request_rejected_before_admission("req", params, "bad request")
+    child_1.request_rejected_before_admission.assert_not_called()
+    child_2.request_rejected_before_admission.assert_called_once_with(
+        "req", params, "bad request"
+    )
+
+
+def test_request_rejected_before_admission_uses_first_accepting_connector():
+    mc = object.__new__(MultiConnector)
+    child_1 = MagicMock(spec_set=KVConnectorBase_V1)
+    child_2 = MagicMock(spec_set=KVConnectorBase_V1)
+    child_1.request_rejected_before_admission.return_value = True
+    child_2.request_rejected_before_admission.return_value = True
+    mc._connectors = [child_1, child_2]
+    mc._connector_names = ["first", "second"]
+
+    params = {"do_remote_prefill": True}
+
+    assert mc.request_rejected_before_admission("req", params, "bad request")
+    child_1.request_rejected_before_admission.assert_called_once_with(
+        "req", params, "bad request"
+    )
+    child_2.request_rejected_before_admission.assert_not_called()
+
+
 def test_engine_id_conflict():
     configs = [KVTransferConfig() for _ in range(2)]
     ids = [config.engine_id for config in configs]

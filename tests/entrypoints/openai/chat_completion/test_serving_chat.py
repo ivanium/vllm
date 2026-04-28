@@ -1059,6 +1059,64 @@ async def test_serving_chat_data_parallel_rank_extraction():
     assert mock_engine.generate.call_args.kwargs["data_parallel_rank"] is None
 
 
+@pytest.mark.asyncio
+async def test_serving_chat_notifies_kv_transfer_rejection_on_render_error():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+    mock_engine.notify_kv_transfer_request_rejected = AsyncMock(return_value=True)
+
+    serving_chat = _build_serving_chat(mock_engine)
+    error_response = serving_chat.create_error_response("prompt too long")
+    serving_chat.render_chat_request = AsyncMock(return_value=error_response)
+
+    kv_transfer_params = {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_engine_id": "remote-engine",
+        "remote_request_id": "prefill-req",
+        "remote_block_ids": [1, 2, 3],
+        "remote_host": "remote-host",
+        "remote_port": 1234,
+    }
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "what is 1+1?"}],
+        request_id="decode-req",
+        kv_transfer_params=kv_transfer_params,
+    )
+    raw_request = MagicMock()
+    raw_request.headers = {"X-data-parallel-rank": "2"}
+    raw_request.state = MagicMock()
+
+    result = await serving_chat.create_chat_completion(request, raw_request)
+
+    assert result is error_response
+    mock_engine.notify_kv_transfer_request_rejected.assert_awaited_once()
+    args = mock_engine.notify_kv_transfer_request_rejected.await_args.args
+    kwargs = mock_engine.notify_kv_transfer_request_rejected.await_args.kwargs
+    assert args == (
+        "chatcmpl-decode-req",
+        kv_transfer_params,
+        "prompt too long",
+    )
+    assert kwargs == {"data_parallel_rank": 2}
+
+    mock_engine.notify_kv_transfer_request_rejected.reset_mock()
+    request_without_kv = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "what is 1+1?"}],
+        request_id="decode-req-no-kv",
+    )
+
+    result = await serving_chat.create_chat_completion(request_without_kv, raw_request)
+
+    assert result is error_response
+    mock_engine.notify_kv_transfer_request_rejected.assert_not_awaited()
+
+
 class TestServingChatWithHarmony:
     """
     These tests ensure Chat Completion requests are being properly converted into

@@ -961,6 +961,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            if scheduler_output.connector_only:
+                assert scheduler_output.total_num_scheduled_tokens == 0
+                return self.kv_connector.no_forward(scheduler_output)
+
             # Update the request states.
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)

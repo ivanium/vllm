@@ -160,11 +160,17 @@ class MultiConnector(KVConnectorBase_V1):
         )
 
         self._connectors: list[KVConnectorBase_V1] = []
+        self._connector_names: list[str] = []
         self._ktc_kv_transfer_config = []
         for connector_cls, temp_config in self._get_connector_classes_and_configs(
             vllm_config
         ):
             self._connectors.append(connector_cls(temp_config, role, kv_cache_config))
+            assert temp_config.kv_transfer_config is not None
+            self._connector_names.append(
+                temp_config.kv_transfer_config.kv_connector
+                or connector_cls.__name__
+            )
             self._ktc_kv_transfer_config.append(temp_config.kv_transfer_config)
 
         # A mapping from request id to the index of the connector chosen to
@@ -449,11 +455,12 @@ class MultiConnector(KVConnectorBase_V1):
     ) -> tuple[bool, dict[str, Any] | None]:
         async_saves = 0
         kv_txfer_params = None
-        for c in self._connectors:
+        for i, c in enumerate(self._connectors):
             async_save, txfer_params = c.request_finished(request, blocks)
             if async_save:
                 async_saves += 1
             if txfer_params is not None:
+                txfer_params.setdefault("_kv_connector_name", self._connector_names[i])
                 if kv_txfer_params is not None:
                     # TODO we can probably change this to merge the dicts here,
                     # checking for key clashes.
@@ -468,6 +475,37 @@ class MultiConnector(KVConnectorBase_V1):
         self._requests_to_connector.pop(request.request_id, None)
 
         return async_saves > 0, kv_txfer_params
+
+    def request_rejected_before_admission(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        connector_name = kv_transfer_params.get("_kv_connector_name")
+        if connector_name is not None:
+            for i, c in enumerate(self._connectors):
+                if connector_name in (
+                    self._connector_names[i],
+                    c.__class__.__name__,
+                    f"{c.__class__.__module__}.{c.__class__.__name__}",
+                ):
+                    return c.request_rejected_before_admission(
+                        request_id, kv_transfer_params, reason
+                    )
+            logger.debug(
+                "No child connector matched rejected request %s connector tag %s",
+                request_id,
+                connector_name,
+            )
+            return False
+
+        for c in self._connectors:
+            if c.request_rejected_before_admission(
+                request_id, kv_transfer_params, reason
+            ):
+                return True
+        return False
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         for c in self._connectors:

@@ -2242,7 +2242,12 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
+            if req_id not in self.requests:
+                logger.debug(
+                    "Ignoring finished KV recv for non-admitted request %s",
+                    req_id,
+                )
+                continue
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
@@ -2251,7 +2256,12 @@ class Scheduler(SchedulerInterface):
                 self._free_blocks(self.requests[req_id])
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
+            if req_id not in self.requests:
+                logger.debug(
+                    "Ignoring finished KV send for non-admitted request %s",
+                    req_id,
+                )
+                continue
             self._free_blocks(self.requests[req_id])
 
     def _update_requests_with_invalid_blocks(

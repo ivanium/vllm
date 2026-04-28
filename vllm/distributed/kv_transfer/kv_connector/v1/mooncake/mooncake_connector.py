@@ -422,6 +422,17 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    def request_rejected_before_admission(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_rejected_before_admission(
+            request_id, kv_transfer_params, reason
+        )
+
     ############################################################
     # Worker Side Methods
     ############################################################
@@ -491,7 +502,7 @@ class MooncakeConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, list[list[int]]]] = {}
+        self._reqs_need_recv: dict[ReqId, tuple[dict[str, Any], list[list[int]]]] = {}
         self._reqs_need_send: dict[ReqId, tuple[Request, list[list[int]]]] = {}
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
@@ -594,7 +605,7 @@ class MooncakeConnectorScheduler:
                 )
                 local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
                 # Get unhashed blocks to pull from remote.
-                self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+                self._reqs_need_recv[request.request_id] = (params, local_block_ids)
             else:
                 logger.warning(
                     "Got invalid KVTransferParams: %s. This "
@@ -620,12 +631,11 @@ class MooncakeConnectorScheduler:
 
         # Loop through scheduled reqs and convert to PullReqMeta.
         if not self.is_kv_producer:
-            for req_id, (req, block_ids) in self._reqs_need_recv.items():
-                assert req.kv_transfer_params is not None
+            for req_id, (kv_transfer_params, block_ids) in self._reqs_need_recv.items():
                 meta.add_new_req(
                     request_id=req_id,
                     local_block_ids=block_ids,
-                    kv_transfer_params=req.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
                 )
             self._reqs_need_recv.clear()
 
@@ -673,7 +683,7 @@ class MooncakeConnectorScheduler:
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
             assert not self.is_kv_producer
-            self._reqs_need_recv[request.request_id] = (request, [])
+            self._reqs_need_recv[request.request_id] = (params, [])
             params["do_remote_prefill"] = False
             return False, None
 
@@ -699,6 +709,37 @@ class MooncakeConnectorScheduler:
             )
 
         return delay_free_blocks, None
+
+    def request_rejected_before_admission(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        if not kv_transfer_params.get("do_remote_prefill"):
+            return False
+        if self.is_kv_producer:
+            return False
+
+        required_params = ("remote_engine_id", "remote_bootstrap_addr", "transfer_id")
+        if not all(kv_transfer_params.get(param) for param in required_params):
+            logger.warning(
+                "Cannot clean up rejected Mooncake remote-prefill request %s; "
+                "missing required KVTransferParams. reason=%s params=%s",
+                request_id,
+                reason,
+                kv_transfer_params,
+            )
+            return False
+
+        logger.debug(
+            "Enqueuing Mooncake cleanup for rejected remote-prefill request %s: %s",
+            request_id,
+            reason,
+        )
+        self._reqs_need_recv[request_id] = (kv_transfer_params, [])
+        kv_transfer_params["do_remote_prefill"] = False
+        return True
 
 
 class MooncakeConnectorWorker:
