@@ -355,6 +355,251 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._skip_store_requests.clear()
         return True
 
+    def run(self):
+        """Drain-and-batch loop: merge queued requests to reduce RPCs."""
+        self.ready_event.set()
+        while True:
+            try:
+                first = self.request_queue.get()
+                if first is None:
+                    self.request_queue.task_done()
+                    continue
+
+                # Non-blocking drain of all queued requests
+                batch: list[ReqMeta] = [first]
+                while True:
+                    try:
+                        item = self.request_queue.get_nowait()
+                        if item is not None:
+                            batch.append(item)
+                        else:
+                            self.request_queue.task_done()
+                    except queue.Empty:
+                        break
+
+                self._handle_batch(batch)
+            except Exception as e:
+                logger.error("Error in %s: %s", self.name, e)
+
+    def _handle_batch(self, batch: list[ReqMeta]):
+        """Process multiple requests in one merged batch_put call."""
+
+        # --- Phase A: Per-request chunk decomposition + filtering ---
+        @dataclass
+        class _Prepared:
+            req_meta: ReqMeta
+            starts: list[int]
+            ends: list[int]
+            keys: list[str]
+            addrs: list[list[int]]
+            sizes: list[list[int]]
+            converted_block_hashes: list[Any]
+
+        prepared: list[_Prepared] = []
+
+        for req_meta in batch:
+            req_id = req_meta.req_id
+
+            if req_id not in self.stored_requests:
+                self.request_queue.task_done()
+                continue
+            if self._should_skip_request(req_id):
+                self.dec_stored_request(req_id)
+                self.request_queue.task_done()
+                continue
+
+            starts = []
+            ends = []
+            keys: list[str] = []
+            block_hashes: list[BlockHash] = []
+            for index, (start, end, key) in enumerate(
+                self.token_database.process_tokens(
+                    req_meta.token_len_chunk, req_meta.block_hashes
+                )
+            ):
+                starts.append(start)
+                ends.append(end)
+                keys.append(key.to_string())
+                block_hashes.append(req_meta.block_hashes[index])
+
+            # Apply put_step striding for TP
+            starts = starts[self.tp_rank % self.put_step :: self.put_step]
+            ends = ends[self.tp_rank % self.put_step :: self.put_step]
+            keys = keys[self.tp_rank % self.put_step :: self.put_step]
+            block_hashes = block_hashes[
+                self.tp_rank % self.put_step :: self.put_step
+            ]
+
+            if not keys:
+                self.dec_stored_request(req_id)
+                self.request_queue.task_done()
+                continue
+
+            # Build addrs/sizes and KV events
+            addrs = []
+            sizes = []
+            for idx, start in enumerate(starts):
+                addr, size, _ = self.token_database.prepare_value(
+                    start, ends[idx], req_meta.block_ids
+                )
+                addrs.append(addr)
+                sizes.append(size)
+
+            prepared.append(
+                _Prepared(
+                    req_meta,
+                    starts,
+                    ends,
+                    keys,
+                    addrs,
+                    sizes,
+                    [maybe_convert_block_hash(bh) for bh in block_hashes],
+                )
+            )
+
+        if not prepared:
+            return
+
+        # --- Phase B: Merged batch_is_exist ---
+        all_keys: list[str] = []
+        offsets: list[tuple[int, int]] = []
+        for p in prepared:
+            offsets.append((len(all_keys), len(all_keys) + len(p.keys)))
+            all_keys.extend(p.keys)
+
+        exists_results = self.store.batch_is_exist(all_keys)
+
+        # --- Phase C: Filter missing keys ---
+        merged_keys: list[str] = []
+        merged_addrs: list[list[int]] = []
+        merged_sizes: list[list[int]] = []
+        merged_req_indices: list[int] = []
+        active_prepared: list[int] = []
+        stored_events_by_req: dict[int, list[BlockStored]] = {}
+
+        for pi, (p, (off_start, off_end)) in enumerate(
+            zip(prepared, offsets, strict=True)
+        ):
+            missing = [
+                i
+                for i, global_idx in enumerate(range(off_start, off_end))
+                if exists_results[global_idx] != 1
+            ]
+            if not missing:
+                self.dec_stored_request(p.req_meta.req_id)
+                self.request_queue.task_done()
+                continue
+
+            for i in missing:
+                merged_keys.append(p.keys[i])
+                merged_addrs.append(p.addrs[i])
+                merged_sizes.append(p.sizes[i])
+                merged_req_indices.append(pi)
+
+            if self.enable_kv_event:
+                prev_key = None
+                stored_events: list[BlockStored] = []
+                for i in missing:
+                    token_ids = (
+                        p.req_meta.token_ids[p.starts[i] : p.ends[i]]
+                        if p.req_meta.token_ids is not None
+                        else None
+                    )
+                    stored_events.append(
+                        BlockStored(
+                            block_hashes=[p.converted_block_hashes[i]],
+                            parent_block_hash=prev_key,
+                            token_ids=token_ids,
+                            block_size=p.req_meta.original_block_size,
+                            lora_id=None,
+                            medium="cpu",
+                            lora_name=None,
+                        )
+                    )
+                    prev_key = p.converted_block_hashes[i]
+                stored_events_by_req[pi] = stored_events
+            active_prepared.append(pi)
+
+        if not merged_keys:
+            return
+
+        # --- Phase D: CUDA event sync ---
+        # Requests from different scheduler steps may carry different
+        # events, so we must synchronize every distinct event.
+        synced_events: set[int] = set()
+        for p in prepared:
+            ev = p.req_meta.current_event
+            if ev is not None and id(ev) not in synced_events:
+                ev.synchronize()
+                synced_events.add(id(ev))
+
+        # --- Phase E: Merged batch_put ---
+        try:
+            if self.replicate_config is None:
+                res = self.store.batch_put_from_multi_buffers(
+                    merged_keys, merged_addrs, merged_sizes
+                )
+            else:
+                res = self.store.batch_put_from_multi_buffers(
+                    merged_keys, merged_addrs, merged_sizes,
+                    self.replicate_config,
+                )
+        except Exception:
+            logger.exception(
+                "Merged batch_put exception (num_keys=%d)",
+                len(merged_keys),
+            )
+            res = [-1] * len(merged_keys)
+
+        # --- Phase F: Per-request result attribution ---
+        per_req_failed: dict[int, list[int]] = defaultdict(list)
+        for mi, status in enumerate(res):
+            if status < 0:
+                per_req_failed[merged_req_indices[mi]].append(status)
+
+        any_success = any(v >= 0 for v in res)
+        if any_success and self._clear_store_pressure():
+            logger.info(
+                "Mooncake CPU/offload pressure cleared after a "
+                "successful merged store batch"
+            )
+
+        for pi in active_prepared:
+            p = prepared[pi]
+            req_id = p.req_meta.req_id
+            failed_codes = per_req_failed.get(pi, [])
+
+            if failed_codes:
+                failed_code_set = set(failed_codes)
+                logger.warning(
+                    "batch_put failed: %d keys failed for req %s "
+                    "(codes=%s) in merged batch",
+                    len(failed_codes), req_id, failed_code_set,
+                )
+                if (
+                    MOONCAKE_NO_AVAILABLE_HANDLE in failed_code_set
+                    and not self._mark_request_skipped_for_pressure(req_id)
+                ):
+                    logger.warning(
+                        "Detected Mooncake CPU/disk offloading pressure "
+                        "(NO_AVAILABLE_HANDLE); skipping future store "
+                        "batches for request %s",
+                        req_id,
+                    )
+
+            stored_events = stored_events_by_req.get(pi, [])
+            if self.enable_kv_event and stored_events:
+                self.update_kv_event(stored_events)
+
+            self.dec_stored_request(req_id)
+            self.request_queue.task_done()
+
+        logger.debug(
+            "Merged batch_put: %d requests, %d total keys, %d failed",
+            len(active_prepared), len(merged_keys),
+            sum(len(v) for v in per_req_failed.values()),
+        )
+
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.token_len_chunk
         block_ids = req_meta.block_ids
