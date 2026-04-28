@@ -247,6 +247,11 @@ class KVTransferThread(threading.Thread):
         self.finished_requests: set[str] = set()
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
+        self.device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else None
+        )
 
     def add_request(self, request: ReqMeta) -> None:
         self.request_queue.put(request)
@@ -262,6 +267,7 @@ class KVTransferThread(threading.Thread):
             self.finished_requests.add(req_id)
 
     def run(self):
+        self._try_bind_numa()
         self.ready_event.set()
         while True:
             try:
@@ -273,6 +279,95 @@ class KVTransferThread(threading.Thread):
                 self._handle_request(request_data)
             except Exception as e:
                 logger.error("Error in %s: %s", self.name, e)
+
+    @staticmethod
+    def _parse_cpulist(cpulist_str: str) -> list[int]:
+        """Parse '0-15,32-47' format into a sorted list of CPU IDs."""
+        cores: list[int] = []
+        for part in cpulist_str.split(","):
+            part = part.strip()
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                cores.extend(range(int(lo), int(hi) + 1))
+            elif part:
+                cores.append(int(part))
+        return sorted(cores)
+
+    @staticmethod
+    def _get_gpu_numa_node(physical_gpu_id: int) -> int | None:
+        """Get NUMA node for a physical GPU.
+
+        Tries nvmlDeviceGetNumaNodeId first (fast, works on most x86),
+        falls back to PCI bus ID → sysfs lookup (works on ARM/Grace).
+        """
+        from vllm.third_party import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_id)
+
+        # Method 1: direct NVML query (raises NotSupported on ARM)
+        try:
+            numa_node = pynvml.nvmlDeviceGetNumaNodeId(handle)
+            if numa_node >= 0:
+                return numa_node
+        except Exception:
+            pass
+
+        # Method 2: PCI bus ID → sysfs numa_node
+        pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
+        bus_id = pci_info.busId
+        if isinstance(bus_id, bytes):
+            bus_id = bus_id.decode("utf-8")
+        bus_id = bus_id.strip().lower()
+        # Normalize 8-digit domain to 4-digit: "00000000:89:00.0" → "0000:89:00.0"
+        parts = bus_id.split(":")
+        if len(parts) >= 2 and len(parts[0]) > 4:
+            parts[0] = parts[0][-4:]
+            bus_id = ":".join(parts)
+
+        numa_path = f"/sys/bus/pci/devices/{bus_id}/numa_node"
+        with open(numa_path) as f:
+            val = int(f.read().strip())
+        return val if val >= 0 else None
+
+    def _try_bind_numa(self):
+        """Best-effort: bind this thread to the current GPU's NUMA node."""
+        if (
+            not hasattr(os, "sched_setaffinity")
+            or not torch.cuda.is_available()
+            or self.device is None
+        ):
+            return
+        try:
+            from vllm.platforms import current_platform
+
+            current_platform.set_device(self.device)
+            device_idx = self.device.index
+            assert device_idx is not None
+            physical_id = current_platform.device_id_to_physical_device_id(device_idx)
+            numa_node = self._get_gpu_numa_node(physical_id)
+            if numa_node is None:
+                logger.warning(
+                    "Could not determine NUMA node for GPU %d", device_idx)
+                return
+
+            cpulist_path = (
+                f"/sys/devices/system/node/node{numa_node}/cpulist"
+            )
+            with open(cpulist_path) as f:
+                cores = self._parse_cpulist(f.read().strip())
+
+            reserved = cores[-2:] if len(cores) > 2 else cores
+            os.sched_setaffinity(0, reserved)
+            logger.info(
+                "Bound %s to NUMA %d cores %s (GPU %d)",
+                self.name, numa_node, reserved, device_idx,
+            )
+        except Exception:
+            logger.warning(
+                "NUMA binding failed for %s, continuing without",
+                self.name, exc_info=True,
+            )
 
     def _handle_request(self, req_meta: Any):
         pass

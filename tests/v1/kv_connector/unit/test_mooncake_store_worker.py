@@ -7,7 +7,7 @@ import sys
 import threading
 import types
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 import torch
@@ -380,6 +380,38 @@ def test_store_sending_thread_uses_default_write_path_without_preferred_segment(
     assert store.batch_put_from_multi_buffers.call_count == 1
     call_args = store.batch_put_from_multi_buffers.call_args.args
     assert len(call_args) == 3
+
+
+def test_transfer_thread_binds_numa_using_captured_worker_device():
+    store = MagicMock()
+    thread = _make_store_sending_thread(store)
+    thread.device = torch.device("cuda", 3)
+
+    fake_platform = SimpleNamespace(
+        set_device=MagicMock(),
+        device_id_to_physical_device_id=MagicMock(return_value=7),
+    )
+
+    with (
+        patch.object(mooncake_store_worker.torch.cuda, "is_available", return_value=True),
+        patch.object(
+            mooncake_store_worker.torch.cuda,
+            "current_device",
+            side_effect=AssertionError("thread should not call current_device"),
+        ),
+        patch("vllm.platforms.current_platform", fake_platform),
+        patch.object(thread, "_get_gpu_numa_node", return_value=1),
+        patch(
+            "builtins.open",
+            mock_open(read_data="0-3,8-9"),
+        ),
+        patch.object(mooncake_store_worker.os, "sched_setaffinity") as mock_affinity,
+    ):
+        thread._try_bind_numa()
+
+    fake_platform.set_device.assert_called_once_with(thread.device)
+    fake_platform.device_id_to_physical_device_id.assert_called_once_with(3)
+    mock_affinity.assert_called_once_with(0, [8, 9])
 
 
 def test_get_disk_offload_buffer_budget_bytes_uses_requester_budget_override(
