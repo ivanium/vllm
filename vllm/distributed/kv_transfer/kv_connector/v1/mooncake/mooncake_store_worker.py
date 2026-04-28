@@ -19,6 +19,7 @@ import regex as re
 import torch
 import zmq
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dcp_group,
@@ -217,6 +218,97 @@ def _split_disk_offload_load_batches(
     if batch_keys:
         batches.append((batch_keys, batch_addrs, batch_sizes))
     return batches, None
+
+
+def _call_replica_predicate(replica_desc: Any, method_name: str) -> bool:
+    method = getattr(replica_desc, method_name, None)
+    if method is None:
+        return False
+    try:
+        return bool(method())
+    except Exception:
+        return False
+
+
+def _classify_replica_tier(replica_descs: Any) -> str:
+    if not replica_descs:
+        return "unknown"
+    try:
+        replica_desc = replica_descs[0]
+    except (IndexError, KeyError, TypeError):
+        return "unknown"
+
+    if _call_replica_predicate(replica_desc, "is_memory_replica"):
+        return "memory"
+    if _call_replica_predicate(
+        replica_desc, "is_disk_replica"
+    ) or _call_replica_predicate(replica_desc, "is_local_disk_replica"):
+        return "disk"
+    return "unknown"
+
+
+def _get_replica_tiers_by_key(store: Any, keys: list[str]) -> dict[str, str]:
+    tiers_by_key = {key: "unknown" for key in keys}
+    try:
+        replica_descs_by_key = store.batch_get_replica_desc(keys)
+    except Exception as e:
+        logger.warning(
+            "Failed to get Mooncake replica descriptors for tier logging "
+            "(batch_keys=%d, error=%s); marking tiers unknown",
+            len(keys),
+            e,
+        )
+        return tiers_by_key
+
+    for key in keys:
+        if hasattr(replica_descs_by_key, "get"):
+            replica_descs = replica_descs_by_key.get(key)
+        else:
+            try:
+                replica_descs = replica_descs_by_key[key]
+            except (KeyError, TypeError):
+                replica_descs = None
+        tiers_by_key[key] = _classify_replica_tier(replica_descs)
+    return tiers_by_key
+
+
+def _log_mooncake_load_tier_summary(
+    req_id: str,
+    batch_keys: list[str],
+    load_results: list[int],
+    tiers_by_key: dict[str, str],
+) -> None:
+    tier_counts = {"memory": 0, "disk": 0, "unknown": 0}
+    bytes_by_tier = {"memory": 0, "disk": 0, "unknown": 0}
+    success_keys = 0
+    failed_keys = 0
+
+    for index, key in enumerate(batch_keys):
+        tier = tiers_by_key.get(key, "unknown")
+        if tier not in tier_counts:
+            tier = "unknown"
+        tier_counts[tier] += 1
+
+        value = load_results[index] if index < len(load_results) else -1
+        if value >= 0:
+            success_keys += 1
+            bytes_by_tier[tier] += int(value)
+        else:
+            failed_keys += 1
+
+    logger.info(
+        "Mooncake load tier summary: req_id=%s batch_keys=%d "
+        "memory_keys=%d disk_keys=%d unknown_keys=%d "
+        "success_keys=%d failed_keys=%d bytes_by_tier=%s",
+        req_id,
+        len(batch_keys),
+        tier_counts["memory"],
+        tier_counts["disk"],
+        tier_counts["unknown"],
+        success_keys,
+        failed_keys,
+        bytes_by_tier,
+    )
 
 
 # ============================================================
@@ -610,9 +702,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         try:
             for batch_keys, batch_addrs, batch_sizes in load_batches:
                 current_batch_keys = batch_keys
+                tiers_by_key: dict[str, str] | None = None
+                if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
+                    tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
                 res = self.store.batch_get_into_multi_buffers(
                     batch_keys, batch_addrs, batch_sizes
                 )
+                if tiers_by_key is not None:
+                    _log_mooncake_load_tier_summary(
+                        req_id, batch_keys, res, tiers_by_key
+                    )
                 failed = [
                     (key, value)
                     for key, value in zip(batch_keys, res, strict=True)

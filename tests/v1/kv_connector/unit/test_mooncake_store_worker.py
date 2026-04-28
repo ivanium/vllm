@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import logging
 import math
 import sys
 import threading
@@ -295,6 +296,20 @@ def test_get_configured_worker_rnic_rejects_short_explicit_csv(monkeypatch):
         )
 
 
+class _ReplicaDesc:
+    def __init__(self, tier: str):
+        self.tier = tier
+
+    def is_memory_replica(self) -> bool:
+        return self.tier == "memory"
+
+    def is_disk_replica(self) -> bool:
+        return self.tier == "disk"
+
+    def is_local_disk_replica(self) -> bool:
+        return self.tier == "disk"
+
+
 def test_store_sending_thread_skips_request_during_cpu_pressure():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
@@ -407,7 +422,8 @@ def test_estimate_disk_offload_staging_bytes_sums_multi_segment_sizes():
     )
 
 
-def test_recv_thread_uses_single_batch_when_no_disk_offload_budget():
+def test_recv_thread_uses_single_batch_when_no_disk_offload_budget(monkeypatch):
+    monkeypatch.delenv("VLLM_MOONCAKE_STORE_TIER_LOG", raising=False)
     store = MagicMock()
     store.batch_get_into_multi_buffers.return_value = [256, 256, 256]
     thread = _make_store_recving_thread(store, disk_offload_buffer_budget_bytes=None)
@@ -428,6 +444,52 @@ def test_recv_thread_uses_single_batch_when_no_disk_offload_budget():
         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6132",
     ]
     assert sizes == [[256], [256], [256]]
+    store.batch_get_replica_desc.assert_not_called()
+
+
+def test_recv_thread_logs_tier_summary_when_enabled(monkeypatch, caplog_vllm):
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_TIER_LOG", "1")
+    caplog_vllm.set_level(logging.INFO, logger=mooncake_store_worker.logger.name)
+
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, 256, -10]
+    thread = _make_store_recving_thread(store, disk_offload_buffer_budget_bytes=None)
+
+    req = _make_load_req(
+        "req-a",
+        [b"a0", b"a1", b"a2"],
+        token_len=48,
+    )
+    expected_keys = [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6130",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6132",
+    ]
+    store.batch_get_replica_desc.return_value = {
+        expected_keys[0]: [_ReplicaDesc("memory")],
+        expected_keys[1]: [_ReplicaDesc("disk")],
+        expected_keys[2]: [],
+    }
+
+    thread._handle_request(req)
+
+    assert store.batch_get_replica_desc.call_args.args == (expected_keys,)
+    assert store.method_calls[0][0] == "batch_get_replica_desc"
+    assert store.method_calls[1][0] == "batch_get_into_multi_buffers"
+
+    messages = [record.getMessage() for record in caplog_vllm.records]
+    assert any(
+        "Mooncake load tier summary" in message
+        and "req_id=req-a" in message
+        and "batch_keys=3" in message
+        and "memory_keys=1" in message
+        and "disk_keys=1" in message
+        and "unknown_keys=1" in message
+        and "success_keys=2" in message
+        and "failed_keys=1" in message
+        and "bytes_by_tier={'memory': 256, 'disk': 256, 'unknown': 0}" in message
+        for message in messages
+    )
 
 
 def test_recv_thread_uses_ratio_scaled_budget_for_first_pass_split():

@@ -5,36 +5,43 @@
 # final Mooncake --kv-transfer-config for each worker node.
 
 model: nvidia/Kimi-K2.5-NVFP4
-mode: remote
+mode: local
 precheck: true
 collect_env: true
-router_port: 30000
+router_port: auto
+prometheus_port: auto
 
 pre_serve:
   - cmd: >-
       bash scripts/mooncake/start_mooncake_master.sh
       --bg
+      --enable-offload
       --env-file {log_dir}/mooncake_master.env
-    repo_path: /home/${USER}/code/vllm-mooncake
+    repo_path: /home/${USER}/repos/vllm-mooncake
+    env:
+      # Short lease TTL so memory replicas become evictable shortly after
+      # NotifyOffloadSuccess; otherwise BatchEvict skips every candidate
+      # (default 1800000 ms = 30 min) and the CPU pool plateaus at 95%.
+      MC_LEASE_TTL: "30000"
 
 serving:
   roles:
     - role: worker
-      count: 2
+      count: 1
       nodes_per_instance: 1
       gpus_per_node: 4
-      base_port: 8000
+      base_port: 8100
       vllm_engine:
-        repo_path: /home/${USER}/code/vllm-mooncake
+        repo_path: /home/${USER}/repos/vllm-mooncake
         cmd: >-
-          bash /home/${USER}/code/vllm-mooncake/scripts/mooncake/run_vllm_with_mooncake_owner.sh
+          bash /home/${USER}/repos/vllm-mooncake/scripts/mooncake/run_vllm_with_mooncake_owner.sh
           vllm serve {model}
           --port {port}
           --trust-remote-code
           --language-model-only
           --load-format dummy
           --enforce-eager
-          -tp 4
+          -dp 4
           -O3
           --gpu-memory-utilization 0.9
           --max-model-len 131072
@@ -48,10 +55,12 @@ serving:
           --disable-uvicorn-access-log
           --disable-hybrid-kv-cache-manager
         env:
+          GLOG_v: "1"
+          VLLM_MOONCAKE_STORE_TIER_LOG: "1"
           MC_MASTER_ENV_FILE: "{log_dir}/mooncake_master.env"
-          MC_OWNER_CPU_MEM_GIB: "700"
-          # MC_OWNER_DISK_GIB: "1000"
-          # MC_OWNER_DISK_PATH: "/mnt/data/${USER}/mooncake_offload"
+          MC_OWNER_CPU_MEM_GIB: "70"
+          MC_OWNER_DISK_GIB: "1000"
+          MC_OWNER_DISK_PATH: "/mnt/data/${USER}/mooncake_offload"
           VLLM_USE_SIMPLE_KV_OFFLOAD: "1"
           VLLM_USE_FLASHINFER_MOE_FP4: "1"
           VLLM_FLASHINFER_MOE_BACKEND: latency
@@ -92,11 +101,14 @@ serving:
 
   # ---- Router (round-robin, no PD disaggregation) ----
   router:
+    repo_path: /home/${USER}/repos/router-internal
     cmd: >-
-      vllm-router
-      --policy round_robin
+      cargo run --release --
+      --policy consistent_hash
+      --prometheus-port {prometheus_port}
       --host 0.0.0.0
       --port {router_port}
+      --intra-node-data-parallel-size 4
       {worker_flags}
     health_check:
       url: http://localhost:{router_port}/health
@@ -108,6 +120,7 @@ serving:
     slurm:
       partition: normal
       time_limit: "12:00:00"
+      # nodelist: "gb200-rack1-[10,11]"
       grace_period_s: 120
 
 post_serve:
@@ -132,4 +145,4 @@ post_serve:
       --save-result
   - vmon: stop
   - cmd: bash scripts/mooncake/start_mooncake_master.sh --stop
-    repo_path: /home/${USER}/code/vllm-mooncake
+    repo_path: /home/${USER}/repos/vllm-mooncake
