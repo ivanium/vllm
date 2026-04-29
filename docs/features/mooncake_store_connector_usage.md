@@ -72,27 +72,60 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
 
 ### Disaggregated Prefill-Decode (XpYd)
 
+In disaggregated prefill-decode mode, use `MultiConnector` to combine `MooncakeConnector` (point-to-point KV transfer) with `MooncakeStoreConnector` (shared KV cache pool). This enables both direct P2P transfer between prefiller and decoder, and cross-instance prefix cache sharing via the distributed store.
 **Prefiller Node:**
 
 ```bash
 MOONCAKE_CONFIG_PATH=mooncake_config.json \
+VLLM_MOONCAKE_BOOTSTRAP_PORT=50052 \
 vllm serve meta-llama/Llama-3.1-8B-Instruct \
     --port 8100 \
-    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_producer"}'
+    --kv-transfer-config '{
+        "kv_connector": "MultiConnector",
+        "kv_role": "kv_producer",
+        "kv_connector_extra_config": {
+            "connectors": [
+                {
+                    "kv_connector": "MooncakeConnector",
+                    "kv_role": "kv_producer"
+                },
+                {
+                    "kv_connector": "MooncakeStoreConnector",
+                    "kv_role": "kv_producer"
+                }
+            ]
+        }
+    }'
 ```
 
 **Decoder Node:**
 
 ```bash
 MOONCAKE_CONFIG_PATH=mooncake_config.json \
+VLLM_MOONCAKE_BOOTSTRAP_PORT=50053 \
 vllm serve meta-llama/Llama-3.1-8B-Instruct \
     --port 8200 \
-    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_consumer"}'
+    --kv-transfer-config '{
+        "kv_connector": "MultiConnector",
+        "kv_role": "kv_consumer",
+        "kv_connector_extra_config": {
+            "connectors": [
+                {
+                    "kv_connector": "MooncakeConnector",
+                    "kv_role": "kv_consumer"
+                },
+                {
+                    "kv_connector": "MooncakeStoreConnector",
+                    "kv_role": "kv_consumer"
+                }
+            ]
+        }
+    }'
 ```
 
 **Proxy:**
 
-Use a disaggregation proxy to route requests between prefiller and decoder nodes.
+A disaggregation proxy is required to route requests between prefiller and decoder nodes. The proxy assigns `do_remote_prefill=True` / `do_remote_decode=True` to coordinate P2P transfer via `MooncakeConnector`. Refer to the [MooncakeConnector usage guide](mooncake_connector_usage.md) for proxy setup details.
 
 ### Disk Offloading
 
@@ -114,6 +147,7 @@ export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=1280mb
 | Variable | Description | Default |
 |---|---|---|
 | `MOONCAKE_CONFIG_PATH` | Path to Mooncake JSON config file | (required) |
+| `VLLM_MOONCAKE_BOOTSTRAP_PORT` | Bootstrap port for MooncakeConnector P2P transfer (disagg mode only) | 8998 |
 | `MOONCAKE_ENABLE_OFFLOAD` | Enable disk offloading (`1` or `true`) | disabled |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | Directory for disk offload files | — |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | Local staging buffer size for disk offload | 1280MB |
