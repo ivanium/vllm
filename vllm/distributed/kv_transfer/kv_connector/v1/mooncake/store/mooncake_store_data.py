@@ -4,7 +4,6 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
@@ -75,6 +74,9 @@ class ChunkedTokenDatabase:
         self.kv_caches_base_addr = kv_caches_base_addr
 
     def set_block_len(self, block_len: list[int]):
+        for length in block_len:
+            if length % self.block_size != 0:
+                raise ValueError(f"block_len {length} % {self.block_size} != 0")
         self.block_len = block_len
 
     def prepare_value(
@@ -91,7 +93,7 @@ class ChunkedTokenDatabase:
         length = len(self.block_len)
         for index, base_addr in enumerate(self.kv_caches_base_addr):
             addr = base_addr + block_id * self.block_len[index % length]
-            size = int(self.block_len[index % length] / self.block_size * (end - start))
+            size = self.block_len[index % length] // self.block_size * (end - start)
             addr_list.append(addr)
             size_list.append(size)
         return addr_list, size_list, block_id
@@ -189,7 +191,7 @@ class ReqMeta:
         is_last_chunk: bool | None = None,
         discard_partial_chunks: bool = True,
         original_block_size: int | None = None,
-    ) -> Optional["ReqMeta"]:
+    ) -> "ReqMeta | None":
         """Create ReqMeta from a RequestTracker."""
         if block_hashes is None:
             block_hashes = []
