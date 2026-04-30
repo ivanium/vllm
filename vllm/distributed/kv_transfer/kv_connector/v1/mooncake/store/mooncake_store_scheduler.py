@@ -184,7 +184,7 @@ class MooncakeStoreScheduler:
                 token_len=num_tokens_to_compute,
                 allocated_block_ids=unfolded_block_ids,
                 num_saved_tokens=0,
-                token_ids=request.prompt_token_ids[:num_tokens_to_compute].copy(),
+                token_ids=request.prompt_token_ids[:num_tokens_to_compute],
             )
             self._request_trackers[request.req_id] = request_tracker
 
