@@ -650,8 +650,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         try:
             for batch_keys, batch_addrs, batch_sizes in load_batches:
                 current_batch_keys = batch_keys
-                batch_bytes = _sum_batch_bytes(batch_sizes)
+                batch_bytes = 0
                 load_get_start = time.perf_counter()
+                batch_bytes = _sum_batch_bytes(batch_sizes)
                 res = self.store.batch_get_into_multi_buffers(
                     batch_keys, batch_addrs, batch_sizes
                 )
