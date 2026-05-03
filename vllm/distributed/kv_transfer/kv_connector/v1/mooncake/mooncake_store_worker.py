@@ -14,6 +14,8 @@ import time
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import reduce
+from math import gcd, lcm
 from typing import Any
 
 import regex as re
@@ -30,6 +32,7 @@ from vllm.distributed import (
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (
     ChunkedTokenDatabase,
+    GroupLayout,
     KeyMetadata,
     MooncakeStoreConnectorMetadata,
     ReqMeta,
@@ -41,8 +44,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
     get_mooncake_dp_engine_index,
 )
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.serial_utils import MsgpackDecoder
 
 from .mooncake_store_metrics import MooncakeStoreConnectorStats
@@ -386,21 +391,73 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self.request_queue.task_done()
             return
 
-        starts = []
-        ends = []
-        keys = []
+        # HMA: assert per-group block_ids matches the registered group count.
+        num_groups = len(self.token_database.groups) or 1
+        if isinstance(block_ids, list) and block_ids and isinstance(block_ids[0], list):
+            req_groups = len(block_ids)
+        else:
+            # Legacy flat list — treat as single group.
+            req_groups = 1
+        if req_groups != num_groups:
+            logger.error(
+                "req %s: KV group count mismatch on save: got %d, expected %d. "
+                "Dropping save.",
+                req_id,
+                req_groups,
+                num_groups,
+            )
+            self.dec_stored_request(req_id)
+            self.request_queue.task_done()
+            return
+
+        starts: list[int] = []
+        ends: list[int] = []
+        groups_per_key: list[int] = []
+        keys: list[str] = []
         block_hashes: list[BlockHash] = []
-        for index, (start, end, key) in enumerate(
-            self.token_database.process_tokens(token_len, req_meta.block_hashes)
+        # Per-group chunk counts (= cdiv(token_len, g_block_size)).
+        # `len(req_meta.block_hashes)` is at hash_block_size granularity,
+        # not per-group, so it can't be used here.
+        group_block_sizes = self.token_database.group_block_sizes or [
+            self.block_size
+        ] * max(1, num_groups)
+        g_total_chunks = [cdiv(token_len, gbs) for gbs in group_block_sizes]
+        hash_bs = max(1, self.token_database.hash_block_size)
+        per_group_savable = [0] * max(1, num_groups)
+        for start, end, group_id, key in self.token_database.process_tokens(
+            token_len, req_meta.block_hashes
         ):
+            g_block_size = group_block_sizes[group_id]
+            chunk_id = start // g_block_size
+            if not self.token_database.is_chunk_in_window_per_request(
+                chunk_id, block_ids, group_id, g_total_chunks[group_id]
+            ):
+                continue
             starts.append(start)
             ends.append(end)
+            groups_per_key.append(group_id)
             keys.append(key.to_string())
-            block_hashes.append(req_meta.block_hashes[index])
+            # Right-edge hash; same index `process_tokens` used for the key.
+            block_hashes.append(req_meta.block_hashes[end // hash_bs - 1])
+            per_group_savable[group_id] += 1
+
+        self._save_debug_counter = getattr(self, "_save_debug_counter", 0) + 1
+        if self._save_debug_counter % 50 == 1:
+            logger.info(
+                "[mooncake-save] call=%d savable=%d per_group=%s "
+                "blocks_per_sw=%s g_total_chunks=%s g_block_sizes=%s",
+                self._save_debug_counter,
+                len(keys),
+                per_group_savable,
+                self.token_database.blocks_per_sw,
+                g_total_chunks,
+                group_block_sizes,
+            )
 
         # Apply put_step striding for TP
         starts = starts[self.tp_rank % self.put_step :: self.put_step]
         ends = ends[self.tp_rank % self.put_step :: self.put_step]
+        groups_per_key = groups_per_key[self.tp_rank % self.put_step :: self.put_step]
         keys = keys[self.tp_rank % self.put_step :: self.put_step]
         block_hashes = block_hashes[self.tp_rank % self.put_step :: self.put_step]
 
@@ -434,6 +491,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         starts = [starts[i] for i in missing_indices]
         ends = [ends[i] for i in missing_indices]
+        groups_per_key = [groups_per_key[i] for i in missing_indices]
         keys = [keys[i] for i in missing_indices]
         block_hashes = [block_hashes[i] for i in missing_indices]
 
@@ -453,8 +511,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
         new_block_hashes = [maybe_convert_block_hash(bh) for bh in block_hashes]
 
         for index, start in enumerate(starts):
+            gid = groups_per_key[index]
             addr, size, _ = self.token_database.prepare_value(
-                start, ends[index], block_ids
+                start,
+                ends[index],
+                block_ids,
+                gid,
+                g_total_chunks[gid],
             )
             addrs.append(addr)
             sizes.append(size)
@@ -495,16 +558,35 @@ class KVCacheStoreSendingThread(KVTransferThread):
             )
             if failed:
                 failed_codes = set(res[i] for i in failed)
+                # Log a sample (first failed key's first segment addr+size).
+                # Cross-correlating addr against the registered ranges in the
+                # startup "Registering KV_Caches" log is the fastest way to
+                # spot the "RDMA address out of registered range" failure
+                # mode (e.g., heterogeneous strides bug from DP=2 EP).
+                fi = failed[0]
+                first_addr = "N/A"
+                first_size = "N/A"
+                if fi < len(addrs):
+                    a = addrs[fi]
+                    s = sizes[fi]
+                    if isinstance(a, list) and a:
+                        first_addr = f"0x{a[0]:x}+{s[0] if isinstance(s, list) else s}"
+                        first_size = f"n_segs={len(a)}"
+                    elif isinstance(a, int):
+                        first_addr = f"0x{a:x}"
+                        first_size = str(s)
                 logger.warning(
                     "batch_put failed: %d/%d keys failed "
                     "(codes=%s, batch_bytes=%d, num_keys=%d), "
-                    "first_key=%s",
+                    "first_key=%s, first_failed_addr=%s, %s",
                     len(failed),
                     len(keys),
                     failed_codes,
                     batch_bytes,
                     len(keys),
                     keys[0] if keys else "N/A",
+                    first_addr,
+                    first_size,
                 )
                 if (
                     MOONCAKE_NO_AVAILABLE_HANDLE in failed_codes
@@ -574,24 +656,65 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
+        # Mask aligns to scheduler frame (LCM); self.block_size is MIN
+        # on HMA and would skip at hash-block granularity.
+        sched_bs = getattr(self.token_database, "scheduler_block_size", self.block_size)
         mask_num = (
             req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
-            // self.block_size
-            * self.block_size
+            // sched_bs
+            * sched_bs
         )
 
+        # HMA: assert per-group block_ids matches the registered group count.
+        num_groups = len(self.token_database.groups) or 1
+        block_ids = req_meta.block_ids
+        if isinstance(block_ids, list) and block_ids and isinstance(block_ids[0], list):
+            req_groups = len(block_ids)
+        else:
+            req_groups = 1
+        if req_groups != num_groups:
+            logger.error(
+                "req %s: KV group count mismatch on load: got %d, expected %d. "
+                "Dropping load.",
+                req_id,
+                req_groups,
+                num_groups,
+            )
+            return
+
+        # Per-group load: skip (chunk, group) pairs outside the group's window.
         addr_list = []
         size_list = []
         key_list = []
-        for start, end, key in self.token_database.process_tokens(
+        # Per-group native chunk counts; symmetric with the save path.
+        load_group_block_sizes = self.token_database.group_block_sizes or [
+            self.block_size
+        ] * max(1, num_groups)
+        load_g_total_chunks = [cdiv(token_len, gbs) for gbs in load_group_block_sizes]
+        for start, end, group_id, key in self.token_database.process_tokens(
             token_len, req_meta.block_hashes, mask_num
         ):
+            g_block_size = load_group_block_sizes[group_id]
+            chunk_id = start // g_block_size
+            if not self.token_database.is_chunk_in_window_per_request(
+                chunk_id, block_ids, group_id, load_g_total_chunks[group_id]
+            ):
+                continue
             addr, size, _ = self.token_database.prepare_value(
-                start, end, req_meta.block_ids
+                start,
+                end,
+                block_ids,
+                group_id,
+                load_g_total_chunks[group_id],
             )
             key_list.append(key.to_string())
             addr_list.append(addr)
             size_list.append(size)
+
+        if not key_list:
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
 
         # Rotate lists by tp_rank for load balancing
         key_list_c = (
@@ -705,7 +828,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 class MooncakeStoreWorker:
     """Worker-side component for MooncakeStoreConnector."""
 
-    def __init__(self, vllm_config: VllmConfig):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: "KVCacheConfig | None" = None,
+    ):
         try:
             from mooncake.store import MooncakeDistributedStore  # type: ignore
         except ImportError as e:
@@ -715,6 +842,7 @@ class MooncakeStoreWorker:
                 "en/build.md to run vLLM with MooncakeStoreConnector."
             ) from e
 
+        self.kv_cache_config = kv_cache_config
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
@@ -818,8 +946,12 @@ class MooncakeStoreWorker:
         self.register_kv_caches({"__cross_layer__": kv_cache})
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        """Register KV cache tensors and start transfer threads."""
-        # TODO(yifan): we haven't supported HMA yet.
+        """Register KV cache tensors and start transfer threads.
+
+        Buckets layers by kv_cache_config.kv_cache_groups so HMA models
+        (mixed FullAttention + SlidingWindow) get one GroupLayout per
+        group and prepare_value can resolve per-group block ids.
+        """
         first_kv_cache = next(iter(kv_caches.values()))
 
         # num_blocks from cache_config is authoritative (set after
@@ -828,75 +960,205 @@ class MooncakeStoreWorker:
         self.num_blocks = self.cache_config.num_gpu_blocks
 
         # Detect the KV cache memory layout using the stride-based
-        # approach from simple_kv_offload/worker.py.
+        # approach from simple_kv_offload/worker.py. Same logic as
+        # before, but now applied per group.
         #
         # The physical layout varies across attention backends:
         #   FlashAttn/ROCm : (2, num_blocks, ...) → K/V outermost
         #   FlashInfer/MLA : (num_blocks, ...)    → blocks outermost
-        #
-        # We derive page_size_bytes = storage.nbytes() // num_blocks,
-        # then classify dims: any dim whose byte-stride exceeds
-        # page_size_bytes must be an outer segment dim (e.g. the K/V
-        # dim of size 2).  For those backends we register each segment
-        # (K, V) as a separate base-address so that the per-block
-        # offset arithmetic in prepare_value() stays correct.
-        storage = first_kv_cache.untyped_storage()
-        el = first_kv_cache.element_size()
-        page_size_bytes = storage.nbytes() // self.num_blocks
-        outer_dims = [
-            d
-            for d in range(first_kv_cache.ndim)
-            if first_kv_cache.stride(d) * el > page_size_bytes
-        ]
+        # Layout detection now happens per-tensor inside the group loop
+        # below (cache_outer_dims). The early `outer_dims` was dead code.
 
-        # Register buffers with the store (deduplicate shared storages)
-        # and record per-segment base addresses for every layer.
-        seen_ptrs: set[int] = set()
-        self.kv_caches_base_addr: list[int] = []
-        self.block_len: list[int] = []
-
-        for cache in kv_caches.values():
-            cache_storage = cache.untyped_storage()
-            base_addr = cache_storage.data_ptr()
-            region_len = cache_storage.nbytes()
-
-            if base_addr not in seen_ptrs:
-                seen_ptrs.add(base_addr)
-                ret = self.store.register_buffer(base_addr, region_len)
-                if ret != 0:
-                    logger.error(
-                        "register_buffer failed for addr %#x len %d: %d",
-                        base_addr,
-                        region_len,
-                        ret,
+        # Bucket layers by KV cache group. If kv_cache_config is missing
+        # (legacy / tests / no-arg construction), fall back to a single
+        # group containing everything — preserves N=1 behavior for
+        # DeepSeek/MLA.
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        is_cross_layer_registration = set(kv_caches) == {"__cross_layer__"}
+        if kv_cache_config is not None:
+            if is_cross_layer_registration:
+                if len(kv_cache_config.kv_cache_groups) != 1:
+                    raise ValueError(
+                        "Cross-layer KV cache registration is only supported for "
+                        "single-group KV cache configs."
                     )
-
-            if not outer_dims:
-                # Blocks-first layout (FlashInfer / MLA): one segment.
-                self.kv_caches_base_addr.append(base_addr)
-                self.block_len.append(page_size_bytes)
+                layer_to_group_idx: dict[str, int] = {"__cross_layer__": 0}
+                num_groups = 1
             else:
-                # K/V-first layout (FlashAttn / ROCm): split segments.
-                seg_stride = cache.stride(outer_dims[0]) * el
-                for idx in range(cache.shape[outer_dims[0]]):
-                    self.kv_caches_base_addr.append(base_addr + idx * seg_stride)
-                    self.block_len.append(seg_stride // self.num_blocks)
+                layer_to_group_idx = {}
+                for g_idx, group in enumerate(kv_cache_config.kv_cache_groups):
+                    for layer_name in group.layer_names:
+                        layer_to_group_idx[layer_name] = g_idx
+                num_groups = len(kv_cache_config.kv_cache_groups)
+        else:
+            layer_to_group_idx = {name: 0 for name in kv_caches}
+            num_groups = 1
+
+        # Bucket layers by group. Fail closed on unknown layer names when
+        # `kv_cache_config` is present: silently defaulting to group 0
+        # would misattribute window/block_size/block_ids on HMA.
+        grouped_caches: list[list[tuple[str, torch.Tensor]]] = [
+            [] for _ in range(num_groups)
+        ]
+        for name, cache in kv_caches.items():
+            if kv_cache_config is not None and name not in layer_to_group_idx:
+                raise ValueError(
+                    f"KV cache layer '{name}' not in any kv_cache_group. "
+                    f"Known groups: "
+                    f"{[g.layer_names for g in kv_cache_config.kv_cache_groups]}"
+                )
+            g_idx = layer_to_group_idx.get(name, 0)
+            grouped_caches[g_idx].append((name, cache))
+
+        seen_ptrs: set[int] = set()
+        groups: list[GroupLayout] = []
+        flat_layer_to_group: list[int] = []
+
+        for g_idx, layers in enumerate(grouped_caches):
+            group_base_addrs: list[int] = []
+            group_block_lens: list[int] = []
+            for _, cache in layers:
+                cache_storage = cache.untyped_storage()
+                base_addr = cache_storage.data_ptr()
+                region_len = cache_storage.nbytes()
+
+                if base_addr not in seen_ptrs:
+                    seen_ptrs.add(base_addr)
+                    ret = self.store.register_buffer(base_addr, region_len)
+                    if ret != 0:
+                        logger.error(
+                            "register_buffer failed for addr %#x len %d: %d",
+                            base_addr,
+                            region_len,
+                            ret,
+                        )
+
+                # Compute outer_dims and page_size_bytes PER TENSOR. HMA mixes
+                # layer types (FA, SWA, indexer, compressor, ...) with
+                # different shapes/strides; using globals from first_kv_cache
+                # produces RDMA put addresses outside the registered range
+                # for any tensor whose per-block stride differs from the
+                # first one.
+                cache_el = cache.element_size()
+                cache_page_size_bytes = region_len // self.num_blocks
+                cache_outer_dims = [
+                    d
+                    for d in range(cache.ndim)
+                    if cache.stride(d) * cache_el > cache_page_size_bytes
+                ]
+
+                if not cache_outer_dims:
+                    # Blocks-first layout (FlashInfer / MLA): one segment.
+                    group_base_addrs.append(base_addr)
+                    group_block_lens.append(cache_page_size_bytes)
+                    flat_layer_to_group.append(g_idx)
+                else:
+                    # K/V-first layout (FlashAttn / ROCm): split segments.
+                    seg_stride = cache.stride(cache_outer_dims[0]) * cache_el
+                    for seg in range(cache.shape[cache_outer_dims[0]]):
+                        group_base_addrs.append(base_addr + seg * seg_stride)
+                        group_block_lens.append(seg_stride // self.num_blocks)
+                        flat_layer_to_group.append(g_idx)
+            groups.append(
+                GroupLayout(
+                    base_addrs=group_base_addrs,
+                    block_lens=group_block_lens,
+                )
+            )
+
+        self.token_database.set_groups(groups, flat_layer_to_group)
+        self.kv_caches_base_addr = self.token_database.kv_caches_base_addr
+        self.block_len = self.token_database.block_len
+
+        # Per-group SWA window in blocks (0 = FA / no clip) and per-group
+        # native block_size. HMA wraps per-layer specs in
+        # `UniformTypeKVCacheSpecs` which hides `sliding_window` /
+        # `attention_chunk_size` at the top level; drill into
+        # `spec.kv_cache_specs` to recover it.
+        if kv_cache_config is not None:
+            blocks_per_sw: list[int] = []
+            group_block_sizes: list[int] = []
+            for group in kv_cache_config.kv_cache_groups:
+                spec = group.kv_cache_spec
+                inner_specs = getattr(spec, "kv_cache_specs", None)
+                probe_spec = next(iter(inner_specs.values())) if inner_specs else spec
+                g_block_size = getattr(spec, "block_size", None) or self.block_size
+                group_block_sizes.append(g_block_size)
+                window_tokens = getattr(probe_spec, "sliding_window", None) or getattr(
+                    probe_spec, "attention_chunk_size", None
+                )
+                if window_tokens:
+                    blocks_per_sw.append(cdiv(window_tokens, g_block_size) + 1)
+                else:
+                    blocks_per_sw.append(0)
+        else:
+            blocks_per_sw = [0] * num_groups
+            group_block_sizes = [self.block_size] * num_groups
+        self.token_database.set_blocks_per_sw(blocks_per_sw)
+        # block_hashes granularity. Honor cache_config.hash_block_size if
+        # set (mirroring vllm's resolver), else GCD(group_block_sizes).
+        hash_block_size_attr = getattr(self.cache_config, "hash_block_size", None)
+        if isinstance(hash_block_size_attr, int) and hash_block_size_attr > 0:
+            hash_block_size = hash_block_size_attr
+        elif group_block_sizes:
+            hash_block_size = reduce(gcd, group_block_sizes)
+        else:
+            hash_block_size = self.block_size
+        # Scheduler-frame alignment = LCM(group_block_sizes), then scale
+        # by pcp/dcp. cache_config.block_size is mutated to MIN for HMA,
+        # so don't read from it.
+        if group_block_sizes:
+            self.scheduler_block_size = reduce(lcm, group_block_sizes)
+        else:
+            self.scheduler_block_size = self.block_size
+        pcp = getattr(self, "pcp_size", 1)
+        dcp = getattr(self, "dcp_size", 1)
+        if pcp > 1:
+            self.scheduler_block_size *= pcp
+        if dcp > 1:
+            self.scheduler_block_size *= dcp
+        self.token_database.set_group_block_sizes(
+            group_block_sizes, hash_block_size, self.scheduler_block_size
+        )
+        self._blocks_per_sw = blocks_per_sw
+        logger.info(
+            "Per-group blocks_per_sw=%s group_block_sizes=%s "
+            "hash_block_size=%d scheduler_block_size=%d "
+            "(self.block_size=%d)",
+            blocks_per_sw,
+            group_block_sizes,
+            hash_block_size,
+            self.scheduler_block_size,
+            self.block_size,
+        )
+
+        # Heterogeneous per-tensor block_lens are now handled correctly,
+        # but logging them up front catches future regressions of the
+        # DP=2 EP "first-tensor page_size for all" failure.
+        unique_block_lens = sorted(set(self.block_len))
+        if len(unique_block_lens) > 1:
+            from collections import Counter
+
+            dist = Counter(self.block_len)
+            logger.info(
+                "Mooncake KV layout has heterogeneous per-tensor block_lens %s "
+                "(distribution=%s); per-tensor stride accounting is in effect.",
+                unique_block_lens,
+                dict(dist),
+            )
 
         logger.info(
-            "Registering KV_Caches. use_mla: %s, shape %s, "
-            "num_blocks: %d, block_len: %s, "
-            "per_key_bytes: %d, "
-            "num_segments: %d",
+            "Registering KV_Caches. use_mla: %s, num_groups: %d, "
+            "shape %s, num_blocks: %d, block_len: %s, "
+            "per_key_bytes: %d, num_segments: %d",
             self.use_mla,
+            num_groups,
             first_kv_cache.shape,
             self.num_blocks,
             list(set(self.block_len)),
             sum(self.block_len),
             len(self.kv_caches_base_addr),
         )
-
-        self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
-        self.token_database.set_block_len(self.block_len)
 
         # Start transfer threads
         if self.kv_role in ["kv_producer", "kv_both"]:
@@ -1072,21 +1334,45 @@ class MooncakeStoreWorker:
         token_len: int,
         block_hashes: list[BlockHash],
     ) -> int:
-        """Check how many prefix tokens exist in the store.
+        """Largest contiguous prefix (in tokens) that all groups + ranks supply.
 
-        Checks across all TP ranks and PP ranks.
+        Per-(chunk, group) keys; a chunk hits iff every queried group
+        returned 1. Single batch_is_exist round-trip.
         """
-        end = 0
         keys: list[str] = []
         multi_tp_keys: list[str] = []
         lookup_start = time.perf_counter()
         try:
-            starts: list[int] = []
-            for start, end, key in self.token_database.process_tokens(
-                token_len, block_hashes
+            hash_bs = max(1, self.token_database.hash_block_size)
+            lookup_token_len = token_len // hash_bs * hash_bs
+            if lookup_token_len <= 0:
+                return 0
+
+            # Per-group chunk counts. Each group's chunk_id indexes a
+            # different token frame, so we keep (chunk_id, group_id) per
+            # key and convert misses back to token positions before
+            # aggregating.
+            group_block_sizes = self.token_database.group_block_sizes or [
+                self.block_size
+            ] * max(1, len(self.token_database.groups) or 1)
+            g_total_chunks_lk = [
+                cdiv(lookup_token_len, gbs) for gbs in group_block_sizes
+            ]
+            chunk_groups: list[tuple[int, int]] = []
+            for start, _end, group_id, key in self.token_database.process_tokens(
+                lookup_token_len, block_hashes
             ):
+                g_block = group_block_sizes[group_id]
+                chunk_id = start // g_block
+                if not self.token_database.is_chunk_in_window(
+                    chunk_id, g_total_chunks_lk[group_id], group_id
+                ):
+                    continue
                 keys.append(key.to_string())
-                starts.append(start)
+                chunk_groups.append((chunk_id, group_id))
+
+            if not keys:
+                return 0
 
             # Expand keys for all TP ranks
             multi_tp_keys = keys[:]
@@ -1109,14 +1395,44 @@ class MooncakeStoreWorker:
                 len(multi_tp_keys),
             )
 
-            num_block = len(keys)
-            multi_tp_values = [
-                res[i * num_block : (i + 1) * num_block]
-                for i in range(min(self.tp_size, self.num_kv_head) * self.pp_size)
-            ]
-            index = self._find_min_first_non_one_index(multi_tp_values)
-            if index != -1:
-                return starts[index]
+            n = len(keys)
+            num_rows = min(self.tp_size, self.num_kv_head) * self.pp_size
+            multi_tp_values = [res[i * n : (i + 1) * n] for i in range(num_rows)]
+
+            # First-miss in token space: each missed (chunk_id, group)
+            # maps to `cid * g_block_size`; the min across rows caps the
+            # available prefix.
+            def first_miss_token(row: list[int]) -> int:
+                miss = lookup_token_len
+                for (cid, gid), v in zip(chunk_groups, row):
+                    if v != 1:
+                        miss = min(miss, cid * group_block_sizes[gid])
+                return miss
+
+            per_row_first_miss = [first_miss_token(r) for r in multi_tp_values]
+            min_token = min(per_row_first_miss) if per_row_first_miss else 0
+
+            self._lookup_debug_counter = getattr(self, "_lookup_debug_counter", 0) + 1
+            if self._lookup_debug_counter % 50 == 1:
+                ones_per_row = [
+                    sum(1 for v in row if v == 1) for row in multi_tp_values
+                ]
+                logger.info(
+                    "[mooncake-lookup] call=%d num_keys=%d ones=%s "
+                    "first_miss_token=%s min_first_miss_token=%d",
+                    self._lookup_debug_counter,
+                    len(multi_tp_keys),
+                    ones_per_row,
+                    per_row_first_miss,
+                    min_token,
+                )
+
+            # Round to scheduler block boundary (LCM); self.block_size
+            # is MIN on HMA, see `register_kv_caches`.
+            sched_bs = getattr(self, "scheduler_block_size", self.block_size)
+            if min_token >= lookup_token_len:
+                return lookup_token_len
+            return (min_token // sched_bs) * sched_bs
         except Exception as e:
             self._record_kv_connector_operation(
                 "lookup_exists",
@@ -1127,16 +1443,6 @@ class MooncakeStoreWorker:
             )
             logger.error("Remote connection failed in lookup: %s", e)
             return 0
-        return end
-
-    @staticmethod
-    def _find_min_first_non_one_index(
-        arr: list[list[int]],
-    ) -> int:
-        try:
-            return min(idx for row in arr for idx, val in enumerate(row) if val != 1)
-        except ValueError:
-            return -1
 
     def get_kv_events(self) -> list[BlockStored]:
         if self.enable_kv_events and self.kv_send_thread is not None:

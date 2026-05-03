@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (
     ChunkedTokenDatabase,
+    GroupLayout,
     KeyMetadata,
     LoadSpec,
     ReqMeta,
@@ -20,6 +21,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_metric
     MooncakeStoreConnectorStats,
 )
 
+from .utils import make_kv_cache_config
+
 
 def _make_store_sending_thread(
     store: MagicMock,
@@ -27,8 +30,7 @@ def _make_store_sending_thread(
     token_database = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0), block_size=16
     )
-    token_database.set_kv_caches_base_addr([0x1000])
-    token_database.set_block_len([256])
+    token_database.set_groups([GroupLayout(base_addrs=[0x1000], block_lens=[256])], [0])
     thread = mooncake_store_worker.KVCacheStoreSendingThread(
         store=store,
         token_database=token_database,
@@ -50,8 +52,7 @@ def _make_store_recving_thread(
     token_database = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0), block_size=16
     )
-    token_database.set_kv_caches_base_addr([0x1000])
-    token_database.set_block_len([256])
+    token_database.set_groups([GroupLayout(base_addrs=[0x1000], block_lens=[256])], [0])
     thread = mooncake_store_worker.KVCacheStoreRecvingThread(
         store=store,
         token_database=token_database,
@@ -496,6 +497,93 @@ def test_lookup_records_mooncake_metrics():
     assert stats.data["lookup_exists"][0]["num_keys"] == 2
 
 
+def test_lookup_rounds_first_miss_by_scheduler_block_size_not_min_block_size():
+    """LCM-vs-MIN regression: a C4 miss at token 12000 must round to
+    11776 (LCM=256), not 12000 (MIN=4)."""
+    # DSV4 post-engine-mutation shape: self.block_size=4, scheduler_block_size=256.
+    worker = _make_bare_worker(block_size=4)
+    worker.token_database.set_groups(
+        [
+            GroupLayout(base_addrs=[0x1000 * (i + 1)], block_lens=[256])
+            for i in range(5)
+        ],
+        layer_to_group=[0, 1, 2, 3, 4],
+    )
+    worker.token_database.set_blocks_per_sw([0, 3, 3, 3, 17])
+    worker.token_database.set_group_block_sizes(
+        [256, 64, 64, 4, 8], hash_block_size=4, scheduler_block_size=256
+    )
+    worker.scheduler_block_size = 256
+
+    token_len = 12_004
+    block_hashes = [f"h{i:04d}".encode() for i in range((token_len + 3) // 4)]
+
+    # Build batch_is_exist response: every key hits except C4 chunk 3000
+    # (start=12000). Keys must be in process_tokens order.
+    db = worker.token_database
+    response = []
+    for start, _end, g, _key in db.process_tokens(token_len, block_hashes):
+        gbs = db.group_block_sizes[g]
+        cid = start // gbs
+        if not db.is_chunk_in_window(cid, (token_len + gbs - 1) // gbs, g):
+            continue
+        response.append(0 if (g == 3 and start == 12000) else 1)
+    worker.store.batch_is_exist.return_value = response
+
+    # 12000 is 4-aligned but not 256-aligned. Correct round-down → 11776.
+    assert worker.lookup(token_len, block_hashes) == 11776
+
+    # Control: with scheduler_block_size=4 (the bug), miss returns unrounded.
+    worker.scheduler_block_size = 4
+    assert worker.lookup(token_len, block_hashes) == 12000
+
+
+def test_lookup_does_not_claim_unhashed_partial_tail_as_full_hit():
+    """If token_len is not hash-aligned, skipped tail chunks are not verified.
+
+    process_tokens() intentionally skips chunks whose right edge is not aligned
+    to hash_block_size. lookup() must use the same effective token length for
+    its all-hit shortcut, otherwise all queried keys can hit while the returned
+    prefix includes tail tokens that were never hashed.
+    """
+    worker = _make_bare_worker(block_size=4)
+    worker.token_database.set_groups(
+        [
+            GroupLayout(base_addrs=[0x1000], block_lens=[256]),
+            GroupLayout(base_addrs=[0x2000], block_lens=[256]),
+            GroupLayout(base_addrs=[0x3000], block_lens=[256]),
+            GroupLayout(base_addrs=[0x4000], block_lens=[256]),
+            GroupLayout(base_addrs=[0x5000], block_lens=[256]),
+        ],
+        layer_to_group=[0, 1, 2, 3, 4],
+    )
+    worker.token_database.set_blocks_per_sw([0, 3, 3, 3, 17])
+    worker.token_database.set_group_block_sizes(
+        [256, 64, 64, 4, 8], hash_block_size=4, scheduler_block_size=256
+    )
+    worker.scheduler_block_size = 256
+
+    token_len = 12_005
+    block_hashes = [f"h{i:04d}".encode() for i in range(token_len // 4)]
+
+    db = worker.token_database
+    queried = []
+    for start, end, g, _key in db.process_tokens(token_len, block_hashes):
+        gbs = db.group_block_sizes[g]
+        cid = start // gbs
+        if db.is_chunk_in_window(cid, (token_len + gbs - 1) // gbs, g):
+            queried.append((start, end, g))
+
+    assert queried
+    assert all(end != token_len for _start, end, _g in queried)
+
+    worker.store.batch_is_exist.return_value = [1] * len(queried)
+
+    result = worker.lookup(token_len, block_hashes)
+
+    assert result == 12_004
+
+
 # ---------------------------------------------------------------------------
 # register_kv_caches tests
 # ---------------------------------------------------------------------------
@@ -642,3 +730,28 @@ def test_register_kv_caches_cross_layer_single_segment():
 
     assert worker2.kv_caches_base_addr == worker.kv_caches_base_addr
     assert worker2.block_len == worker.block_len
+
+
+def test_register_cross_layers_kv_caches_allows_synthetic_key_with_config():
+    """Cross-layer registration uses a synthetic key outside kv_cache_groups."""
+    num_blocks = 10
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    worker.kv_cache_config = make_kv_cache_config(block_size=16, swa_enabled=False)
+    tensor = torch.zeros(num_blocks, 256, dtype=torch.float16)
+
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_worker.KVCacheStoreSendingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_worker.KVCacheStoreRecvingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+    ):
+        worker.register_cross_layers_kv_caches(tensor)
+
+    assert len(worker.token_database.groups) == 1
+    assert worker.kv_caches_base_addr == [tensor.untyped_storage().data_ptr()]

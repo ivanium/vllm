@@ -3,7 +3,9 @@
 """Scheduler-side logic for MooncakeStoreConnector."""
 
 import os
-from typing import Any
+from functools import reduce
+from math import lcm
+from typing import Any, cast
 
 import zmq
 
@@ -22,10 +24,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
     get_mooncake_dp_engine_index,
 )
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    SlidingWindowSpec,
+)
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
 
@@ -35,7 +43,11 @@ logger = init_logger(__name__)
 class MooncakeStoreScheduler:
     """Scheduler-side component for MooncakeStoreConnector."""
 
-    def __init__(self, vllm_config: VllmConfig):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig | None = None,
+    ):
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "load_async", False
@@ -45,8 +57,17 @@ class MooncakeStoreScheduler:
         self.load_specs: dict[str, LoadSpec] = {}
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        # Scheduler alignment = LCM(group_block_sizes); engine mutates
+        # cache_config.block_size to MIN for HMA. Fall back to
+        # cache_config.block_size for non-HMA / pre-spec callers.
         self.original_block_size = vllm_config.cache_config.block_size
-        self._block_size = vllm_config.cache_config.block_size
+        if kv_cache_config is not None and kv_cache_config.kv_cache_groups:
+            self._block_size = reduce(
+                lcm,
+                (g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups),
+            )
+        else:
+            self._block_size = vllm_config.cache_config.block_size
         if self.pcp_size > 1:
             self._block_size *= self.pcp_size
         if self.dcp_size > 1:
@@ -59,8 +80,60 @@ class MooncakeStoreScheduler:
                 "discard_partial_chunks", True
             )
         )
-        self._unfinished_requests: dict[str, tuple[Request, list[int]]] = {}
+        self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
         self._unfinished_request_ids: set[str] = set()
+
+        # HMA detection. blocks_per_sw[g] is non-zero only for SlidingWindowSpec
+        # groups; FullAttentionSpec groups stay 0 and are never clipped.
+        self._is_hma_required = False
+        self.blocks_per_sw: list[int] = [0]
+        if kv_cache_config is not None:
+            self._is_hma_required = (
+                not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+                and any(
+                    not isinstance(g.kv_cache_spec, FullAttentionSpec)
+                    for g in kv_cache_config.kv_cache_groups
+                )
+            )
+            sw_sizes_tokens: list[tuple[int, int]] = [
+                (g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size)
+                if isinstance(g.kv_cache_spec, SlidingWindowSpec)
+                else (0, self._block_size)
+                for g in kv_cache_config.kv_cache_groups
+            ]
+            self.blocks_per_sw = [
+                cdiv(n_tokens, block_size) + 1 if n_tokens else 0
+                for n_tokens, block_size in sw_sizes_tokens
+            ]
+
+    def get_sw_clipped_blocks(
+        self,
+        block_ids: tuple[list[int], ...] | list[list[int]],
+    ) -> list[list[int]]:
+        """Clip per-group block IDs to the SWA window. No-op for non-HMA."""
+        if len(block_ids) == 0 or not self._is_hma_required:
+            return list(block_ids)
+        return [
+            blocks[-self.blocks_per_sw[i] :] if self.blocks_per_sw[i] > 0 else blocks
+            for i, blocks in enumerate(block_ids)
+        ]
+
+    def _normalize_block_ids(
+        self,
+        block_ids: tuple[list[int], ...] | list[int] | list[list[int]],
+    ) -> list[list[int]]:
+        """Return a per-group list[list[int]] regardless of input shape."""
+        if isinstance(block_ids, tuple):
+            return self.get_sw_clipped_blocks(block_ids)
+        if (
+            isinstance(block_ids, list)
+            and len(block_ids) > 0
+            and isinstance(block_ids[0], list)
+        ):
+            return self.get_sw_clipped_blocks(cast(list[list[int]], block_ids))
+        # Flat list[int] → wrap as single group, no clipping.
+        flat = cast(list[int], block_ids)
+        return [list(flat)] if flat else [[]]
 
     def get_num_new_matched_tokens(
         self,
@@ -114,9 +187,13 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
-        local_block_ids: list[int] = []
         if num_external_tokens > 0:
-            local_block_ids = blocks.get_block_ids()[0]
+            # Always per-group (tuple) → list[list[int]]; clip SWA groups.
+            local_block_ids = self.get_sw_clipped_blocks(blocks.get_block_ids())
+        else:
+            # One empty group per detected KV cache group, so subsequent
+            # .update() calls have correct shape.
+            local_block_ids = [[] for _ in range(len(self.blocks_per_sw))]
 
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         self._unfinished_request_ids.add(request.request_id)
@@ -174,10 +251,7 @@ class MooncakeStoreScheduler:
             request_tuple = self._unfinished_requests.get(request.req_id)
             request_real = request_tuple[0]  # type: ignore[index]
 
-            if not isinstance(request.block_ids[0], list):
-                unfolded_block_ids = request.block_ids.copy()
-            else:
-                unfolded_block_ids = request.block_ids[0].copy()
+            unfolded_block_ids = self._normalize_block_ids(request.block_ids)
 
             request_tracker = RequestTracker(
                 req_id=request.req_id,
@@ -218,10 +292,7 @@ class MooncakeStoreScheduler:
                 req_meta = None
                 if req_id in self._preempted_req_ids:
                     # Resumed after preemption
-                    if isinstance(new_block_ids, tuple):
-                        new_block_ids = new_block_ids[0].copy()
-                    else:
-                        new_block_ids = new_block_ids.copy()
+                    new_block_ids = self._normalize_block_ids(new_block_ids)
                     self._preempted_req_ids.discard(req_id)
                     load_spec = self.load_specs.pop(req_id, None)
                     request_tuple = self._unfinished_requests.get(req_id)
@@ -346,7 +417,7 @@ class MooncakeStoreScheduler:
     def request_finished(
         self,
         request: Request,
-        block_ids: list[int],
+        block_ids: tuple[list[int], ...] | list[int] | list[list[int]],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Determine whether to delay freeing blocks for async save."""
         if self.kv_role == "kv_consumer":
@@ -354,11 +425,12 @@ class MooncakeStoreScheduler:
         tracker = self._request_trackers.get(request.request_id)
         if tracker is not None and tracker.num_saved_tokens <= 0:
             return False, None
-        delay_free_blocks = len(block_ids) > 0
+        normalized = self._normalize_block_ids(block_ids)
+        delay_free_blocks = any(len(group) > 0 for group in normalized)
         if delay_free_blocks:
             logger.debug(
-                "Delaying free of %d blocks for request %s",
-                len(block_ids),
+                "Delaying free of %s blocks for request %s",
+                [len(g) for g in normalized],
                 request.request_id,
             )
         return delay_free_blocks, None
