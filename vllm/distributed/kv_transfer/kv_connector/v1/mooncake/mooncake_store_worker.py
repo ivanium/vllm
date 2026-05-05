@@ -180,10 +180,6 @@ def _get_usable_disk_offload_buffer_budget_bytes(raw_budget_bytes: int) -> int:
     return max(1, int(raw_budget_bytes * DISK_OFFLOAD_USABLE_BUDGET_RATIO))
 
 
-def _get_usable_disk_offload_batch_key_count(num_keys: int) -> int:
-    return max(1, int(num_keys * DISK_OFFLOAD_USABLE_BUDGET_RATIO))
-
-
 def _split_disk_offload_load_batches(
     keys: list[str],
     addrs: list[list[int]],
@@ -191,7 +187,6 @@ def _split_disk_offload_load_batches(
     usable_budget_bytes: int,
     raw_budget_bytes: int,
 ) -> tuple[list[tuple[list[str], list[list[int]], list[list[int]]]], str | None]:
-    max_batch_keys = _get_usable_disk_offload_batch_key_count(len(keys))
     batches: list[tuple[list[str], list[list[int]], list[list[int]]]] = []
     batch_keys: list[str] = []
     batch_addrs: list[list[int]] = []
@@ -209,10 +204,7 @@ def _split_disk_offload_load_batches(
                 batch_bytes = 0
             batches.append(([key], [addr], [size]))
             continue
-        if batch_keys and (
-            batch_bytes + key_bytes > usable_budget_bytes
-            or len(batch_keys) >= max_batch_keys
-        ):
+        if batch_keys and batch_bytes + key_bytes > usable_budget_bytes:
             batches.append((batch_keys, batch_addrs, batch_sizes))
             batch_keys, batch_addrs, batch_sizes = [], [], []
             batch_bytes = 0
@@ -581,13 +573,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             total_staging_bytes = sum(
                 _estimate_disk_offload_staging_bytes(size) for size in size_list_c
             )
-            usable_batch_keys = _get_usable_disk_offload_batch_key_count(
-                len(key_list_c)
-            )
-            if (
-                total_staging_bytes > self.usable_disk_offload_buffer_budget_bytes
-                or len(key_list_c) > usable_batch_keys
-            ):
+            if total_staging_bytes > self.usable_disk_offload_buffer_budget_bytes:
                 assert self.disk_offload_buffer_budget_bytes is not None
                 load_batches, oversized_key = _split_disk_offload_load_batches(
                     key_list_c,
