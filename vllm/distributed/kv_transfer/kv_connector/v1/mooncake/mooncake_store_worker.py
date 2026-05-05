@@ -64,11 +64,15 @@ class MooncakeStoreConfig:
     protocol: str
     device_name: str
     master_server_address: str
+    enable_offload: bool = False
 
     @staticmethod
     def from_file(file_path: str) -> "MooncakeStoreConfig":
         with open(file_path) as file:
             config = json.load(file)
+        enable_offload = bool(config.get("enable_offload", False)) or os.getenv(
+            "MOONCAKE_ENABLE_OFFLOAD", ""
+        ).lower() in ("1", "true")
         return MooncakeStoreConfig(
             metadata_server=_get_config_or_env_value(
                 config, "metadata_server", "MOONCAKE_TE_META_DATA_SERVER", ""
@@ -83,6 +87,7 @@ class MooncakeStoreConfig:
             master_server_address=_get_config_or_env_value(
                 config, "master_server_address", "MOONCAKE_MASTER", ""
             ),
+            enable_offload=enable_offload,
         )
 
     @staticmethod
@@ -118,7 +123,9 @@ def _get_kv_connector_extra_config(vllm_config: VllmConfig) -> Mapping[str, Any]
     return kv_transfer_config.kv_connector_extra_config
 
 
-def _get_disk_offload_buffer_budget_bytes() -> int:
+def _get_disk_offload_buffer_budget_bytes(enable_offload: bool) -> int | None:
+    if not enable_offload:
+        return None
     value = os.getenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES")
     if value is None:
         return DEFAULT_MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE
@@ -746,7 +753,9 @@ class MooncakeStoreWorker:
             self.store_replicate_config = ReplicateConfig()
             self.store_replicate_config.preferred_segment = preferred_segment
 
-        self.disk_offload_buffer_budget_bytes = _get_disk_offload_buffer_budget_bytes()
+        self.disk_offload_buffer_budget_bytes = _get_disk_offload_buffer_budget_bytes(
+            store_config.enable_offload
+        )
 
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = False
