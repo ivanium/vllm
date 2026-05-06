@@ -70,9 +70,6 @@ class MooncakeStoreConfig:
     def from_file(file_path: str) -> "MooncakeStoreConfig":
         with open(file_path) as file:
             config = json.load(file)
-        enable_offload = bool(config.get("enable_offload", False)) or os.getenv(
-            "MOONCAKE_ENABLE_OFFLOAD", ""
-        ).lower() in ("1", "true")
         return MooncakeStoreConfig(
             metadata_server=_get_config_or_env_value(
                 config, "metadata_server", "MOONCAKE_TE_META_DATA_SERVER", ""
@@ -87,7 +84,9 @@ class MooncakeStoreConfig:
             master_server_address=_get_config_or_env_value(
                 config, "master_server_address", "MOONCAKE_MASTER", ""
             ),
-            enable_offload=enable_offload,
+            enable_offload=_get_bool_config_or_env_value(
+                config, "enable_offload", "MOONCAKE_ENABLE_OFFLOAD", False
+            ),
         )
 
     @staticmethod
@@ -107,6 +106,15 @@ def _get_config_or_env_value(
     if env_value not in (None, ""):
         return env_value
     return config.get(key, default)
+
+
+def _get_bool_config_or_env_value(
+    config: Mapping[str, Any], key: str, env_var: str, default: bool
+) -> bool:
+    env_value = os.getenv(env_var)
+    if env_value:
+        return env_value.strip().lower() in ("1", "true")
+    return bool(config.get(key, default))
 
 
 def _get_requester_local_buffer_size(config: Mapping[str, Any]) -> int:
