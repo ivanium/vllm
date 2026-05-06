@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Data classes for MooncakeStoreConnector."""
 
-from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import reduce
 from math import lcm
@@ -82,6 +81,84 @@ class GroupLayout:
     block_lens: list[int]
 
 
+@dataclass
+class GroupDatabase:
+    """Token/address database for one KV cache group.
+
+    This owns the group's memory layout and block sizing. The parent
+    ``ChunkedTokenDatabase`` holds the group list and flat layout views, while
+    group-specific callers use this object directly.
+    """
+
+    metadata: KeyMetadata
+    group_id: int
+    layout: GroupLayout
+    block_size: int
+    hash_block_size: int
+    emit_group_id: bool = False
+
+    def _make_key_by_hash(self, chunk_hash: str) -> PoolKey:
+        return PoolKey(
+            self.metadata,
+            chunk_hash,
+            self.group_id if self.emit_group_id else None,
+        )
+
+    def make_key(self, chunk_hash: BlockHash | bytes | str) -> PoolKey:
+        """Build this group's Mooncake key from a right-edge chunk hash."""
+        if isinstance(chunk_hash, str):
+            hash_str = chunk_hash
+        else:
+            hash_str = bytes(chunk_hash).hex()
+        return self._make_key_by_hash(hash_str)
+
+    def _select_block_ids(
+        self,
+        block_ids: list[list[int]] | list[int],
+    ) -> list[int]:
+        """Accept either full per-group block_ids or this group's local list."""
+        if block_ids and isinstance(block_ids[0], list):
+            per_group = cast(list[list[int]], block_ids)
+            if self.group_id >= len(per_group):
+                return []
+            return per_group[self.group_id]
+        return cast(list[int], block_ids)
+
+    def prepare_value(
+        self,
+        start: int,
+        end: int,
+        block_ids: list[list[int]] | list[int],
+        total_chunks: int,
+    ) -> tuple[list[int], list[int], int]:
+        """Memory addrs + sizes for ``[start, end)`` in this group."""
+        group_block_ids = self._select_block_ids(block_ids)
+        chunk_id = start // self.block_size
+        local_i = chunk_id - (total_chunks - len(group_block_ids))
+
+        addr_list: list[int] = []
+        size_list: list[int] = []
+        last_block_id = 0
+        for base_addr, block_len in zip(
+            self.layout.base_addrs,
+            self.layout.block_lens,
+            strict=True,
+        ):
+            if not (0 <= local_i < len(group_block_ids)):
+                # No resident block for this logical chunk. Coordinated
+                # transfer plans avoid this; preserve list shape defensively.
+                addr_list.append(0)
+                size_list.append(0)
+                continue
+            block_id = group_block_ids[local_i]
+            addr = base_addr + block_id * block_len
+            size = int(block_len / self.block_size * (end - start))
+            addr_list.append(addr)
+            size_list.append(size)
+            last_block_id = block_id
+        return addr_list, size_list, last_block_id
+
+
 class ChunkedTokenDatabase:
     """Maps token positions to store keys and GPU memory addresses."""
 
@@ -96,8 +173,6 @@ class ChunkedTokenDatabase:
         self.groups: list[GroupLayout] = []
         # layer_to_group[seg_idx] -> which group owns segment seg_idx.
         self.layer_to_group: list[int] = []
-        # Per-group SWA window in blocks; 0 = FA / no clip.
-        self.blocks_per_sw: list[int] = []
         # Per-group native block_size in tokens (HMA: mixed; else uniform).
         self.group_block_sizes: list[int] = []
         # block_hashes granularity = GCD(group_block_sizes). Each chunk's
@@ -107,13 +182,7 @@ class ChunkedTokenDatabase:
         # lookup return-value rounding and mask_num. NOT cache_config.block_size:
         # engine mutates that to MIN(group_block_sizes) for HMA.
         self.scheduler_block_size: int = block_size
-
-    def _make_key_by_hash(
-        self,
-        chunk_hash: str,
-        group_id: int | None = None,
-    ) -> PoolKey:
-        return PoolKey(self.metadata, chunk_hash, group_id)
+        self.group_dbs: list[GroupDatabase] = []
 
     def set_groups(
         self,
@@ -130,18 +199,7 @@ class ChunkedTokenDatabase:
             flat_lens.extend(layout.block_lens)
         self.kv_caches_base_addr = flat_addrs
         self.block_len = flat_lens
-        # Default to "no window" so legacy single-group callers behave like FA.
-        if len(self.blocks_per_sw) != len(groups):
-            self.blocks_per_sw = [0] * len(groups)
-
-    def set_blocks_per_sw(self, blocks_per_sw: list[int]) -> None:
-        """Per-group window in blocks (0 = FA / no clip)."""
-        if self.groups and len(blocks_per_sw) != len(self.groups):
-            raise ValueError(
-                f"blocks_per_sw length {len(blocks_per_sw)} != "
-                f"num_groups {len(self.groups)}"
-            )
-        self.blocks_per_sw = list(blocks_per_sw)
+        self._rebuild_group_dbs()
 
     def set_group_block_sizes(
         self,
@@ -166,6 +224,7 @@ class ChunkedTokenDatabase:
             self.scheduler_block_size = reduce(lcm, group_block_sizes)
         else:
             self.scheduler_block_size = self.block_size
+        self._rebuild_group_dbs()
 
     def _g_block_size(self, group_id: int) -> int:
         """Return group `group_id`'s native block_size (falls back to global)."""
@@ -173,177 +232,36 @@ class ChunkedTokenDatabase:
             return self.group_block_sizes[group_id]
         return self.block_size
 
-    @staticmethod
-    def _normalize_per_group(
-        block_ids: list[list[int]] | list[int],
-    ) -> list[list[int]]:
-        """Coerce a flat list[int] to a single-group list[list[int]]."""
-        if block_ids and not isinstance(block_ids[0], list):
-            return [cast(list[int], block_ids)]
-        return cast(list[list[int]], block_ids)
+    def _rebuild_group_dbs(self) -> None:
+        """Rebuild per-group databases from the current group geometry."""
+        emit_group_id = len(self.groups) > 1
+        self.group_dbs = [
+            GroupDatabase(
+                metadata=self.metadata,
+                group_id=group_id,
+                layout=layout,
+                block_size=self._g_block_size(group_id),
+                hash_block_size=self.hash_block_size,
+                emit_group_id=emit_group_id,
+            )
+            for group_id, layout in enumerate(self.groups)
+        ]
 
-    def prepare_value(
-        self,
-        start: int,
-        end: int,
-        block_ids: list[list[int]] | list[int],
-        group_id: int | None = None,
-        total_chunks: int | None = None,
-    ) -> tuple[list[int], list[int], int]:
-        """Memory addrs + sizes for a token range.
-
-        With `group_id` set, emits only that group's segments at its native
-        block_size. Without it, emits all segments scaled by `self.block_size`
-        (single-group / pre-HMA shape). `total_chunks` defaults to
-        `max(len(g))`.
-        """
-        per_group = self._normalize_per_group(block_ids)
-        scoped_block_size = (
-            self._g_block_size(group_id) if group_id is not None else self.block_size
-        )
-        chunk_id = start // scoped_block_size
-        if total_chunks is None:
-            total_chunks = max(len(g) for g in per_group) if per_group else 0
-        # SWA groups have shorter block_ids; offset shifts chunk_id into the
-        # group's local frame.
-        per_group_local: list[int] = []
-        for group in per_group:
-            offset = total_chunks - len(group)
-            local_i = chunk_id - offset
-            per_group_local.append(local_i if 0 <= local_i < len(group) else -1)
-
-        addr_list: list[int] = []
-        size_list: list[int] = []
-        last_block_id = 0
-        for seg_idx, base_addr in enumerate(self.kv_caches_base_addr):
-            g = self.layer_to_group[seg_idx] if self.layer_to_group else 0
-            if group_id is not None and g != group_id:
-                continue
-            local_i = per_group_local[g]
-            if local_i < 0:
-                # Out-of-window; per-group callers filter via
-                # is_chunk_in_window. Emit zeros to preserve list shape.
-                addr_list.append(0)
-                size_list.append(0)
-                continue
-            block_id = per_group[g][local_i]
-            block_len = self.block_len[seg_idx]
-            addr = base_addr + block_id * block_len
-            size = int(block_len / scoped_block_size * (end - start))
-            addr_list.append(addr)
-            size_list.append(size)
-            last_block_id = block_id
-        return addr_list, size_list, last_block_id
-
-    def is_chunk_savable(
-        self,
-        start: int,
-        block_ids: list[list[int]] | list[int],
-    ) -> bool:
-        """Legacy all-groups gate. Per-group code uses is_chunk_in_window*."""
-        per_group = self._normalize_per_group(block_ids)
-        if not per_group:
-            return False
-        chunk_id = start // self.block_size
-        total_chunks = max(len(g) for g in per_group)
-        for group in per_group:
-            offset = total_chunks - len(group)
-            local_i = chunk_id - offset
-            if not (0 <= local_i < len(group)):
-                return False
-        return True
-
-    def is_chunk_in_window(
-        self,
-        chunk_id: int,
-        total_chunks: int,
-        group_id: int,
-    ) -> bool:
-        """Lookup-side window check using static `blocks_per_sw` (no block_ids)."""
-        if not self.blocks_per_sw or group_id >= len(self.blocks_per_sw):
-            return True
-        sw_blocks = self.blocks_per_sw[group_id]
-        if sw_blocks == 0:
-            return True
-        return chunk_id >= total_chunks - sw_blocks
-
-    def is_chunk_in_window_per_request(
-        self,
-        chunk_id: int,
-        block_ids: list[list[int]] | list[int],
-        group_id: int,
-        total_chunks: int | None = None,
-    ) -> bool:
-        """Save/load-side window check using observed `block_ids` shape.
-
-        `total_chunks` must match the lookup path (= `cdiv(token_len,
-        block_size)`); without it SWA offsets disagree by ±1 when vllm
-        allocates a scratch block beyond the live prefix. Defaults to
-        `max(len(g))`.
-        """
-        per_group = self._normalize_per_group(block_ids)
-        if not per_group or group_id >= len(per_group):
-            return True
-        if total_chunks is None:
-            total_chunks = max(len(g) for g in per_group)
-        group_blocks = per_group[group_id]
-        local_i = chunk_id - (total_chunks - len(group_blocks))
-        return 0 <= local_i < len(group_blocks)
-
-    def process_tokens(
-        self,
-        token_len: int,
-        block_hashes: list[BlockHash] | list[str],
-        mask_num: int = 0,
-    ) -> Iterable[tuple[int, int, int, PoolKey]]:
-        """Yield (start, end, group_id, pool_key) per (chunk, group).
-
-        Each group iterates at its OWN native block_size; callers
-        window-clip via `is_chunk_in_window*`.
-
-        Each key's hash is `block_hashes[end_idx // hash_block_size - 1]`
-        (right-edge), so groups with `g_block_size > hash_block_size`
-        fingerprint the full chunk content instead of only the first
-        `hash_block_size` tokens.
-
-        Single-group keys use `group_id=None` so the wire format matches
-        the pre-HMA shape; existing master state stays valid. Callers
-        must filter out-of-window (chunk, group) tuples themselves.
-        """
-        if not block_hashes:
-            return
-        if not isinstance(block_hashes[0], str):
-            block_hashes = [
-                h.hex()  # type: ignore[union-attr]
-                for h in block_hashes
-            ]
-        num_groups = max(1, len(self.groups))
-        emit_group_id = num_groups > 1
-        n_hashes = len(block_hashes)
-        hash_bs = max(1, self.hash_block_size)
-        for g in range(num_groups):
-            g_block_size = self._g_block_size(g)
-            chunk_id = 0
-            while True:
-                start_idx = chunk_id * g_block_size
-                if start_idx >= token_len:
-                    break
-                end_idx = min(start_idx + g_block_size, token_len)
-                if start_idx >= mask_num:
-                    # Skip non-hash-aligned partial tail: block_hashes
-                    # only fingerprints up to the last full hash_bs
-                    # boundary, so emitting a key here would leave the
-                    # trailing 1..hash_bs-1 tokens unfingerprinted.
-                    if end_idx % hash_bs != 0:
-                        chunk_id += 1
-                        continue
-                    hash_idx = end_idx // hash_bs - 1
-                    if 0 <= hash_idx < n_hashes:
-                        key = self._make_key_by_hash(
-                            block_hashes[hash_idx], g if emit_group_id else None
-                        )
-                        yield start_idx, end_idx, g, key
-                chunk_id += 1
+    def group(self, group_id: int) -> GroupDatabase:
+        """Return the independent token database for one KV cache group."""
+        if not self.group_dbs and group_id == 0:
+            return GroupDatabase(
+                metadata=self.metadata,
+                group_id=0,
+                layout=GroupLayout(
+                    base_addrs=self.kv_caches_base_addr,
+                    block_lens=self.block_len,
+                ),
+                block_size=self.block_size,
+                hash_block_size=self.hash_block_size,
+                emit_group_id=False,
+            )
+        return self.group_dbs[group_id]
 
 
 @dataclass
@@ -375,7 +293,7 @@ class RequestTracker:
 
         Accepts:
           - tuple/list of per-group block lists (HMA shape)
-          - flat list[int] for legacy single-group callers
+          - flat list[int] for single-group callers
         """
         if len(new_block_ids) == 0:
             return

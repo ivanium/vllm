@@ -168,15 +168,21 @@ def test_prepare_value_picks_right_group_block_ids():
     sw_block_ids = list(range(100, 109))
     block_ids_per_group = [fa_block_ids, sw_block_ids]
 
-    # Chunk 19 (last): SWA local index = 19 - (20 - 9) = 8 → 108.
-    addr_list, size_list, _ = db.prepare_value(
+    # Chunk 19 (last): FA local index = 19; SWA local index = 19 - (20 - 9) = 8 → 108.
+    fa_addr, _, _ = db.group(0).prepare_value(
         start=19 * block_size,
         end=20 * block_size,
         block_ids=block_ids_per_group,
+        total_chunks=20,
     )
-    assert len(addr_list) == 2
-    assert addr_list[0] == 0x1000 + 19 * 256  # FA: block 19
-    assert addr_list[1] == 0x2000 + 108 * 256  # SWA: block 108
+    sw_addr, _, _ = db.group(1).prepare_value(
+        start=19 * block_size,
+        end=20 * block_size,
+        block_ids=block_ids_per_group,
+        total_chunks=20,
+    )
+    assert fa_addr == [0x1000 + 19 * 256]
+    assert sw_addr == [0x2000 + 108 * 256]
 
 
 @pytest.mark.cpu_test
@@ -196,42 +202,54 @@ def test_prepare_value_single_group_unchanged():
     db.set_groups([layout], layer_to_group=[0, 0])
 
     block_ids_per_group = [[5, 6, 7, 8]]
-    addr_list, _, _ = db.prepare_value(
+    addr_list, _, _ = db.group(0).prepare_value(
         start=2 * block_size,
         end=3 * block_size,
         block_ids=block_ids_per_group,
+        total_chunks=4,
     )
     assert addr_list == [0x1000 + 7 * 256, 0x2000 + 7 * 256]
 
 
 @pytest.mark.cpu_test
-def test_is_chunk_savable_intersection_of_groups():
-    """A chunk is savable iff it lies within every group's window."""
+def test_group_database_accepts_group_local_block_ids():
+    """Each group DB owns its layout and accepts that group's block table."""
     block_size = 16
-    metadata = KeyMetadata(
-        model_name="m",
-        tp_rank=0,
-        pcp_rank=0,
-        dcp_rank=0,
-        pp_rank=0,
-    )
-    db = ChunkedTokenDatabase(metadata, block_size=block_size)
+    db = ChunkedTokenDatabase(KeyMetadata("m", 0, 0, 0, 0), block_size=block_size)
     db.set_groups(
         [
             GroupLayout(base_addrs=[0x1000], block_lens=[256]),
-            GroupLayout(base_addrs=[0x2000], block_lens=[256]),
+            GroupLayout(base_addrs=[0x2000], block_lens=[512]),
         ],
         layer_to_group=[0, 1],
     )
+    db.set_group_block_sizes(
+        [block_size, block_size],
+        hash_block_size=block_size,
+        scheduler_block_size=block_size,
+    )
 
     fa = list(range(20))
-    sw = list(range(100, 109))  # group_start_chunk = 11
+    sw = list(range(100, 109))
     block_ids = [fa, sw]
 
-    assert db.is_chunk_savable(start=5 * block_size, block_ids=block_ids) is False
-    assert db.is_chunk_savable(start=11 * block_size, block_ids=block_ids) is True
-    assert db.is_chunk_savable(start=19 * block_size, block_ids=block_ids) is True
-    assert db.is_chunk_savable(start=20 * block_size, block_ids=block_ids) is False
+    g1 = db.group(1)
+    per_group_addr, per_group_size, per_group_block_id = g1.prepare_value(
+        start=19 * block_size,
+        end=20 * block_size,
+        block_ids=block_ids,
+        total_chunks=20,
+    )
+    local_addr, local_size, local_block_id = g1.prepare_value(
+        start=19 * block_size,
+        end=20 * block_size,
+        block_ids=sw,
+        total_chunks=20,
+    )
+
+    assert per_group_addr == local_addr == [0x2000 + 108 * 512]
+    assert per_group_size == local_size == [512]
+    assert per_group_block_id == local_block_id == 108
 
 
 # ---------------------------------------------------------------------------
@@ -339,76 +357,8 @@ def _dsv4_db():
         ],
         layer_to_group=[0, 1, 2, 3, 4],
     )
-    db.set_blocks_per_sw([0, 3, 3, 3, 17])
     db.set_group_block_sizes([256, 64, 64, 4, 8], hash_block_size=4)
     return db
-
-
-@pytest.mark.cpu_test
-def test_dsv4_process_tokens_emits_per_group_native_chunks():
-    """Each group walks its own native block_size; key hash is right-edge."""
-    db = _dsv4_db()
-    token_len = 12_000  # divisible by all group block sizes
-    n_hashes = token_len // 4
-    hashes = [f"h{i:04d}" for i in range(n_hashes)]
-
-    by_group: dict[int, list[tuple[int, int, str]]] = {g: [] for g in range(5)}
-    for start, end, g, key in db.process_tokens(token_len, hashes):
-        by_group[g].append((start, end, key.chunk_hash))
-
-    # cdiv(12000, gbs) per group.
-    assert [len(by_group[g]) for g in range(5)] == [47, 188, 188, 3000, 1500]
-
-    # FA chunk 0 [0, 256) → hash_idx 63 → h0063.
-    assert by_group[0][0] == (0, 256, "h0063")
-    assert by_group[0][1] == (256, 512, "h0127")
-    # FA last chunk [11776, 12000) → hash_idx 2999 → h2999.
-    # Note: token_len=12000, FA ceil(12000/256)=47, last chunk is partial
-    # (12000-11776=224 tokens) but end_idx=12000 is hash-aligned.
-    assert by_group[0][46] == (11776, 12000, "h2999")
-    # SWA group 1 last chunk [11968, 12000) → same hash index.
-    assert by_group[1][187] == (11968, 12000, "h2999")
-    # C4 last chunk [11996, 12000) → same hash index.
-    assert by_group[3][2999] == (11996, 12000, "h2999")
-
-
-@pytest.mark.cpu_test
-def test_dsv4_window_clipping_yields_47_3_3_3_17_in_window_keys():
-    """Save-side window: FA all + SWA tails + compressor tail = 73 keys."""
-    db = _dsv4_db()
-    token_len = 12_000
-    hashes = [f"h{i:04d}" for i in range(token_len // 4)]
-    block_ids = [
-        list(range(47)),
-        list(range(3)),
-        list(range(3)),
-        list(range(3)),
-        list(range(17)),
-    ]
-    g_total = [47, 188, 188, 3000, 1500]
-
-    in_window = []
-    for start, _end, g, _key in db.process_tokens(token_len, hashes):
-        chunk_id = start // db.group_block_sizes[g]
-        if db.is_chunk_in_window_per_request(chunk_id, block_ids, g, g_total[g]):
-            in_window.append(g)
-
-    per_group_count = [in_window.count(k) for k in range(5)]
-    assert per_group_count == [47, 3, 3, 3, 17]
-
-
-@pytest.mark.cpu_test
-def test_dsv4_lookup_window_static_uses_blocks_per_sw():
-    """Lookup-side window check (no block_ids) agrees with save-side."""
-    db = _dsv4_db()
-    g_total = [47, 188, 188, 3000, 1500]
-    in_window = sum(
-        1
-        for g in range(5)
-        for c in range(g_total[g])
-        if db.is_chunk_in_window(c, g_total[g], g)
-    )
-    assert in_window == 73
 
 
 @pytest.mark.cpu_test
@@ -430,18 +380,3 @@ def test_set_group_block_sizes_explicit_scheduler_block_size():
     )
     db.set_group_block_sizes([256, 64], hash_block_size=64, scheduler_block_size=512)
     assert db.scheduler_block_size == 512
-
-
-@pytest.mark.cpu_test
-def test_dsv4_partial_last_chunk_indexes_safely():
-    """Last chunk of every group uses end_idx // hash_bs - 1 in range."""
-    db = _dsv4_db()
-    token_len = 12_000
-    hashes = [f"h{i:04d}" for i in range(token_len // 4)]
-
-    by_group_last: dict[int, tuple[int, int, str]] = {}
-    for start, end, g, key in db.process_tokens(token_len, hashes):
-        by_group_last[g] = (start, end, key.chunk_hash)
-
-    for g, (start, end, h) in by_group_last.items():
-        assert h == f"h{end // 4 - 1:04d}", f"group {g} chunk [{start}, {end}): {h}"
