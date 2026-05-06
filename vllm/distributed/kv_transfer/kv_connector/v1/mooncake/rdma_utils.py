@@ -3,9 +3,6 @@
 """Minimal Mooncake requester config helpers."""
 
 import os
-import re
-import socket
-import urllib.request
 from collections.abc import Mapping
 from typing import Any
 
@@ -15,10 +12,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_SEGMENT_METRIC_RE = re.compile(
-    r'^segment_total_capacity_bytes\{segment="([^"]+)"\}\s+', re.MULTILINE
-)
-_AUTO_DETECT_TIMEOUT_SECONDS = 2.0
+_PREFERRED_SEGMENT_ENV = "MOONCAKE_PREFERRED_SEGMENT"
 
 
 def normalize_string_override(value: Any) -> str | None:
@@ -51,59 +45,6 @@ def get_requester_local_hostname(local_ip: str) -> str:
     return local_ip
 
 
-def _enumerate_local_ipv4_addresses() -> set[str]:
-    """Return all local non-loopback IPv4 addresses across every NIC."""
-    try:
-        import psutil
-    except ImportError:
-        return set()
-    addresses: set[str] = set()
-    try:
-        for _, addrs in psutil.net_if_addrs().items():
-            for addr in addrs:
-                if addr.family != socket.AF_INET:
-                    continue
-                if not addr.address or addr.address.startswith("127."):
-                    continue
-                addresses.add(addr.address)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Mooncake could not enumerate local IPs: %s", exc)
-    return addresses
-
-
-def _fetch_master_segments(metrics_url: str) -> list[str]:
-    """Pull `segment_total_capacity_bytes` labels from the master /metrics page."""
-    try:
-        with urllib.request.urlopen(  # noqa: S310 - operator-controlled URL
-            metrics_url, timeout=_AUTO_DETECT_TIMEOUT_SECONDS
-        ) as resp:
-            text = resp.read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        logger.debug(
-            "Mooncake could not fetch master metrics from %s: %s", metrics_url, exc
-        )
-        return []
-    return _SEGMENT_METRIC_RE.findall(text)
-
-
-def _auto_detect_preferred_segment(metrics_url: str) -> str | None:
-    """Pick the master segment whose host matches a local IP, or None."""
-    local_ips = _enumerate_local_ipv4_addresses()
-    if not local_ips:
-        return None
-    for segment in _fetch_master_segments(metrics_url):
-        host, _, _ = segment.partition(":")
-        if host in local_ips:
-            logger.info(
-                "Mooncake auto-detected local owner segment %s from master "
-                "/metrics (matched local IP %s)",
-                segment,
-                host,
-            )
-            return segment
-    return None
-
-
 def get_configured_preferred_segment(
     extra_config: Mapping[str, Any],
 ) -> str | None:
@@ -115,16 +56,15 @@ def get_configured_preferred_segment(
             "Mooncake preferred_segment override must be a non-empty string"
         )
 
-    # Auto-detect: query master /metrics, find the segment whose host matches
-    # any local IP. This is best-effort — failures fall back to None (random
-    # allocator), so the worker still functions in deployments without an
-    # accessible master HTTP endpoint.
-    metrics_url = normalize_string_override(
-        extra_config.get("master_metrics_url")
-    ) or normalize_string_override(os.getenv("MOONCAKE_MASTER_METRICS_URL"))
-    if metrics_url is None:
-        return None
-    return _auto_detect_preferred_segment(metrics_url)
+    env_value = normalize_string_override(os.getenv(_PREFERRED_SEGMENT_ENV))
+    if env_value is not None:
+        logger.info(
+            "Mooncake preferred_segment from %s: %s",
+            _PREFERRED_SEGMENT_ENV,
+            env_value,
+        )
+        return env_value
+    return None
 
 
 def _get_explicit_worker_rnic(device_list: str) -> str:
