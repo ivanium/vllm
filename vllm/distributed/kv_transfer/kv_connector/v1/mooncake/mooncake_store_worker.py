@@ -64,6 +64,7 @@ class MooncakeStoreConfig:
     protocol: str
     device_name: str
     master_server_address: str
+    enable_offload: bool = False
 
     @staticmethod
     def from_file(file_path: str) -> "MooncakeStoreConfig":
@@ -82,6 +83,9 @@ class MooncakeStoreConfig:
             ),
             master_server_address=_get_config_or_env_value(
                 config, "master_server_address", "MOONCAKE_MASTER", ""
+            ),
+            enable_offload=_get_bool_config_or_env_value(
+                config, "enable_offload", "MOONCAKE_ENABLE_OFFLOAD", False
             ),
         )
 
@@ -104,6 +108,15 @@ def _get_config_or_env_value(
     return config.get(key, default)
 
 
+def _get_bool_config_or_env_value(
+    config: Mapping[str, Any], key: str, env_var: str, default: bool
+) -> bool:
+    env_value = os.getenv(env_var)
+    if env_value:
+        return env_value.strip().lower() in ("1", "true")
+    return bool(config.get(key, default))
+
+
 def _get_requester_local_buffer_size(config: Mapping[str, Any]) -> int:
     value = config.get("local_buffer_size")
     if value is None:
@@ -118,7 +131,9 @@ def _get_kv_connector_extra_config(vllm_config: VllmConfig) -> Mapping[str, Any]
     return kv_transfer_config.kv_connector_extra_config
 
 
-def _get_disk_offload_buffer_budget_bytes() -> int:
+def _get_disk_offload_buffer_budget_bytes(enable_offload: bool) -> int | None:
+    if not enable_offload:
+        return None
     value = os.getenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES")
     if value is None:
         return DEFAULT_MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE
@@ -173,10 +188,6 @@ def _get_usable_disk_offload_buffer_budget_bytes(raw_budget_bytes: int) -> int:
     return max(1, int(raw_budget_bytes * DISK_OFFLOAD_USABLE_BUDGET_RATIO))
 
 
-def _get_usable_disk_offload_batch_key_count(num_keys: int) -> int:
-    return max(1, int(num_keys * DISK_OFFLOAD_USABLE_BUDGET_RATIO))
-
-
 def _split_disk_offload_load_batches(
     keys: list[str],
     addrs: list[list[int]],
@@ -184,7 +195,6 @@ def _split_disk_offload_load_batches(
     usable_budget_bytes: int,
     raw_budget_bytes: int,
 ) -> tuple[list[tuple[list[str], list[list[int]], list[list[int]]]], str | None]:
-    max_batch_keys = _get_usable_disk_offload_batch_key_count(len(keys))
     batches: list[tuple[list[str], list[list[int]], list[list[int]]]] = []
     batch_keys: list[str] = []
     batch_addrs: list[list[int]] = []
@@ -202,10 +212,7 @@ def _split_disk_offload_load_batches(
                 batch_bytes = 0
             batches.append(([key], [addr], [size]))
             continue
-        if batch_keys and (
-            batch_bytes + key_bytes > usable_budget_bytes
-            or len(batch_keys) >= max_batch_keys
-        ):
+        if batch_keys and batch_bytes + key_bytes > usable_budget_bytes:
             batches.append((batch_keys, batch_addrs, batch_sizes))
             batch_keys, batch_addrs, batch_sizes = [], [], []
             batch_bytes = 0
@@ -574,13 +581,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             total_staging_bytes = sum(
                 _estimate_disk_offload_staging_bytes(size) for size in size_list_c
             )
-            usable_batch_keys = _get_usable_disk_offload_batch_key_count(
-                len(key_list_c)
-            )
-            if (
-                total_staging_bytes > self.usable_disk_offload_buffer_budget_bytes
-                or len(key_list_c) > usable_batch_keys
-            ):
+            if total_staging_bytes > self.usable_disk_offload_buffer_budget_bytes:
                 assert self.disk_offload_buffer_budget_bytes is not None
                 load_batches, oversized_key = _split_disk_offload_load_batches(
                     key_list_c,
@@ -746,7 +747,9 @@ class MooncakeStoreWorker:
             self.store_replicate_config = ReplicateConfig()
             self.store_replicate_config.preferred_segment = preferred_segment
 
-        self.disk_offload_buffer_budget_bytes = _get_disk_offload_buffer_budget_bytes()
+        self.disk_offload_buffer_budget_bytes = _get_disk_offload_buffer_budget_bytes(
+            store_config.enable_offload
+        )
 
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = False
