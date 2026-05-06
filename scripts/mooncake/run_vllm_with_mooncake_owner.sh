@@ -344,11 +344,6 @@ if [[ "$MOONCAKE_PROTOCOL" == "rdma" || "$MOONCAKE_PROTOCOL" == "efa" ]]; then
     fi
 fi
 
-if command_has_kv_transfer_config "$@"; then
-    echo "Error: run_vllm_with_mooncake_owner.sh injects Mooncake --kv-transfer-config automatically. Remove the explicit --kv-transfer-config from the wrapped command." >&2
-    exit 1
-fi
-
 prepare_owner_disk_path
 
 if [[ -z "${OWNER_HOST//[[:space:]]/}" ]]; then
@@ -385,8 +380,6 @@ if [[ -n "$OWNER_HOST" ]]; then
     OWNER_CMD+=(--host "$OWNER_HOST")
 fi
 
-KV_TRANSFER_CONFIG_JSON="$(build_kv_transfer_config_json)"
-
 echo "Mooncake master: $MOONCAKE_MASTER"
 echo "Mooncake metadata server: $MOONCAKE_TE_META_DATA_SERVER"
 if [[ -n "${MC_GID_INDEX:-}" ]]; then
@@ -399,7 +392,13 @@ if [[ -n "${OWNER_DEVICE:-}" ]]; then
     echo "Detected owner RNICs: $OWNER_DEVICE"
 fi
 
-SERVER_CMD=("$@" "--kv-transfer-config" "$KV_TRANSFER_CONFIG_JSON")
+if command_has_kv_transfer_config "$@"; then
+    echo "Wrapped command already has --kv-transfer-config; skipping wrapper auto-inject."
+    SERVER_CMD=("$@")
+else
+    KV_TRANSFER_CONFIG_JSON="$(build_kv_transfer_config_json)"
+    SERVER_CMD=("$@" "--kv-transfer-config" "$KV_TRANSFER_CONFIG_JSON")
+fi
 
 trap cleanup EXIT INT TERM
 
