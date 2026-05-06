@@ -218,6 +218,23 @@ def test_get_configured_preferred_segment_returns_explicit_override():
     )
 
 
+def test_get_configured_preferred_segment_prefers_explicit_over_env(monkeypatch):
+    monkeypatch.setenv("MOONCAKE_PREFERRED_SEGMENT", "10.0.0.8:50053")
+
+    assert (
+        rdma_utils.get_configured_preferred_segment(
+            {"preferred_segment": "10.0.0.7:50053"}
+        )
+        == "10.0.0.7:50053"
+    )
+
+
+def test_get_configured_preferred_segment_returns_env_override(monkeypatch):
+    monkeypatch.setenv("MOONCAKE_PREFERRED_SEGMENT", "10.0.0.8:50053")
+
+    assert rdma_utils.get_configured_preferred_segment({}) == "10.0.0.8:50053"
+
+
 def test_get_configured_preferred_segment_rejects_empty_override():
     with pytest.raises(ValueError, match="preferred_segment"):
         rdma_utils.get_configured_preferred_segment({"preferred_segment": "  "})

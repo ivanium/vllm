@@ -12,6 +12,8 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+_PREFERRED_SEGMENT_ENV = "MOONCAKE_PREFERRED_SEGMENT"
+
 
 def normalize_string_override(value: Any) -> str | None:
     if not isinstance(value, str):
@@ -53,6 +55,15 @@ def get_configured_preferred_segment(
         raise ValueError(
             "Mooncake preferred_segment override must be a non-empty string"
         )
+
+    env_value = normalize_string_override(os.getenv(_PREFERRED_SEGMENT_ENV))
+    if env_value is not None:
+        logger.info(
+            "Mooncake preferred_segment from %s: %s",
+            _PREFERRED_SEGMENT_ENV,
+            env_value,
+        )
+        return env_value
     return None
 
 
