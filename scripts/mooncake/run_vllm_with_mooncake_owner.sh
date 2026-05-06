@@ -359,6 +359,9 @@ if [[ -z "${OWNER_HOST//[[:space:]]/}" ]]; then
     exit 1
 fi
 
+export MOONCAKE_PREFERRED_SEGMENT="${OWNER_HOST}:${OWNER_SEGMENT_PORT}"
+echo "Mooncake preferred segment: $MOONCAKE_PREFERRED_SEGMENT"
+
 OWNER_CMD=(
     bash "${SCRIPT_DIR}/start_mooncake_owner.sh"
     --cpu-mem-size "$OWNER_CPU_MEM_GIB"
