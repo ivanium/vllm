@@ -75,7 +75,7 @@ def _make_load_req(
     return ReqMeta(
         req_id=req_id,
         token_len_chunk=token_len,
-        block_ids=list(range(len(block_hashes))),
+        block_ids=[list(range(len(block_hashes)))],
         block_hashes=block_hashes,
         load_spec=LoadSpec(
             vllm_cached_tokens=vllm_cached_tokens,
@@ -90,7 +90,7 @@ def _make_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMeta:
     return ReqMeta(
         req_id=req_id,
         token_len_chunk=32,
-        block_ids=[0, 1],
+        block_ids=[[0, 1]],
         block_hashes=block_hashes,
         can_save=True,
         original_block_size=16,
@@ -420,7 +420,20 @@ def _make_bare_worker(
     Sets only the attributes that register_kv_caches() reads so we can
     test the stride-based layout detection without a real
     MooncakeDistributedStore.
+
+    Also constructs a minimal :class:`MooncakeLookupCoordinator` so
+    :meth:`lookup` works (lookup is now coordinator-only — see
+    ``docs/design/mooncake_lookup_coordinator.md``).
     """
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_lookup_coordinator import (  # noqa: E501
+        MooncakeLookupCoordinator,
+    )
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+    )
+
     worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
     worker.cache_config = MagicMock()
     worker.cache_config.num_gpu_blocks = num_gpu_blocks
@@ -443,6 +456,19 @@ def _make_bare_worker(
     worker.tp_size = 1
     worker.num_kv_head = 1
     worker.pp_size = 1
+    # Default single-group FA coordinator so ``lookup`` works.
+    spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=4, head_size=16, dtype=torch.float16
+    )
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=num_gpu_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
+    )
+    worker._lookup_coordinator = MooncakeLookupCoordinator(
+        worker.kv_cache_config, hash_block_size=block_size
+    )
+    worker._coordinator_construction_failed = False
     return worker
 
 
@@ -497,91 +523,135 @@ def test_lookup_records_mooncake_metrics():
     assert stats.data["lookup_exists"][0]["num_keys"] == 2
 
 
-def test_lookup_rounds_first_miss_by_scheduler_block_size_not_min_block_size():
-    """LCM-vs-MIN regression: a C4 miss at token 12000 must round to
-    11776 (LCM=256), not 12000 (MIN=4)."""
-    # DSV4 post-engine-mutation shape: self.block_size=4, scheduler_block_size=256.
-    worker = _make_bare_worker(block_size=4)
-    worker.token_database.set_groups(
-        [
-            GroupLayout(base_addrs=[0x1000 * (i + 1)], block_lens=[256])
-            for i in range(5)
+def _make_bare_worker_fa_swa(*, block_size: int = 16, sliding_window: int = 64):
+    """Bare worker with one FA group and one SWA group, sharing block_size."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        SlidingWindowSpec,
+    )
+
+    worker = _make_bare_worker(block_size=block_size)
+    fa_spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=4, head_size=16, dtype=torch.float16
+    )
+    swa_spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=4,
+        head_size=16,
+        dtype=torch.float16,
+        sliding_window=sliding_window,
+    )
+    config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["fa0"], fa_spec),
+            KVCacheGroupSpec(["swa0"], swa_spec),
         ],
-        layer_to_group=[0, 1, 2, 3, 4],
     )
-    worker.token_database.set_blocks_per_sw([0, 3, 3, 3, 17])
-    worker.token_database.set_group_block_sizes(
-        [256, 64, 64, 4, 8], hash_block_size=4, scheduler_block_size=256
-    )
-    worker.scheduler_block_size = 256
-
-    token_len = 12_004
-    block_hashes = [f"h{i:04d}".encode() for i in range((token_len + 3) // 4)]
-
-    # Build batch_is_exist response: every key hits except C4 chunk 3000
-    # (start=12000). Keys must be in process_tokens order.
-    db = worker.token_database
-    response = []
-    for start, _end, g, _key in db.process_tokens(token_len, block_hashes):
-        gbs = db.group_block_sizes[g]
-        cid = start // gbs
-        if not db.is_chunk_in_window(cid, (token_len + gbs - 1) // gbs, g):
-            continue
-        response.append(0 if (g == 3 and start == 12000) else 1)
-    worker.store.batch_is_exist.return_value = response
-
-    # 12000 is 4-aligned but not 256-aligned. Correct round-down → 11776.
-    assert worker.lookup(token_len, block_hashes) == 11776
-
-    # Control: with scheduler_block_size=4 (the bug), miss returns unrounded.
-    worker.scheduler_block_size = 4
-    assert worker.lookup(token_len, block_hashes) == 12000
-
-
-def test_lookup_does_not_claim_unhashed_partial_tail_as_full_hit():
-    """If token_len is not hash-aligned, skipped tail chunks are not verified.
-
-    process_tokens() intentionally skips chunks whose right edge is not aligned
-    to hash_block_size. lookup() must use the same effective token length for
-    its all-hit shortcut, otherwise all queried keys can hit while the returned
-    prefix includes tail tokens that were never hashed.
-    """
-    worker = _make_bare_worker(block_size=4)
+    worker.kv_cache_config = config
     worker.token_database.set_groups(
         [
             GroupLayout(base_addrs=[0x1000], block_lens=[256]),
             GroupLayout(base_addrs=[0x2000], block_lens=[256]),
-            GroupLayout(base_addrs=[0x3000], block_lens=[256]),
-            GroupLayout(base_addrs=[0x4000], block_lens=[256]),
-            GroupLayout(base_addrs=[0x5000], block_lens=[256]),
         ],
-        layer_to_group=[0, 1, 2, 3, 4],
+        layer_to_group=[0, 1],
     )
-    worker.token_database.set_blocks_per_sw([0, 3, 3, 3, 17])
+    blocks_per_sw_swa = math.ceil(sliding_window / block_size) + 1
+    worker.token_database.set_blocks_per_sw([0, blocks_per_sw_swa])
     worker.token_database.set_group_block_sizes(
-        [256, 64, 64, 4, 8], hash_block_size=4, scheduler_block_size=256
+        [block_size, block_size],
+        hash_block_size=block_size,
+        scheduler_block_size=block_size,
     )
-    worker.scheduler_block_size = 256
+    worker.scheduler_block_size = block_size
+    return worker
 
-    token_len = 12_005
-    block_hashes = [f"h{i:04d}".encode() for i in range(token_len // 4)]
 
-    db = worker.token_database
-    queried = []
-    for start, end, g, _key in db.process_tokens(token_len, block_hashes):
-        gbs = db.group_block_sizes[g]
-        cid = start // gbs
-        if db.is_chunk_in_window(cid, (token_len + gbs - 1) // gbs, g):
-            queried.append((start, end, g))
+def test_lookup_returns_zero_when_coordinator_construction_failed():
+    """Fail-closed: if coordinator construction failed (unknown spec,
+    misaligned hash block size, ...), lookup returns 0 immediately.
 
-    assert queried
-    assert all(end != token_len for _start, end, _g in queried)
+    There is no legacy single-pass fallback — that path can't express
+    manager-specific hit semantics for the unknown spec either, so
+    falling back would silently over-report hits.
+    """
+    worker = _make_bare_worker()
+    worker._coordinator_construction_failed = True
+    worker._lookup_coordinator = None
+    # Even a valid lookup query returns 0 — never reaches Mooncake.
+    worker.store.batch_is_exist.return_value = [1, 1, 1]
+    assert worker.lookup(48, [b"a0", b"a1", b"a2"]) == 0
+    # batch_is_exist NOT called.
+    worker.store.batch_is_exist.assert_not_called()
 
-    worker.store.batch_is_exist.return_value = [1] * len(queried)
 
-    result = worker.lookup(token_len, block_hashes)
+def test_lookup_coordinator_path_handles_hex_string_hashes():
+    """Regression: scheduler hex-encodes BlockHashes for the ZMQ wire,
+    so worker.lookup receives ``list[str]``. Coordinator path must
+    decode before entering vllm's manager find_longest_cache_hit
+    (which uses ``b"".join`` on hashes for HMA groups).
 
-    assert result == 12_004
+    Before the fix this raised on every lookup:
+        TypeError: sequence item 0: expected a bytes-like object, str found
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_lookup_coordinator import (  # noqa: E501
+        MooncakeLookupCoordinator,
+    )
+
+    block_size = 16
+    sliding_window = 32
+    worker = _make_bare_worker_fa_swa(
+        block_size=block_size, sliding_window=sliding_window
+    )
+    worker._lookup_coordinator = MooncakeLookupCoordinator(
+        worker.kv_cache_config, hash_block_size=block_size
+    )
+
+    token_len = 8 * block_size
+    # HEX-STRING hashes — same shape the worker actually receives.
+    block_hashes = [f"{i:016x}" for i in range(token_len // block_size)]
+    n_all = sum(
+        1 for _ in worker.token_database.process_tokens(token_len, block_hashes)
+    )
+    worker.store.batch_is_exist.return_value = [1] * n_all
+
+    # Should NOT raise. Returns full hit length.
+    assert worker.lookup(token_len, block_hashes) == token_len
+
+
+def test_lookup_coordinator_path_first_chunk_miss_returns_zero():
+    """FA chunk 0 miss → both paths return 0."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_lookup_coordinator import (  # noqa: E501
+        MooncakeLookupCoordinator,
+    )
+
+    block_size = 16
+    sliding_window = 32
+
+    worker = _make_bare_worker_fa_swa(
+        block_size=block_size, sliding_window=sliding_window
+    )
+    worker._lookup_coordinator = MooncakeLookupCoordinator(
+        worker.kv_cache_config, hash_block_size=block_size
+    )
+
+    token_len = 8 * block_size
+    block_hashes = [f"h{i:04d}".encode() for i in range(token_len // block_size)]
+
+    # Build response in process_tokens order (no window filter for coord path).
+    response = []
+    for start, _end, g, _key in worker.token_database.process_tokens(
+        token_len, block_hashes
+    ):
+        cid = start // block_size
+        # FA chunk 0 missed; everything else hits.
+        response.append(0 if (g == 0 and cid == 0) else 1)
+    worker.store.batch_is_exist.return_value = response
+
+    assert worker.lookup(token_len, block_hashes) == 0
 
 
 # ---------------------------------------------------------------------------

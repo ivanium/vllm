@@ -173,41 +173,27 @@ class ChunkedTokenDatabase:
             return self.group_block_sizes[group_id]
         return self.block_size
 
-    @staticmethod
-    def _normalize_per_group(
-        block_ids: list[list[int]] | list[int],
-    ) -> list[list[int]]:
-        """Coerce a flat list[int] to a single-group list[list[int]]."""
-        if block_ids and not isinstance(block_ids[0], list):
-            return [cast(list[int], block_ids)]
-        return cast(list[list[int]], block_ids)
-
     def prepare_value(
         self,
         start: int,
         end: int,
-        block_ids: list[list[int]] | list[int],
-        group_id: int | None = None,
-        total_chunks: int | None = None,
+        block_ids: list[list[int]],
+        group_id: int,
+        total_chunks: int,
     ) -> tuple[list[int], list[int], int]:
-        """Memory addrs + sizes for a token range.
+        """Memory addrs + sizes for ``[start, end)`` in group ``group_id``.
 
-        With `group_id` set, emits only that group's segments at its native
-        block_size. Without it, emits all segments scaled by `self.block_size`
-        (single-group / pre-HMA shape). `total_chunks` defaults to
-        `max(len(g))`.
+        ``block_ids`` is the full per-group list — ``block_ids[g]`` is
+        the (possibly SWA-clipped) block id list for group ``g``. Only
+        segments owned by ``group_id`` (per ``layer_to_group``) are
+        emitted; the others are skipped.
         """
-        per_group = self._normalize_per_group(block_ids)
-        scoped_block_size = (
-            self._g_block_size(group_id) if group_id is not None else self.block_size
-        )
+        scoped_block_size = self._g_block_size(group_id)
         chunk_id = start // scoped_block_size
-        if total_chunks is None:
-            total_chunks = max(len(g) for g in per_group) if per_group else 0
         # SWA groups have shorter block_ids; offset shifts chunk_id into the
         # group's local frame.
         per_group_local: list[int] = []
-        for group in per_group:
+        for group in block_ids:
             offset = total_chunks - len(group)
             local_i = chunk_id - offset
             per_group_local.append(local_i if 0 <= local_i < len(group) else -1)
@@ -217,16 +203,16 @@ class ChunkedTokenDatabase:
         last_block_id = 0
         for seg_idx, base_addr in enumerate(self.kv_caches_base_addr):
             g = self.layer_to_group[seg_idx] if self.layer_to_group else 0
-            if group_id is not None and g != group_id:
+            if g != group_id:
                 continue
             local_i = per_group_local[g]
             if local_i < 0:
-                # Out-of-window; per-group callers filter via
-                # is_chunk_in_window. Emit zeros to preserve list shape.
+                # Out-of-window; callers filter via is_chunk_in_window*.
+                # Emit zeros to preserve list shape.
                 addr_list.append(0)
                 size_list.append(0)
                 continue
-            block_id = per_group[g][local_i]
+            block_id = block_ids[g][local_i]
             block_len = self.block_len[seg_idx]
             addr = base_addr + block_id * block_len
             size = int(block_len / scoped_block_size * (end - start))
@@ -234,24 +220,6 @@ class ChunkedTokenDatabase:
             size_list.append(size)
             last_block_id = block_id
         return addr_list, size_list, last_block_id
-
-    def is_chunk_savable(
-        self,
-        start: int,
-        block_ids: list[list[int]] | list[int],
-    ) -> bool:
-        """Legacy all-groups gate. Per-group code uses is_chunk_in_window*."""
-        per_group = self._normalize_per_group(block_ids)
-        if not per_group:
-            return False
-        chunk_id = start // self.block_size
-        total_chunks = max(len(g) for g in per_group)
-        for group in per_group:
-            offset = total_chunks - len(group)
-            local_i = chunk_id - offset
-            if not (0 <= local_i < len(group)):
-                return False
-        return True
 
     def is_chunk_in_window(
         self,
@@ -270,23 +238,19 @@ class ChunkedTokenDatabase:
     def is_chunk_in_window_per_request(
         self,
         chunk_id: int,
-        block_ids: list[list[int]] | list[int],
+        block_ids: list[list[int]],
         group_id: int,
-        total_chunks: int | None = None,
+        total_chunks: int,
     ) -> bool:
         """Save/load-side window check using observed `block_ids` shape.
 
         `total_chunks` must match the lookup path (= `cdiv(token_len,
         block_size)`); without it SWA offsets disagree by ±1 when vllm
-        allocates a scratch block beyond the live prefix. Defaults to
-        `max(len(g))`.
+        allocates a scratch block beyond the live prefix.
         """
-        per_group = self._normalize_per_group(block_ids)
-        if not per_group or group_id >= len(per_group):
+        if not block_ids or group_id >= len(block_ids):
             return True
-        if total_chunks is None:
-            total_chunks = max(len(g) for g in per_group)
-        group_blocks = per_group[group_id]
+        group_blocks = block_ids[group_id]
         local_i = chunk_id - (total_chunks - len(group_blocks))
         return 0 <= local_i < len(group_blocks)
 

@@ -168,15 +168,23 @@ def test_prepare_value_picks_right_group_block_ids():
     sw_block_ids = list(range(100, 109))
     block_ids_per_group = [fa_block_ids, sw_block_ids]
 
-    # Chunk 19 (last): SWA local index = 19 - (20 - 9) = 8 → 108.
-    addr_list, size_list, _ = db.prepare_value(
+    # Chunk 19 (last): FA local index = 19; SWA local index = 19 - (20 - 9) = 8 → 108.
+    fa_addr, _, _ = db.prepare_value(
         start=19 * block_size,
         end=20 * block_size,
         block_ids=block_ids_per_group,
+        group_id=0,
+        total_chunks=20,
     )
-    assert len(addr_list) == 2
-    assert addr_list[0] == 0x1000 + 19 * 256  # FA: block 19
-    assert addr_list[1] == 0x2000 + 108 * 256  # SWA: block 108
+    sw_addr, _, _ = db.prepare_value(
+        start=19 * block_size,
+        end=20 * block_size,
+        block_ids=block_ids_per_group,
+        group_id=1,
+        total_chunks=20,
+    )
+    assert fa_addr == [0x1000 + 19 * 256]
+    assert sw_addr == [0x2000 + 108 * 256]
 
 
 @pytest.mark.cpu_test
@@ -200,22 +208,17 @@ def test_prepare_value_single_group_unchanged():
         start=2 * block_size,
         end=3 * block_size,
         block_ids=block_ids_per_group,
+        group_id=0,
+        total_chunks=4,
     )
     assert addr_list == [0x1000 + 7 * 256, 0x2000 + 7 * 256]
 
 
 @pytest.mark.cpu_test
-def test_is_chunk_savable_intersection_of_groups():
-    """A chunk is savable iff it lies within every group's window."""
+def test_is_chunk_in_window_per_request_swa_offset():
+    """SWA group's per-request window check uses (total_chunks - len) offset."""
     block_size = 16
-    metadata = KeyMetadata(
-        model_name="m",
-        tp_rank=0,
-        pcp_rank=0,
-        dcp_rank=0,
-        pp_rank=0,
-    )
-    db = ChunkedTokenDatabase(metadata, block_size=block_size)
+    db = ChunkedTokenDatabase(KeyMetadata("m", 0, 0, 0, 0), block_size=block_size)
     db.set_groups(
         [
             GroupLayout(base_addrs=[0x1000], block_lens=[256]),
@@ -225,13 +228,18 @@ def test_is_chunk_savable_intersection_of_groups():
     )
 
     fa = list(range(20))
-    sw = list(range(100, 109))  # group_start_chunk = 11
+    sw = list(range(100, 109))  # SWA holds last 9: covers chunks [11, 20)
     block_ids = [fa, sw]
 
-    assert db.is_chunk_savable(start=5 * block_size, block_ids=block_ids) is False
-    assert db.is_chunk_savable(start=11 * block_size, block_ids=block_ids) is True
-    assert db.is_chunk_savable(start=19 * block_size, block_ids=block_ids) is True
-    assert db.is_chunk_savable(start=20 * block_size, block_ids=block_ids) is False
+    # FA group: every chunk is in window (len matches total_chunks).
+    for cid in (0, 5, 19):
+        assert db.is_chunk_in_window_per_request(cid, block_ids, 0, 20) is True
+
+    # SWA group: only the last 9 chunks are in window.
+    assert db.is_chunk_in_window_per_request(10, block_ids, 1, 20) is False
+    assert db.is_chunk_in_window_per_request(11, block_ids, 1, 20) is True
+    assert db.is_chunk_in_window_per_request(19, block_ids, 1, 20) is True
+    assert db.is_chunk_in_window_per_request(20, block_ids, 1, 20) is False
 
 
 # ---------------------------------------------------------------------------

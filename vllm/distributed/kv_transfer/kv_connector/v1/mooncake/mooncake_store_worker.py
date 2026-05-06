@@ -30,6 +30,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_lookup_coordinator import (  # noqa: E501
+    MooncakeLookupCoordinator,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (
     ChunkedTokenDatabase,
     GroupLayout,
@@ -427,8 +430,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         for start, end, group_id, key in self.token_database.process_tokens(
             token_len, req_meta.block_hashes
         ):
-            g_block_size = group_block_sizes[group_id]
-            chunk_id = start // g_block_size
+            chunk_id = start // group_block_sizes[group_id]
             if not self.token_database.is_chunk_in_window_per_request(
                 chunk_id, block_ids, group_id, g_total_chunks[group_id]
             ):
@@ -694,8 +696,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         for start, end, group_id, key in self.token_database.process_tokens(
             token_len, req_meta.block_hashes, mask_num
         ):
-            g_block_size = load_group_block_sizes[group_id]
-            chunk_id = start // g_block_size
+            chunk_id = start // load_group_block_sizes[group_id]
             if not self.token_database.is_chunk_in_window_per_request(
                 chunk_id, block_ids, group_id, load_g_total_chunks[group_id]
             ):
@@ -860,6 +861,22 @@ class MooncakeStoreWorker:
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         # NOTE(yifan): enforce load_async for now for better compute-I/O overlap.
         self.load_async = True
+        # Mirror Scheduler.__init__'s use_eagle derivation; the coordinator
+        # uses it to apply the upstream "flag all groups when none are
+        # annotated" fallback for EAGLE configs.
+        self._use_eagle = False
+        spec_cfg = getattr(vllm_config, "speculative_config", None)
+        if spec_cfg is not None:
+            use_eagle_fn = getattr(spec_cfg, "use_eagle", None)
+            if callable(use_eagle_fn):
+                try:
+                    self._use_eagle = bool(use_eagle_fn())
+                except Exception:
+                    self._use_eagle = False
+        # Set in register_kv_caches; None → construction failed →
+        # lookup returns 0 (fail-closed).
+        self._lookup_coordinator: MooncakeLookupCoordinator | None = None
+        self._coordinator_construction_failed: bool = False
         self.cache_config = vllm_config.cache_config
         self.original_block_size = self.cache_config.block_size
         self.block_size = self.cache_config.block_size
@@ -1121,15 +1138,38 @@ class MooncakeStoreWorker:
             group_block_sizes, hash_block_size, self.scheduler_block_size
         )
         self._blocks_per_sw = blocks_per_sw
+        # Build the lookup coordinator once for the worker's lifetime.
+        # On construction failure (unknown spec, misaligned hash block
+        # size, ...), fail closed so lookup returns 0 instead of risking
+        # over-reported hits. Tests use ``__new__`` and skip __init__,
+        # so kv_cache_config may be None.
+        self._coordinator_construction_failed = False
+        if kv_cache_config is not None:
+            try:
+                self._lookup_coordinator = MooncakeLookupCoordinator(
+                    kv_cache_config=kv_cache_config,
+                    hash_block_size=hash_block_size,
+                    use_eagle=getattr(self, "_use_eagle", False),
+                )
+            except Exception as e:
+                logger.error(
+                    "MooncakeLookupCoordinator construction failed (%s); "
+                    "external cache hits DISABLED for this worker "
+                    "(lookup will return 0).",
+                    e,
+                )
+                self._lookup_coordinator = None
+                self._coordinator_construction_failed = True
         logger.info(
             "Per-group blocks_per_sw=%s group_block_sizes=%s "
             "hash_block_size=%d scheduler_block_size=%d "
-            "(self.block_size=%d)",
+            "(self.block_size=%d) coordinator=%s",
             blocks_per_sw,
             group_block_sizes,
             hash_block_size,
             self.scheduler_block_size,
             self.block_size,
+            "active" if self._lookup_coordinator is not None else "disabled",
         )
 
         # Heterogeneous per-tensor block_lens are now handled correctly,
@@ -1336,38 +1376,41 @@ class MooncakeStoreWorker:
     ) -> int:
         """Largest contiguous prefix (in tokens) that all groups + ranks supply.
 
-        Per-(chunk, group) keys; a chunk hits iff every queried group
-        returned 1. Single batch_is_exist round-trip.
+        Per-(chunk, group) keys → ``batch_is_exist`` → vllm's per-manager
+        ``find_longest_cache_hit`` (via :class:`MooncakeLookupCoordinator`).
+        Single round-trip to Mooncake; a chunk hits iff every queried group
+        for that chunk returned 1.
         """
+        # Fail-closed when the coordinator wasn't built.
+        if (
+            getattr(self, "_coordinator_construction_failed", False)
+            or getattr(self, "_lookup_coordinator", None) is None
+        ):
+            return 0
+
         keys: list[str] = []
         multi_tp_keys: list[str] = []
         lookup_start = time.perf_counter()
+        # Local alias to narrow Optional type past the guard above.
+        coord = self._lookup_coordinator
+        assert coord is not None
         try:
             hash_bs = max(1, self.token_database.hash_block_size)
             lookup_token_len = token_len // hash_bs * hash_bs
             if lookup_token_len <= 0:
                 return 0
 
-            # Per-group chunk counts. Each group's chunk_id indexes a
-            # different token frame, so we keep (chunk_id, group_id) per
-            # key and convert misses back to token positions before
-            # aggregating.
             group_block_sizes = self.token_database.group_block_sizes or [
                 self.block_size
             ] * max(1, len(self.token_database.groups) or 1)
-            g_total_chunks_lk = [
-                cdiv(lookup_token_len, gbs) for gbs in group_block_sizes
-            ]
             chunk_groups: list[tuple[int, int]] = []
+            # Query every (chunk, group) — no window filter. The
+            # per-manager find_longest_cache_hit needs the full set to
+            # shrink max_length correctly across iterations.
             for start, _end, group_id, key in self.token_database.process_tokens(
                 lookup_token_len, block_hashes
             ):
-                g_block = group_block_sizes[group_id]
-                chunk_id = start // g_block
-                if not self.token_database.is_chunk_in_window(
-                    chunk_id, g_total_chunks_lk[group_id], group_id
-                ):
-                    continue
+                chunk_id = start // group_block_sizes[group_id]
                 keys.append(key.to_string())
                 chunk_groups.append((chunk_id, group_id))
 
@@ -1399,18 +1442,26 @@ class MooncakeStoreWorker:
             num_rows = min(self.tp_size, self.num_kv_head) * self.pp_size
             multi_tp_values = [res[i * n : (i + 1) * n] for i in range(num_rows)]
 
-            # First-miss in token space: each missed (chunk_id, group)
-            # maps to `cid * g_block_size`; the min across rows caps the
-            # available prefix.
-            def first_miss_token(row: list[int]) -> int:
-                miss = lookup_token_len
-                for (cid, gid), v in zip(chunk_groups, row):
-                    if v != 1:
-                        miss = min(miss, cid * group_block_sizes[gid])
-                return miss
+            sched_bs = getattr(self, "scheduler_block_size", self.block_size)
 
-            per_row_first_miss = [first_miss_token(r) for r in multi_tp_values]
-            min_token = min(per_row_first_miss) if per_row_first_miss else 0
+            # Block hashes arrive over ZMQ as hex strings; the
+            # coordinator's BlockHashListWithBlockSize does b"".join() on
+            # them for HMA groups, which fails on str. Decode once.
+            bh_bytes = [
+                bytes.fromhex(h) if isinstance(h, str) else h for h in block_hashes
+            ]
+            per_row_hits: list[int] = []
+            for row in multi_tp_values:
+                exists_map = {chunk_groups[i]: row[i] for i in range(len(chunk_groups))}
+                # Swap in this row's pool, then let the inherited
+                # find_longest_cache_hit probe through it.
+                coord.block_pool = coord.build_block_pool(exists_map, bh_bytes)
+                _hit_blocks, hit_length = coord.find_longest_cache_hit(
+                    bh_bytes,
+                    max_cache_hit_length=lookup_token_len,
+                )
+                per_row_hits.append(hit_length)
+            min_token = min(per_row_hits) if per_row_hits else 0
 
             self._lookup_debug_counter = getattr(self, "_lookup_debug_counter", 0) + 1
             if self._lookup_debug_counter % 50 == 1:
@@ -1419,17 +1470,14 @@ class MooncakeStoreWorker:
                 ]
                 logger.info(
                     "[mooncake-lookup] call=%d num_keys=%d ones=%s "
-                    "first_miss_token=%s min_first_miss_token=%d",
+                    "per_row_hit_tokens=%s min_hit_tokens=%d",
                     self._lookup_debug_counter,
                     len(multi_tp_keys),
                     ones_per_row,
-                    per_row_first_miss,
+                    per_row_hits,
                     min_token,
                 )
 
-            # Round to scheduler block boundary (LCM); self.block_size
-            # is MIN on HMA, see `register_kv_caches`.
-            sched_bs = getattr(self, "scheduler_block_size", self.block_size)
             if min_token >= lookup_token_len:
                 return lookup_token_len
             return (min_token // sched_bs) * sched_bs
@@ -1441,7 +1489,7 @@ class MooncakeStoreWorker:
                 status="error",
                 num_failed_keys=len(multi_tp_keys),
             )
-            logger.error("Remote connection failed in lookup: %s", e)
+            logger.error("Mooncake lookup failed: %s", e)
             return 0
 
     def get_kv_events(self) -> list[BlockStored]:
