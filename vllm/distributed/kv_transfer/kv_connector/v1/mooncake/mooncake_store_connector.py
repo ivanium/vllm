@@ -23,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
@@ -83,7 +84,7 @@ class MooncakeStoreKVEvents(KVConnectorKVEvents):
         return f"<MooncakeStoreKVEvents events={self.get_all_events()}>"
 
 
-class MooncakeStoreConnector(KVConnectorBase_V1):
+class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
     """KV connector using MooncakeDistributedStore as shared KV pool."""
 
     @property
@@ -112,9 +113,15 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
         self.connector_worker: MooncakeStoreWorker | None = None
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = MooncakeStoreScheduler(vllm_config)
+            self.connector_scheduler = MooncakeStoreScheduler(
+                vllm_config,
+                kv_cache_config=kv_cache_config,
+            )
         else:
-            self.connector_worker = MooncakeStoreWorker(vllm_config)
+            self.connector_worker = MooncakeStoreWorker(
+                vllm_config,
+                kv_cache_config=kv_cache_config,
+            )
             if vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
 
@@ -153,7 +160,15 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
     def request_finished(
         self,
         request: Request,
-        block_ids: list[int],
+        block_ids: tuple[list[int], ...] | list[int] | list[list[int]],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: Request,
+        block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
