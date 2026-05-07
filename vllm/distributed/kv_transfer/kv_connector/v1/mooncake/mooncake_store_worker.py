@@ -371,7 +371,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.token_len_chunk
-        block_ids = req_meta.block_ids
+        block_ids_per_group = req_meta.block_ids
         req_id = req_meta.req_id
         current_event = req_meta.current_event
 
@@ -461,8 +461,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
         new_block_hashes = [maybe_convert_block_hash(bh) for bh in block_hashes]
 
         for index, start in enumerate(starts):
-            db = self.token_databases[group_indices[index]]
-            addr, size, _ = db.prepare_value(start, ends[index], block_ids)
+            g_idx = group_indices[index]
+            db = self.token_databases[g_idx]
+            addr, size, _ = db.prepare_value(
+                start, ends[index], block_ids_per_group[g_idx]
+            )
             addrs.append(addr)
             sizes.append(size)
 
@@ -590,11 +593,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         addr_list: list[list[int]] = []
         size_list: list[list[int]] = []
         key_list: list[str] = []
-        for db in self.token_databases:
+        for g_idx, db in enumerate(self.token_databases):
             for start, end, key in db.process_tokens(
                 token_len, req_meta.block_hashes, mask_num
             ):
-                addr, size, _ = db.prepare_value(start, end, req_meta.block_ids)
+                addr, size, _ = db.prepare_value(start, end, req_meta.block_ids[g_idx])
                 key_list.append(key.to_string())
                 addr_list.append(addr)
                 size_list.append(size)

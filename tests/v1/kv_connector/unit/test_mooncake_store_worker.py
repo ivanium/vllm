@@ -74,7 +74,7 @@ def _make_load_req(
     return ReqMeta(
         req_id=req_id,
         token_len_chunk=token_len,
-        block_ids=list(range(len(block_hashes))),
+        block_ids=(list(range(len(block_hashes))),),
         block_hashes=block_hashes,
         load_spec=LoadSpec(
             vllm_cached_tokens=vllm_cached_tokens,
@@ -89,7 +89,7 @@ def _make_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMeta:
     return ReqMeta(
         req_id=req_id,
         token_len_chunk=32,
-        block_ids=[0, 1],
+        block_ids=([0, 1],),
         block_hashes=block_hashes,
         can_save=True,
         original_block_size=16,

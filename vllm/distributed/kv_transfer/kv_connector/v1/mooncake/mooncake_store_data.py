@@ -146,7 +146,7 @@ class RequestTracker:
 
     req_id: str
     token_len: int
-    allocated_block_ids: list[int]
+    allocated_block_ids: tuple[list[int], ...]
     num_saved_tokens: int = 0
     token_ids: list[int] | None = None
 
@@ -154,15 +154,18 @@ class RequestTracker:
         self,
         new_block_ids: tuple[list[int], ...] | list[int],
     ) -> None:
-        if len(new_block_ids) == 0:
-            new_block_ids = []
-        elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
-        elif isinstance(new_block_ids, list):
-            pass
-        else:
-            raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
-        self.allocated_block_ids.extend(new_block_ids)
+        # Backward-compat: accept a single list (broadcast to single group).
+        if isinstance(new_block_ids, list):
+            new_block_ids = (new_block_ids,)
+        if len(new_block_ids) != len(self.allocated_block_ids):
+            raise ValueError(
+                f"Group count mismatch: tracker has "
+                f"{len(self.allocated_block_ids)} groups, update has "
+                f"{len(new_block_ids)}"
+            )
+        for existing, new in zip(self.allocated_block_ids, new_block_ids, strict=True):
+            if new:
+                existing.extend(new)
 
 
 @dataclass
@@ -171,7 +174,7 @@ class ReqMeta:
 
     req_id: str
     token_len_chunk: int
-    block_ids: list[int]
+    block_ids: tuple[list[int], ...]
     block_hashes: list[BlockHash]
 
     can_save: bool | None = None

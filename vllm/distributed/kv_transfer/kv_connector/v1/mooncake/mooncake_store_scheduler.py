@@ -67,7 +67,7 @@ class MooncakeStoreScheduler:
                 "discard_partial_chunks", True
             )
         )
-        self._unfinished_requests: dict[str, tuple[Request, list[int]]] = {}
+        self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
 
     def get_num_new_matched_tokens(
@@ -122,9 +122,9 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
-        local_block_ids: list[int] = []
+        local_block_ids: tuple[list[int], ...] = ()
         if num_external_tokens > 0:
-            local_block_ids = blocks.get_block_ids()[0]
+            local_block_ids = blocks.get_block_ids()
 
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         self._unfinished_request_ids.add(request.request_id)
@@ -185,10 +185,12 @@ class MooncakeStoreScheduler:
             request_tuple = self._unfinished_requests.get(request.req_id)
             request_real = request_tuple[0]  # type: ignore[index]
 
-            if not isinstance(request.block_ids[0], list):
-                unfolded_block_ids = request.block_ids.copy()
+            if isinstance(request.block_ids, tuple):
+                # Multi-group: preserve per-group structure.
+                unfolded_block_ids = tuple(b.copy() for b in request.block_ids)
             else:
-                unfolded_block_ids = request.block_ids[0].copy()
+                # Single-group legacy: list[int] -> 1-tuple.
+                unfolded_block_ids = (request.block_ids.copy(),)
 
             request_tracker = RequestTracker(
                 req_id=request.req_id,
@@ -230,9 +232,9 @@ class MooncakeStoreScheduler:
                 if req_id in self._preempted_req_ids:
                     # Resumed after preemption
                     if isinstance(new_block_ids, tuple):
-                        new_block_ids = new_block_ids[0].copy()
+                        new_block_ids = tuple(b.copy() for b in new_block_ids)
                     else:
-                        new_block_ids = new_block_ids.copy()
+                        new_block_ids = (new_block_ids.copy(),)
                     self._preempted_req_ids.discard(req_id)
                     load_spec = self.load_specs.pop(req_id, None)
                     request_tuple = self._unfinished_requests.get(req_id)
