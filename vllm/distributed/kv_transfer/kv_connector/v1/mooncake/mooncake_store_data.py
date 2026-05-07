@@ -27,6 +27,7 @@ class KeyMetadata:
     pcp_rank: int
     dcp_rank: int
     pp_rank: int
+    group_id: int = 0
 
 
 @dataclass(order=True)
@@ -44,6 +45,7 @@ class PoolKey:
                 self.key_metadata.pcp_rank,
                 self.key_metadata.dcp_rank,
                 self.key_metadata.pp_rank,
+                self.key_metadata.group_id,
                 self.chunk_hash,
             )
         )
@@ -55,6 +57,7 @@ class PoolKey:
             f"@pcp{self.key_metadata.pcp_rank}"
             f"@dcp{self.key_metadata.dcp_rank}"
             f"@pp_rank:{self.key_metadata.pp_rank}"
+            f"@group:{self.key_metadata.group_id}"
             f"@{self.chunk_hash}"
         )
 
