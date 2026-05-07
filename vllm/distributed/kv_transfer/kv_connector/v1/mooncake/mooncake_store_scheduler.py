@@ -26,6 +26,7 @@ from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
 
@@ -35,7 +36,11 @@ logger = init_logger(__name__)
 class MooncakeStoreScheduler:
     """Scheduler-side component for MooncakeStoreConnector."""
 
-    def __init__(self, vllm_config: VllmConfig):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+    ):
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "load_async", False

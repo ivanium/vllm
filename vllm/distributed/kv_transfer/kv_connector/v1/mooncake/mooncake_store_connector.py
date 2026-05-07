@@ -94,6 +94,27 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
             == "true"
         )
 
+    @staticmethod
+    def _validate_kv_cache_config(
+        vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+    ) -> None:
+        from vllm.v1.kv_cache_interface import CrossAttentionSpec
+
+        unsupported: list[str] = []
+        for g_idx, g in enumerate(kv_cache_config.kv_cache_groups):
+            if isinstance(g.kv_cache_spec, CrossAttentionSpec):
+                unsupported.append(f"group {g_idx}: CrossAttentionSpec")
+        pcp = vllm_config.parallel_config.prefill_context_parallel_size
+        dcp = vllm_config.parallel_config.decode_context_parallel_size
+        if len(kv_cache_config.kv_cache_groups) > 1 and (pcp > 1 or dcp > 1):
+            unsupported.append(
+                f"PCP/DCP > 1 (pcp={pcp}, dcp={dcp}) with hybrid attention"
+            )
+        if unsupported:
+            raise ValueError(
+                "MooncakeStoreConnector does not support: " + "; ".join(unsupported)
+            )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -105,6 +126,9 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
             role=role,
             kv_cache_config=kv_cache_config,
         )
+        assert kv_cache_config is not None, "kv_cache_config is required"
+        self._validate_kv_cache_config(vllm_config, kv_cache_config)
+        self._kv_cache_config = kv_cache_config
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self._kv_cache_events: MooncakeStoreKVEvents | None = None
 
@@ -112,9 +136,11 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
         self.connector_worker: MooncakeStoreWorker | None = None
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = MooncakeStoreScheduler(vllm_config)
+            self.connector_scheduler = MooncakeStoreScheduler(
+                vllm_config, kv_cache_config
+            )
         else:
-            self.connector_worker = MooncakeStoreWorker(vllm_config)
+            self.connector_worker = MooncakeStoreWorker(vllm_config, kv_cache_config)
             if vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
 
@@ -192,6 +218,10 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
         self, kv_cache: torch.Tensor, attn_backend: type
     ):
         assert self.connector_worker is not None
+        assert (
+            self._kv_cache_config is not None
+            and len(self._kv_cache_config.kv_cache_groups) == 1
+        ), "Cross-layer KV cache does not supported with hybrid models"
         self.connector_worker.register_cross_layers_kv_caches(kv_cache)
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:

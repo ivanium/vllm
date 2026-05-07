@@ -43,6 +43,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.serial_utils import MsgpackDecoder
 
 from .mooncake_store_metrics import MooncakeStoreConnectorStats
@@ -705,7 +706,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 class MooncakeStoreWorker:
     """Worker-side component for MooncakeStoreConnector."""
 
-    def __init__(self, vllm_config: VllmConfig):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+    ):
         try:
             from mooncake.store import MooncakeDistributedStore  # type: ignore
         except ImportError as e:
