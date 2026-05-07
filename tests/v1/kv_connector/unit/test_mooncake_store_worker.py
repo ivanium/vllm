@@ -25,13 +25,13 @@ def _make_store_sending_thread(
     store: MagicMock,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     token_database = ChunkedTokenDatabase(
-        KeyMetadata("test-model", 0, 0, 0, 0), block_size=16
+        KeyMetadata("test-model", 0, 0, 0, 0, group_id=0), block_size=16
     )
     token_database.set_kv_caches_base_addr([0x1000])
     token_database.set_block_len([256])
     thread = mooncake_store_worker.KVCacheStoreSendingThread(
         store=store,
-        token_database=token_database,
+        token_databases=[token_database],
         block_size=16,
         tp_rank=0,
         put_step=1,
@@ -48,13 +48,13 @@ def _make_store_recving_thread(
     disk_offload_buffer_budget_bytes: int | None = None,
 ) -> mooncake_store_worker.KVCacheStoreRecvingThread:
     token_database = ChunkedTokenDatabase(
-        KeyMetadata("test-model", 0, 0, 0, 0), block_size=16
+        KeyMetadata("test-model", 0, 0, 0, 0, group_id=0), block_size=16
     )
     token_database.set_kv_caches_base_addr([0x1000])
     token_database.set_block_len([256])
     thread = mooncake_store_worker.KVCacheStoreRecvingThread(
         store=store,
-        token_database=token_database,
+        token_databases=[token_database],
         block_size=16,
         tp_rank=0,
         ready_event=threading.Event(),
@@ -224,9 +224,9 @@ def test_recv_thread_uses_single_batch_when_no_disk_offload_budget():
     assert store.batch_get_into_multi_buffers.call_count == 1
     keys, addrs, sizes = store.batch_get_into_multi_buffers.call_args.args
     assert keys == [
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6130",
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6131",
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6132",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
     ]
     assert sizes == [[256], [256], [256]]
 
@@ -276,10 +276,10 @@ def test_recv_thread_uses_ratio_scaled_budget_for_first_pass_split():
     first_keys = store.batch_get_into_multi_buffers.call_args_list[0].args[0]
     second_keys = store.batch_get_into_multi_buffers.call_args_list[1].args[0]
     assert first_keys == [
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6130",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
     ]
     assert second_keys == [
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
     ]
 
 
@@ -311,14 +311,14 @@ def test_recv_thread_splits_disk_offload_loads_by_budget():
     first_sizes = store.batch_get_into_multi_buffers.call_args_list[0].args[2]
     second_sizes = store.batch_get_into_multi_buffers.call_args_list[1].args[2]
     assert first_keys == [
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6130",
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
     ]
     assert second_keys == [
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6132",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
     ]
-    base_addr = thread.token_database.kv_caches_base_addr[0]
-    block_len = thread.token_database.block_len[0]
+    base_addr = thread.token_databases[0].kv_caches_base_addr[0]
+    block_len = thread.token_databases[0].block_len[0]
     assert first_addrs == [[base_addr], [base_addr + block_len]]
     assert second_addrs == [[base_addr + 2 * block_len]]
     expected_size = block_len
@@ -366,11 +366,11 @@ def test_recv_thread_uses_soft_key_cap_for_disk_offload_split():
 
     assert store.batch_get_into_multi_buffers.call_count == 2
     assert store.batch_get_into_multi_buffers.call_args_list[0].args[0] == [
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6130",
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
     ]
     assert store.batch_get_into_multi_buffers.call_args_list[1].args[0] == [
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@6132",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
     ]
 
 
@@ -426,9 +426,12 @@ def _make_bare_worker(
     worker.store = MagicMock()
     worker.store.register_buffer.return_value = 0
     worker.use_mla = False
-    worker.token_database = ChunkedTokenDatabase(
-        KeyMetadata("test-model", 0, 0, 0, 0), block_size=block_size
-    )
+    worker._token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+            block_size=block_size,
+        )
+    ]
     worker.kv_role = kv_role
     worker.block_size = block_size
     worker.tp_rank = 0

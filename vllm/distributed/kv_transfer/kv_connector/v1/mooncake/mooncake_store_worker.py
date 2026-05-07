@@ -6,6 +6,7 @@ Includes the store worker, transfer threads, lookup server,
 and MooncakeDistributedStore integration.
 """
 
+import dataclasses
 import json
 import os
 import queue
@@ -220,7 +221,7 @@ class KVTransferThread(threading.Thread):
     def __init__(
         self,
         store: Any,
-        token_database: ChunkedTokenDatabase,
+        token_databases: list[ChunkedTokenDatabase],
         block_size: int,
         tp_rank: int,
         ready_event: threading.Event,
@@ -232,7 +233,7 @@ class KVTransferThread(threading.Thread):
         self.ready_event = ready_event
         self.block_size = block_size
         self.tp_rank = tp_rank
-        self.token_database = token_database
+        self.token_databases = token_databases
         self._record_operation_cb = record_operation
         self.done_task_lock = threading.Lock()
         self.request_queue: queue.Queue[Any] = queue.Queue()
@@ -307,7 +308,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
     def __init__(
         self,
         store: Any,
-        token_database: ChunkedTokenDatabase,
+        token_databases: list[ChunkedTokenDatabase],
         block_size: int,
         tp_rank: int,
         put_step: int,
@@ -318,7 +319,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
     ):
         super().__init__(
             store,
-            token_database,
+            token_databases,
             block_size,
             tp_rank,
             ready_event,
@@ -387,23 +388,28 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self.request_queue.task_done()
             return
 
-        starts = []
-        ends = []
-        keys = []
+        starts: list[int] = []
+        ends: list[int] = []
+        keys: list[str] = []
         block_hashes: list[BlockHash] = []
-        for index, (start, end, key) in enumerate(
-            self.token_database.process_tokens(token_len, req_meta.block_hashes)
-        ):
-            starts.append(start)
-            ends.append(end)
-            keys.append(key.to_string())
-            block_hashes.append(req_meta.block_hashes[index])
+        group_indices: list[int] = []
+        for g_idx, db in enumerate(self.token_databases):
+            for chunk_idx, (start, end, key) in enumerate(
+                db.process_tokens(token_len, req_meta.block_hashes)
+            ):
+                starts.append(start)
+                ends.append(end)
+                keys.append(key.to_string())
+                block_hashes.append(req_meta.block_hashes[chunk_idx])
+                group_indices.append(g_idx)
 
         # Apply put_step striding for TP
-        starts = starts[self.tp_rank % self.put_step :: self.put_step]
-        ends = ends[self.tp_rank % self.put_step :: self.put_step]
-        keys = keys[self.tp_rank % self.put_step :: self.put_step]
-        block_hashes = block_hashes[self.tp_rank % self.put_step :: self.put_step]
+        sl = slice(self.tp_rank % self.put_step, None, self.put_step)
+        starts = starts[sl]
+        ends = ends[sl]
+        keys = keys[sl]
+        block_hashes = block_hashes[sl]
+        group_indices = group_indices[sl]
 
         if not keys:
             self.dec_stored_request(req_id)
@@ -437,6 +443,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         ends = [ends[i] for i in missing_indices]
         keys = [keys[i] for i in missing_indices]
         block_hashes = [block_hashes[i] for i in missing_indices]
+        group_indices = [group_indices[i] for i in missing_indices]
 
         logger.debug(
             "Storing KV cache for %d out of %d blocks "
@@ -454,9 +461,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         new_block_hashes = [maybe_convert_block_hash(bh) for bh in block_hashes]
 
         for index, start in enumerate(starts):
-            addr, size, _ = self.token_database.prepare_value(
-                start, ends[index], block_ids
-            )
+            db = self.token_databases[group_indices[index]]
+            addr, size, _ = db.prepare_value(start, ends[index], block_ids)
             addrs.append(addr)
             sizes.append(size)
 
@@ -547,7 +553,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     def __init__(
         self,
         store: Any,
-        token_database: ChunkedTokenDatabase,
+        token_databases: list[ChunkedTokenDatabase],
         block_size: int,
         tp_rank: int,
         ready_event: threading.Event,
@@ -556,7 +562,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     ):
         super().__init__(
             store,
-            token_database,
+            token_databases,
             block_size,
             tp_rank,
             ready_event,
@@ -581,18 +587,17 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             * self.block_size
         )
 
-        addr_list = []
-        size_list = []
-        key_list = []
-        for start, end, key in self.token_database.process_tokens(
-            token_len, req_meta.block_hashes, mask_num
-        ):
-            addr, size, _ = self.token_database.prepare_value(
-                start, end, req_meta.block_ids
-            )
-            key_list.append(key.to_string())
-            addr_list.append(addr)
-            size_list.append(size)
+        addr_list: list[list[int]] = []
+        size_list: list[list[int]] = []
+        key_list: list[str] = []
+        for db in self.token_databases:
+            for start, end, key in db.process_tokens(
+                token_len, req_meta.block_hashes, mask_num
+            ):
+                addr, size, _ = db.prepare_value(start, end, req_meta.block_ids)
+                key_list.append(key.to_string())
+                addr_list.append(addr)
+                size_list.append(size)
 
         # Rotate lists by tp_rank for load balancing
         key_list_c = (
@@ -774,7 +779,22 @@ class MooncakeStoreWorker:
             pp_rank=self.pp_rank,
         )
 
-        self.token_database = ChunkedTokenDatabase(self.metadata, self.block_size)
+        # Per-group ChunkedTokenDatabase. Hybrid attention (multi-group) is
+        # not yet wired through save/load/lookup; the assert pins that invariant
+        # so a multi-group config doesn't silently misbehave.
+        kv_cache_groups = list(kv_cache_config.kv_cache_groups)
+        assert len(kv_cache_groups) == 1, (
+            f"MooncakeStoreConnector does not yet support hybrid attention "
+            f"(got {len(kv_cache_groups)} kv-cache groups); only single-group "
+            f"configs are supported."
+        )
+        self._token_dbs: list[ChunkedTokenDatabase] = [
+            ChunkedTokenDatabase(
+                dataclasses.replace(self.metadata, group_id=g_idx),
+                self.block_size,
+            )
+            for g_idx in range(len(kv_cache_groups))
+        ]
 
         # Initialize MooncakeDistributedStore with its own TransferEngine
         store_config = MooncakeStoreConfig.load_from_env()
@@ -900,15 +920,16 @@ class MooncakeStoreWorker:
             len(self.kv_caches_base_addr),
         )
 
-        self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
-        self.token_database.set_block_len(self.block_len)
+        for db in self._token_dbs:
+            db.set_kv_caches_base_addr(self.kv_caches_base_addr)
+            db.set_block_len(self.block_len)
 
         # Start transfer threads
         if self.kv_role in ["kv_producer", "kv_both"]:
             ready_event_sending = threading.Event()
             self.kv_send_thread = KVCacheStoreSendingThread(
                 self.store,
-                self.token_database,
+                self._token_dbs,
                 self.block_size,
                 self.tp_rank,
                 self.put_step,
@@ -922,7 +943,7 @@ class MooncakeStoreWorker:
         ready_event_recving = threading.Event()
         self.kv_recv_thread = KVCacheStoreRecvingThread(
             self.store,
-            self.token_database,
+            self._token_dbs,
             self.block_size,
             self.tp_rank,
             ready_event_recving,
@@ -1087,11 +1108,10 @@ class MooncakeStoreWorker:
         lookup_start = time.perf_counter()
         try:
             starts: list[int] = []
-            for start, end, key in self.token_database.process_tokens(
-                token_len, block_hashes
-            ):
-                keys.append(key.to_string())
-                starts.append(start)
+            for db in self._token_dbs:
+                for start, end, key in db.process_tokens(token_len, block_hashes):
+                    keys.append(key.to_string())
+                    starts.append(start)
 
             # Expand keys for all TP ranks
             multi_tp_keys = keys[:]
