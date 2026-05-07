@@ -833,7 +833,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         apt-get purge -y ${MOONCAKE_BUILD_PKGS} && \
         apt-get install -y --no-install-recommends \
             libgoogle-glog0v5 libjsoncpp25 liburing2 libgflags2.2 \
-            libjemalloc2 libhiredis0.14 libcurl4 && \
+            libjemalloc2 libhiredis0.14 libcurl4 libyaml-cpp0.7 && \
         apt-get autoremove -y && rm -rf /var/lib/apt/lists/* && \
         if [ ! -f /usr/local/cuda/lib64/libcudart.so ] && [ -f /usr/local/cuda/lib64/libcudart.so.13 ]; then \
             ln -s libcudart.so.13 /usr/local/cuda/lib64/libcudart.so; \
