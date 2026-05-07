@@ -1207,7 +1207,8 @@ class LookupKeyServer:
                 token_len = int.from_bytes(all_frames[0], byteorder="big")
                 hash_frames = all_frames[1:]
                 hashes_str = self.decoder.decode(hash_frames)
-                result = self.store_worker.lookup(token_len, hashes_str)
+                block_hashes = [BlockHash(bytes.fromhex(s)) for s in hashes_str]
+                result = self.store_worker.lookup(token_len, block_hashes)
                 response = result.to_bytes(4, "big")
                 self.socket.send(response)
 

@@ -13,7 +13,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    BlockHashListWithBlockSize,
+)
 
 logger = init_logger(__name__)
 
@@ -65,9 +68,20 @@ class PoolKey:
 class ChunkedTokenDatabase:
     """Maps token positions to store keys and GPU memory addresses."""
 
-    def __init__(self, metadata: KeyMetadata, block_size: int):
+    def __init__(
+        self,
+        metadata: KeyMetadata,
+        block_size: int,
+        hash_block_size: int | None = None,
+    ):
         self.metadata = metadata
         self.block_size = block_size
+        self.hash_block_size = hash_block_size or block_size
+        if self.block_size % self.hash_block_size != 0:
+            raise ValueError(
+                f"block_size ({self.block_size}) must be a multiple of "
+                f"hash_block_size ({self.hash_block_size})"
+            )
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
 
@@ -102,32 +116,35 @@ class ChunkedTokenDatabase:
     def process_tokens(
         self,
         token_len: int,
-        block_hashes: list[BlockHash] | list[str],
+        block_hashes: list[BlockHash],
         mask_num: int = 0,
     ) -> Iterable[tuple[int, int, PoolKey]]:
         """Process tokens and yield (start_idx, end_idx, pool_key) tuples.
 
         Args:
             token_len: Total number of tokens.
-            block_hashes: Block hashes for each block.
+            block_hashes: Block hashes computed at ``hash_block_size`` granularity.
+                When ``block_size > hash_block_size`` consecutive hashes are merged
+                up to the group's ``block_size`` via ``BlockHashListWithBlockSize``.
             mask_num: Number of tokens to skip from the beginning.
         """
         if not block_hashes:
             return
-        if not isinstance(block_hashes[0], str):
-            block_hashes = [
-                h.hex()  # type: ignore[union-attr]
-                for h in block_hashes
-            ]
-        for chunk_id, hash_val in enumerate(block_hashes):
+        chunk_hashes: Iterable[BlockHash] = (
+            block_hashes
+            if self.block_size == self.hash_block_size
+            else BlockHashListWithBlockSize(
+                block_hashes, self.hash_block_size, self.block_size
+            )
+        )
+        for chunk_id, h in enumerate(chunk_hashes):
             start_idx = chunk_id * self.block_size
             if start_idx >= token_len:
                 break
             end_idx = min(start_idx + self.block_size, token_len)
             if start_idx < mask_num:
                 continue
-            else:
-                yield start_idx, end_idx, self._make_key_by_hash(hash_val)
+            yield start_idx, end_idx, self._make_key_by_hash(h.hex())
 
 
 @dataclass
