@@ -57,18 +57,57 @@ This starts the master in the background. Logs go to `scripts/mooncake/mooncake_
 Default ports:
 
 - RPC: 50051
-- HTTP metadata: 8080
 - Prometheus metrics: 9003
 
-See the script header for environment variables (`MC_RPC_PORT`, `MC_HTTP_PORT`, etc.) to customize ports and eviction settings. Mooncake master is launched cluster-wise, so we may get port conflict if someone else has already launched it. Typically we don't need to change this, and multiple users should be able to share the same master. One can freely change ports here, but also remember to update the `mooncake_config.json` for the client (vLLM) below.
+See the script header for environment variables (`MC_RPC_PORT`, `MC_METRICS_PORT`, etc.) to customize ports and eviction settings. Mooncake master is launched cluster-wise, so we may get port conflict if someone else has already launched it. Typically we don't need to change this, and multiple users should be able to share the same master. One can freely change ports here, but also remember to update the `mooncake_config.json` for the client (vLLM) below.
 
-### 2. Configure Mooncake
+### 2. Recommended Validation Flow
+
+Validate Mooncake from the bottom up before interpreting vLLM or SGLang results:
+
+1. Start the Mooncake master and confirm it stays in `serving` state.
+2. Watch all active RDMA/RoCE NICs with `rdma_monitor.sh` while traffic is running.
+3. Run the standalone Mooncake smoke test and confirm put/get succeeds.
+4. Run a standalone Mooncake put/get benchmark and record operations per second plus approximate bandwidth.
+5. Only after Mooncake itself looks healthy, run the vLLM or SGLang integration benchmark.
+
+### 3. Monitor RDMA/RoCE Bandwidth
+
+Use `rdma_monitor.sh` to watch real-time traffic on active RDMA ports. A 2-second refresh interval is useful for deployment checks:
+
+```bash
+./rdma_monitor.sh 2
+```
+
+To focus on a specific RDMA device or name fragment:
+
+```bash
+./rdma_monitor.sh 2 rocep139s0
+```
+
+The monitor reads `/sys/class/infiniband` counters and prints per-port RX/TX bandwidth and PPS, along with the mapped Linux netdev when available.
+
+### 4. Standalone Mooncake Benchmark Expectations
+
+Before connecting Mooncake to vLLM or SGLang, run Mooncake by itself. The goal is not final serving throughput; the goal is to verify that Mooncake Store, RDMA, and metadata discovery are healthy.
+
+At minimum, record:
+
+- Successful `put` operations per second.
+- Successful `get` operations per second.
+- Value or object size.
+- Approximate bandwidth, using `ops_per_second * value_size`.
+- Failure codes and failure ratio, especially metadata misses, RDMA timeouts, or resource-allocation failures.
+
+Once standalone Mooncake is stable, framework-level benchmark failures are much easier to interpret.
+
+### 5. Configure Mooncake
 
 Edit `scripts/mooncake/mooncake_config.json`:
 
 ```json
 {
-  "metadata_server": "http://127.0.0.1:8080/metadata",
+  "metadata_server": "P2PHANDSHAKE",
   "master_server_address": "127.0.0.1:50051",
   "global_segment_size": "600GB",
   "local_buffer_size": "4GB",
@@ -78,6 +117,7 @@ Edit `scripts/mooncake/mooncake_config.json`:
 ```
 
 - `protocol`: Use `"rdma"` for best performance. `"tcp"` works as a fallback but performs poorly.
+- `metadata_server`: Use `"P2PHANDSHAKE"` so Transfer Engine peer discovery does not require a separate metadata service.
 - Adjust `global_segment_size` and `local_buffer_size` based on available memory.
     - global_segment_size: Memory contributed to the distributed pool
     - local_buffer_size: Private buffer for this node's own operations
@@ -85,7 +125,9 @@ Edit `scripts/mooncake/mooncake_config.json`:
     - **These sizes are per GPU (per rank), not for the entire node.** For example, with 4 GPUs and `global_segment_size` set to `80GB`, each rank allocates 80 GB of CPU memory, totaling 320 GB across the node.
 - Note: the benchmark script automatically updates `global_segment_size` and `local_buffer_size` to match `CPU_OFFLOAD_GIB`. The `CPU_OFFLOAD_GIB` and `DISK_OFFLOAD_GIB` env vars in the benchmark scripts are also per GPU (per rank).
 
-### 3. Environment Setup (setup_vllm_env.sh)
+The local master helper does not start an embedded HTTP metadata server. Keep the default config and smoke-test example on `"P2PHANDSHAKE"` unless you intentionally run a separate metadata service and update the client config to match it.
+
+### 6. Environment Setup (setup_vllm_env.sh)
 
 Before running benchmarks with the mooncake backend, source `setup_vllm_env.sh` to configure all necessary environment variables. The benchmark scripts do this automatically, but you can also use it directly:
 
@@ -106,7 +148,7 @@ This script:
 - Enables `MC_TCP_ENABLE_CONNECTION_POOL`
 - When `--disk-size` is given, sets all disk offloading env vars (`MOONCAKE_ENABLE_OFFLOAD`, `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`, eviction policy, io_uring, etc.)
 
-### 4a. Single-Turn Benchmark (benchmark_cpu_offloading.sh)
+### 7a. Single-Turn Benchmark (benchmark_cpu_offloading.sh)
 
 Measures raw KV offloading overhead using random (unique) prompts so no prefix cache is ever hit.
 
@@ -144,7 +186,7 @@ MOONCAKE_CONFIG_PATH=scripts/mooncake/mooncake_config.json \
 bash scripts/mooncake/benchmark_cpu_offloading.sh
 ```
 
-### 4b. Multi-Turn Benchmark (benchmark_multi_turn.sh)
+### 7b. Multi-Turn Benchmark (benchmark_multi_turn.sh)
 
 Measures multi-turn chat performance with prefix sharing (global + conversation prefixes).
 
@@ -167,7 +209,7 @@ Additional environment variables:
 - `GLOBAL_PREFIX_RATIO` - Fraction of input as global prefix (default: 0.1)
 - `CONV_PREFIX_RATIO` - Fraction of input as conversation prefix (default: 0.8)
 
-### 5. Compare Results (compare_results.py)
+### 8. Compare Results (compare_results.py)
 
 Both benchmark scripts automatically run the comparison at the end. To re-run manually:
 
@@ -179,7 +221,7 @@ python scripts/mooncake/compare_results.py ./bench_results
 python scripts/mooncake/compare_results.py ./bench_results --prefix mt_
 ```
 
-### 6. Stop the Master
+### 9. Stop the Master
 
 ```bash
 bash scripts/mooncake/start_mooncake_master.sh --stop
