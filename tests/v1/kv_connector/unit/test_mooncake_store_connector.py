@@ -18,6 +18,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data i
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_metrics import (  # noqa: E501
     MooncakeStoreConnectorStats,
 )
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+)
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import create_vllm_config
@@ -27,6 +33,17 @@ def _make_vllm_config():
     return create_vllm_config(
         kv_connector="MooncakeStoreConnector",
         kv_role="kv_both",
+    )
+
+
+def _make_kv_cache_config() -> KVCacheConfig:
+    """Single-group full-attention KVCacheConfig — enough for the connector
+    constructor's validate() pass."""
+    spec = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+    return KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[KVCacheTensor(size=8192, shared_by=["layer0"])],
+        kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
     )
 
 
@@ -44,6 +61,7 @@ def _make_block_stored() -> BlockStored:
 
 def test_scheduler_role_initializes_store_scheduler_only():
     vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
 
     with (
         set_current_vllm_config(vllm_config),
@@ -61,10 +79,10 @@ def test_scheduler_role_initializes_store_scheduler_only():
         ) as mock_lookup_server,
     ):
         connector = mooncake_store_connector.MooncakeStoreConnector(
-            vllm_config, KVConnectorRole.SCHEDULER
+            vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config
         )
 
-    mock_scheduler.assert_called_once_with(vllm_config)
+    mock_scheduler.assert_called_once_with(vllm_config, kv_cache_config)
     mock_worker.assert_not_called()
     mock_lookup_server.assert_not_called()
     assert connector.connector_scheduler is mock_scheduler.return_value
@@ -73,6 +91,7 @@ def test_scheduler_role_initializes_store_scheduler_only():
 
 def test_worker_role_initializes_store_worker_and_lookup_server_on_rank0():
     vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
 
     with (
         set_current_vllm_config(vllm_config),
@@ -90,11 +109,11 @@ def test_worker_role_initializes_store_worker_and_lookup_server_on_rank0():
         ) as mock_lookup_server,
     ):
         connector = mooncake_store_connector.MooncakeStoreConnector(
-            vllm_config, KVConnectorRole.WORKER
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
         )
 
     mock_scheduler.assert_not_called()
-    mock_worker.assert_called_once_with(vllm_config)
+    mock_worker.assert_called_once_with(vllm_config, kv_cache_config)
     mock_lookup_server.assert_called_once_with(mock_worker.return_value, vllm_config)
     assert connector.connector_scheduler is None
     assert connector.connector_worker is mock_worker.return_value
@@ -103,6 +122,7 @@ def test_worker_role_initializes_store_worker_and_lookup_server_on_rank0():
 def test_worker_role_skips_lookup_server_on_nonzero_rank():
     vllm_config = _make_vllm_config()
     vllm_config.parallel_config.rank = 1
+    kv_cache_config = _make_kv_cache_config()
 
     with (
         set_current_vllm_config(vllm_config),
@@ -116,10 +136,10 @@ def test_worker_role_skips_lookup_server_on_nonzero_rank():
         ) as mock_lookup_server,
     ):
         mooncake_store_connector.MooncakeStoreConnector(
-            vllm_config, KVConnectorRole.WORKER
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
         )
 
-    mock_worker.assert_called_once_with(vllm_config)
+    mock_worker.assert_called_once_with(vllm_config, kv_cache_config)
     mock_lookup_server.assert_not_called()
 
 
@@ -146,6 +166,7 @@ def test_lookup_rpc_path_uses_local_rank_when_local_engines_only():
 
 def test_worker_methods_delegate_to_store_worker():
     vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
     kv_caches = {"layer0": MagicMock()}
     metadata = MooncakeStoreConnectorMetadata(set(), set())
     finished_req_ids = {"req-1"}
@@ -162,7 +183,7 @@ def test_worker_methods_delegate_to_store_worker():
         ),
     ):
         connector = mooncake_store_connector.MooncakeStoreConnector(
-            vllm_config, KVConnectorRole.WORKER
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
         )
 
     worker = mock_worker_cls.return_value
@@ -179,6 +200,7 @@ def test_worker_methods_delegate_to_store_worker():
 
 def test_get_kv_connector_kv_cache_events_returns_none_when_empty():
     vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
 
     with (
         set_current_vllm_config(vllm_config),
@@ -192,7 +214,7 @@ def test_get_kv_connector_kv_cache_events_returns_none_when_empty():
         ),
     ):
         connector = mooncake_store_connector.MooncakeStoreConnector(
-            vllm_config, KVConnectorRole.WORKER
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
         )
 
     mock_worker_cls.return_value.get_kv_events.return_value = []
@@ -201,6 +223,7 @@ def test_get_kv_connector_kv_cache_events_returns_none_when_empty():
 
 def test_get_kv_connector_stats_delegates_to_worker():
     vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
     expected_stats = MooncakeStoreConnectorStats()
     expected_stats.record_operation("save_put", 0.01, 2, num_bytes=1024)
 
@@ -216,7 +239,7 @@ def test_get_kv_connector_stats_delegates_to_worker():
         ),
     ):
         connector = mooncake_store_connector.MooncakeStoreConnector(
-            vllm_config, KVConnectorRole.WORKER
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
         )
 
     mock_worker_cls.return_value.get_kv_connector_stats.return_value = expected_stats
@@ -247,6 +270,7 @@ def test_build_kv_connector_stats_reconstructs_mooncake_stats():
 
 def test_get_kv_connector_kv_cache_events_wraps_worker_events():
     vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
     event = _make_block_stored()
 
     with (
@@ -261,7 +285,7 @@ def test_get_kv_connector_kv_cache_events_wraps_worker_events():
         ),
     ):
         connector = mooncake_store_connector.MooncakeStoreConnector(
-            vllm_config, KVConnectorRole.WORKER
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
         )
 
     mock_worker_cls.return_value.get_kv_events.return_value = [event]
@@ -275,6 +299,7 @@ def test_get_kv_connector_kv_cache_events_wraps_worker_events():
 def test_prefer_cross_layer_blocks_from_config():
     # Default: disabled
     vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
     with (
         set_current_vllm_config(vllm_config),
         patch(
@@ -283,7 +308,7 @@ def test_prefer_cross_layer_blocks_from_config():
         ),
     ):
         connector = mooncake_store_connector.MooncakeStoreConnector(
-            vllm_config, KVConnectorRole.SCHEDULER
+            vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config
         )
     assert connector.prefer_cross_layer_blocks is False
 
@@ -301,13 +326,14 @@ def test_prefer_cross_layer_blocks_from_config():
         ),
     ):
         connector_enabled = mooncake_store_connector.MooncakeStoreConnector(
-            vllm_config_enabled, KVConnectorRole.SCHEDULER
+            vllm_config_enabled, KVConnectorRole.SCHEDULER, kv_cache_config
         )
     assert connector_enabled.prefer_cross_layer_blocks is True
 
 
 def test_register_cross_layers_kv_cache_delegates_to_worker():
     vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
 
     with (
         set_current_vllm_config(vllm_config),
@@ -321,7 +347,7 @@ def test_register_cross_layers_kv_cache_delegates_to_worker():
         ),
     ):
         connector = mooncake_store_connector.MooncakeStoreConnector(
-            vllm_config, KVConnectorRole.WORKER
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
         )
 
     fake_tensor = MagicMock()
@@ -334,6 +360,7 @@ def test_register_cross_layers_kv_cache_delegates_to_worker():
 
 def test_update_connector_output_and_take_events():
     vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
     event = _make_block_stored()
 
     with (
@@ -344,7 +371,7 @@ def test_update_connector_output_and_take_events():
         ),
     ):
         connector = mooncake_store_connector.MooncakeStoreConnector(
-            vllm_config, KVConnectorRole.SCHEDULER
+            vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config
         )
 
     kv_events = mooncake_store_connector.MooncakeStoreKVEvents(num_workers=1)
