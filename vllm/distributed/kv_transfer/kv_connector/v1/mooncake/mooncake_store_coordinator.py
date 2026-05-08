@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 
@@ -25,11 +26,11 @@ class ExternalCachedBlockPool:
     """Duck-typed BlockPool backed by a ``(group_id, hash)`` exists set."""
 
     def __init__(self, exists: set[tuple[int, bytes]] | None = None) -> None:
-        # ``exists=None`` is the tautological pool: used on the recv side
-        # where hit_length is already determined and we just want each
-        # spec's manager to apply its own mask pattern.
+        # ``exists=None`` is used on the recv side where hit_length is already
+        # determined and we just want each spec's manager to apply its own mask.
         self._exists = exists
         self.null_block = KVCacheBlock(block_id=0)
+        # Dummy ID 1 for present block for duck-typing.
         self._present_block = KVCacheBlock(block_id=1)
 
     def get_cached_block(
@@ -71,7 +72,7 @@ class MooncakeStoreCoordinator:
             tuple[KVCacheSpec, list[int], type[SingleTypeKVCacheManager]]
         ] = []
         for i, g in enumerate(self.kv_cache_groups):
-            spec = g.kv_cache_spec
+            spec = _unwrap_spec(g.kv_cache_spec)
             manager_cls = spec_manager_map[type(spec)]
             for existing_spec, group_ids, existing_cls in attention_groups:
                 if existing_spec == spec:
@@ -212,3 +213,9 @@ class MooncakeStoreCoordinator:
             tuple(blks if blks is not None else [] for blks in hit_blocks_by_group),
             hit_length,
         )
+
+
+def _unwrap_spec(spec: KVCacheSpec) -> KVCacheSpec:
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return next(iter(spec.kv_cache_specs.values()))
+    return spec
