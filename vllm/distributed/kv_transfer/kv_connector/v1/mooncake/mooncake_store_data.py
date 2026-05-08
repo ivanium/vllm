@@ -130,13 +130,12 @@ class ChunkedTokenDatabase:
         """
         if not block_hashes:
             return
-        chunk_hashes: Iterable[BlockHash] = (
-            block_hashes
-            if self.block_size == self.hash_block_size
-            else BlockHashListWithBlockSize(
+        if self.block_size == self.hash_block_size:
+            chunk_hashes: Iterable[BlockHash] = block_hashes
+        else:
+            chunk_hashes = BlockHashListWithBlockSize(
                 block_hashes, self.hash_block_size, self.block_size
             )
-        )
         for chunk_id, h in enumerate(chunk_hashes):
             start_idx = chunk_id * self.block_size
             if start_idx >= token_len:

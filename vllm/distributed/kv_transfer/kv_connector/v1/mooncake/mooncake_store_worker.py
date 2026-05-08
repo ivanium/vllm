@@ -13,7 +13,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,10 +29,15 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_coordinator import (  # noqa: E501
+    ExternalCachedBlockPool,
+    MooncakeStoreCoordinator,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (
     ChunkedTokenDatabase,
     KeyMetadata,
     MooncakeStoreConnectorMetadata,
+    PoolKey,
     ReqMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_scheduler import (  # noqa: E501
@@ -43,8 +48,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
 )
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip, make_zmq_socket
-from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    BlockHashListWithBlockSize,
+    maybe_convert_block_hash,
+)
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.serial_utils import MsgpackDecoder
 
 from .mooncake_store_metrics import MooncakeStoreConnectorStats
@@ -560,6 +569,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         block_size: int,
         tp_rank: int,
         ready_event: threading.Event,
+        coord: MooncakeStoreCoordinator,
         disk_offload_buffer_budget_bytes: int | None = None,
         record_operation: Callable[..., None] | None = None,
     ):
@@ -580,6 +590,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 disk_offload_buffer_budget_bytes
             )
         )
+        self._coord = coord
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
@@ -590,13 +601,23 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             * self.block_size
         )
 
+        # Skip chunks the consumer's per-group spec wouldn't populate
+        # locally (e.g. SWA pre-window) even if the producer stored them.
+        load_mask_per_group, _ = self._coord.find_longest_cache_hit(
+            req_meta.block_hashes, token_len, ExternalCachedBlockPool()
+        )
+
         addr_list: list[list[int]] = []
         size_list: list[list[int]] = []
         key_list: list[str] = []
         for g_idx, db in enumerate(self.token_databases):
+            mask = load_mask_per_group[g_idx]
             for start, end, key in db.process_tokens(
                 token_len, req_meta.block_hashes, mask_num
             ):
+                chunk_idx = start // db.block_size
+                if chunk_idx >= len(mask) or not mask[chunk_idx]:
+                    continue
                 addr, size, _ = db.prepare_value(start, end, req_meta.block_ids[g_idx])
                 key_list.append(key.to_string())
                 addr_list.append(addr)
@@ -782,22 +803,26 @@ class MooncakeStoreWorker:
             pp_rank=self.pp_rank,
         )
 
-        # Per-group ChunkedTokenDatabase. Hybrid attention (multi-group) is
-        # not yet wired through save/load/lookup; the assert pins that invariant
-        # so a multi-group config doesn't silently misbehave.
-        kv_cache_groups = list(kv_cache_config.kv_cache_groups)
-        assert len(kv_cache_groups) == 1, (
+        # Hybrid attention (multi-group save/load/lookup) is not wired yet;
+        self._kv_cache_groups: list[KVCacheGroupSpec] = list(
+            kv_cache_config.kv_cache_groups
+        )
+        assert len(self._kv_cache_groups) == 1, (
             f"MooncakeStoreConnector does not yet support hybrid attention "
-            f"(got {len(kv_cache_groups)} kv-cache groups); only single-group "
+            f"(got {len(self._kv_cache_groups)} kv-cache groups); only single-group "
             f"configs are supported."
         )
+        self.hash_block_size: int = self.cache_config.hash_block_size or self.block_size
         self._token_dbs: list[ChunkedTokenDatabase] = [
             ChunkedTokenDatabase(
                 dataclasses.replace(self.metadata, group_id=g_idx),
                 self.block_size,
             )
-            for g_idx in range(len(kv_cache_groups))
+            for g_idx in range(len(self._kv_cache_groups))
         ]
+        self._coord = MooncakeStoreCoordinator(
+            self._kv_cache_groups, hash_block_size=self.hash_block_size
+        )
 
         # Initialize MooncakeDistributedStore with its own TransferEngine
         store_config = MooncakeStoreConfig.load_from_env()
@@ -950,6 +975,7 @@ class MooncakeStoreWorker:
             self.block_size,
             self.tp_rank,
             ready_event_recving,
+            self._coord,
             disk_offload_buffer_budget_bytes=self.disk_offload_buffer_budget_bytes,
             record_operation=self._record_kv_connector_operation,
         )
@@ -1105,66 +1131,70 @@ class MooncakeStoreWorker:
 
         Checks across all TP ranks and PP ranks.
         """
-        end = 0
-        keys: list[str] = []
-        multi_tp_keys: list[str] = []
+        if not block_hashes or token_len <= 0:
+            return 0
+
+        # Build per-(group, hash) candidate keys expanded across TP/PP.
+        # candidate_meta[i] is the (group_id, hash_bytes) for candidate_keys[i].
+        candidate_keys: list[str] = []
+        candidate_meta: list[tuple[int, bytes]] = []
+        tp_count = min(self.tp_size, self.num_kv_head)
+        for g_idx, db in enumerate(self._token_dbs):
+            spec_block_size = db.block_size
+            if spec_block_size == self.hash_block_size:
+                group_hashes: Iterable[BlockHash] = block_hashes
+            else:
+                group_hashes = BlockHashListWithBlockSize(
+                    block_hashes, self.hash_block_size, spec_block_size
+                )
+            for chunk_id, h in enumerate(group_hashes):
+                start_idx = chunk_id * spec_block_size
+                if start_idx >= token_len:
+                    break
+                h_bytes = bytes(h)
+                hash_str = h.hex()
+                for tp in range(tp_count):
+                    for pp in range(self.pp_size):
+                        md = dataclasses.replace(
+                            self.metadata, tp_rank=tp, pp_rank=pp, group_id=g_idx
+                        )
+                        candidate_keys.append(PoolKey(md, hash_str).to_string())
+                        candidate_meta.append((g_idx, h_bytes))
+
+        if not candidate_keys:
+            return 0
+
         lookup_start = time.perf_counter()
         try:
-            starts: list[int] = []
-            for db in self._token_dbs:
-                for start, end, key in db.process_tokens(token_len, block_hashes):
-                    keys.append(key.to_string())
-                    starts.append(start)
-
-            # Expand keys for all TP ranks
-            multi_tp_keys = keys[:]
-            for i in range(1, min(self.tp_size, self.num_kv_head)):
-                for item in keys:
-                    new_str = item.replace("@tp_rank:0", f"@tp_rank:{i}", 1)
-                    multi_tp_keys.append(new_str)
-
-            # Expand keys for all PP ranks
-            pp_base_keys = multi_tp_keys.copy()
-            for i in range(1, self.pp_size):
-                for item in pp_base_keys:
-                    new_str = item.replace("@pp_rank:0", f"@pp_rank:{i}", 1)
-                    multi_tp_keys.append(new_str)
-
-            res = self.store.batch_is_exist(multi_tp_keys)
-            self._record_kv_connector_operation(
-                "lookup_exists",
-                time.perf_counter() - lookup_start,
-                len(multi_tp_keys),
-            )
-
-            num_block = len(keys)
-            multi_tp_values = [
-                res[i * num_block : (i + 1) * num_block]
-                for i in range(min(self.tp_size, self.num_kv_head) * self.pp_size)
-            ]
-            index = self._find_min_first_non_one_index(multi_tp_values)
-            if index != -1:
-                return starts[index]
+            res = self.store.batch_is_exist(candidate_keys)
         except Exception as e:
             self._record_kv_connector_operation(
                 "lookup_exists",
                 time.perf_counter() - lookup_start,
-                len(multi_tp_keys),
+                len(candidate_keys),
                 status="error",
-                num_failed_keys=len(multi_tp_keys),
+                num_failed_keys=len(candidate_keys),
             )
             logger.error("Remote connection failed in lookup: %s", e)
             return 0
-        return end
+        self._record_kv_connector_operation(
+            "lookup_exists",
+            time.perf_counter() - lookup_start,
+            len(candidate_keys),
+        )
 
-    @staticmethod
-    def _find_min_first_non_one_index(
-        arr: list[list[int]],
-    ) -> int:
-        try:
-            return min(idx for row in arr for idx, val in enumerate(row) if val != 1)
-        except ValueError:
-            return -1
+        # A (group, hash) is "present" only when every TP*PP rank has it.
+        expected_per_key = max(1, tp_count * self.pp_size)
+        present_count: dict[tuple[int, bytes], int] = {}
+        for gh, exists in zip(candidate_meta, res, strict=True):
+            if exists == 1:
+                present_count[gh] = present_count.get(gh, 0) + 1
+        exists_set = {gh for gh, c in present_count.items() if c >= expected_per_key}
+
+        _masks, hit_length = self._coord.find_longest_cache_hit(
+            block_hashes, token_len, ExternalCachedBlockPool(exists_set)
+        )
+        return hit_length
 
     def get_kv_events(self) -> list[BlockStored]:
         if self.enable_kv_events and self.kv_send_thread is not None:

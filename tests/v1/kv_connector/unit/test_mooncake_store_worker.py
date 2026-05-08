@@ -25,7 +25,7 @@ def _make_store_sending_thread(
     store: MagicMock,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     token_database = ChunkedTokenDatabase(
-        KeyMetadata("test-model", 0, 0, 0, 0, group_id=0), block_size=16
+        KeyMetadata("test-model", 0, 0, 0, 0), block_size=16
     )
     token_database.set_kv_caches_base_addr([0x1000])
     token_database.set_block_len([256])
@@ -47,17 +47,24 @@ def _make_store_recving_thread(
     *,
     disk_offload_buffer_budget_bytes: int | None = None,
 ) -> mooncake_store_worker.KVCacheStoreRecvingThread:
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
     token_database = ChunkedTokenDatabase(
-        KeyMetadata("test-model", 0, 0, 0, 0, group_id=0), block_size=16
+        KeyMetadata("test-model", 0, 0, 0, 0), block_size=16
     )
     token_database.set_kv_caches_base_addr([0x1000])
     token_database.set_block_len([256])
+    spec = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+    coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        [KVCacheGroupSpec(["layer0"], spec)], hash_block_size=16
+    )
     thread = mooncake_store_worker.KVCacheStoreRecvingThread(
         store=store,
         token_databases=[token_database],
         block_size=16,
         tp_rank=0,
         ready_event=threading.Event(),
+        coord=coord,
         disk_offload_buffer_budget_bytes=disk_offload_buffer_budget_bytes,
     )
     thread.request_queue.task_done = MagicMock()
@@ -426,12 +433,9 @@ def _make_bare_worker(
     worker.store = MagicMock()
     worker.store.register_buffer.return_value = 0
     worker.use_mla = False
-    worker._token_dbs = [
-        ChunkedTokenDatabase(
-            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
-            block_size=block_size,
-        )
-    ]
+    worker.token_database = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0), block_size=block_size
+    )
     worker.kv_role = kv_role
     worker.block_size = block_size
     worker.tp_rank = 0
@@ -445,6 +449,40 @@ def _make_bare_worker(
     worker.tp_size = 1
     worker.num_kv_head = 1
     worker.pp_size = 1
+    # Minimal single-full-attention-group config so the coordinator-based
+    # lookup path works (the connector no longer carries a legacy single-group
+    # path; everything flows through the coordinator).
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+    )
+
+    spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=8, head_size=64, dtype=None
+    )
+    # Layer names match the kv_caches keys used by register_kv_caches tests
+    # ("layer0", "__cross_layer__") so register_kv_caches' layer_to_group
+    # resolution succeeds.
+    group = KVCacheGroupSpec(["layer0", "__cross_layer__"], spec)
+    worker._kv_cache_groups = [group]
+    worker._effective_kv_cache_groups = [group]
+    worker._layer_to_group_id = {"layer0": 0, "__cross_layer__": 0}
+    worker.pcp_size = 1
+    worker.dcp_size = 1
+    worker.hash_block_size = block_size
+    worker.metadata = KeyMetadata("test-model", 0, 0, 0, 0)
+    # Pre-build a single-group _token_dbs so lookup-only tests don't have to
+    # call register_kv_caches.
+    worker._token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+            block_size=block_size,
+            hash_block_size=block_size,
+        )
+    ]
+    worker._coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups, hash_block_size=block_size
+    )
     return worker
 
 
@@ -497,6 +535,30 @@ def test_lookup_records_mooncake_metrics():
     assert isinstance(stats, MooncakeStoreConnectorStats)
     assert len(stats.data["lookup_exists"]) == 1
     assert stats.data["lookup_exists"][0]["num_keys"] == 2
+
+
+def test_lookup_partial_prefix_returns_first_hit_length():
+    worker = _make_bare_worker()
+    worker.store.batch_is_exist.return_value = [1, 1, 0]
+    assert worker.lookup(48, [b"a0", b"a1", b"a2"]) == 32
+
+
+def test_lookup_swa_single_group_returns_full_when_tail_window_present():
+    """Single-SWA, sliding_window=32 (= 2 blocks): producer stored only the
+    tail. The old left-to-right scan would return 0; coordinator-driven
+    lookup returns full prefix."""
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec, SlidingWindowSpec
+
+    worker = _make_bare_worker(block_size=16)
+    swa = SlidingWindowSpec(
+        block_size=16, num_kv_heads=8, head_size=64, dtype=None, sliding_window=32
+    )
+    worker._kv_cache_groups = [KVCacheGroupSpec(["layer0"], swa)]
+    worker._coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups, hash_block_size=worker.hash_block_size
+    )
+    worker.store.batch_is_exist.return_value = [0, 0, 1, 1]
+    assert worker.lookup(64, [b"h0", b"h1", b"h2", b"h3"]) == 64
 
 
 # ---------------------------------------------------------------------------
