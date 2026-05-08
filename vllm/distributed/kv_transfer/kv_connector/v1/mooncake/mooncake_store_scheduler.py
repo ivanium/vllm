@@ -359,7 +359,7 @@ class MooncakeStoreScheduler:
     def request_finished(
         self,
         request: Request,
-        block_ids: list[int],
+        block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Determine whether to delay freeing blocks for async save."""
         if self.kv_role == "kv_consumer":
@@ -367,11 +367,12 @@ class MooncakeStoreScheduler:
         tracker = self._request_trackers.get(request.request_id)
         if tracker is not None and tracker.num_saved_tokens <= 0:
             return False, None
-        delay_free_blocks = len(block_ids) > 0
+        total_blocks = sum(len(g) for g in block_ids)
+        delay_free_blocks = total_blocks > 0
         if delay_free_blocks:
             logger.debug(
                 "Delaying free of %d blocks for request %s",
-                len(block_ids),
+                total_blocks,
                 request.request_id,
             )
         return delay_free_blocks, None

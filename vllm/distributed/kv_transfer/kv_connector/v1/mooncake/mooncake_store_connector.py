@@ -23,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
@@ -83,7 +84,7 @@ class MooncakeStoreKVEvents(KVConnectorKVEvents):
         return f"<MooncakeStoreKVEvents events={self.get_all_events()}>"
 
 
-class MooncakeStoreConnector(KVConnectorBase_V1):
+class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
     """KV connector using MooncakeDistributedStore as shared KV pool."""
 
     @property
@@ -180,6 +181,13 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
         self,
         request: Request,
         block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return self.request_finished_all_groups(request, (block_ids,))
+
+    def request_finished_all_groups(
+        self,
+        request: Request,
+        block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
