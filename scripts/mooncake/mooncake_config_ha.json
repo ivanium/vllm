@@ -1,0 +1,9 @@
+{
+  "_comment": "Example Mooncake config for HA mode (3-node etcd backend). Replace IPs and ports with your start_etcd_cluster.sh defaults. master_server_address takes a comma-separated list of etcd endpoints; the C++ client picks any one to query master_view.",
+  "metadata_server": "P2PHANDSHAKE",
+  "master_server_address": "etcd://192.168.0.101:23800,192.168.0.101:23801,192.168.0.101:23802",
+  "global_segment_size": "100GB",
+  "local_buffer_size": "4GB",
+  "protocol": "rdma",
+  "device_name": ""
+}
