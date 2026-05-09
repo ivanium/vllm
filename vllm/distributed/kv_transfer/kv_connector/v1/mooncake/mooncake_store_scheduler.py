@@ -278,8 +278,20 @@ class MooncakeStoreScheduler:
                         raise ValueError(
                             f"Request {req_id} is not in _unfinished_requests"
                         )
-                    num_computed_token = cached_reqs.num_computed_tokens[i]
-                    if num_computed_token >= len(request.prompt_token_ids):
+                    # Async-safe clamp: request.block_hashes auto-extends on
+                    # output token append (vllm/v1/request.py:211), but the
+                    # scheduler may tick before that update lands.
+                    # Without the clamp, ReqMeta.from_request_tracker would
+                    # request more block_hashes than exist -> worker reads
+                    # past the end. Mirrors upstream commit 7ee5d5093b idiom.
+                    hashed_cap = len(request.block_hashes) * self._block_size
+                    if request_tracker.token_len > hashed_cap:
+                        request_tracker.token_len = hashed_cap
+                    # Skip if no new full block has crossed since last save.
+                    # (Decode mid-block; chunk_boundary in
+                    # ReqMeta.from_request_tracker would also skip, but
+                    # short-circuiting here saves the function call.)
+                    if request_tracker.token_len <= request_tracker.num_saved_tokens:
                         continue
                     request_tracker.update(new_block_ids)
 
