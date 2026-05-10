@@ -198,8 +198,9 @@ def test_e2e_swa_plus_full_save_then_lookup_hits():
     ready = threading.Event()
     send_thread = KVCacheStoreSendingThread(
         store=store,
-        token_databases=worker._token_dbs,
+        token_databases=worker.token_dbs,
         block_size=worker.block_size,
+        coord=worker.coord,
         tp_rank=worker.tp_rank,
         put_step=worker.put_step,
         kv_role=worker.kv_role,

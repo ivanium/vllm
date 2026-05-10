@@ -112,6 +112,46 @@ class MooncakeStoreCoordinator:
         )
         return masks, hit_length
 
+    def store_mask(self, aligned_token_len: int) -> tuple[list[bool], ...]:
+        """Per-group store masks: ``mask[g][i]`` is True iff chunk ``i`` of
+        group ``g`` would be populated by some future cache hit at length
+        ``L = N * lcm_block_size <= aligned_token_len``.
+        """
+        assert aligned_token_len % self.lcm_block_size == 0, (
+            f"aligned_token_len ({aligned_token_len}) must be a multiple of "
+            f"lcm_block_size ({self.lcm_block_size})"
+        )
+        if aligned_token_len == 0:
+            return tuple([] for _ in self.kv_cache_groups)
+
+        num_chunks_per_group = [
+            aligned_token_len // g.kv_cache_spec.block_size
+            for g in self.kv_cache_groups
+        ]
+
+        # Fast path: single group or full attn groups or uniform block_sizes
+        if all(
+            isinstance(spec, FullAttentionSpec)
+            or spec.block_size == self.lcm_block_size
+            for spec, _, _ in self.attention_groups
+        ):
+            return tuple([True] * n for n in num_chunks_per_group)
+
+        n_segments = aligned_token_len // self.lcm_block_size
+        # Dummy list of the correct length is sufficient
+        dummy_hashes: list[BlockHash] = [BlockHash(b"\x00" * 4)] * (
+            self.lcm_block_size // self.hash_block_size
+        )
+        template_masks, _ = self.find_longest_cache_hit(
+            dummy_hashes,
+            max_length=self.lcm_block_size,
+            cached_block_pool=ExternalCachedBlockPool(),
+        )
+        return tuple(
+            list(template_masks[g]) * n_segments
+            for g in range(len(self.kv_cache_groups))
+        )
+
     def _block_hashes_for_spec(
         self, block_hashes: list[BlockHash], spec: KVCacheSpec
     ) -> BlockHashList:

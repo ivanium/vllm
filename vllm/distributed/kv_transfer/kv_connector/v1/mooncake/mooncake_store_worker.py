@@ -318,6 +318,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
     def __init__(
         self,
         store: Any,
+        coord: MooncakeStoreCoordinator,
         token_databases: list[ChunkedTokenDatabase],
         block_size: int,
         tp_rank: int,
@@ -337,6 +338,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             record_operation=record_operation,
         )
         self.put_step = put_step
+        self.coord = coord
         self.kv_role = kv_role
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
         self.enable_kv_event = enable_kv_event
@@ -380,12 +382,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
         return True
 
     def _handle_request(self, req_meta: ReqMeta):
-        token_len = req_meta.token_len_chunk
+        # Cache hits are always a multiple of ``lcm_block_size`` tokens
+        lcm_block_size = self.coord.lcm_block_size
+        token_len = req_meta.token_len_chunk // lcm_block_size * lcm_block_size
         block_ids_per_group = req_meta.block_ids
         req_id = req_meta.req_id
         current_event = req_meta.current_event
 
         if req_id not in self.stored_requests:
+            self.request_queue.task_done()
+            return
+        if token_len == 0:
+            self.dec_stored_request(req_id)
             self.request_queue.task_done()
             return
         if self._should_skip_request(req_id):
@@ -398,15 +406,21 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self.request_queue.task_done()
             return
 
+        # Within each lcm region only per-spec relevant chunks are loaded
+        # (e.g., SWA or linear attn), so mask out irrelevant chunks
+        store_masks = self.coord.store_mask(token_len)
         starts: list[int] = []
         ends: list[int] = []
         keys: list[str] = []
         block_hashes: list[BlockHash] = []
         group_indices: list[int] = []
         for g_idx, db in enumerate(self.token_databases):
+            mask = store_masks[g_idx]
             for chunk_idx, (start, end, key) in enumerate(
                 db.process_tokens(token_len, req_meta.block_hashes)
             ):
+                if chunk_idx >= len(mask) or not mask[chunk_idx]:
+                    continue
                 starts.append(start)
                 ends.append(end)
                 keys.append(key.to_string())
@@ -561,11 +575,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     def __init__(
         self,
         store: Any,
+        coord: MooncakeStoreCoordinator,
         token_databases: list[ChunkedTokenDatabase],
         block_size: int,
         tp_rank: int,
         ready_event: threading.Event,
-        coord: MooncakeStoreCoordinator,
         disk_offload_buffer_budget_bytes: int | None = None,
         record_operation: Callable[..., None] | None = None,
     ):
@@ -586,7 +600,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 disk_offload_buffer_budget_bytes
             )
         )
-        self._coord = coord
+        self.coord = coord
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
@@ -599,7 +613,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
         # Skip chunks the consumer's per-group spec wouldn't populate
         # locally (e.g. SWA pre-window) even if the producer stored them.
-        load_mask_per_group, _ = self._coord.find_longest_cache_hit(
+        load_mask_per_group, _ = self.coord.find_longest_cache_hit(
             req_meta.block_hashes, token_len, ExternalCachedBlockPool()
         )
 
@@ -837,12 +851,12 @@ class MooncakeStoreWorker:
             list(kv_cache_config.kv_cache_groups)
         )
         self.hash_block_size = self._resolve_hash_block_size()
-        self._coord = MooncakeStoreCoordinator(
+        self.coord = MooncakeStoreCoordinator(
             self._kv_cache_groups, hash_block_size=self.hash_block_size
         )
         # One ChunkedTokenDatabase per group; addresses populated in
         # register_kv_caches once the kv-cache layout is known.
-        self._token_dbs: list[ChunkedTokenDatabase] = [
+        self.token_dbs: list[ChunkedTokenDatabase] = [
             ChunkedTokenDatabase(
                 dataclasses.replace(self.metadata, group_id=g_idx),
                 g.kv_cache_spec.block_size,
@@ -945,12 +959,12 @@ class MooncakeStoreWorker:
 
         logger.info(
             "Registered KV caches: num_groups=%d, num_segments=%d, num_blocks=%d",
-            len(self._token_dbs),
+            len(self.token_dbs),
             len(addrs),
             self.num_blocks,
         )
 
-        for db in self._token_dbs:
+        for db in self.token_dbs:
             db.set_kv_caches_base_addr(addrs)
             db.set_block_len(block_lens)
 
@@ -959,7 +973,8 @@ class MooncakeStoreWorker:
             ready_event_sending = threading.Event()
             self.kv_send_thread = KVCacheStoreSendingThread(
                 self.store,
-                self._token_dbs,
+                self.coord,
+                self.token_dbs,
                 self.block_size,
                 self.tp_rank,
                 self.put_step,
@@ -973,11 +988,11 @@ class MooncakeStoreWorker:
         ready_event_recving = threading.Event()
         self.kv_recv_thread = KVCacheStoreRecvingThread(
             self.store,
-            self._token_dbs,
+            self.coord,
+            self.token_dbs,
             self.block_size,
             self.tp_rank,
             ready_event_recving,
-            self._coord,
             disk_offload_buffer_budget_bytes=self.disk_offload_buffer_budget_bytes,
             record_operation=self._record_kv_connector_operation,
         )
@@ -1138,7 +1153,7 @@ class MooncakeStoreWorker:
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
         tp_count = min(self.tp_size, self.num_kv_head)
-        for g_idx, db in enumerate(self._token_dbs):
+        for g_idx, db in enumerate(self.token_dbs):
             spec_block_size = db.block_size
             if spec_block_size == self.hash_block_size:
                 group_hashes: Iterable[BlockHash] = block_hashes
@@ -1185,7 +1200,7 @@ class MooncakeStoreWorker:
                 present_count[gh] = present_count.get(gh, 0) + 1
         exists_set = {gh for gh, c in present_count.items() if c >= expected_per_key}
 
-        _masks, hit_length = self._coord.find_longest_cache_hit(
+        _masks, hit_length = self.coord.find_longest_cache_hit(
             block_hashes, token_len, ExternalCachedBlockPool(exists_set)
         )
         return hit_length
