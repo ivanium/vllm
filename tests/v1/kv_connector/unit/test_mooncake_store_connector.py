@@ -483,3 +483,57 @@ def test_lookup_key_client_reset_uses_magic_protocol():
     # NACK path: server returns 0, client surfaces False.
     fake_socket.recv.return_value = (0).to_bytes(4, "big")
     assert client.reset() is False
+
+
+def test_scheduler_reset_connector_cache_invokes_connector_reset():
+    """Integration-shaped test for the cascade
+
+    ``Scheduler.reset_prefix_cache(reset_connector=True)``
+        -> ``Scheduler.reset_connector_cache()``
+        -> ``MooncakeStoreConnector.reset_cache()``
+        -> ``MooncakeStoreScheduler.reset_store()``.
+
+    We construct a real (SCHEDULER role) ``MooncakeStoreConnector`` with
+    ``MooncakeStoreScheduler`` patched out, then drive the cascade via a
+    minimal stub that mimics the Scheduler's call site.
+    """
+    vllm_config = _make_vllm_config()
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_connector.MooncakeStoreScheduler"
+        ) as mock_scheduler_cls,
+    ):
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER
+        )
+
+    mock_scheduler_cls.return_value.reset_store.return_value = True
+
+    # Mirror Scheduler.reset_connector_cache (scheduler.py:1917-1929):
+    # the only relevant lines are
+    #   if self.connector.reset_cache() is False:
+    #       return False
+    #   return True
+    # We bypass the Scheduler class itself (heavy KVCacheManager setup)
+    # and exercise the same call shape.
+    class _StubScheduler:
+        def __init__(self, c):
+            self.connector = c
+            self.log_stats = False
+
+        def reset_connector_cache(self):
+            if self.connector.reset_cache() is False:
+                return False
+            return True
+
+    sched = _StubScheduler(connector)
+    assert sched.reset_connector_cache() is True
+    mock_scheduler_cls.return_value.reset_store.assert_called_once_with()
+
+    # Negative branch: store reset fails -> reset_connector_cache returns False.
+    mock_scheduler_cls.return_value.reset_store.reset_mock()
+    mock_scheduler_cls.return_value.reset_store.return_value = False
+    assert sched.reset_connector_cache() is False
