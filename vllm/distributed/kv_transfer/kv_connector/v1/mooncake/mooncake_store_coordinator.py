@@ -56,12 +56,14 @@ class MooncakeStoreCoordinator:
         self,
         kv_cache_groups: list[KVCacheGroupSpec],
         hash_block_size: int,
+        use_eagle: bool = False,
     ) -> None:
         assert all(
             g.kv_cache_spec.block_size % hash_block_size == 0 for g in kv_cache_groups
         ), "block_size must be divisible by hash_block_size"
         self.kv_cache_groups = kv_cache_groups
         self.hash_block_size = hash_block_size
+        self.use_eagle = use_eagle
         self._verify_and_split_kv_cache_groups()
 
     def _verify_and_split_kv_cache_groups(self) -> None:
@@ -91,6 +93,8 @@ class MooncakeStoreCoordinator:
             for i, (_, group_ids, _) in enumerate(self.attention_groups)
             if any(self.kv_cache_groups[gid].is_eagle_group for gid in group_ids)
         }
+        if self.use_eagle and not self.eagle_attn_group_indices:
+            self.eagle_attn_group_indices = set(range(len(self.attention_groups)))
         block_sizes = [spec.block_size for spec, _, _ in self.attention_groups]
         self.lcm_block_size = lcm(*block_sizes) if block_sizes else self.hash_block_size
 

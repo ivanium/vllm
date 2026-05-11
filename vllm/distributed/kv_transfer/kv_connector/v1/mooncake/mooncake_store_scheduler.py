@@ -24,7 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_utils import BlockHash, resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
@@ -51,11 +51,11 @@ class MooncakeStoreScheduler:
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         self.original_block_size = vllm_config.cache_config.block_size
-        self._block_size = vllm_config.cache_config.block_size
-        if self.pcp_size > 1:
-            self._block_size *= self.pcp_size
-        if self.dcp_size > 1:
-            self._block_size *= self.dcp_size
+        # LCM for multi-group HMA; bs * pcp * dcp for single-group. Matches
+        # the engine's own scheduler block size by construction.
+        self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config
+        )
 
         self._request_trackers: dict[str, RequestTracker] = {}
         self._preempted_req_ids: set[str] = set()

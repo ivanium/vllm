@@ -8,7 +8,6 @@ and MooncakeDistributedStore integration.
 
 import dataclasses
 import json
-import math
 import os
 import queue
 import threading
@@ -53,6 +52,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashListWithBlockSize,
     maybe_convert_block_hash,
+    resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.serial_utils import MsgpackDecoder
@@ -770,11 +770,9 @@ class MooncakeStoreWorker:
         self.load_async = True
         self.cache_config = vllm_config.cache_config
         self.original_block_size = self.cache_config.block_size
-        self.block_size = self.cache_config.block_size
-        if self.pcp_size > 1:
-            self.block_size *= self.pcp_size
-        if self.dcp_size > 1:
-            self.block_size *= self.dcp_size
+        self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config
+        )
         self.num_layers = model_config.get_num_layers(parallel_config)
 
         self.use_mla = False
@@ -843,16 +841,31 @@ class MooncakeStoreWorker:
         self.kv_connector_stats = MooncakeStoreConnectorStats()
 
         self._kv_cache_config = kv_cache_config
-        # Single-group + PCP/DCP > 1 needs spec.block_size scaled so the
-        # coordinator's ``block_size % hash_block_size == 0`` invariant
-        # holds. Multi-group has PCP/DCP == 1 by refusal, so groups pass
-        # through unchanged.
-        self._kv_cache_groups: list[KVCacheGroupSpec] = self._build_groups(
-            list(kv_cache_config.kv_cache_groups)
+        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
+        # self.block_size (= scheduler_block_size) so the coordinator's
+        # ``block_size % hash_block_size == 0`` invariant holds.
+        groups = list(kv_cache_config.kv_cache_groups)
+        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
+            g = groups[0]
+            groups = [
+                dataclasses.replace(
+                    g,
+                    kv_cache_spec=dataclasses.replace(
+                        g.kv_cache_spec, block_size=self.block_size
+                    ),
+                )
+            ]
+        self._kv_cache_groups: list[KVCacheGroupSpec] = groups
+        spec_cfg = getattr(vllm_config, "speculative_config", None)
+        use_eagle = bool(
+            spec_cfg.use_eagle()
+            if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
+            else False
         )
-        self.hash_block_size = self._resolve_hash_block_size()
         self.coord = MooncakeStoreCoordinator(
-            self._kv_cache_groups, hash_block_size=self.hash_block_size
+            self._kv_cache_groups,
+            hash_block_size=self.hash_block_size,
+            use_eagle=use_eagle,
         )
         # One ChunkedTokenDatabase per group; addresses populated in
         # register_kv_caches once the kv-cache layout is known.
@@ -864,27 +877,6 @@ class MooncakeStoreWorker:
             )
             for g_idx, g in enumerate(self._kv_cache_groups)
         ]
-
-    def _build_groups(self, groups: list[KVCacheGroupSpec]) -> list[KVCacheGroupSpec]:
-        scale = self.pcp_size * self.dcp_size
-        if scale == 1 or len(groups) != 1:
-            return groups
-        g = groups[0]
-        scaled_spec = dataclasses.replace(
-            g.kv_cache_spec, block_size=g.kv_cache_spec.block_size * scale
-        )
-        return [dataclasses.replace(g, kv_cache_spec=scaled_spec)]
-
-    def _resolve_hash_block_size(self) -> int:
-        """Mirrors vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes."""
-        groups = self._kv_cache_groups
-        if len(groups) == 1:
-            # Effective spec already has block_size scaled by pcp * dcp.
-            return groups[0].kv_cache_spec.block_size
-        override = self.cache_config.hash_block_size
-        if override is not None:
-            return override
-        return math.gcd(*[g.kv_cache_spec.block_size for g in groups])
 
     def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
         """Register a cross-layers KV cache tensor.
