@@ -54,9 +54,7 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
         for operation, records in sorted(self.data.items()):
             if not records:
                 continue
-            durations = [
-                float(record["duration_seconds"]) for record in records
-            ]
+            durations = [float(record["duration_seconds"]) for record in records]
             reduced[f"{operation}_count"] = len(records)
             reduced[f"{operation}_avg_ms"] = round(fmean(durations) * 1e3, 3)
             reduced[f"{operation}_p90_ms"] = round(

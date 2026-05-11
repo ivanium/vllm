@@ -64,7 +64,7 @@ def test_scheduler_role_initializes_store_scheduler_only():
             vllm_config, KVConnectorRole.SCHEDULER
         )
 
-    mock_scheduler.assert_called_once_with(vllm_config)
+    mock_scheduler.assert_called_once_with(vllm_config, kv_cache_config=None)
     mock_worker.assert_not_called()
     mock_lookup_server.assert_not_called()
     assert connector.connector_scheduler is mock_scheduler.return_value
@@ -94,7 +94,7 @@ def test_worker_role_initializes_store_worker_and_lookup_server_on_rank0():
         )
 
     mock_scheduler.assert_not_called()
-    mock_worker.assert_called_once_with(vllm_config)
+    mock_worker.assert_called_once_with(vllm_config, kv_cache_config=None)
     mock_lookup_server.assert_called_once_with(mock_worker.return_value, vllm_config)
     assert connector.connector_scheduler is None
     assert connector.connector_worker is mock_worker.return_value
@@ -119,7 +119,7 @@ def test_worker_role_skips_lookup_server_on_nonzero_rank():
             vllm_config, KVConnectorRole.WORKER
         )
 
-    mock_worker.assert_called_once_with(vllm_config)
+    mock_worker.assert_called_once_with(vllm_config, kv_cache_config=None)
     mock_lookup_server.assert_not_called()
 
 
