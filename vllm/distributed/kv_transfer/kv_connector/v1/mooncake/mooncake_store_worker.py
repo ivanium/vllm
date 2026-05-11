@@ -40,6 +40,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_schedu
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     get_mooncake_dp_engine_index,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.protocol import (
+    LOOKUP_MSG,
+    RESET_MSG,
+    RESP_ERR,
+    RESP_OK,
+)
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
@@ -1148,18 +1154,20 @@ class MooncakeStoreWorker:
 # Lookup Key Server
 # ============================================================
 
-# Sentinel used by LookupKeyClient/Server to discriminate the RESET admin
-# command from a normal token-length-prefixed lookup request. 0xFFFFFFFF
-# is the max uint32, far above any real model context length.
-RESET_MAGIC = 0xFFFFFFFF
-
-
 class LookupKeyServer:
-    """ZMQ server on worker rank 0 for handling prefix lookup queries.
+    """ZMQ server on worker rank 0 for the LookupKey admin channel.
 
-    Also accepts a RESET admin command (single 4-byte frame == RESET_MAGIC)
-    that triggers `store_worker.store.remove_all(force=True)`. Response is
-    `RESET_MAGIC` on success or `0` on failure. See `LookupKeyClient.reset`.
+    Handles two request types, discriminated by the named tag at frame 0
+    (see ``protocol.py`` for the wire format):
+
+    - ``LOOKUP_MSG``: prefix-cache hit query. Returns hit count as 4-byte BE.
+    - ``RESET_MSG``: ``store.remove_all(force=True)`` admin command. Returns
+      ``RESP_OK`` on success or ``RESP_ERR`` on failure.
+
+    Reset semantics: the caller must ensure no in-flight Mooncake
+    lookups/transfers when invoking reset. The ZMQ socket is REQ/REP and
+    serialises requests, but pending puts/gets in worker transfer threads
+    are independent of this channel.
     """
 
     def __init__(
@@ -1186,21 +1194,32 @@ class LookupKeyServer:
         def process_request():
             while self.running:
                 all_frames = self.socket.recv_multipart(copy=False)
-                token_len = int.from_bytes(all_frames[0], byteorder="big")
-                if token_len == RESET_MAGIC and len(all_frames) == 1:
+                msg_type = bytes(all_frames[0])
+
+                if msg_type == LOOKUP_MSG:
+                    token_len = int.from_bytes(all_frames[1], byteorder="big")
+                    hash_frames = all_frames[2:]
+                    hashes_str = self.decoder.decode(hash_frames)
+                    result = self.store_worker.lookup(token_len, hashes_str)
+                    self.socket.send(result.to_bytes(4, "big"))
+
+                elif msg_type == RESET_MSG:
                     try:
                         self.store_worker.store.remove_all(force=True)
-                        response = RESET_MAGIC.to_bytes(4, "big")
+                        logger.info(
+                            "Mooncake store reset via remove_all(force=True) "
+                            "succeeded."
+                        )
+                        self.socket.send(RESP_OK)
                     except Exception as e:
                         logger.error("Mooncake remove_all failed: %s", e)
-                        response = (0).to_bytes(4, "big")
-                    self.socket.send(response)
-                    continue
-                hash_frames = all_frames[1:]
-                hashes_str = self.decoder.decode(hash_frames)
-                result = self.store_worker.lookup(token_len, hashes_str)
-                response = result.to_bytes(4, "big")
-                self.socket.send(response)
+                        self.socket.send(RESP_ERR)
+
+                else:
+                    logger.warning(
+                        "LookupKeyServer received unknown msg_type: %r", msg_type
+                    )
+                    self.socket.send(RESP_ERR)
 
         self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()

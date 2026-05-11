@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
     mooncake_store_connector,
     mooncake_store_scheduler,
+    protocol,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (
     MooncakeStoreConnectorMetadata,
@@ -357,7 +358,7 @@ def test_update_connector_output_and_take_events():
 
 
 # ============================================================
-# reset_cache() — verl-style RL hard-reset path
+# reset_cache() — RL hard-reset path via typed LookupKey protocol
 # ============================================================
 
 
@@ -457,8 +458,14 @@ def test_scheduler_reset_store_handles_rpc_exception():
     assert sched.reset_store() is False
 
 
-def test_lookup_key_client_reset_uses_magic_protocol():
-    """LookupKeyClient.reset() sends the RESET_MAGIC sentinel and parses ack."""
+def test_lookup_key_client_reset_uses_admin_protocol():
+    """LookupKeyClient.reset() sends RESET_MSG tag and parses RESP_OK/ERR."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.protocol import (
+        RESET_MSG,
+        RESP_ERR,
+        RESP_OK,
+    )
+
     vllm_config = _make_vllm_config()
 
     # Avoid touching real ZMQ during construction.
@@ -469,19 +476,14 @@ def test_lookup_key_client_reset_uses_magic_protocol():
         client = mooncake_store_scheduler.LookupKeyClient(vllm_config)
 
     fake_socket = mock_make_socket.return_value
-    fake_socket.recv.return_value = (
-        mooncake_store_scheduler.RESET_MAGIC.to_bytes(4, "big")
-    )
+    fake_socket.recv.return_value = RESP_OK
     assert client.reset() is True
 
-    sent_frames = fake_socket.send_multipart.call_args[0][0]
-    assert len(sent_frames) == 1
-    assert int.from_bytes(sent_frames[0], "big") == (
-        mooncake_store_scheduler.RESET_MAGIC
-    )
+    sent_frame = fake_socket.send.call_args[0][0]
+    assert bytes(sent_frame) == RESET_MSG
 
-    # NACK path: server returns 0, client surfaces False.
-    fake_socket.recv.return_value = (0).to_bytes(4, "big")
+    # NACK path: server returns RESP_ERR, client surfaces False.
+    fake_socket.recv.return_value = RESP_ERR
     assert client.reset() is False
 
 

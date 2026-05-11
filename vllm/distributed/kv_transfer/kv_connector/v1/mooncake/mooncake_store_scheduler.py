@@ -21,6 +21,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data i
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     get_mooncake_dp_engine_index,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.protocol import (
+    LOOKUP_MSG,
+    RESET_MSG,
+    RESP_OK,
+)
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -364,19 +369,28 @@ class MooncakeStoreScheduler:
         return delay_free_blocks, None
 
     def reset_store(self) -> bool:
-        """Trigger a global `remove_all(force=True)` on the Mooncake master.
+        """Trigger a global ``remove_all(force=True)`` on the Mooncake master.
 
-        Routes through the existing ZMQ admin channel to worker rank 0,
-        which owns the `MooncakeDistributedStore` handle. Returns True on
-        success, False if the worker failed to clear or the RPC errored.
+        Routes through the existing LookupKey ZMQ admin channel to worker
+        rank 0, which owns the ``MooncakeDistributedStore`` handle.
+
+        Ordering assumption: caller (typically
+        ``Scheduler.reset_connector_cache``, invoked via
+        ``reset_prefix_cache(reset_connector=True)``) MUST ensure no
+        in-flight Mooncake lookups or transfers. For RL workflows this is
+        satisfied at the step boundary after weight updates and rollout
+        drain. Violating this can allow stale KV to be served on the next
+        request, defeating the hard-reset guarantee.
+
+        Returns True on ACK from worker, False on NACK or RPC error.
         """
         try:
             ok = self.client.reset()
             if ok:
-                logger.info("Mooncake store reset via RemoveAll succeeded.")
+                logger.info("Mooncake store reset via remove_all succeeded.")
             else:
                 logger.warning(
-                    "Mooncake store reset returned failure ack from worker."
+                    "Mooncake store reset returned NACK from worker."
                 )
             return ok
         except Exception as e:
@@ -384,12 +398,13 @@ class MooncakeStoreScheduler:
             return False
 
 
-# Mirror of RESET_MAGIC in mooncake_store_worker.LookupKeyServer.
-RESET_MAGIC = 0xFFFFFFFF
-
-
 class LookupKeyClient:
-    """ZMQ client for querying prefix cache hits from worker."""
+    """ZMQ client for the LookupKey admin channel.
+
+    Routes both prefix-cache lookups and admin commands (currently:
+    ``reset``) to ``LookupKeyServer`` on worker rank 0. The first frame
+    of every request is a named tag from ``protocol.py``.
+    """
 
     def __init__(self, vllm_config: VllmConfig):
         self.encoder = MsgpackEncoder()
@@ -406,20 +421,23 @@ class LookupKeyClient:
         hash_strs = [h.hex() for h in block_hashes]
         hash_frames = self.encoder.encode(hash_strs)
         token_len_bytes = token_len.to_bytes(4, byteorder="big")
-        all_frames = [token_len_bytes] + list(hash_frames)
+        all_frames = [LOOKUP_MSG, token_len_bytes] + list(hash_frames)
         self.socket.send_multipart(all_frames, copy=False)
         resp = self.socket.recv()
         result = int.from_bytes(resp, "big")
         return result
 
     def reset(self) -> bool:
-        """Trigger `store.remove_all(force=True)` on worker rank 0.
+        """Trigger ``store.remove_all(force=True)`` on worker rank 0.
 
-        Returns True on success, False on failure.
+        Ordering assumption: caller MUST ensure no in-flight Mooncake
+        lookups or transfers when invoking reset. In RL workflows this
+        holds naturally at the step boundary after weight updates and
+        rollout drain. Returns True on ACK, False on NACK.
         """
-        self.socket.send_multipart([RESET_MAGIC.to_bytes(4, "big")], copy=False)
+        self.socket.send(RESET_MSG)
         resp = self.socket.recv()
-        return int.from_bytes(resp, "big") == RESET_MAGIC
+        return bytes(resp) == RESP_OK
 
     def close(self):
         self.socket.close(linger=0)
