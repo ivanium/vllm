@@ -479,7 +479,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         addrs: list[list[int]] = []
         sizes: list[list[int]] = []
         stored_events: list[BlockStored] = []
-        prev_key = None
+        # parent_block_hash chains live within a group, not across.
+        prev_key_per_group: dict[int, Any] = {}
         new_block_hashes = [maybe_convert_block_hash(bh) for bh in block_hashes]
 
         for idx, (s, e, g_idx) in enumerate(
@@ -496,7 +497,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 )
                 stored_event = BlockStored(
                     block_hashes=[new_block_hashes[idx]],
-                    parent_block_hash=prev_key,
+                    parent_block_hash=prev_key_per_group.get(g_idx),
                     token_ids=token_ids,
                     block_size=req_meta.original_block_size,
                     lora_id=None,
@@ -504,7 +505,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     lora_name=None,
                 )
                 stored_events.append(stored_event)
-                prev_key = new_block_hashes[idx]
+                prev_key_per_group[g_idx] = new_block_hashes[idx]
 
         if current_event is not None:
             current_event.synchronize()
