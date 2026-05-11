@@ -354,3 +354,132 @@ def test_update_connector_output_and_take_events():
     assert connector._kv_cache_events is kv_events
     assert list(connector.take_events()) == [event]
     assert connector._kv_cache_events is None
+
+
+# ============================================================
+# reset_cache() — verl-style RL hard-reset path
+# ============================================================
+
+
+def test_reset_cache_scheduler_role_delegates_to_reset_store():
+    """SCHEDULER role reset_cache() routes to scheduler.reset_store()."""
+    vllm_config = _make_vllm_config()
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_connector.MooncakeStoreScheduler"
+        ) as mock_scheduler_cls,
+    ):
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER
+        )
+
+    mock_scheduler_cls.return_value.reset_store.return_value = True
+    assert connector.reset_cache() is True
+    mock_scheduler_cls.return_value.reset_store.assert_called_once_with()
+
+
+def test_reset_cache_scheduler_role_propagates_failure():
+    """SCHEDULER role surfaces False when scheduler.reset_store() fails."""
+    vllm_config = _make_vllm_config()
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_connector.MooncakeStoreScheduler"
+        ) as mock_scheduler_cls,
+    ):
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER
+        )
+
+    mock_scheduler_cls.return_value.reset_store.return_value = False
+    assert connector.reset_cache() is False
+
+
+def test_reset_cache_worker_role_returns_none():
+    """WORKER role reset_cache() is a no-op; reset is driven via ZMQ admin."""
+    vllm_config = _make_vllm_config()
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_connector.MooncakeStoreWorker"
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_connector.LookupKeyServer"
+        ),
+    ):
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.WORKER
+        )
+
+    assert connector.reset_cache() is None
+
+
+def test_scheduler_reset_store_returns_client_reset_result():
+    """MooncakeStoreScheduler.reset_store() returns LookupKeyClient.reset()."""
+    vllm_config = _make_vllm_config()
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_scheduler.LookupKeyClient"
+        ) as mock_client_cls,
+    ):
+        sched = mooncake_store_scheduler.MooncakeStoreScheduler(vllm_config)
+
+    mock_client_cls.return_value.reset.return_value = True
+    assert sched.reset_store() is True
+    mock_client_cls.return_value.reset.assert_called_once_with()
+
+
+def test_scheduler_reset_store_handles_rpc_exception():
+    """Exceptions from the ZMQ reset RPC are converted to False, not raised."""
+    vllm_config = _make_vllm_config()
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_scheduler.LookupKeyClient"
+        ) as mock_client_cls,
+    ):
+        sched = mooncake_store_scheduler.MooncakeStoreScheduler(vllm_config)
+
+    mock_client_cls.return_value.reset.side_effect = RuntimeError("rpc timed out")
+    assert sched.reset_store() is False
+
+
+def test_lookup_key_client_reset_uses_magic_protocol():
+    """LookupKeyClient.reset() sends the RESET_MAGIC sentinel and parses ack."""
+    vllm_config = _make_vllm_config()
+
+    # Avoid touching real ZMQ during construction.
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+        "mooncake_store_scheduler.make_zmq_socket"
+    ) as mock_make_socket:
+        client = mooncake_store_scheduler.LookupKeyClient(vllm_config)
+
+    fake_socket = mock_make_socket.return_value
+    fake_socket.recv.return_value = (
+        mooncake_store_scheduler.RESET_MAGIC.to_bytes(4, "big")
+    )
+    assert client.reset() is True
+
+    sent_frames = fake_socket.send_multipart.call_args[0][0]
+    assert len(sent_frames) == 1
+    assert int.from_bytes(sent_frames[0], "big") == (
+        mooncake_store_scheduler.RESET_MAGIC
+    )
+
+    # NACK path: server returns 0, client surfaces False.
+    fake_socket.recv.return_value = (0).to_bytes(4, "big")
+    assert client.reset() is False

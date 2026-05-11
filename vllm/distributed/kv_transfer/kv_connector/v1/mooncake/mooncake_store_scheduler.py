@@ -363,6 +363,30 @@ class MooncakeStoreScheduler:
             )
         return delay_free_blocks, None
 
+    def reset_store(self) -> bool:
+        """Trigger a global `remove_all(force=True)` on the Mooncake master.
+
+        Routes through the existing ZMQ admin channel to worker rank 0,
+        which owns the `MooncakeDistributedStore` handle. Returns True on
+        success, False if the worker failed to clear or the RPC errored.
+        """
+        try:
+            ok = self.client.reset()
+            if ok:
+                logger.info("Mooncake store reset via RemoveAll succeeded.")
+            else:
+                logger.warning(
+                    "Mooncake store reset returned failure ack from worker."
+                )
+            return ok
+        except Exception as e:
+            logger.error("Mooncake reset_store RPC failed: %s", e)
+            return False
+
+
+# Mirror of RESET_MAGIC in mooncake_store_worker.LookupKeyServer.
+RESET_MAGIC = 0xFFFFFFFF
+
 
 class LookupKeyClient:
     """ZMQ client for querying prefix cache hits from worker."""
@@ -387,6 +411,15 @@ class LookupKeyClient:
         resp = self.socket.recv()
         result = int.from_bytes(resp, "big")
         return result
+
+    def reset(self) -> bool:
+        """Trigger `store.remove_all(force=True)` on worker rank 0.
+
+        Returns True on success, False on failure.
+        """
+        self.socket.send_multipart([RESET_MAGIC.to_bytes(4, "big")], copy=False)
+        resp = self.socket.recv()
+        return int.from_bytes(resp, "big") == RESET_MAGIC
 
     def close(self):
         self.socket.close(linger=0)

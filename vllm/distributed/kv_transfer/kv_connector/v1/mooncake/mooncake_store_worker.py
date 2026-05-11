@@ -1148,9 +1148,19 @@ class MooncakeStoreWorker:
 # Lookup Key Server
 # ============================================================
 
+# Sentinel used by LookupKeyClient/Server to discriminate the RESET admin
+# command from a normal token-length-prefixed lookup request. 0xFFFFFFFF
+# is the max uint32, far above any real model context length.
+RESET_MAGIC = 0xFFFFFFFF
+
 
 class LookupKeyServer:
-    """ZMQ server on worker rank 0 for handling prefix lookup queries."""
+    """ZMQ server on worker rank 0 for handling prefix lookup queries.
+
+    Also accepts a RESET admin command (single 4-byte frame == RESET_MAGIC)
+    that triggers `store_worker.store.remove_all(force=True)`. Response is
+    `RESET_MAGIC` on success or `0` on failure. See `LookupKeyClient.reset`.
+    """
 
     def __init__(
         self,
@@ -1177,6 +1187,15 @@ class LookupKeyServer:
             while self.running:
                 all_frames = self.socket.recv_multipart(copy=False)
                 token_len = int.from_bytes(all_frames[0], byteorder="big")
+                if token_len == RESET_MAGIC and len(all_frames) == 1:
+                    try:
+                        self.store_worker.store.remove_all(force=True)
+                        response = RESET_MAGIC.to_bytes(4, "big")
+                    except Exception as e:
+                        logger.error("Mooncake remove_all failed: %s", e)
+                        response = (0).to_bytes(4, "big")
+                    self.socket.send(response)
+                    continue
                 hash_frames = all_frames[1:]
                 hashes_str = self.decoder.decode(hash_frames)
                 result = self.store_worker.lookup(token_len, hashes_str)
