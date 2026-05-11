@@ -54,6 +54,9 @@ class MooncakeStoreScheduler:
 
         self._request_trackers: dict[str, RequestTracker] = {}
         self._preempted_req_ids: set[str] = set()
+        # num_saved_tokens snapshot at preemption, restored on resume so
+        # we don't re-issue exists checks for already-saved chunks.
+        self._preempted_saved_tokens: dict[str, int] = {}
         self._discard_partial_chunks = (
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "discard_partial_chunks", True
@@ -153,10 +156,13 @@ class MooncakeStoreScheduler:
             self._unfinished_requests.pop(finished_req_id, None)
             self._unfinished_request_ids.discard(finished_req_id)
             self._preempted_req_ids.discard(finished_req_id)
+            self._preempted_saved_tokens.pop(finished_req_id, None)
 
         self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
         for req_id in scheduler_output.preempted_req_ids:
-            self._request_trackers.pop(req_id, None)
+            tracker = self._request_trackers.pop(req_id, None)
+            if tracker is not None and tracker.num_saved_tokens > 0:
+                self._preempted_saved_tokens[req_id] = tracker.num_saved_tokens
             self._unfinished_requests.pop(req_id, None)
 
         meta = MooncakeStoreConnectorMetadata(
@@ -234,7 +240,7 @@ class MooncakeStoreScheduler:
                         req_id=req_id,
                         token_len=num_tokens_to_compute,
                         allocated_block_ids=new_block_ids,
-                        num_saved_tokens=0,
+                        num_saved_tokens=self._preempted_saved_tokens.pop(req_id, 0),
                         token_ids=request_real.prompt_token_ids[
                             :num_tokens_to_compute
                         ].copy(),
