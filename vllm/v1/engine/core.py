@@ -627,7 +627,18 @@ class EngineCore:
         self.model_executor.reset_encoder_cache()
 
     def _reset_caches(self, reset_running_requests=True) -> None:
-        self.reset_prefix_cache(reset_running_requests=reset_running_requests)
+        # reset_connector=True so that external KV-store connectors
+        # (e.g. MooncakeStoreConnector) drop their state alongside the
+        # local prefix/mm/encoder caches. This is the cache invariant
+        # callers of ``pause_generation(clear_cache=True)`` expect: clear
+        # all caches, not just the on-engine ones. Callers that only
+        # want a local-only invalidation should invoke
+        # ``self.scheduler.reset_prefix_cache(reset_connector=False)``
+        # directly instead of going through this cascade.
+        self.reset_prefix_cache(
+            reset_running_requests=reset_running_requests,
+            reset_connector=True,
+        )
         self.reset_mm_cache()
         self.reset_encoder_cache()
 
