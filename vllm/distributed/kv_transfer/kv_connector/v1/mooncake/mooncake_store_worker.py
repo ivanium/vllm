@@ -614,9 +614,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
         # Skip chunks the consumer's per-group spec wouldn't populate
         # locally (e.g. SWA pre-window) even if the producer stored them.
-        load_mask_per_group, _ = self.coord.find_longest_cache_hit(
-            req_meta.block_hashes, token_len, ExternalCachedBlockPool()
-        )
+        load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
 
         addr_list: list[list[int]] = []
         size_list: list[list[int]] = []

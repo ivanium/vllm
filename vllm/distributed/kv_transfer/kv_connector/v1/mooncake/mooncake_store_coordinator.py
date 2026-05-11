@@ -116,6 +116,20 @@ class MooncakeStoreCoordinator:
         )
         return masks, hit_length
 
+    def load_mask(
+        self,
+        block_hashes: list[BlockHash],
+        token_len: int,
+    ) -> tuple[list[bool], ...]:
+        """Per-group load masks: ``mask[g][i]`` is True iff group ``g``'s
+        spec would populate chunk ``i`` locally at length ``token_len``
+        (e.g. SWA / Mamba tail-only).
+        """
+        masks, _ = self.find_longest_cache_hit(
+            block_hashes, token_len, ExternalCachedBlockPool()
+        )
+        return masks
+
     def store_mask(self, aligned_token_len: int) -> tuple[list[bool], ...]:
         """Per-group store masks: ``mask[g][i]`` is True iff chunk ``i`` of
         group ``g`` would be populated by some future cache hit at length
