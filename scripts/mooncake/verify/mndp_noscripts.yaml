@@ -1,0 +1,245 @@
+# MooncakeStore DP=4 disk-offload validation — zero shell scripts.
+#
+# Layout:
+#   pre_serve[0]   mooncake_master  (with HTTP metadata server for prod perf)
+#   pre_serve[1]   mooncake_client  (per-node owner)
+#   serving        plain `vllm serve` cmd — JSON --kv-transfer-config inlined
+#                  directly because there's no bash -c wrapping anymore.
+#   post_serve     vllm-bench, then kill owner + master via stored PID files.
+#
+# scripts/mooncake/mooncake_config.json holds the runtime connection params
+# (master/metadata/protocol/...) and is selected via MOONCAKE_CONFIG_PATH below.
+#
+# Required on PATH: mooncake_master, mooncake_client, vllm, nc.
+
+model: Qwen/Qwen3-8B
+mode: local
+precheck: true
+collect_env: true
+router_port: auto
+prometheus_port: auto
+
+# -----------------------------------------------------------------------------
+# 1) Start the Mooncake master (object-store metadata + eviction + offload sig
+#    + HTTP metadata server on port 8080 for cached peer discovery).
+# -----------------------------------------------------------------------------
+pre_serve:
+  - cmd: |
+      bash -c '
+        set -euo pipefail
+        mkdir -p {log_dir}
+        nohup mooncake_master \
+          -rpc_port=50051 \
+          -rpc_thread_num=4 \
+          -default_kv_lease_ttl=30000 \
+          -eviction_high_watermark_ratio=0.95 \
+          -eviction_ratio=0.1 \
+          -enable_metric_reporting=true \
+          -metrics_port=9003 \
+          -enable_http_metadata_server=true \
+          -http_metadata_server_host=0.0.0.0 \
+          -http_metadata_server_port=8080 \
+          -enable_offload=true \
+          -logtostderr \
+          > {log_dir}/mooncake_master.log 2>&1 < /dev/null &
+        MASTER_PID=$$!
+        echo $$MASTER_PID > {log_dir}/mooncake_master.pid
+        for _ in $$(seq 60); do
+          nc -z 127.0.0.1 50051 && nc -z 127.0.0.1 8080 && break
+          kill -0 $$MASTER_PID 2>/dev/null || {
+            echo "mooncake_master crashed during startup" >&2
+            tail -n 40 {log_dir}/mooncake_master.log >&2 || true
+            exit 1
+          }
+          sleep 0.5
+        done
+        echo "mooncake_master ready (pid=$$MASTER_PID, rpc=:50051, http=:8080)"
+      '
+    repo_path: /home/${USER}/repos/vllm-mooncake
+
+  # -----------------------------------------------------------------------------
+  # 2) Start the per-node Mooncake owner (mooncake_client). Holds the node's
+  #    CPU pool + SSD tier. Backgrounded; PID stored so post_serve can kill it.
+  # -----------------------------------------------------------------------------
+  - cmd: |
+      bash -c '
+        set -euo pipefail
+        OWNER_HOST=127.0.0.1
+        OWNER_RPC_PORT=50052
+        OWNER_SEGMENT_PORT=50053
+        OWNER_CPU_GIB=$${MC_OWNER_CPU_MEM_GIB:-4}
+        OWNER_DISK_GIB=$${MC_OWNER_DISK_GIB:-1000}
+        OWNER_DISK_PATH=$${MC_OWNER_DISK_PATH:-/mnt/data/$USER/mooncake_offload}
+        OWNER_DEVICES=$${MC_OWNER_DEVICES:-rocep139s0,rocep140s0,rocep195s0,rocep196s0}
+
+        mkdir -p "$$OWNER_DISK_PATH"
+        export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$$OWNER_DISK_PATH"
+        export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
+        export MOONCAKE_BUCKET_EVICTION_POLICY=lru
+        export MOONCAKE_USE_URING=true
+        export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=$$(( 32 * 1073741824 ))
+        export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=$$(( OWNER_DISK_GIB * 1073741824 ))
+
+        nohup mooncake_client \
+          --master_server_address=127.0.0.1:50051 \
+          --metadata_server=http://127.0.0.1:8080/metadata \
+          --host=$${OWNER_HOST}:$${OWNER_SEGMENT_PORT} \
+          --port=$${OWNER_RPC_PORT} \
+          --protocol=rdma \
+          --device_names="$$OWNER_DEVICES" \
+          --global_segment_size=$${OWNER_CPU_GIB}GB \
+          --enable_offload=true \
+          --threads=1 \
+          > {log_dir}/mooncake_owner.log 2>&1 < /dev/null &
+        OWNER_PID=$$!
+        echo $$OWNER_PID > {log_dir}/mooncake_owner.pid
+        for _ in $$(seq 60); do
+          nc -z 127.0.0.1 $${OWNER_SEGMENT_PORT} && break
+          kill -0 $$OWNER_PID 2>/dev/null || {
+            echo "mooncake_client crashed during startup" >&2
+            tail -n 60 {log_dir}/mooncake_owner.log >&2 || true
+            exit 1
+          }
+          sleep 1
+        done
+        echo "mooncake_client ready (pid=$$OWNER_PID, segment=127.0.0.1:$${OWNER_SEGMENT_PORT})"
+      '
+    env:
+      MC_OWNER_CPU_MEM_GIB: "4"
+      MC_OWNER_DISK_GIB: "1000"
+      MC_OWNER_DISK_PATH: "/mnt/data/${USER}/mooncake_offload"
+      MC_OWNER_DEVICES: "rocep139s0,rocep140s0,rocep195s0,rocep196s0"
+    repo_path: /home/${USER}/repos/vllm-mooncake
+
+# -----------------------------------------------------------------------------
+# 3) Serving — plain `vllm serve`. No bash -c wrapping, so the inline
+#    --kv-transfer-config JSON works exactly like ci-fork pd_xpyd recipes.
+# -----------------------------------------------------------------------------
+serving:
+  roles:
+    - role: worker
+      count: 1
+      nodes_per_instance: 1
+      gpus_per_node: 4
+      base_port: 8100
+      vllm_engine:
+        repo_path: /home/${USER}/repos/vllm-mooncake
+        cmd: >-
+          vllm serve {model}
+          --port {port}
+          --trust-remote-code
+          --load-format dummy
+          --enforce-eager
+          -dp 4
+          --gpu-memory-utilization 0.4
+          --num-gpu-blocks-override 1024
+          --max-model-len 16384
+          --max-num-seqs 32
+          --max-num-batched-tokens 8192
+          --enable-prefix-caching
+          --enable-chunked-prefill
+          --disable-uvicorn-access-log
+          --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"load_async":true,"enable_cross_layers_blocks":true,"enable_offload":true}}'
+        env:
+          # Connection params for the vllm-side MooncakeStoreConfig.
+          MOONCAKE_CONFIG_PATH: "/home/${USER}/repos/vllm-mooncake/scripts/mooncake/mooncake_config.json"
+          # Steer this rank to the owner we just spawned (same node, port 50053).
+          MOONCAKE_PREFERRED_SEGMENT: "127.0.0.1:50053"
+          # vLLM-side tier logging.
+          VLLM_MOONCAKE_STORE_TIER_LOG: "1"
+          GLOG_v: "1"
+          VLLM_USE_SIMPLE_KV_OFFLOAD: "1"
+          # Timeouts.
+          VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+          VLLM_RPC_TIMEOUT: "600000"
+          VLLM_LOG_STATS_INTERVAL: "1"
+          # UCX for MNNVL.
+          UCX_MEMTYPE_CACHE: "n"
+          UCX_MEMTYPE_REG_WHOLE: "n"
+          UCX_TLS: "cuda_copy,cuda_ipc,tcp"
+          UCX_CUDA_IPC_ENABLE_MNNVL: "y"
+          UCX_RC_TIMEOUT: "5s"
+          UCX_RC_RETRY_COUNT: "14"
+          UCX_RC_RNR_TIMEOUT: "10ms"
+          UCX_RC_RNR_RETRY_COUNT: "14"
+          # Model cache.
+          HF_HOME: /mnt/lustre/hf-models
+          # NCCL for GB200 NVL72.
+          NCCL_P2P_DISABLE: "0"
+          NCCL_P2P_LEVEL: NVL
+          NCCL_SOCKET_IFNAME: enp192s2
+          NCCL_IB_HCA: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
+          NCCL_NET_GDR_LEVEL: "5"
+          NCCL_SHM_DISABLE: "1"
+          NCCL_DEBUG: WARN
+          NCCL_TIMEOUT: "1800"
+          TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "1800"
+          GLOO_SOCKET_IFNAME: enp192s2
+        health_check:
+          url: "http://localhost:{port}/health"
+          timeout_s: 3600
+          poll_interval_s: 10
+
+  router:
+    repo_path: /home/${USER}/repos/router-internal
+    cmd: >-
+      cargo run --release --
+      --policy consistent_hash
+      --prometheus-port {prometheus_port}
+      --host 0.0.0.0
+      --port {router_port}
+      --intra-node-data-parallel-size 4
+      {worker_flags}
+    health_check:
+      url: http://localhost:{router_port}/health
+      timeout_s: 300
+      poll_interval_s: 5
+
+  remote:
+    launcher: slurm
+    slurm:
+      partition: normal
+      time_limit: "12:00:00"
+      grace_period_s: 120
+
+# -----------------------------------------------------------------------------
+# 4) Benchmark, then kill owner + master via PID files we wrote earlier.
+# -----------------------------------------------------------------------------
+post_serve:
+  - vmon: start
+  - cmd: >-
+      vllm-bench
+      --backend openai-chat
+      --base-url http://localhost:{router_port}
+      --model {model}
+      --dataset-name random
+      --random-input-len 16000
+      --random-output-len 300
+      --num-prompts 100
+      --multi-turn
+      --multi-turn-num-turns 3
+      --multi-turn-concurrency 32
+      --multi-turn-delay-ms 500
+      --multi-turn-prefix-global-ratio 0.1
+      --multi-turn-prefix-conversation-ratio 0.8
+      --percentile-metrics "ttft,tpot,itl,e2el"
+      --result-dir {log_dir}
+      --save-result
+  - vmon: stop
+  - cmd: |
+      bash -c '
+        for tag in owner master; do
+          PID_FILE={log_dir}/mooncake_$${tag}.pid
+          if [[ -f $$PID_FILE ]]; then
+            PID=$$(<$$PID_FILE)
+            kill -TERM "$$PID" 2>/dev/null || true
+            for _ in $$(seq 5); do kill -0 "$$PID" 2>/dev/null || break; sleep 1; done
+            kill -KILL "$$PID" 2>/dev/null || true
+            rm -f $$PID_FILE
+          fi
+        done
+        # Safety-net.
+        pkill -u $USER -x mooncake_client 2>/dev/null || true
+        pkill -u $USER -x mooncake_master 2>/dev/null || true
+        true
+      '
