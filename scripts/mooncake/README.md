@@ -227,6 +227,26 @@ python scripts/mooncake/compare_results.py ./bench_results --prefix mt_
 bash scripts/mooncake/start_mooncake_master.sh --stop
 ```
 
+## High Availability (Optional)
+
+3 `mooncake_master` replicas behind a 3-node etcd cluster. Master leader
+dies → standby elected within ~5s (etcd lease TTL) → vLLM client
+auto-reconnects via `leader_monitor_thread_`.
+
+```bash
+bash scripts/mooncake/start_etcd_cluster.sh --bg
+bash scripts/mooncake/start_mooncake_master_ha.sh --bg
+export MOONCAKE_CONFIG_PATH=scripts/mooncake/mooncake_config_ha.json
+
+# Validate failover (optional)
+bash scripts/mooncake/failover_chaos.sh kill_master ./out/ && jq . ./out/failover.json
+```
+
+Recovery distribution, election-only HA caveat, redis SPOF, and snapshot
+limitations: see [vllm-knowledge HA field report][1].
+
+[1]: https://github.com/Inferact/vllm-knowledge/tree/feat/sprint-dist-kv-research/kv-cache/distributed-kv/mooncake/deployment
+
 ## Notes
 
 ### Cross-DP External Prefix Cache Hits
