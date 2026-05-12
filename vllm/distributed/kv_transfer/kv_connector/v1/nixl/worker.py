@@ -92,14 +92,9 @@ class NixlConnectorWorker:
         dst_num_blocks: int,
         block_size_ratio: float | None,
         physical_blocks_per_logical: int,
-        num_regions: int | None = None,
     ) -> np.ndarray:
-        """Compute NIXL descriptor IDs for given block IDs.
-
-        ``num_regions`` caps addressing to the shared layer prefix; the
-        same value must be passed for both sides of a transfer pair.
-        """
-        num_fa_regions = num_regions if num_regions is not None else self.num_regions
+        """Compute NIXL descriptor IDs for given block IDs."""
+        num_fa_regions = self.num_regions
         num_ssm_regions = len(self.block_len_per_layer) * 4 if self._has_mamba else 0
 
         num_blocks = dst_num_blocks
@@ -382,8 +377,6 @@ class NixlConnectorWorker:
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
         self.dst_num_blocks: dict[EngineId, int] = {}
-        # Diverges between local and remote when only one side has spec/draft layers.
-        self.dst_num_regions: dict[EngineId, int] = {}
         self._registered_descs: list[Any] = []
 
         # In progress transfers.
@@ -796,24 +789,10 @@ class NixlConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
-        # Mixed per-layer kv_heads (e.g. main GQA + EAGLE3 draft) is registered
-        # as-is; the shared-prefix handshake below lets peers without the draft
-        # layers transfer just main, while peers that have them transfer both.
-        kv_heads_seen: set[int] = set()
-        for layer_name in kv_caches:
-            spec = self._layer_specs[layer_name]
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                spec = spec.kv_cache_specs[layer_name]
-            if not isinstance(spec, MambaSpec):
-                kv_heads_seen.add(spec.num_kv_heads)
-        self._has_mixed_kv_heads = len(kv_heads_seen) > 1
-        if self._has_mixed_kv_heads and (
-            self._is_hma_required or self._has_mamba or self.use_host_buffer
-        ):
-            raise NotImplementedError(
-                "NIXL: mixed per-layer kv_heads is not yet supported with "
-                "HMA, Mamba-hybrid models, or host-buffer offload."
-            )
+        # Per-layer num_kv_heads. None for Mamba (handled by separate path).
+        # Used to derive per-side replication (K < world_size) at use sites,
+        # and to validate per-region block_lens at handshake.
+        self._layer_kv_heads: list[int | None] = []
 
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
@@ -867,10 +846,10 @@ class NixlConnectorWorker:
         # (roughly 8KB vs 5KB).
         # Conversely for FlashInfer, K and V are registered in the same region
         # to better exploit the memory layout (ie num_blocks is the first dim).
-        tensor_size_bytes = None
 
-        # Enable different block lengths for different layers *only* when MLA is used.
-        # This is not used for SSM layers, which use the counterpart `mamba_ssm_size`.
+        # Per-layer block lengths. Differ across layers when MLA is used or
+        # when the model has heads-replicated layers (e.g. EAGLE3 draft).
+        # Not used for SSM layers, which use the counterpart `mamba_ssm_size`.
         self.block_len_per_layer = list[int]()
         for layer_name, cache_or_caches in xfer_buffers.items():
             # NOTE (NickLucche) Hybrid SSM models assume a layout that is similar to
@@ -908,8 +887,6 @@ class NixlConnectorWorker:
             # `page_size` accounts for physical blocks, st KVCache is always
             # [`num_blocks` * `page_size`]
             curr_tensor_size_bytes = num_blocks * physical_page_size
-            if tensor_size_bytes is None:
-                tensor_size_bytes = curr_tensor_size_bytes
 
             # TODO (NickLucche) we could eventually unify how we handle FA/FI regions,
             # registering a single tensor for both K/V and splitting logically like FI.
@@ -931,8 +908,10 @@ class NixlConnectorWorker:
                     self.block_len_per_layer.append(
                         physical_page_size // self._physical_blocks_per_logical_kv_block
                     )
+                    self._layer_kv_heads.append(None)
                 else:
                     self.block_len_per_layer.append(physical_page_size)
+                    self._layer_kv_heads.append(layer_spec.num_kv_heads)
 
                 if cache.shape[0] != num_blocks:
                     raise AssertionError(
@@ -950,12 +929,8 @@ class NixlConnectorWorker:
                         f"{self.transfer_topo.is_kv_layout_blocks_first}"
                     )
 
-                if not self.use_mla and not self._has_mixed_kv_heads:
-                    # HeteroTP needs uniform shape; mixed kv_heads is the
-                    # opt-out and is validated per-layer in the handshake.
-                    assert tensor_size_bytes == curr_tensor_size_bytes, (
-                        "All kv cache tensors must have the same size"
-                    )
+                # Per-layer sizes are validated in the handshake against the
+                # remote agent's metadata; no global uniformity required here.
                 # Need to make sure the device ID is non-negative for NIXL,
                 # Torch uses -1 to indicate CPU tensors.
                 self.device_id = max(cache.get_device(), 0)
@@ -993,7 +968,6 @@ class NixlConnectorWorker:
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
-        self.dst_num_regions[self.engine_id] = self.num_regions
 
         if self._has_mamba:
             logger.info(
@@ -1176,46 +1150,112 @@ class NixlConnectorWorker:
         plan: TPMapping,
         nixl_agent_meta: NixlAgentMetadata,
         block_size_ratio: int,
+        remote_tp_rank: int,
+        remote_tp_size: int,
     ) -> list[tuple[int, int, int]]:
-        """Build remote FA descriptors for all layers."""
+        """Build remote FA descriptors for all layers.
+
+        Per-layer chunk and offset are derived from each layer's
+        ``num_kv_heads`` and each side's TP world size:
+
+        - **Case 1** (K < min(local_W, remote_W); both sides replicated): each
+          remote rank holds the full row; one read covers the layer.
+        - **Case 2** (local sharded, remote replicated; tp_ratio < 0): local
+          assembles its shard from staggered offsets within ``|tp_ratio|``
+          remote ranks (any of which has the full K heads).
+        - **Case 3** (local replicated, remote sharded): rejected at
+          handshake — local would need multi-source reads under tp_ratio>0
+          which the TP plan does not support.
+        - **Case 4** (both sharded): standard plan-driven chunking.
+        """
         assert self.transfer_topo is not None
         fa_group_idx = next(
             i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
         )
-        num_attn_reads = len(plan.source_ranks_per_group[fa_group_idx])
+        fa_source_ranks = plan.source_ranks_per_group[fa_group_idx]
+        num_attn_reads = len(fa_source_ranks)
+        # Index of this remote rank within the local rank's reading group;
+        # used to stagger offsets across the |tp_ratio| reads when the
+        # remote layer is replicated (cases 1, 2 under tp_ratio < 0).
+        source_idx = (
+            fa_source_ranks.index(remote_tp_rank)
+            if remote_tp_rank in fa_source_ranks
+            else 0
+        )
+        # Engine-wide replicated paths (MLA, total_kv_heads<remote_W) keep
+        # their existing plan-driven offsets — `rank_offset_factor` was set
+        # for that case in compute_tp_mapping.
+        engine_replicated = self.use_mla or self.transfer_topo.is_kv_replicated(
+            nixl_agent_meta.engine_id
+        )
         num_blocks = nixl_agent_meta.num_blocks
         result: list[tuple[int, int, int]] = []
         for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
-            # Read our whole local region size from remote..
-            local_block_len = self.get_backend_aware_kv_block_len(
+            # local_per_rank_bl: local's per-rank size for this layer.
+            local_per_rank_bl = self.get_backend_aware_kv_block_len(
                 layer_idx=i, first_split=True, mamba_view=False
             )
-            remote_kv_block_len = local_block_len // block_size_ratio
+            remote_kv_block_len = local_per_rank_bl // block_size_ratio
             if block_size_ratio > 1:
-                # ..using remote kv_block_len as transfer unit
-                local_block_len = remote_kv_block_len
+                local_per_rank_bl = remote_kv_block_len
 
-            local_block_len = local_block_len // num_attn_reads
-            rank_offset = plan.rank_offset_factor * remote_kv_block_len
+            K = self._layer_kv_heads[i]
+            if K is None or engine_replicated:
+                # Fallback: existing engine-wide chunking.
+                chunk_bl = local_per_rank_bl // num_attn_reads
+                rank_offset = plan.rank_offset_factor * remote_kv_block_len
+                v_chunk_divisor = num_attn_reads
+            else:
+                local_repl = self.world_size > K
+                remote_repl = remote_tp_size > K
+                # Case 3 should have been rejected at handshake; sanity check.
+                assert not (local_repl and not remote_repl), (
+                    f"NIXL: case-3 layer {i} reached _build_fa_remote — "
+                    f"handshake should have rejected this."
+                )
+                if num_attn_reads == 1:
+                    # tp_ratio >= 1 (one local rank reads from one remote rank).
+                    chunk_bl = local_per_rank_bl
+                    if remote_repl:
+                        # Cases 1: D wants full row, P has full row.
+                        rank_offset = 0
+                    else:
+                        # Case 4: D's slot within P's region.
+                        rank_offset = plan.rank_offset_factor * remote_kv_block_len
+                    v_chunk_divisor = 1
+                else:
+                    # tp_ratio < 0 (|tp_ratio| remote ranks per local rank).
+                    chunk_bl = local_per_rank_bl // num_attn_reads
+                    if remote_repl:
+                        # Case 1 / Case 2: every remote rank has full K heads.
+                        # Stagger offset so each of the |tp_ratio| reads picks
+                        # a different head slice. For locally-replicated
+                        # layers (case 1) D's start = 0; for locally-sharded
+                        # layers (case 2) D's start = tp_rank * local_per_rank.
+                        d_start = 0 if local_repl else self.tp_rank * local_per_rank_bl
+                        rank_offset = d_start + source_idx * chunk_bl
+                    else:
+                        # Case 4: each remote rank holds D's i-th slice at
+                        # offset 0 of its own region.
+                        rank_offset = 0
+                    v_chunk_divisor = num_attn_reads
 
             page_size = nixl_agent_meta.block_lens[i]
             for block_id in range(num_blocks):
                 block_offset = block_id * page_size
-                # For each block, grab the kv heads chunk belonging to current local
-                # tp rank of size local_block_len.
                 addr = base_addr + block_offset + rank_offset
-                result.append((addr, local_block_len, nixl_agent_meta.device_id))
+                result.append((addr, chunk_bl, nixl_agent_meta.device_id))
 
             if self.transfer_topo.is_kv_layout_blocks_first:
-                # With FlashInfer index V separately to allow head splitting.
+                # FlashInfer: K and V interleaved per block; index V separately.
                 second_split = self.get_backend_aware_kv_block_len(
                     layer_idx=i, first_split=False, mamba_view=False
                 )
-                second_split = second_split // num_attn_reads
+                second_split = second_split // v_chunk_divisor
                 for block_id in range(num_blocks):
                     block_offset = block_id * page_size
                     addr = base_addr + block_offset + rank_offset
-                    # Hop over the first split of remote page, K, to read V.
+                    # Hop over the K half of the remote page to reach V.
                     v_addr = addr + nixl_agent_meta.block_lens[i] // 2
                     result.append((v_addr, second_split, nixl_agent_meta.device_id))
         return result
@@ -1360,7 +1400,6 @@ class NixlConnectorWorker:
 
         if engine_id not in self.dst_num_blocks:
             self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
-        self.dst_num_regions[engine_id] = len(nixl_agent_meta.kv_caches_base_addr)
 
         # Keep track of remote agent kv caches base addresses.
         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
@@ -1414,6 +1453,8 @@ class NixlConnectorWorker:
             plan,
             nixl_agent_meta,
             block_size_ratio,
+            remote_tp_rank,
+            remote_tp_size,
         )
         logger.debug(
             "Created %s blocks for dst engine %s with remote rank %s and local rank %s",
@@ -1468,16 +1509,16 @@ class NixlConnectorWorker:
         block_size_ratio = self.transfer_topo.block_size_ratio(
             nixl_agent_meta.block_size
         )
-        # Trailing local-only layers (e.g. EAGLE3 draft on D, none on P)
-        # stay local; we pull only the shared prefix.
-        n_remote_layers = len(nixl_agent_meta.block_lens)
-        n_local_layers = len(self.block_len_per_layer)
-        if n_remote_layers > n_local_layers:
+        # Layer counts must match: callers must run the same model topology
+        # (including spec/draft layers) on both sides. P and D running with
+        # different EAGLE3 configs is unsupported.
+        if len(nixl_agent_meta.block_lens) != len(self.block_len_per_layer):
             raise RuntimeError(
-                f"Remote advertises more NIXL layers ({n_remote_layers}) than "
-                f"local has ({n_local_layers})."
+                f"Remote and local advertise different NIXL layer counts "
+                f"({len(nixl_agent_meta.block_lens)} vs "
+                f"{len(self.block_len_per_layer)}). Ensure both sides run the "
+                f"same model + speculative-config."
             )
-        n_shared_layers = n_remote_layers
         # num_kv_heads > tp_size with P_TP > D_TP not supported for non-mamba.
         # Mamba models can have replicated FA KV with tp_ratio < 0.
         # MLA models do not need to handle kv replication.
@@ -1485,13 +1526,6 @@ class NixlConnectorWorker:
             assert not (
                 tp_ratio < 0 and self.transfer_topo.is_kv_replicated(remote_engine_id)
             )
-            # Same-TP makes per-layer rank_offset trivially 0 (rank % 1 = 0);
-            # hetero-TP would need per-layer rank_offset for mixed kv_heads.
-            if self._has_mixed_kv_heads and abs(tp_ratio) != 1:
-                raise NotImplementedError(
-                    "NIXL: hetero-TP with mixed kv_heads (e.g. EAGLE3 draft) "
-                    "not yet supported; use the same TP on prefill and decode."
-                )
 
         if self._is_hma_required:
             assert block_size_ratio == 1, (
@@ -1552,66 +1586,57 @@ class NixlConnectorWorker:
                 "Use HND layout on the prefill side."
             )
 
-        # block_len varies per-layer under MLA or mixed kv_heads.
-        remote_block_len = nixl_agent_meta.block_lens[0]
-        if self.use_mla or self.transfer_topo.is_kv_replicated(remote_engine_id):
-            # With replicated KV cache, only the number of blocks can differ.
-            # TODO (ZhanqiuHu): For mamba models, validate FA and mamba
-            # block_lens separately.
-            if not self._has_mamba:
-                for i in range(n_shared_layers):
-                    assert (
-                        self.block_len_per_layer[i] // block_size_ratio
-                        == nixl_agent_meta.block_lens[i]
-                    ), "KV cache sizes must match between P and D when replicated"
-        elif self._has_mixed_kv_heads:
-            # Per-layer match on the shared prefix (tp_ratio is ±1 here).
-            for i in range(n_shared_layers):
-                assert (
-                    self.block_len_per_layer[i] // block_size_ratio
-                    == nixl_agent_meta.block_lens[i]
-                ), (
-                    f"block_len mismatch at layer {i}: "
-                    f"local={self.block_len_per_layer[i]}, "
-                    f"remote={nixl_agent_meta.block_lens[i]}."
-                )
-        else:
-            # When MLA is not used, this is a list of the same block length
-            for block_len in nixl_agent_meta.block_lens:
-                assert block_len == remote_block_len, (
-                    "All remote layers must have the same block size"
-                )
-
-            # HMA hybrid models (mamba+attention) pad block_len to
-            # max(attn_page, mamba_page), so the linear tp_ratio scaling
-            # assumption only holds for pure-attention models.
-            if not self._has_mamba:
-                if tp_ratio > 0:
-                    assert (
-                        remote_block_len
-                        == (self.block_len_per_layer[0] * tp_ratio) // block_size_ratio
-                    ), (
-                        "Remote P worker KV layer cache must be of shape [2, N,"
-                        " local_kv_heads*tp_ratio, page_size, head_dim] and "
-                        "same dtype."
-                    )
+        # Per-region block_len validation derived from each layer's kv_heads
+        # and each side's TP world size. For layer i with K = kv_heads[i]:
+        #   per_rank_heads(W) = K if K < W else K // W
+        #   expected_remote_bl[i] = local_bl[i] * remote_per_rank / local_per_rank
+        # MLA and engine-wide replication take the identity branch.
+        # Mamba layers pad block_len differently — validated separately.
+        # TODO (ZhanqiuHu): For mamba models, validate FA and mamba
+        # block_lens separately.
+        if not self._has_mamba:
+            engine_replicated = self.use_mla or self.transfer_topo.is_kv_replicated(
+                remote_engine_id
+            )
+            for i, local_bl in enumerate(self.block_len_per_layer):
+                K = self._layer_kv_heads[i]
+                if engine_replicated or K is None:
+                    # MLA / engine-wide replicated / Mamba slot: identity.
+                    expected = local_bl // block_size_ratio
                 else:
-                    assert block_size_ratio == 1, (
-                        "Different local/remote block sizes are not supported"
-                        " when P TP > D TP."
+                    local_repl = self.world_size > K
+                    remote_repl = remote_tp_size > K
+                    # Case 3: local has full row but remote shards. Plan would
+                    # need to read from multiple remote ranks even under
+                    # tp_ratio > 0, which the existing TPMapping does not
+                    # support. Reject explicitly.
+                    if local_repl and not remote_repl:
+                        raise NotImplementedError(
+                            f"NIXL: layer {i} (kv_heads={K}) is locally "
+                            f"replicated (K < local_W={self.world_size}) but "
+                            f"remotely sharded (K >= remote_W={remote_tp_size})."
+                            f" Multi-source per-region reads are not yet "
+                            f"supported by the TP plan. Use same TP, or "
+                            f"choose TPs so that all layers have matching "
+                            f"replication state on both sides."
+                        )
+                    local_per_rank = K if local_repl else K // self.world_size
+                    remote_per_rank = K if remote_repl else K // remote_tp_size
+                    expected = (local_bl * remote_per_rank) // (
+                        local_per_rank * block_size_ratio
                     )
-                    assert remote_block_len == self.block_len_per_layer[0] // (
-                        -tp_ratio
-                    ), (
-                        "Remote P worker KV layer cache must be of shape [2, N,"
-                        " local_kv_heads/tp_ratio, page_size, head_dim] and "
-                        "same dtype."
-                    )
+                assert nixl_agent_meta.block_lens[i] == expected, (
+                    f"block_len mismatch at layer {i}: "
+                    f"local={local_bl}, remote={nixl_agent_meta.block_lens[i]}, "
+                    f"expected={expected}, kv_heads={K}, "
+                    f"local_W={self.world_size}, remote_W={remote_tp_size}, "
+                    f"tp_ratio={tp_ratio}."
+                )
 
         # TP workers that handhshake with same remote have same #blocks.
         assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
-        assert n_shared_layers == len(nixl_agent_meta.kv_caches_base_addr)
-        assert n_shared_layers <= len(self.block_len_per_layer)
+        # Same number of regions/~layers.
+        assert len(nixl_agent_meta.kv_caches_base_addr) == len(self.block_len_per_layer)
 
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
         """copy recved kv from host buffer to device."""
@@ -2234,25 +2259,18 @@ class NixlConnectorWorker:
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
         # workers will issue xfers to parts of the P worker remote kv caches.
 
-        # Cap descriptor IDs to the shared layer prefix (trailing local-only
-        # draft layers, e.g. EAGLE3, have no remote counterpart).
-        n_shared_regions = min(
-            self.dst_num_regions[self.engine_id],
-            self.dst_num_regions[dst_engine_id],
-        )
+        # Get descs ids.
         remote_block_descs_ids = self._compute_desc_ids(
             block_ids=remote_block_ids,
             dst_num_blocks=self.dst_num_blocks[dst_engine_id],
             block_size_ratio=None,
             physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
-            num_regions=n_shared_regions,
         )
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
             dst_num_blocks=self.dst_num_blocks[self.engine_id],
             block_size_ratio=block_size_ratio,
             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-            num_regions=n_shared_regions,
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
