@@ -61,7 +61,7 @@ def test_scheduler_role_initializes_store_scheduler_only():
     assert conn.connector_worker is None
 
 
-def test_worker_role_initializes_store_worker_on_rank0():
+def test_worker_role_initializes_store_worker():
     vllm_config = _make_vllm_config()
 
     with (

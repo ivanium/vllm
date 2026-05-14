@@ -1,0 +1,10 @@
+{
+  "mode": "owner-client",
+  "metadata_server": "http://127.0.0.1:8080/metadata",
+  "master_server_address": "127.0.0.1:50051",
+  "global_segment_size": 0,
+  "local_buffer_size": "4GB",
+  "protocol": "rdma",
+  "device_name": "rocep139s0,rocep140s0,rocep195s0,rocep196s0",
+  "enable_offload": true
+}
