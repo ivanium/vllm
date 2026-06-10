@@ -289,6 +289,55 @@ def test_splitting_ops_dynamic():
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
 
 
+@pytest.mark.skipif(
+    not current_platform.support_static_graph_mode(),
+    reason="Skip if not cudagraph mode supported",
+)
+def test_agrs_dcp_downgrades_full_cudagraphs():
+    with patch.object(current_platform, "device_count", return_value=4):
+        config = VllmConfig(
+            parallel_config=ParallelConfig(
+                tensor_parallel_size=4,
+                decode_context_parallel_size=4,
+            ),
+        )
+
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+
+
+@pytest.mark.skipif(
+    not current_platform.support_static_graph_mode(),
+    reason="Skip if not cudagraph mode supported",
+)
+def test_a2a_dcp_keeps_full_cudagraphs():
+    with patch.object(current_platform, "device_count", return_value=4):
+        config = VllmConfig(
+            parallel_config=ParallelConfig(
+                tensor_parallel_size=4,
+                decode_context_parallel_size=4,
+                dcp_comm_backend="a2a",
+            ),
+        )
+
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+@pytest.mark.skipif(
+    not current_platform.support_static_graph_mode(),
+    reason="Skip if not cudagraph mode supported",
+)
+def test_without_dcp_keeps_full_cudagraphs():
+    with patch.object(current_platform, "device_count", return_value=4):
+        config = VllmConfig(
+            parallel_config=ParallelConfig(
+                tensor_parallel_size=4,
+                decode_context_parallel_size=1,
+            ),
+        )
+
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+
+
 def test_moe_splitting_ops_deepep_ht_inductor_partition():
     # Inductor partition case: user-provided splitting_ops should be
     # preserved and MoE ops should be appended for DeepEP HT with dp>1.

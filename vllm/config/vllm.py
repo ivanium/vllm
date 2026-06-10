@@ -1337,6 +1337,21 @@ class VllmConfig:
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
+            if (
+                self.parallel_config.decode_context_parallel_size > 1
+                and self.parallel_config.dcp_comm_backend == "ag_rs"
+                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            ):
+                logger.warning_once(
+                    "Decode context parallelism with dcp_comm_backend='ag_rs' "
+                    "can hang during full CUDA graph profiling/capture "
+                    "(decode_context_parallel_size=%d, nnodes=%d). "
+                    "Downgrading cudagraph_mode to PIECEWISE.",
+                    self.parallel_config.decode_context_parallel_size,
+                    self.parallel_config.nnodes,
+                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
             # disable cudagraph when enforce eager execution
             if self.model_config is not None and self.model_config.enforce_eager:
                 logger.info("Cudagraph is disabled under eager mode")
