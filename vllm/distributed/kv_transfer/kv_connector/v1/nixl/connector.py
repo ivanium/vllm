@@ -90,6 +90,13 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
             # Hybrid SSM models do not yet support cross-layer layout
             return False
 
+        extra_config = self.kv_transfer_config.kv_connector_extra_config
+        if (
+            str(extra_config.get("enable_cross_layers_blocks", "False")).lower()
+            != "true"
+        ):
+            return False
+
         backend = get_current_attn_backend(self._vllm_config)
         if backend.get_name() not in (
             "FLASH_ATTN",
@@ -100,14 +107,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
 
         # For now there is no benefit to run cross layers when backend
         # does not support on HND
-        if get_kv_cache_layout() != "HND":
-            return False
-
-        extra_config = self.kv_transfer_config.kv_connector_extra_config
-        return (
-            str(extra_config.get("enable_cross_layers_blocks", "False")).lower()
-            == "true"
-        )
+        return get_kv_cache_layout() == "HND"
 
     def __init__(
         self,

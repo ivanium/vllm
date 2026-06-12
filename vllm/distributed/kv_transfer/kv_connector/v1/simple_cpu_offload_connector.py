@@ -30,7 +30,7 @@ from vllm.v1.simple_kv_offload.worker import (
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
-    from vllm.v1.attention.backend import AttentionMetadata
+    from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -44,6 +44,14 @@ DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
 
 class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     """CPU KV cache offloading with custom kernel transfers and BlockPool LRU."""
+
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        extra_config = self._kv_transfer_config.kv_connector_extra_config
+        return (
+            str(extra_config.get("enable_cross_layers_blocks", "False")).lower()
+            == "true"
+        )
 
     def __init__(
         self,
@@ -120,6 +128,18 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self.worker_handler is not None:
             self.worker_handler.register_kv_caches(kv_caches)
+
+    def register_cross_layers_kv_cache(
+        self,
+        kv_cache: torch.Tensor,
+        attn_backend: "type[AttentionBackend] | None",
+        block_stride: int | None = None,
+    ) -> None:
+        assert attn_backend is not None and block_stride is None, (
+            "SimpleCPUOffloadConnector does not support the packed cross-layer layout"
+        )
+        if self.worker_handler is not None:
+            self.worker_handler.register_kv_caches({"cross_layers": kv_cache})
 
     def bind_connector_metadata(
         self,

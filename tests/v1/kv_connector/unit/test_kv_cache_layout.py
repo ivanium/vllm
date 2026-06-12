@@ -73,3 +73,29 @@ def test_deepseek_v32_indexer_rejects_cross_layer_kv_cache():
     assert DeepseekV32IndexerBackend.get_kv_cache_stride_order(
         include_num_layers_dimension=False
     ) == (0, 1, 2)
+
+
+def test_stride_aware_mla_backends_opt_into_cross_layer_kv_cache():
+    """Backends whose kernels read the cache's block-dim stride opt into
+    the cross-layer layout: blocks outermost, layers second."""
+    from vllm.v1.attention.backends.mla.cutlass_mla import CutlassMLABackend
+    from vllm.v1.attention.backends.mla.flashattn_mla import FlashAttnMLABackend
+    from vllm.v1.attention.backends.mla.flashinfer_mla import FlashInferMLABackend
+    from vllm.v1.attention.backends.mla.flashmla import FlashMLABackend
+    from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend
+
+    for backend in (
+        FlashMLABackend,
+        FlashAttnMLABackend,
+        FlashInferMLABackend,
+        CutlassMLABackend,
+        TritonMLABackend,
+    ):
+        stride_order = backend.get_kv_cache_stride_order(
+            include_num_layers_dimension=True
+        )
+        assert stride_order == (1, 0, 2, 3), backend.get_name()
+        assert stride_order[0] != 0  # blocks outermost => cross-layer OK
+        assert backend.get_kv_cache_stride_order(
+            include_num_layers_dimension=False
+        ) == (0, 1, 2), backend.get_name()
