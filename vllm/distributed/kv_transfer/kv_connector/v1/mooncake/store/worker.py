@@ -1376,20 +1376,48 @@ class MooncakeStoreWorker:
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
         tp_count = min(self.tp_size, self.num_kv_head)
+        # Probe only blocks the producer would have stored. The save path writes
+        # just the reachable blocks (``coord.store_mask`` / ``reachable_block_mask``,
+        # honoring ``retention_interval``); for sliding-window groups that is only
+        # the tail blocks of each segment, so the rest are never in the store and
+        # probing them is pure waste. A pruned block is treated as absent by
+        # ``find_longest_cache_hit`` exactly as a probed-and-absent one would be,
+        # so this is an exact optimization, not an approximation.
+        lcm = self.coord.lcm_block_size
+        aligned_token_len = token_len // lcm * lcm
+        reach_indices: tuple[list[int], ...] = (
+            self.coord.reachable_block_indices(
+                aligned_token_len, num_prompt_tokens=aligned_token_len
+            )
+            if aligned_token_len > 0
+            else tuple([] for _ in self.token_dbs)
+        )
         for g_idx, db in enumerate(self.token_dbs):
-            spec_block_size = db.block_size
             group_hashes = self.coord.block_hashes_for_spec(
                 block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
             )
-            for chunk_id, h in enumerate(group_hashes):
-                start_idx = chunk_id * spec_block_size
-                if start_idx >= token_len:
-                    break
-                for tp in range(tp_count):
-                    for pp in range(self.pp_size):
-                        md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
-                        candidate_keys.append(PoolKey(md, h.hex()).to_string())
-                        candidate_meta.append((g_idx, bytes(h)))
+            n_hashes = len(group_hashes)
+            # The TP/PP key prefix is constant across chunks, so build it once
+            # per (tp, pp) instead of re-running dataclasses.replace + PoolKey +
+            # to_string for every chunk.
+            key_prefixes = [
+                PoolKey(
+                    dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp), ""
+                ).to_string()
+                for tp in range(tp_count)
+                for pp in range(self.pp_size)
+            ]
+            # Iterate only the reachable chunks (generated in O(reachable)) and
+            # materialize their hashes lazily, instead of scanning every chunk.
+            for chunk_id in reach_indices[g_idx]:
+                if chunk_id >= n_hashes:
+                    continue
+                h = group_hashes[chunk_id]
+                hex_h = h.hex()
+                bytes_h = bytes(h)
+                for prefix in key_prefixes:
+                    candidate_keys.append(prefix + hex_h)
+                    candidate_meta.append((g_idx, bytes_h))
 
         if not candidate_keys:
             return 0

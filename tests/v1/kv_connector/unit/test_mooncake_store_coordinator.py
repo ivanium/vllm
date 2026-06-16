@@ -3,6 +3,8 @@
 
 from math import lcm
 
+import pytest
+
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
     ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
@@ -280,6 +282,30 @@ def test_store_mask_dsv4_5_groups_full_mla_plus_4_swa():
     # SWA(8, sw=64): tail = ceil(63/8) = 8; C = 256/8 = 32.
     # Last 8 of each 32-chunk segment True.
     assert masks[4] == ([False] * 24 + [True] * 8) * 2
+
+
+@pytest.mark.parametrize("retention", [None, 0, 64, 256, 32768])
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_reachable_block_indices_matches_store_mask(retention, use_eagle):
+    """The arithmetic fast path (reachable_block_indices) must produce exactly
+    the reachable set the generic per-block mask (store_mask) would, across
+    full-attn + sparse/dense SWA groups, retention values, eagle, and prompt
+    boundaries. This pins the duplicated formula to the core mask logic."""
+    groups = [
+        KVCacheGroupSpec(["L0"], _full(block_size=256)),
+        KVCacheGroupSpec(["L1"], _swa(block_size=64, sliding_window=128)),
+        KVCacheGroupSpec(["L2"], _swa(block_size=4, sliding_window=8)),
+        KVCacheGroupSpec(["L3"], _swa(block_size=8, sliding_window=128)),
+    ]
+    coord = _make_coord(
+        groups, hash_block_size=4, use_eagle=use_eagle, retention_interval=retention
+    )
+    aligned = 256 * 6
+    for num_prompt in (aligned, aligned - 256 + 8, 256 + 4):
+        masks = coord.store_mask(aligned, num_prompt_tokens=num_prompt)
+        expected = tuple([i for i, m in enumerate(mask) if m] for mask in masks)
+        got = coord.reachable_block_indices(aligned, num_prompt_tokens=num_prompt)
+        assert got == expected, (retention, use_eagle, num_prompt)
 
 
 def test_store_mask_fast_path_all_block_sizes_equal_lcm():

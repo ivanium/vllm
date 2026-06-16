@@ -1233,6 +1233,33 @@ def test_lookup_swa_single_group_returns_full_when_tail_window_present():
     assert worker.lookup(64, [b"h0", b"h1", b"h2", b"h3"]) == 64
 
 
+def test_lookup_prunes_unreachable_sliding_window_blocks():
+    """SWA producers store only the reachable tail of each segment, so the
+    lookup must probe only those blocks (via reachable_block_mask), not every
+    block. Here block_size=4, window=8, alignment=256 -> only need=2 of every
+    64 blocks are reachable."""
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec, SlidingWindowSpec
+
+    worker = _make_bare_worker(block_size=4)
+    swa = SlidingWindowSpec(
+        block_size=4, num_kv_heads=1, head_size=64, dtype=None, sliding_window=8
+    )
+    worker._kv_cache_groups = [KVCacheGroupSpec(["layer0"], swa)]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups,
+        scheduler_block_size=256,
+        hash_block_size=4,
+    )
+    worker.store.batch_is_exist.return_value = [1, 1]
+
+    # 256 tokens => 64 blocks of size 4; only the last 2 are reachable.
+    block_hashes = [bytes([i & 0xFF, (i >> 8) & 0xFF]) * 2 for i in range(64)]
+    worker.lookup(256, block_hashes)
+
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert len(keys) == 2  # not 64
+
+
 # ---------------------------------------------------------------------------
 # register_kv_caches tests
 # ---------------------------------------------------------------------------

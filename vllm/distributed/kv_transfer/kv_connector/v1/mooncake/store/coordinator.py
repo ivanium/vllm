@@ -8,6 +8,7 @@ from typing import cast
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     chunk_hashes_for_block_size,
 )
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -20,9 +21,63 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+
+def _sliding_window_reachable_indices(
+    spec: KVCacheSpec,
+    num_chunks: int,
+    alignment_tokens: int,
+    use_eagle: bool,
+    retention_interval: int | None,
+    num_prompt_tokens: int | None,
+) -> list[int] | None:
+    """Reachable chunk indices for a sliding-window group, generated directly.
+
+    Arithmetic mirror of ``SlidingWindowManager.reachable_block_mask`` that emits
+    the sparse reachable set in ``O(reachable)`` instead of scanning every block.
+    Returns ``None`` for non-sliding-window specs, or when every block is
+    reachable (``need >= per_segment``), so the caller falls back to the generic
+    mask path. Pinned to the core formula by
+    ``test_reachable_block_indices_matches_store_mask``.
+    """
+    if not isinstance(spec, SlidingWindowSpec):
+        return None
+    block_size = spec.block_size
+    need = cdiv(spec.sliding_window - 1, block_size) + (1 if use_eagle else 0)
+    shift = 1 if use_eagle else 0
+    segment_tokens = (
+        alignment_tokens
+        if retention_interval is None
+        else (None if retention_interval == 0 else retention_interval)
+    )
+    idxs: set[int] = set()
+    # (1) Segment-boundary tails: the last ``need`` blocks of each segment.
+    if segment_tokens is not None:
+        per_segment = segment_tokens // block_size
+        if need >= per_segment:
+            return None  # every block reachable; let the caller handle it
+        seg = 0
+        while True:
+            seg_end = shift + (seg + 1) * per_segment
+            lo = seg_end - need
+            if lo >= num_chunks:
+                break
+            for i in range(max(lo, shift), min(seg_end, num_chunks)):
+                idxs.add(i)
+            seg += 1
+    # (2) Replay-boundary tail near the prompt end.
+    if retention_interval is not None and num_prompt_tokens is not None:
+        latest = (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
+        prompt_end_block = latest // block_size + shift
+        for i in range(
+            max(0, prompt_end_block - need), min(num_chunks, prompt_end_block)
+        ):
+            idxs.add(i)
+    return sorted(idxs)
 
 
 class ExternalCachedBlockPool:
@@ -210,6 +265,57 @@ class MooncakeStoreCoordinator:
         return chunk_hashes_for_block_size(
             block_hashes, self.hash_block_size, spec.block_size
         )
+
+    def reachable_block_indices(
+        self, aligned_token_len: int, num_prompt_tokens: int | None = None
+    ) -> tuple[list[int], ...]:
+        """Per-group sorted reachable chunk indices at ``aligned_token_len``.
+
+        Equivalent to ``[i for i, m in enumerate(store_mask()[g]) if m]`` but, for
+        sliding-window groups, generated arithmetically in ``O(reachable)``
+        instead of scanning every block. The lookup only needs to probe the
+        (often very sparse, under a large ``retention_interval``) reachable set,
+        so this avoids the ``O(token_len / block_size)`` mask build + scan for
+        small-block groups.
+        """
+        assert aligned_token_len % self.lcm_block_size == 0, (
+            f"aligned_token_len ({aligned_token_len}) must be a multiple of "
+            f"lcm_block_size ({self.lcm_block_size})"
+        )
+        out: list[list[int]] = []
+        for g_idx, g in enumerate(self.kv_cache_groups):
+            spec = _unwrap_spec(g.kv_cache_spec)
+            num_chunks = aligned_token_len // spec.block_size
+            use_eagle = g_idx in self.eagle_group_ids
+            fast = _sliding_window_reachable_indices(
+                spec,
+                num_chunks,
+                self.lcm_block_size,
+                use_eagle,
+                self.retention_interval,
+                num_prompt_tokens,
+            )
+            if fast is not None:
+                out.append(fast)
+                continue
+            # Fallback (full attention / other types / dense windows): derive
+            # from the generic per-block mask.
+            manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+            assert manager_cls is not None
+            mask = manager_cls.reachable_block_mask(
+                start_block=0,
+                end_block=num_chunks,
+                alignment_tokens=self.lcm_block_size,
+                kv_cache_spec=spec,
+                use_eagle=use_eagle,
+                retention_interval=self.retention_interval,
+                num_prompt_tokens=num_prompt_tokens,
+            )
+            if mask is None:
+                out.append(list(range(num_chunks)))
+            else:
+                out.append([i for i, m in enumerate(mask) if m])
+        return tuple(out)
 
     def _find_hit_blocks(
         self,
