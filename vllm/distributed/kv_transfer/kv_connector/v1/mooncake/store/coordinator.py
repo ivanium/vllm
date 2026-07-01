@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager,
+    get_aligned_prompt_boundary_token_len,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -186,28 +187,43 @@ class MooncakeStoreCoordinator:
         Reuses the engine's ``SingleTypeKVCacheManager.reachable_block_mask``
         so the store retains exactly the blocks the local prefix cache would.
         """
+        aligned_boundary_token_len = get_aligned_prompt_boundary_token_len(
+            num_prompt_tokens,
+            self.lcm_block_size,
+        )
         return self._reachable_masks(
             aligned_token_len,
             start_token,
             retention_interval=self.retention_interval,
-            num_prompt_tokens=num_prompt_tokens,
+            aligned_boundary_token_len=aligned_boundary_token_len,
         )
 
     def lookup_mask(
         self,
         aligned_token_len: int,
+        aligned_boundary_token_len: int | None = None,
     ) -> tuple[list[bool] | None, ...]:
         """Per-group lookup masks.
 
         ``mask[g][i]`` is True iff chunk ``i`` of group ``g`` should be
         looked up as an aligned hit boundary. ``None`` is the all-True
         sentinel.
+
+        ``aligned_boundary_token_len`` narrows sparse groups to the blocks
+        needed to prove one exact boundary; dense groups are unchanged.
         """
+        retention_interval = None
+        if aligned_boundary_token_len is not None:
+            assert aligned_boundary_token_len % self.lcm_block_size == 0, (
+                "aligned_boundary_token_len must be lcm-aligned"
+            )
+            assert 0 < aligned_boundary_token_len <= aligned_token_len
+            retention_interval = 0
         return self._reachable_masks(
             aligned_token_len,
             0,
-            retention_interval=None,
-            num_prompt_tokens=None,
+            retention_interval=retention_interval,
+            aligned_boundary_token_len=aligned_boundary_token_len,
         )
 
     def _reachable_masks(
@@ -216,7 +232,7 @@ class MooncakeStoreCoordinator:
         start_token: int,
         *,
         retention_interval: int | None,
-        num_prompt_tokens: int | None,
+        aligned_boundary_token_len: int | None = None,
     ) -> tuple[list[bool] | None, ...]:
         assert aligned_token_len % self.lcm_block_size == 0, (
             f"aligned_token_len ({aligned_token_len}) must be a multiple of "
@@ -237,7 +253,7 @@ class MooncakeStoreCoordinator:
                 kv_cache_spec=spec,
                 use_eagle=use_eagle,
                 retention_interval=retention_interval,
-                num_prompt_tokens=num_prompt_tokens,
+                aligned_boundary_token_len=aligned_boundary_token_len,
             )
             if mask is not None:
                 assert len(mask) == end_chunk - start_chunk

@@ -17,7 +17,7 @@ import queue
 import socket
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -89,9 +89,18 @@ DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES = 1280 * 1024 * 1024
 # Mirrors DirectIO alignment in Mooncake's AllocateBatch.
 _DIRECT_IO_ALIGNMENT = 4096
 _DIRECT_IO_PADDING_BYTES = 2 * _DIRECT_IO_ALIGNMENT
+SESSION_BREAKPOINT_MAX_SESSIONS = 100_000
 
 
 MooncakeMode = Literal["embedded", "standalone-store"]
+
+
+@dataclass
+class SessionBreakpoint:
+    """Validated store boundary for a request session."""
+
+    aligned_token_len: int
+    boundary_block_hash: bytes
 
 
 @dataclass
@@ -454,6 +463,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
         enable_kv_event: bool = False,
         replicate_config: Any = None,
         record_operation: Callable[..., None] | None = None,
+        record_session_breakpoint: Callable[
+            [str | None, int, Sequence[BlockHash]], None
+        ]
+        | None = None,
     ):
         super().__init__(
             store,
@@ -472,6 +485,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Caller always passes a non-None ReplicateConfig — see
         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
         self.replicate_config = replicate_config
+        self._record_session_breakpoint_cb = record_session_breakpoint
 
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
@@ -521,6 +535,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._store_pressure_active = False
             self._skip_store_requests.clear()
         return True
+
+    def _record_session_breakpoint(self, req_meta: ReqMeta, token_len: int) -> None:
+        if self._record_session_breakpoint_cb is None:
+            return
+        self._record_session_breakpoint_cb(
+            req_meta.session_id,
+            token_len,
+            req_meta.block_hashes,
+        )
 
     def _handle_request(self, req_meta: ReqMeta):
         # Cache hits are always a multiple of ``lcm_block_size`` tokens, which
@@ -612,6 +635,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             if not missing_indices:
                 self._record_saved(req_id, token_len)
+                self._record_session_breakpoint(req_meta, token_len)
                 return
 
             if len(missing_indices) != len(keys):
@@ -715,6 +739,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         )
                 else:
                     self._record_saved(req_id, token_len)
+                    self._record_session_breakpoint(req_meta, token_len)
                     if self._clear_store_pressure():
                         logger.info(
                             "Mooncake CPU/disk offloading pressure cleared "
@@ -1093,6 +1118,16 @@ class MooncakeStoreWorker:
             if store_config.enable_offload
             else None
         )
+        self._session_breakpoints_enabled = (
+            envs.VLLM_MOONCAKE_SESSION_BREAKPOINTS and self.kv_role != "kv_consumer"
+        )
+        self._session_breakpoint_history_size = (
+            envs.VLLM_MOONCAKE_SESSION_BREAKPOINT_HISTORY_SIZE
+        )
+        self._session_breakpoints: OrderedDict[str, list[SessionBreakpoint]] = (
+            OrderedDict()
+        )
+        self._session_breakpoints_lock = threading.Lock()
 
         # Start lookup server on rank 0 for scheduler-side prefix queries
         self.lookup_server: LookupKeyServer | None = None
@@ -1290,6 +1325,14 @@ class MooncakeStoreWorker:
                 self.enable_kv_events,
                 self.store_replicate_config,
                 record_operation=self._record_kv_connector_operation,
+                record_session_breakpoint=(
+                    self._record_session_breakpoint
+                    if (
+                        self._session_breakpoints_enabled
+                        and self.lookup_server is not None
+                    )
+                    else None
+                ),
             )
             self.kv_send_thread.start()
 
@@ -1454,10 +1497,106 @@ class MooncakeStoreWorker:
 
         return finished_sending
 
-    def lookup(self, token_len: int, block_hashes: Sequence[BlockHash]) -> int:
+    def _record_session_breakpoint(
+        self,
+        session_id: str | None,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+    ) -> None:
+        if not self._session_breakpoints_enabled or not session_id or token_len <= 0:
+            return
+
+        lcm_block_size = self.coord.lcm_block_size
+        aligned_token_len = token_len // lcm_block_size * lcm_block_size
+        if aligned_token_len <= 0 or self.hash_block_size <= 0:
+            return
+
+        boundary_block_idx = aligned_token_len // self.hash_block_size - 1
+        if boundary_block_idx < 0 or boundary_block_idx >= len(block_hashes):
+            return
+
+        session_breakpoint = SessionBreakpoint(
+            aligned_token_len=aligned_token_len,
+            boundary_block_hash=bytes(block_hashes[boundary_block_idx]),
+        )
+        with self._session_breakpoints_lock:
+            breakpoints = self._session_breakpoints.pop(session_id, [])
+            breakpoints = [
+                existing
+                for existing in breakpoints
+                if not (
+                    existing.aligned_token_len == session_breakpoint.aligned_token_len
+                    and existing.boundary_block_hash
+                    == session_breakpoint.boundary_block_hash
+                )
+            ]
+            breakpoints.insert(0, session_breakpoint)
+            del breakpoints[self._session_breakpoint_history_size :]
+            self._session_breakpoints[session_id] = breakpoints
+            while len(self._session_breakpoints) > SESSION_BREAKPOINT_MAX_SESSIONS:
+                self._session_breakpoints.popitem(last=False)
+
+    def _get_session_breakpoint_len(
+        self,
+        session_id: str | None,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+    ) -> int | None:
+        if not self._session_breakpoints_enabled or not session_id or token_len <= 0:
+            return None
+
+        with self._session_breakpoints_lock:
+            breakpoints = self._session_breakpoints.get(session_id)
+            if not breakpoints:
+                return None
+            breakpoint_snapshot = tuple(breakpoints)
+            self._session_breakpoints.move_to_end(session_id)
+
+        if self.hash_block_size <= 0:
+            return None
+
+        best_breakpoint_len: int | None = None
+        for session_breakpoint in breakpoint_snapshot:
+            if session_breakpoint.aligned_token_len > token_len:
+                continue
+            breakpoint_len = session_breakpoint.aligned_token_len
+            boundary_block_idx = breakpoint_len // self.hash_block_size - 1
+            if boundary_block_idx < 0 or boundary_block_idx >= len(block_hashes):
+                continue
+            if (
+                bytes(block_hashes[boundary_block_idx])
+                != session_breakpoint.boundary_block_hash
+            ):
+                continue
+            if best_breakpoint_len is None or breakpoint_len > best_breakpoint_len:
+                best_breakpoint_len = breakpoint_len
+        return best_breakpoint_len
+
+    def clear_session_breakpoints(self) -> None:
+        with self._session_breakpoints_lock:
+            self._session_breakpoints.clear()
+
+    def _session_breakpoint_lookup_is_dense(self, token_len: int) -> bool:
+        return all(
+            mask is None
+            for mask in self.coord.lookup_mask(
+                token_len,
+                aligned_boundary_token_len=token_len,
+            )
+        )
+
+    def _lookup_full(
+        self,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        aligned_boundary_token_len: int | None = None,
+    ) -> int:
         """Check how many prefix tokens exist in the store.
 
         Checks across all rank-specific key namespaces that may be loaded.
+        ``aligned_boundary_token_len`` narrows sparse (SWA) groups to the
+        blocks needed to prove one exact boundary, cutting candidate keys;
+        dense groups are unchanged.
         """
         if not block_hashes or token_len <= 0:
             return 0
@@ -1466,7 +1605,10 @@ class MooncakeStoreWorker:
         # candidate_meta stores the (group, hash_bytes) for key slice.
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
-        lookup_masks = self.coord.lookup_mask(token_len)
+        lookup_masks = self.coord.lookup_mask(
+            token_len,
+            aligned_boundary_token_len=aligned_boundary_token_len,
+        )
         for g_idx, db in enumerate(self.token_dbs):
             spec_block_size = db.block_size
             lookup_mask = lookup_masks[g_idx]
@@ -1526,6 +1668,40 @@ class MooncakeStoreWorker:
             block_hashes, token_len, ExternalCachedBlockPool(exists_set)
         )
         return hit_length
+
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        session_id: str | None = None,
+    ) -> int:
+        if not block_hashes or token_len <= 0:
+            return 0
+
+        breakpoint_len = self._get_session_breakpoint_len(
+            session_id,
+            token_len,
+            block_hashes,
+        )
+        if breakpoint_len is not None:
+            # TODO: Make this fast path EAGLE/MTP-aware. EAGLE may prune one
+            # matched block, and sparse groups may need a peek block outside the
+            # clamped boundary to validate a breakpoint.
+            breakpoint_hit = self._lookup_full(
+                breakpoint_len,
+                block_hashes,
+                aligned_boundary_token_len=breakpoint_len,
+            )
+            if breakpoint_hit == breakpoint_len or (
+                breakpoint_len == token_len
+                and self._session_breakpoint_lookup_is_dense(breakpoint_len)
+            ):
+                # A full breakpoint hit can skip the new tail. Exact-length
+                # partial hits are only final when the clamped scan is dense;
+                # sparse groups may have an earlier boundary for fallback.
+                return breakpoint_hit
+
+        return self._lookup_full(token_len, block_hashes)
 
     def get_kv_events(self) -> list[BlockStored]:
         if self.enable_kv_events and self.kv_send_thread is not None:
@@ -1594,7 +1770,14 @@ class LookupKeyServer:
                     hash_len = int.from_bytes(all_frames[2], byteorder="big")
                     blob = all_frames[3].buffer
                     block_hashes = BlobBlockHashes(blob, hash_len)
-                    result = self.store_worker.lookup(token_len, block_hashes)
+                    session_id = None
+                    if len(all_frames) > 4:
+                        session_id = bytes(all_frames[4]).decode() or None
+                    result = self.store_worker.lookup(
+                        token_len,
+                        block_hashes,
+                        session_id=session_id,
+                    )
                     self.socket.send(result.to_bytes(4, "big"))
 
                 elif msg_type == RESET_MSG:
@@ -1606,6 +1789,7 @@ class LookupKeyServer:
                         if self.store_worker.kv_send_thread is not None:
                             self.store_worker.kv_send_thread.request_queue.join()
                         self.store_worker.store.remove_all(force=True)
+                        self.store_worker.clear_session_breakpoints()
                         logger.info("Mooncake store reset via remove_all succeeded.")
                         self.socket.send(RESP_OK)
                     except Exception as e:
@@ -1657,14 +1841,21 @@ class LookupKeyClient:
         )
         self.futures: dict[str, Future[int]] = {}
 
-    def _lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    def _lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        session_id: str | None,
+    ) -> int:
         hash_len = len(block_hashes[0]) if block_hashes else 0
-        all_frames = (
+        all_frames = [
             LOOKUP_MSG,
             token_len.to_bytes(4, byteorder="big"),
             hash_len.to_bytes(2, byteorder="big"),
             b"".join(block_hashes),
-        )
+        ]
+        if session_id is not None:
+            all_frames.append(session_id.encode())
         self.socket.send_multipart(all_frames, copy=False)
         resp = self.socket.recv()
         return int.from_bytes(resp, "big")
@@ -1674,13 +1865,19 @@ class LookupKeyClient:
         req_id: str,
         token_len: int,
         block_hashes: list[BlockHash],
+        session_id: str | None = None,
         non_block: bool = False,
     ) -> int | None:
         """If non_block is True, will return None until the result is ready,
         so the caller retries on a later step."""
         future = self.futures.get(req_id)
         if future is None:
-            future = self.executor.submit(self._lookup, token_len, list(block_hashes))
+            future = self.executor.submit(
+                self._lookup,
+                token_len,
+                list(block_hashes),
+                session_id,
+            )
             self.futures[req_id] = future
         if non_block and not future.done():
             return None

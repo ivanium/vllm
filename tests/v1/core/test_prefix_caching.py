@@ -3912,7 +3912,10 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
     the manager keeps one cached state per interval-sized segment (plus the
     latest replay boundary) instead of a snapshot per block, which is what
     lets a small attention block_size avoid Mamba dominating the KV pool."""
-    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        MambaManager,
+        get_aligned_prompt_boundary_token_len,
+    )
 
     block_size = 16
     spec = MambaSpec(
@@ -3923,6 +3926,10 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
     )
 
     def retained(retention_interval, num_prompt_tokens=256, end_block=16):
+        aligned_boundary_token_len = get_aligned_prompt_boundary_token_len(
+            num_prompt_tokens,
+            block_size,
+        )
         m = MambaManager.reachable_block_mask(
             start_block=0,
             end_block=end_block,
@@ -3930,7 +3937,7 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
             kv_cache_spec=spec,
             use_eagle=False,
             retention_interval=retention_interval,
-            num_prompt_tokens=num_prompt_tokens,
+            aligned_boundary_token_len=aligned_boundary_token_len,
         )
         return None if m is None else {i for i, v in enumerate(m) if v}
 

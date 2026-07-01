@@ -7,6 +7,7 @@
 
 from typing import Any
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -67,6 +68,9 @@ class MooncakeStoreScheduler:
         kvc_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
+        self._session_breakpoints_enabled = (
+            envs.VLLM_MOONCAKE_SESSION_BREAKPOINTS and self.kv_role != "kv_consumer"
+        )
         self.client = LookupKeyClient(vllm_config)
 
         # Align with the engine's own scheduler_block_size and hash_block_size.
@@ -95,10 +99,16 @@ class MooncakeStoreScheduler:
         if token_len < self._block_size:
             return 0, False
 
+        session_id = (
+            _session_id_from_request(request)
+            if self._session_breakpoints_enabled
+            else None
+        )
         num_external_hit_tokens = self.client.lookup(
             request.request_id,
             token_len,
             request.block_hashes,
+            session_id=session_id,
             non_block=self.lookup_async,
         )
         if num_external_hit_tokens is None:

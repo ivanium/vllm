@@ -8,12 +8,14 @@ import queue
 import sys
 import threading
 import types
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
     rdma_utils,
 )
@@ -76,6 +78,7 @@ def _make_store_sending_thread(
     tp_rank: int = 0,
     put_step: int = 1,
     replicate_config: object | None = None,
+    record_session_breakpoint: MagicMock | None = None,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
         coord = _default_send_coord()
@@ -84,6 +87,9 @@ def _make_store_sending_thread(
         db.set_kv_caches_base_addr([0x1000])
         db.set_block_len([256])
         token_databases = [db]
+    kwargs = {}
+    if record_session_breakpoint is not None:
+        kwargs["record_session_breakpoint"] = record_session_breakpoint
     thread = mooncake_store_worker.KVCacheStoreSendingThread(
         store=store,
         token_databases=token_databases,
@@ -94,6 +100,7 @@ def _make_store_sending_thread(
         kv_role="kv_producer",
         ready_event=threading.Event(),
         replicate_config=replicate_config,
+        **kwargs,
     )
     thread.request_queue.task_done = MagicMock()
     return thread
@@ -160,6 +167,15 @@ def _make_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMeta:
         block_hashes=block_hashes,
         can_save=True,
     )
+
+
+def _set_session_breakpoints(monkeypatch, enabled: bool) -> None:
+    if enabled:
+        monkeypatch.setenv("VLLM_MOONCAKE_SESSION_BREAKPOINTS", "1")
+    else:
+        monkeypatch.delenv("VLLM_MOONCAKE_SESSION_BREAKPOINTS", raising=False)
+    monkeypatch.delenv("VLLM_MOONCAKE_SESSION_BREAKPOINT_HISTORY_SIZE", raising=False)
+    envs.disable_envs_cache()
 
 
 _DISK_OFFLOAD_SINGLE_KEY_BYTES = worker._estimate_disk_offload_staging_bytes([256])
@@ -653,6 +669,84 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
 
     assert full_hashes == [b"a2".hex(), b"a3".hex()]
     assert masked_hashes == [b"a2".hex()]
+
+
+def test_store_sending_thread_records_session_breakpoint_after_successful_put(
+    monkeypatch,
+):
+    _set_session_breakpoints(monkeypatch, True)
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    record_session_breakpoint = MagicMock()
+    thread = _make_store_sending_thread(
+        store,
+        record_session_breakpoint=record_session_breakpoint,
+    )
+    req = _make_store_req("req-a", [b"a0", b"a1"])
+    req.session_id = "conv-abc"
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(req)
+
+    record_session_breakpoint.assert_called_once_with("conv-abc", 32, [b"a0", b"a1"])
+
+
+def test_store_sending_thread_records_session_breakpoint_when_keys_already_exist(
+    monkeypatch,
+):
+    _set_session_breakpoints(monkeypatch, True)
+    store = MagicMock()
+    store.batch_is_exist.return_value = [1, 1]
+    record_session_breakpoint = MagicMock()
+    thread = _make_store_sending_thread(
+        store,
+        record_session_breakpoint=record_session_breakpoint,
+    )
+    req = _make_store_req("req-a", [b"a0", b"a1"])
+    req.session_id = "conv-abc"
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(req)
+
+    store.batch_put_from_multi_buffers.assert_not_called()
+    record_session_breakpoint.assert_called_once_with("conv-abc", 32, [b"a0", b"a1"])
+
+
+def test_store_sending_thread_does_not_record_session_breakpoint_without_callback():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    record_session_breakpoint = MagicMock()
+    thread = _make_store_sending_thread(store)
+    req = _make_store_req("req-a", [b"a0", b"a1"])
+    req.session_id = "conv-abc"
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(req)
+
+    record_session_breakpoint.assert_not_called()
+
+
+def test_store_sending_thread_does_not_record_session_breakpoint_on_partial_put(
+    monkeypatch,
+):
+    _set_session_breakpoints(monkeypatch, True)
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [-200, 256]
+    record_session_breakpoint = MagicMock()
+    thread = _make_store_sending_thread(
+        store,
+        record_session_breakpoint=record_session_breakpoint,
+    )
+    req = _make_store_req("req-a", [b"a0", b"a1"])
+    req.session_id = "conv-abc"
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(req)
+
+    record_session_breakpoint.assert_not_called()
 
 
 def test_store_sending_thread_only_skips_on_no_available_handle():
@@ -1581,6 +1675,7 @@ def _make_bare_worker(
     worker.tp_size = 1
     worker.num_kv_head = 1
     worker.pp_size = 1
+    worker.lookup_server = object()
     # Minimal single-full-attention-group config so the coordinator-based
     # lookup path works (the connector no longer carries a legacy single-group
     # path; everything flows through the coordinator).
@@ -1591,6 +1686,14 @@ def _make_bare_worker(
 
     worker.disk_offload_buffer_budget_bytes = None
     worker.store_replicate_config = SimpleNamespace()
+    worker._session_breakpoints_enabled = (
+        envs.VLLM_MOONCAKE_SESSION_BREAKPOINTS and kv_role != "kv_consumer"
+    )
+    worker._session_breakpoint_history_size = (
+        envs.VLLM_MOONCAKE_SESSION_BREAKPOINT_HISTORY_SIZE
+    )
+    worker._session_breakpoints = OrderedDict()
+    worker._session_breakpoints_lock = threading.Lock()
     worker._kv_connector_stats_lock = threading.Lock()
     worker.kv_connector_stats = MooncakeStoreConnectorStats()
 
@@ -1695,18 +1798,13 @@ def test_lookup_swa_single_group_returns_full_when_tail_window_present():
     assert worker.lookup(64, [b"h0", b"h1", b"h2", b"h3"]) == 64
 
 
-def test_lookup_checks_all_potential_swa_hit_boundaries():
-    """Lookup should skip SWA chunks that can never validate a hit, but still
-    check earlier aligned boundaries when sparse retention stores only the
-    current request's replay boundary.
-    """
+def _configure_hybrid_full_swa_worker(worker, retention_interval=None):
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         KVCacheGroupSpec,
         SlidingWindowSpec,
     )
 
-    worker = _make_bare_worker(block_size=8)
     full = FullAttentionSpec(block_size=32, num_kv_heads=8, head_size=64, dtype=None)
     swa = SlidingWindowSpec(
         block_size=8, num_kv_heads=8, head_size=64, dtype=None, sliding_window=8
@@ -1731,9 +1829,18 @@ def test_lookup_checks_all_potential_swa_hit_boundaries():
         worker._kv_cache_groups,
         scheduler_block_size=32,
         hash_block_size=8,
-        retention_interval=0,
+        retention_interval=retention_interval,
     )
     worker._init_lookup_key_prefixes()
+
+
+def test_lookup_checks_all_potential_swa_hit_boundaries():
+    """Lookup should skip SWA chunks that can never validate a hit, but still
+    check earlier aligned boundaries when sparse retention stores only the
+    current request's replay boundary.
+    """
+    worker = _make_bare_worker(block_size=8)
+    _configure_hybrid_full_swa_worker(worker, retention_interval=0)
     # Candidate order: 3 full-attention chunks, then SWA chunks 3, 7, 11.
     # Only the first full chunk and the SWA chunk ending at token 32 exist, so
     # lookup should recover a 32-token external prefix hit. A sparse
@@ -1758,44 +1865,8 @@ def test_lookup_checks_all_potential_swa_hit_boundaries():
 
 
 def test_lookup_applies_swa_mask_before_accessing_hashes():
-    """Lookup must apply the sparse SWA mask before touching group hashes, so
-    false-mask chunks pay neither the hash access nor the key-construction cost.
-    """
-    from vllm.v1.kv_cache_interface import (
-        FullAttentionSpec,
-        KVCacheGroupSpec,
-        SlidingWindowSpec,
-    )
-
     worker = _make_bare_worker(block_size=8)
-    full = FullAttentionSpec(block_size=32, num_kv_heads=8, head_size=64, dtype=None)
-    swa = SlidingWindowSpec(
-        block_size=8, num_kv_heads=8, head_size=64, dtype=None, sliding_window=8
-    )
-    worker._kv_cache_groups = [
-        KVCacheGroupSpec(["full"], full),
-        KVCacheGroupSpec(["swa"], swa),
-    ]
-    worker.token_dbs = [
-        ChunkedTokenDatabase(
-            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
-            block_size=32,
-            hash_block_size=8,
-        ),
-        ChunkedTokenDatabase(
-            KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
-            block_size=8,
-            hash_block_size=8,
-        ),
-    ]
-    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
-        worker._kv_cache_groups,
-        scheduler_block_size=32,
-        hash_block_size=8,
-        retention_interval=0,
-    )
-    worker._init_lookup_key_prefixes()
-
+    _configure_hybrid_full_swa_worker(worker)
     block_hashes = _RecordingBlockHashes([f"h{i}".encode() for i in range(12)])
     accessed_before_rpc: list[int] = []
 
@@ -1807,10 +1878,261 @@ def test_lookup_applies_swa_mask_before_accessing_hashes():
 
     worker.lookup(96, block_hashes)
 
-    # Full-attention chunks (compact hashes at 3, 7, 11) plus only the reachable
-    # SWA boundary tails (chunks 3, 7, 11) are hash-accessed. Every masked SWA
-    # chunk in between is skipped before both the hash access and key build.
     assert accessed_before_rpc == [3, 7, 11, 3, 7, 11]
+
+
+def test_lookup_uses_session_breakpoint_length_when_enabled(monkeypatch):
+    _set_session_breakpoints(monkeypatch, True)
+    worker = _make_bare_worker()
+    worker._record_session_breakpoint("conv-abc", 32, [b"a0", b"a1"])
+    worker.store.batch_is_exist.return_value = [1, 1]
+
+    result = worker.lookup(
+        48,
+        [b"a0", b"a1", b"a2"],
+        session_id="conv-abc",
+    )
+
+    assert result == 32
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert len(keys) == 2
+    assert keys[-1].endswith("@6131")
+
+
+def test_lookup_ignores_session_breakpoint_when_disabled(monkeypatch):
+    _set_session_breakpoints(monkeypatch, True)
+    worker = _make_bare_worker()
+    worker._record_session_breakpoint("conv-abc", 32, [b"a0", b"a1"])
+    worker._session_breakpoints_enabled = False
+    worker.store.batch_is_exist.return_value = [1, 1, 1]
+
+    result = worker.lookup(
+        48,
+        [b"a0", b"a1", b"a2"],
+        session_id="conv-abc",
+    )
+
+    assert result == 48
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert len(keys) == 3
+
+
+def test_lookup_falls_back_when_session_breakpoint_misses(monkeypatch):
+    _set_session_breakpoints(monkeypatch, True)
+    worker = _make_bare_worker()
+    worker._record_session_breakpoint("conv-abc", 32, [b"a0", b"a1"])
+    worker.store.batch_is_exist.side_effect = [
+        [1, 0],
+        [1, 1, 1],
+    ]
+
+    result = worker.lookup(
+        48,
+        [b"a0", b"a1", b"a2"],
+        session_id="conv-abc",
+    )
+
+    assert result == 48
+    assert [
+        len(call.args[0]) for call in worker.store.batch_is_exist.call_args_list
+    ] == [2, 3]
+
+
+def test_lookup_skips_stale_session_breakpoint_anchor(monkeypatch):
+    _set_session_breakpoints(monkeypatch, True)
+    worker = _make_bare_worker()
+    worker._record_session_breakpoint("conv-abc", 32, [b"a0", b"a1"])
+    worker.store.batch_is_exist.return_value = [1, 1, 1]
+
+    result = worker.lookup(
+        48,
+        [b"a0", b"changed", b"a2"],
+        session_id="conv-abc",
+    )
+
+    assert result == 48
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert len(keys) == 3
+
+
+def test_lookup_uses_older_session_breakpoint_when_latest_branch_differs(monkeypatch):
+    _set_session_breakpoints(monkeypatch, True)
+    worker = _make_bare_worker()
+    worker._record_session_breakpoint("conv-abc", 32, [b"a0", b"a1"])
+    worker._record_session_breakpoint("conv-abc", 48, [b"a0", b"b1", b"b2"])
+    worker.store.batch_is_exist.return_value = [1, 1]
+
+    result = worker.lookup(
+        48,
+        [b"a0", b"a1", b"a2"],
+        session_id="conv-abc",
+    )
+
+    assert result == 32
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert len(keys) == 2
+
+
+def test_lookup_session_breakpoint_uses_boundary_swa_mask(monkeypatch):
+    _set_session_breakpoints(monkeypatch, True)
+    worker = _make_bare_worker(block_size=8)
+    _configure_hybrid_full_swa_worker(worker)
+    block_hashes = [f"h{i}".encode() for i in range(16)]
+    worker._record_session_breakpoint("conv-abc", 96, block_hashes)
+
+    def exists(keys):
+        return [1] * len(keys)
+
+    worker.store.batch_is_exist.side_effect = exists
+
+    result = worker.lookup(128, block_hashes, session_id="conv-abc")
+
+    assert result == 96
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert len(keys) == 4
+    swa_keys = [key for key in keys if "@group:1@" in key]
+    assert swa_keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:1@683131",
+    ]
+
+
+def test_lookup_session_breakpoint_miss_falls_back_to_dense_swa_mask(monkeypatch):
+    _set_session_breakpoints(monkeypatch, True)
+    worker = _make_bare_worker(block_size=8)
+    _configure_hybrid_full_swa_worker(worker)
+    block_hashes = [f"h{i}".encode() for i in range(16)]
+    worker._record_session_breakpoint("conv-abc", 96, block_hashes)
+    call_sizes = []
+
+    def exists(keys):
+        call_sizes.append(len(keys))
+        if len(call_sizes) == 1:
+            return [1] * (len(keys) - 1) + [0]
+        return [1] * len(keys)
+
+    worker.store.batch_is_exist.side_effect = exists
+
+    result = worker.lookup(128, block_hashes, session_id="conv-abc")
+
+    assert result == 128
+    assert call_sizes == [4, 8]
+
+
+def test_lookup_exact_session_breakpoint_falls_back_for_sparse_partial_hit(
+    monkeypatch,
+):
+    _set_session_breakpoints(monkeypatch, True)
+    worker = _make_bare_worker(block_size=8)
+    _configure_hybrid_full_swa_worker(worker)
+    block_hashes = [f"h{i}".encode() for i in range(16)]
+    worker._record_session_breakpoint("conv-abc", 128, block_hashes)
+
+    def exists(keys):
+        return [
+            0 if "@group:1@" in key and key.endswith("@683135") else 1 for key in keys
+        ]
+
+    worker.store.batch_is_exist.side_effect = exists
+
+    result = worker.lookup(128, block_hashes, session_id="conv-abc")
+
+    assert result == 96
+    assert worker.store.batch_is_exist.call_count == 2
+
+
+def test_record_session_breakpoint_caps_history_size(monkeypatch):
+    monkeypatch.setenv("VLLM_MOONCAKE_SESSION_BREAKPOINTS", "1")
+    monkeypatch.setenv("VLLM_MOONCAKE_SESSION_BREAKPOINT_HISTORY_SIZE", "2")
+    envs.disable_envs_cache()
+    worker = _make_bare_worker()
+
+    worker._record_session_breakpoint("conv-abc", 16, [b"a0"])
+    worker._record_session_breakpoint("conv-abc", 32, [b"a0", b"a1"])
+    worker._record_session_breakpoint("conv-abc", 48, [b"a0", b"a1", b"a2"])
+
+    breakpoints = worker._session_breakpoints["conv-abc"]
+    assert [breakpoint.aligned_token_len for breakpoint in breakpoints] == [48, 32]
+
+
+def test_record_session_breakpoint_respects_instance_disabled_flag(monkeypatch):
+    _set_session_breakpoints(monkeypatch, True)
+    worker = _make_bare_worker()
+    worker._session_breakpoints_enabled = False
+
+    worker._record_session_breakpoint("conv-abc", 32, [b"a0", b"a1"])
+
+    assert not worker._session_breakpoints
+
+
+def test_register_kv_caches_omits_session_breakpoint_callback_when_disabled(
+    monkeypatch,
+):
+    _set_session_breakpoints(monkeypatch, False)
+    worker = _make_bare_worker()
+    tensor = torch.zeros(10, 64, dtype=torch.float16)
+    prefix = "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker."
+
+    with (
+        patch(
+            prefix + "KVCacheStoreSendingThread",
+            side_effect=_auto_set_ready_event,
+        ) as send_thread_cls,
+        patch(
+            prefix + "KVCacheStoreRecvingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+    ):
+        worker.register_kv_caches({"layer0": tensor})
+
+    assert send_thread_cls.call_args.kwargs["record_session_breakpoint"] is None
+
+
+def test_register_kv_caches_wires_session_breakpoint_callback_when_enabled(monkeypatch):
+    _set_session_breakpoints(monkeypatch, True)
+    worker = _make_bare_worker()
+    tensor = torch.zeros(10, 64, dtype=torch.float16)
+    prefix = "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker."
+
+    with (
+        patch(
+            prefix + "KVCacheStoreSendingThread",
+            side_effect=_auto_set_ready_event,
+        ) as send_thread_cls,
+        patch(
+            prefix + "KVCacheStoreRecvingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+    ):
+        worker.register_kv_caches({"layer0": tensor})
+
+    assert (
+        send_thread_cls.call_args.kwargs["record_session_breakpoint"]
+        == worker._record_session_breakpoint
+    )
+
+
+def test_register_kv_caches_omits_session_breakpoint_callback_without_lookup_server(
+    monkeypatch,
+):
+    _set_session_breakpoints(monkeypatch, True)
+    worker = _make_bare_worker()
+    worker.lookup_server = None
+    tensor = torch.zeros(10, 64, dtype=torch.float16)
+    prefix = "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker."
+
+    with (
+        patch(
+            prefix + "KVCacheStoreSendingThread",
+            side_effect=_auto_set_ready_event,
+        ) as send_thread_cls,
+        patch(
+            prefix + "KVCacheStoreRecvingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+    ):
+        worker.register_kv_caches({"layer0": tensor})
+
+    assert send_thread_cls.call_args.kwargs["record_session_breakpoint"] is None
 
 
 # ---------------------------------------------------------------------------

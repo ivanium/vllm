@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     chunk_hashes_for_block_size,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -394,6 +395,51 @@ def test_store_mask_retention_prefix_stable_as_aligned_length_grows():
     assert shorter is not None
     assert longer is not None
     assert longer[: len(shorter)] == shorter
+
+
+# ----- lookup_mask with session breakpoint boundary -----
+
+
+def test_lookup_mask_hint_boundary_keeps_only_target_swa_tail():
+    coord = _make_coord(_retention_groups(), hash_block_size=8)
+
+    masks = coord.lookup_mask(128, aligned_boundary_token_len=96)
+
+    assert masks[0] is None
+    assert masks[1] == [i == 11 for i in range(16)]
+
+
+def test_swa_reachable_mask_accepts_aligned_boundary_directly():
+    mask = SlidingWindowManager.reachable_block_mask(
+        start_block=0,
+        end_block=16,
+        alignment_tokens=32,
+        kv_cache_spec=_swa(block_size=8, sliding_window=8),
+        use_eagle=False,
+        retention_interval=0,
+        aligned_boundary_token_len=96,
+    )
+
+    assert mask == [i == 11 for i in range(16)]
+
+
+def test_swa_reachable_mask_ignores_aligned_boundary_for_dense_retention():
+    kwargs = dict(
+        start_block=0,
+        end_block=8,
+        alignment_tokens=32,
+        kv_cache_spec=_swa(block_size=8, sliding_window=8),
+        use_eagle=True,
+        retention_interval=None,
+    )
+
+    dense_mask = SlidingWindowManager.reachable_block_mask(**kwargs)
+    dense_with_boundary = SlidingWindowManager.reachable_block_mask(
+        **kwargs,
+        aligned_boundary_token_len=0,
+    )
+
+    assert dense_with_boundary == dense_mask
 
 
 # ----- Eagle / MTP interaction with load_mask -----

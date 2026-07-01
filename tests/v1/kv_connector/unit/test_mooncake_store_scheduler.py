@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import vllm.envs as envs
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     LoadSpec,
     ReqMeta,
@@ -17,6 +18,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler impor
 def _make_bare_scheduler() -> MooncakeStoreScheduler:
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = "kv_both"
+    scheduler._session_breakpoints_enabled = (
+        envs.VLLM_MOONCAKE_SESSION_BREAKPOINTS and scheduler.kv_role != "kv_consumer"
+    )
+    scheduler.load_async = False
     scheduler.lookup_async = False
     scheduler._block_size = 16
     scheduler.load_specs = {}
@@ -474,15 +479,87 @@ def test_from_request_tracker_no_load_saves_normally():
 class _StubLookupClient:
     def __init__(self, hit_tokens: int) -> None:
         self._hit_tokens = hit_tokens
+        self.calls: list[dict[str, object]] = []
 
     def lookup(
         self,
         req_id: str,
         token_len: int,
         block_hashes: list[bytes],
+        session_id: str | None = None,
         non_block: bool = False,
     ) -> int:
+        self.calls.append(
+            {
+                "req_id": req_id,
+                "token_len": token_len,
+                "block_hashes": block_hashes,
+                "session_id": session_id,
+                "non_block": non_block,
+            }
+        )
         return self._hit_tokens
+
+
+def test_lookup_passes_session_id_when_session_breakpoints_enabled(monkeypatch):
+    monkeypatch.setenv("VLLM_MOONCAKE_SESSION_BREAKPOINTS", "1")
+    envs.disable_envs_cache()
+    scheduler = _make_bare_scheduler()
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+        sampling_params=SimpleNamespace(extra_args={"session_id": "conv-abc"}),
+    )
+
+    scheduler.get_num_new_matched_tokens(request, num_computed_tokens=0)
+
+    assert scheduler.client.calls == [
+        {
+            "req_id": "req-0",
+            "token_len": 48,
+            "block_hashes": [b"h0", b"h1", b"h2"],
+            "session_id": "conv-abc",
+            "non_block": False,
+        }
+    ]
+
+
+def test_lookup_omits_session_id_when_session_breakpoints_disabled(monkeypatch):
+    monkeypatch.delenv("VLLM_MOONCAKE_SESSION_BREAKPOINTS", raising=False)
+    envs.disable_envs_cache()
+    scheduler = _make_bare_scheduler()
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+        sampling_params=SimpleNamespace(extra_args={"session_id": "conv-abc"}),
+    )
+
+    scheduler.get_num_new_matched_tokens(request, num_computed_tokens=0)
+
+    assert scheduler.client.calls[0]["session_id"] is None
+
+
+def test_lookup_omits_session_id_for_consumer_role(monkeypatch):
+    monkeypatch.setenv("VLLM_MOONCAKE_SESSION_BREAKPOINTS", "1")
+    envs.disable_envs_cache()
+    scheduler = _make_bare_scheduler()
+    scheduler.kv_role = "kv_consumer"
+    scheduler._session_breakpoints_enabled = False
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+        sampling_params=SimpleNamespace(extra_args={"session_id": "conv-abc"}),
+    )
+
+    scheduler.get_num_new_matched_tokens(request, num_computed_tokens=0)
+
+    assert scheduler.client.calls[0]["session_id"] is None
 
 
 def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():

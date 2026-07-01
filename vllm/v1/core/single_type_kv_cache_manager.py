@@ -30,6 +30,16 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 
 
+def get_aligned_prompt_boundary_token_len(
+    num_prompt_tokens: int | None,
+    alignment_tokens: int | None,
+) -> int | None:
+    """Return the aligned cache-hit boundary immediately before prompt end."""
+    if num_prompt_tokens is None or alignment_tokens is None or num_prompt_tokens <= 0:
+        return None
+    return (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
+
+
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -341,6 +351,10 @@ class SingleTypeKVCacheManager(ABC):
         if num_cached_blocks >= num_full_blocks:
             return
 
+        aligned_boundary_token_len = get_aligned_prompt_boundary_token_len(
+            request.num_prompt_tokens,
+            self.scheduler_block_size,
+        )
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
@@ -348,7 +362,7 @@ class SingleTypeKVCacheManager(ABC):
             kv_cache_spec=self.kv_cache_spec,
             use_eagle=self.use_eagle,
             retention_interval=retention_interval,
-            num_prompt_tokens=request.num_prompt_tokens,
+            aligned_boundary_token_len=aligned_boundary_token_len,
         )
         self.block_pool.cache_full_blocks(
             request=request,
@@ -371,7 +385,7 @@ class SingleTypeKVCacheManager(ABC):
         kv_cache_spec: KVCacheSpec,
         use_eagle: bool,
         retention_interval: int | None = None,
-        num_prompt_tokens: int | None = None,
+        aligned_boundary_token_len: int | None = None,
     ) -> list[bool] | None:
         """Per-block mask for ``cache_full_blocks``. ``None`` means cache
         every (non-null) block — the default for full attention.
@@ -781,7 +795,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         kv_cache_spec: KVCacheSpec,
         use_eagle: bool,
         retention_interval: int | None = None,
-        num_prompt_tokens: int | None = None,
+        aligned_boundary_token_len: int | None = None,
     ) -> list[bool] | None:
         assert isinstance(kv_cache_spec, SlidingWindowSpec)
         if alignment_tokens is None:
@@ -821,13 +835,17 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 if i >= shift and (i - shift) % per_segment >= per_segment - need:
                     mask[i - start_block] = True
 
-        # (2) Replay-boundary tail. ``get_computed_blocks`` caps hits at
-        # ``num_prompt - 1`` (to recompute the last token's logits), so an exact
-        # prompt replay can only land on the latest *fine*-aligned boundary.
-        # Sparse retention would otherwise skip it, so keep its tail explicitly.
-        if retention_interval is not None and num_prompt_tokens is not None:
-            latest = (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
-            prompt_end_block = latest // block_size + shift
+        # (2) Exact-boundary tail. Sparse retention keeps the latest prompt
+        # replay boundary; external-store lookup can pass a specific boundary
+        # when it only needs to prove that one hit length. Dense retention
+        # already checks every alignment boundary, so preserve that old path.
+        boundary = (
+            aligned_boundary_token_len if retention_interval is not None else None
+        )
+        if boundary is not None:
+            assert boundary % alignment_tokens == 0
+        if boundary is not None:
+            prompt_end_block = boundary // block_size + shift
             for i in range(
                 max(start_block, prompt_end_block - need),
                 min(end_block, prompt_end_block),
@@ -1096,7 +1114,7 @@ class MambaManager(SingleTypeKVCacheManager):
         kv_cache_spec: KVCacheSpec,
         use_eagle: bool,
         retention_interval: int | None = None,
-        num_prompt_tokens: int | None = None,
+        aligned_boundary_token_len: int | None = None,
     ) -> list[bool] | None:
         """Sparse Mamba state-snapshot retention.
 
@@ -1133,9 +1151,9 @@ class MambaManager(SingleTypeKVCacheManager):
         # ``num_prompt - 1``, so an exact prompt replay lands on the latest
         # fine-aligned boundary. Sparse retention would otherwise skip its
         # state, so keep it explicitly.
-        if num_prompt_tokens is not None:
-            latest = (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
-            boundary_block = latest // block_size - 1
+        if aligned_boundary_token_len is not None:
+            assert aligned_boundary_token_len % alignment_tokens == 0
+            boundary_block = aligned_boundary_token_len // block_size - 1
             if start_block <= boundary_block < end_block:
                 mask[boundary_block - start_block] = True
 
