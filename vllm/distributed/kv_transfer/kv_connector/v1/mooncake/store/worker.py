@@ -1109,6 +1109,18 @@ class MooncakeStoreWorker:
             use_eagle=use_eagle,
             retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
         )
+        # Mirrors HybridKVCacheCoordinator.enable_partial_hash_hits: the
+        # engine then reports mid-block local hit lengths, which this
+        # connector cannot consume yet (support lands in a follow-up PR).
+        if self.hash_block_size < self.block_size and all(
+            manager_cls.supports_fine_grained_hash_lookup
+            or spec.block_size == self.hash_block_size
+            for spec, _, manager_cls in self.coord.attention_groups
+        ):
+            raise NotImplementedError(
+                "MooncakeStoreConnector does not support fine-grained partial "
+                "prefix-cache hits yet. Unset --hash-block-size to disable them."
+            )
         # One ChunkedTokenDatabase per group; addresses populated in
         # register_kv_caches once the kv-cache layout is known.
         self.token_dbs: list[ChunkedTokenDatabase] = [
@@ -1442,7 +1454,9 @@ class MooncakeStoreWorker:
         exists_set = {gh for gh, c in present_count.items() if c >= expected_per_key}
 
         _masks, hit_length = self.coord.find_longest_cache_hit(
-            block_hashes, token_len, ExternalCachedBlockPool(exists_set)
+            block_hashes,
+            token_len,
+            ExternalCachedBlockPool(exists_set, hash_block_size=self.hash_block_size),
         )
         return hit_length
 
