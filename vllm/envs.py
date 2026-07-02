@@ -165,6 +165,8 @@ if TYPE_CHECKING:
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
+    VLLM_DSV4_ENABLE_TP_SHARDQ: bool = False
+    VLLM_DSV4_TP_SHARDQ_A2A: str = "sm"
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
@@ -722,6 +724,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: breakable cudagraph does not rely on torch.compile
     "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (
         os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1"
+    ),
+    # Experimental DeepSeek-V4 tensor-parallel shardQ prototype.
+    "VLLM_DSV4_ENABLE_TP_SHARDQ": lambda: (
+        os.environ.get("VLLM_DSV4_ENABLE_TP_SHARDQ", "0") == "1"
+    ),
+    # DeepSeek-V4 tensor-parallel shardQ A2A backend. "nccl" uses the
+    # all-to-all reference path; "sm" and "ce" use symmetric memory when
+    # available and fall back to NCCL otherwise.
+    "VLLM_DSV4_TP_SHARDQ_A2A": env_with_choices(
+        "VLLM_DSV4_TP_SHARDQ_A2A",
+        "sm",
+        ["sm", "ce", "nccl"],
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').

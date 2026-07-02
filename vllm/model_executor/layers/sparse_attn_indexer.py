@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+from typing import Any, cast
+
 import torch
 
 import vllm.envs as envs
@@ -747,6 +749,33 @@ class SparseAttnIndexer(CustomOp):
                 "SparseAttnIndexer native forward is only implemented for "
                 "CUDA, ROCm and XPU platforms."
             )
+
+    def forward_with_metadata(
+        self,
+        hidden_states: torch.Tensor,
+        q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        indexer_metadata: DeepseekV32IndexerMetadata,
+        topk_indices_buffer: torch.Tensor,
+    ):
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return self.forward_native(hidden_states, q_quant, k, weights)
+
+        metadata_dict = cast(dict[Any, Any], attn_metadata)
+        old_metadata = metadata_dict.get(self.k_cache.prefix)
+        old_topk_indices_buffer = self.topk_indices_buffer
+        try:
+            metadata_dict[self.k_cache.prefix] = indexer_metadata
+            self.topk_indices_buffer = topk_indices_buffer
+            return self.forward_native(hidden_states, q_quant, k, weights)
+        finally:
+            if old_metadata is None:
+                metadata_dict.pop(self.k_cache.prefix, None)
+            else:
+                metadata_dict[self.k_cache.prefix] = old_metadata
+            self.topk_indices_buffer = old_topk_indices_buffer
 
     def forward_cuda(
         self,

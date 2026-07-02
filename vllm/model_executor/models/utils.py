@@ -885,7 +885,13 @@ def sequence_parallel_chunk_impl(x: torch.Tensor) -> torch.Tensor:
     remainder = seq_len % tp_size
     if remainder != 0:
         pad_len = tp_size - remainder
-        y = nn.functional.pad(x, (0, 0, 0, pad_len))
+        # Pad the token dim (dim 0). F.pad's spec runs last-dim-first, so a
+        # hard-coded (0, 0, 0, pad_len) pads dim -2 — correct for a 2-D
+        # [tokens, hidden] residual but corrupts the 3-D mHC residual
+        # [tokens, hc_mult, hidden] (it grows hc_mult). Build the spec from
+        # the rank so it always targets dim 0.
+        pad = (0, 0) * (x.dim() - 1) + (0, pad_len)
+        y = nn.functional.pad(x, pad)
     else:
         y = x
 

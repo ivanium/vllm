@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
@@ -29,8 +30,12 @@ from vllm.v1.worker.workspace import current_workspace_manager
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
+# Sentinel cached on the forward context when a shardq prefill plan has no
+# prefill segments, so the empty result is memoized instead of recomputed.
+from vllm.models.deepseek_v4.nvidia.shardq_mixin import ShardQMixin
 
-class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
+
+class DeepseekV4FlashMLAAttention(ShardQMixin, DeepseekV4Attention):
     """FlashMLA sparse MLA attention layer for DeepSeek V4 (CUDA)."""
 
     backend_cls = DeepseekV4FlashMLABackend
@@ -38,6 +43,18 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
+        # Replicated full-head attention sink: every rank holds ALL heads' sink
+        # values, so the shardq sequence-CP path needs no per-layer all-gather.
+        # Filled from the (unsharded) checkpoint attn_sink by the weight loader;
+        # bit-identical to gather_full_attn_sink (real heads + -inf pad).
+        self.attn_sink_full = torch.nn.Parameter(
+            torch.full(
+                (self.get_padded_num_q_heads(self.n_heads),),
+                -float("inf"),
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return deep_gemm_fp8_o_proj(
@@ -54,6 +71,28 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             einsum_recipe=self._einsum_recipe,
             tma_aligned_scales=self._tma_aligned_scales,
         )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not envs.VLLM_DSV4_ENABLE_TP_SHARDQ or self.indexer is None:
+            return super().forward(positions, hidden_states, llama_4_scaling)
+
+        forward_context = get_forward_context()
+        if not isinstance(forward_context.attn_metadata, dict):
+            # Warmup/profile steps do not carry enough metadata to build the
+            # shardq pseudo-request view. Reserve the extra shardq-path buffers
+            # while the normal warmup path runs, so memory profiling accounts
+            # for the env-gated runtime path instead of only the fallback path.
+            profile_tensors = self._reserve_shardq_profile_memory(hidden_states)
+            try:
+                return super().forward(positions, hidden_states, llama_4_scaling)
+            finally:
+                del profile_tensors
+        return self._forward_shardq(positions, hidden_states)
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:

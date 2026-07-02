@@ -1146,6 +1146,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert batch_descriptor is not None
             is_sp_sharded = self._is_sp_sharded(batch_descriptor.num_tokens)
 
+        # Eager SP fallback: each layer all-gathers the mHC stream back to the
+        # padded (tp-aligned) token count before attention, but under
+        # enforce_eager the runner does not pad `positions` (the compile SP pass
+        # is skipped). Pad it to match so the fused qnorm/rope kernel's
+        # q/kv/position row counts agree. No-op under cudagraph (runner pre-pads).
+        if is_sp_sharded:
+            _tp = get_tensor_model_parallel_world_size()
+            _rem = positions.shape[0] % _tp
+            if _rem:
+                positions = nn.functional.pad(positions, (0, _tp - _rem))
+
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
@@ -1302,6 +1313,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     n = narrow_weight.shape[0]
                     params_dict[name][:n].copy_(narrow_weight)
                     loaded_params.add(name)
+                    # Also populate the replicated full-head sink (shardq path),
+                    # if the layer registered one, from the unsharded weight.
+                    full_name = name.replace("attn_sink", "attn_sink_full")
+                    if full_name in params_dict:
+                        nf = loaded_weight.shape[0]
+                        params_dict[full_name][:nf].copy_(loaded_weight)
+                        loaded_params.add(full_name)
                     continue
                 else:
                     if is_pp_missing_parameter(name, self):

@@ -53,6 +53,7 @@ from vllm.utils.multi_stream_utils import (
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
+    DeepseekV32IndexerMetadata,
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
@@ -190,6 +191,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.compress_ratio = 1
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
+        # shardQ runs on top of Sequence Parallelism (it reuses the SP a2a /
+        # token-split path); standalone it only adds a2a cost with no SP payoff.
+        # Gate it behind SP being enabled (tp_size>1 and sp_threshold set), so
+        # shardQ is never active when SP is off.
+        sp_enabled = vllm_config.parallel_config.enable_sp
+        self.shardq_born_local = (
+            envs.VLLM_DSV4_ENABLE_TP_SHARDQ
+            and sp_enabled
+            and self.backend_cls.__name__ == "DeepseekV4FlashMLABackend"
+            and self.compress_ratio == 4
+        )
+        if envs.VLLM_DSV4_ENABLE_TP_SHARDQ and not sp_enabled:
+            logger.warning_once(
+                "VLLM_DSV4_ENABLE_TP_SHARDQ is set but Sequence Parallelism is "
+                "disabled (requires tp_size>1 and sp_threshold set). shardQ runs "
+                "on top of SP, so it is disabled; set sp_threshold to enable it."
+            )
 
         # Padded Q head count is dictated by the platform subclass.
         self.padded_heads = self.get_padded_num_q_heads(self.n_local_heads)
@@ -209,14 +227,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             disable_tp=True,  # fused ReplicatedLinear
         )
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = ColumnParallelLinear(
-            self.q_lora_rank,
-            self.n_heads * self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.wq_b",
-        )
+        if self.shardq_born_local:
+            self.wq_b = ReplicatedLinear(
+                self.q_lora_rank,
+                self.n_heads * self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.wq_b",
+            )
+        else:
+            self.wq_b = ColumnParallelLinear(
+                self.q_lora_rank,
+                self.n_heads * self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.wq_b",
+            )
 
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         self.wo_a = ColumnParallelLinear(
@@ -429,6 +457,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
+    def _wq_b_head_parallel_view(self, qr: torch.Tensor) -> torch.Tensor:
+        out = self.wq_b(qr)
+        if self.shardq_born_local:
+            # Replicated wq_b emits all n_heads; slice to this rank's
+            # head-parallel width so the base (profiling) path stays
+            # shape-consistent. Only hit in profiling — steady-state born-local
+            # uses the shardq path (q_proj_born_local).
+            out = out[:, : self.n_local_heads * self.head_dim]
+        return out.view(-1, self.n_local_heads, self.head_dim)
+
     @eager_break_during_capture
     def attention_impl(
         self,
@@ -456,7 +494,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                q = self._wq_b_head_parallel_view(qr)
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
@@ -490,7 +528,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                q = self._wq_b_head_parallel_view(qr)
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
@@ -503,7 +541,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
         else:
             # SWA-only layer: no compressor, no overlap.
-            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+            q = self._wq_b_head_parallel_view(qr)
             q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         # MLA attention writes into the pre-allocated `out` buffer
@@ -598,6 +636,169 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             block_size,
         )
         return q_fp8
+
+    def _fused_qnorm_rope_q_only(
+        self,
+        q: torch.Tensor,
+        q_positions: torch.Tensor,
+        attn_metadata: (
+            dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
+        ),
+    ) -> torch.Tensor:
+        padded_heads = self.get_padded_num_q_heads(q.shape[-2])
+        if not isinstance(attn_metadata, dict):
+            if q.shape[-2] < padded_heads:
+                return F.pad(
+                    q,
+                    (0, 0, 0, padded_heads - q.shape[-2]),
+                    value=0.0,
+                )
+            return q
+
+        if q.shape[0] == 0:
+            return q.new_empty((0, padded_heads, q.shape[-1]))
+
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata | None",
+            attn_metadata.get(self.swa_cache_layer.prefix),
+        )
+        assert swa_metadata is not None
+
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        assert q_positions.dtype == torch.int64
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        cache_dtype = swa_kv_cache.dtype
+        empty_slot_mapping = torch.empty(0, dtype=torch.int64, device=q.device)
+        dummy_kv = q.new_empty((q.shape[0], self.head_dim))
+        op = torch.ops._C
+
+        if cache_dtype == torch.uint8:
+            swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+            return op.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                q,
+                dummy_kv,
+                swa_kv_cache_2d,
+                empty_slot_mapping,
+                q_positions,
+                cos_sin_cache,
+                padded_heads,
+                self.eps,
+                swa_metadata.block_size,
+            )
+
+        block_size = swa_metadata.block_size
+        swa_kv_cache_3d = swa_kv_cache.view(-1, block_size, self.head_dim)
+        if cache_dtype == torch.bfloat16:
+            op.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+                q,
+                dummy_kv,
+                swa_kv_cache_3d,
+                empty_slot_mapping,
+                q_positions,
+                cos_sin_cache,
+                self.eps,
+                block_size,
+            )
+            if q.shape[-2] < padded_heads:
+                return F.pad(
+                    q,
+                    (0, 0, 0, padded_heads - q.shape[-2]),
+                    value=0.0,
+                )
+            return q
+
+        q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+        op.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
+            q,
+            dummy_kv,
+            q_fp8,
+            swa_kv_cache_3d,
+            empty_slot_mapping,
+            q_positions,
+            cos_sin_cache,
+            self._flashinfer_fp8_kv_scale,
+            self._flashinfer_fp8_q_scale_inv,
+            self.eps,
+            block_size,
+        )
+        if q_fp8.shape[-2] < padded_heads:
+            return F.pad(
+                q_fp8,
+                (0, 0, 0, padded_heads - q_fp8.shape[-2]),
+                value=0.0,
+            )
+        return q_fp8
+
+    def _kv_insert_only(
+        self,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        attn_metadata: (
+            dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
+        ),
+    ) -> None:
+        if not isinstance(attn_metadata, dict) or kv.shape[0] == 0:
+            return
+
+        dummy_q = kv.new_empty((kv.shape[0], 1, self.head_dim))
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata | None",
+            attn_metadata.get(self.swa_cache_layer.prefix),
+        )
+        assert swa_metadata is not None
+
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        assert positions.dtype == torch.int64
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        cache_dtype = swa_kv_cache.dtype
+        op = torch.ops._C
+
+        if cache_dtype == torch.uint8:
+            # The returned dummy Q is discarded; use the smallest fused-kernel
+            # padded-head instantiation that can hold the single live head.
+            swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+            op.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                dummy_q,
+                kv,
+                swa_kv_cache_2d,
+                swa_metadata.slot_mapping,
+                positions,
+                cos_sin_cache,
+                8,
+                self.eps,
+                swa_metadata.block_size,
+            )
+            return
+
+        block_size = swa_metadata.block_size
+        swa_kv_cache_3d = swa_kv_cache.view(-1, block_size, self.head_dim)
+        if cache_dtype == torch.bfloat16:
+            op.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+                dummy_q,
+                kv,
+                swa_kv_cache_3d,
+                swa_metadata.slot_mapping,
+                positions,
+                cos_sin_cache,
+                self.eps,
+                block_size,
+            )
+            return
+
+        q_fp8 = torch.empty_like(dummy_q, dtype=torch.float8_e4m3fn)
+        op.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
+            dummy_q,
+            kv,
+            q_fp8,
+            swa_kv_cache_3d,
+            swa_metadata.slot_mapping,
+            positions,
+            cos_sin_cache,
+            self._flashinfer_fp8_kv_scale,
+            self._flashinfer_fp8_q_scale_inv,
+            self.eps,
+            block_size,
+        )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
@@ -769,6 +970,46 @@ class DeepseekV4Indexer(nn.Module):
             torch.cuda.Event(),
             torch.cuda.Event(),
         ]
+
+    def forward_query_with_metadata(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        compressed_kv_score: torch.Tensor,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+        indexer_metadata: DeepseekV32IndexerMetadata,
+        topk_indices_buffer: torch.Tensor,
+    ) -> torch.Tensor:
+        compressor = self.compressor
+
+        def wq_b_and_q_quant():
+            # ReplicatedLinear returns (output, bias); bias is None.
+            q, _ = self.wq_b(qr)
+            q = q.view(-1, self.n_head, self.head_dim)
+            return fused_indexer_q_rope_quant(
+                positions,
+                q,
+                rotary_emb.cos_sin_cache,
+                indexer_weights,
+                self.softmax_scale,
+                self.n_head**-0.5,
+                use_fp4=self.use_fp4_kv,
+            )
+
+        # Keep the producer side full-token so the replicated searchable K cache
+        # stays global; only the query/topK rows use shardq local metadata.
+        (q_quant, weights), k = maybe_execute_in_parallel(
+            wq_b_and_q_quant,
+            lambda: compressor(compressed_kv_score, positions, rotary_emb),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+        return self.indexer_op.forward_with_metadata(
+            hidden_states, q_quant, k, weights, indexer_metadata, topk_indices_buffer
+        )
 
     def forward(
         self,
