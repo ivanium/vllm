@@ -3453,9 +3453,11 @@ def test_different_block_size():
     assert len(computed_blocks.blocks[1]) == 6
     assert num_computed_tokens == 6 * 16
 
-    # Evict some blocks to make sliding window cache hit length 5*16
-    # But should return 4 * 16 because full attention cache hit length must be
-    # a multiple of 32
+    # Evict some blocks to make sliding window cache hit length 5*16.
+    # hash_block_size (16) < lcm (32) enables partial hits for this FA+SWA
+    # config, so the common hit stays at 5*16: full attention serves the
+    # mid-block tail with a copy-on-write of its third block (kept in the
+    # returned blocks), instead of clamping down to a 32-aligned 4*16.
     manager.block_pool.cached_block_hash_to_block.pop(
         make_block_hash_with_group_id(req1.block_hashes[6], 1), 11
     )
@@ -3463,9 +3465,9 @@ def test_different_block_size():
         make_block_hash_with_group_id(req1.block_hashes[5], 1), 10
     )
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
-    assert len(computed_blocks.blocks[0]) == 2
-    assert len(computed_blocks.blocks[1]) == 4
-    assert num_computed_tokens == 4 * 16
+    assert len(computed_blocks.blocks[0]) == 3
+    assert len(computed_blocks.blocks[1]) == 5
+    assert num_computed_tokens == 5 * 16
 
 
 def test_hybrid_cache_blocks_swa_tail_window_only():
@@ -3540,12 +3542,11 @@ def test_hybrid_cache_blocks_swa_tail_window_only():
             )
 
 
-def test_hybrid_cache_blocks_clamped_to_lcm():
-    """HybridKVCacheCoordinator.cache_blocks() clamps to scheduler_block_size.
-    Chunks past the last lcm-aligned boundary can never participate in a
-    cache hit (find_longest_cache_hit always returns lcm-aligned hits), so
-    caching them only pollutes the prefix-cache hash map and keeps blocks
-    on the LRU list that could otherwise return to the free pool."""
+def test_hybrid_cache_blocks_fine_tail_cached():
+    """With hash_block_size < lcm, partial hash hits are enabled for FA+SWA
+    hybrids, so HybridKVCacheCoordinator.cache_blocks() no longer clamps to
+    scheduler_block_size: chunks past the last lcm-aligned boundary are now
+    legitimate fine-grained hit targets and must be cached."""
     block_size = 16
     # Full attn block_size=32, SWA block_size=16 -> lcm=32.
     kv_cache_config = KVCacheConfig(
@@ -3595,16 +3596,14 @@ def test_hybrid_cache_blocks_clamped_to_lcm():
     assert len(req.block_hashes) == 7
 
     pool = manager.block_pool
-    # SWA group_id=1: hashes 0..5 cached (6 blocks * 16 tokens = 96), hash 6
-    # spans tokens [96, 112) past the lcm boundary and must NOT be cached.
-    for i in range(6):
+    # SWA group_id=1: with partial hits enabled, all 7 hashes are cached —
+    # including hash 6 spanning tokens [96, 112) past the lcm boundary, which
+    # a fine-grained lookup can now hit directly.
+    for i in range(7):
         assert (
             pool.get_cached_block(req.block_hashes[i], kv_cache_group_ids=[1])
             is not None
         ), f"SWA hash {i} should be cached"
-    assert pool.get_cached_block(req.block_hashes[6], kv_cache_group_ids=[1]) is None, (
-        "SWA hash 6 spans tokens past the lcm boundary; should not be cached"
-    )
 
 
 def test_hybrid_local_kv_retention_interval_aligns_in_manager(monkeypatch):

@@ -21,7 +21,6 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
-    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
@@ -551,13 +550,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         ), "block_size must be divisible by hash_block_size"
         assert dcp_world_size == 1, "DCP not support hybrid attn now."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
-        self.enable_partial_hash_hits = any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
-            for g in kv_cache_config.kv_cache_groups
-        )
         self.verify_and_split_kv_cache_groups()
+        # Fine-grained partial hits need every group to either scan at hash
+        # granularity or have nothing to gain from it (block_size ==
+        # hash_block_size, where the coarse path is already exact). Groups
+        # that support neither (chunked local attention) disable them.
+        self.enable_partial_hash_hits = hash_block_size < scheduler_block_size and all(
+            group.manager_cls.supports_fine_grained_hash_lookup
+            or group.spec.block_size == hash_block_size
+            for group in self.attention_groups
+        )
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
@@ -705,9 +707,19 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
                 _max_length = curr_hit_length
                 if drop_eagle_block:
-                    # Eagle needs to match one more block and then pop the last.
+                    # Eagle matches one more drop unit and then drops it: one
+                    # hash block for fine-grained managers, else one cache
+                    # block. The margin must equal the drop so the post-drop
+                    # length cannot exceed `curr_hit_length`.
+                    eagle_margin = (
+                        self.hash_block_size
+                        if self.enable_partial_hash_hits
+                        and manager_cls.supports_fine_grained_hash_lookup
+                        and spec.block_size > self.hash_block_size
+                        else spec.block_size
+                    )
                     _max_length = min(
-                        curr_hit_length + spec.block_size, max_cache_hit_length
+                        curr_hit_length + eagle_margin, max_cache_hit_length
                     )
                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
                     block_hashes=block_hashes,
