@@ -42,6 +42,10 @@ class SingleTypeKVCacheManager(ABC):
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
 
+    # Whether newly allocated block IDs are reported via `take_new_block_ids`
+    # (feeds `new_block_ids_to_zero` for worker-side zeroing).
+    tracks_new_block_ids: ClassVar[bool] = False
+
     def __init__(
         self,
         kv_cache_spec: KVCacheSpec,
@@ -293,12 +297,7 @@ class SingleTypeKVCacheManager(ABC):
             cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
         )
         req_blocks.extend(allocated_blocks)
-        if type(self.kv_cache_spec) in (
-            FullAttentionSpec,
-            TQFullAttentionSpec,
-            MLAAttentionSpec,
-            HiddenStateCacheSpec,
-        ):
+        if self.tracks_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
@@ -326,12 +325,7 @@ class SingleTypeKVCacheManager(ABC):
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
-            if type(self.kv_cache_spec) in (
-                FullAttentionSpec,
-                TQFullAttentionSpec,
-                MLAAttentionSpec,
-                HiddenStateCacheSpec,
-            ):
+            if self.tracks_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
 
@@ -614,6 +608,7 @@ class SingleTypeKVCacheManager(ABC):
 
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+    tracks_new_block_ids: ClassVar[bool] = True
 
     @classmethod
     def _find_fine_grained_cache_hit(
@@ -1702,6 +1697,10 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
 
 
 class SinkFullAttentionManager(FullAttentionManager):
+    # SinkFullAttentionSpec was never in the spec-type allowlist this flag
+    # replaced, so its new blocks stay unreported for zeroing.
+    tracks_new_block_ids: ClassVar[bool] = False
+
     def __init__(
         self,
         kv_cache_spec: SinkFullAttentionSpec,
