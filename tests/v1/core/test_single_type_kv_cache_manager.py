@@ -337,6 +337,105 @@ def test_sliding_window_remove_skipped_blocks():
     assert_block_id(block_table, [null_block_id] * 4 + original_block_ids[4:])
 
 
+def test_sliding_window_fine_grained_cache_hit():
+    block_size = 4
+    hash_block_size = 2
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=8,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=hash_block_size
+    )
+
+    # 7 hash blocks = 14 tokens. Full-block keys are the hashes at each
+    # block's last hash boundary (indices 1, 3, 5 -> blocks 0, 1, 2); index 6
+    # is a partial prompt tail at 14 tokens inside block 3.
+    hashes = [BlockHash(str(i).encode()) for i in range(7)]
+
+    def insert(hash_idx: int, pool_block_id: int) -> None:
+        block_pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(hashes[hash_idx], 0),
+            block_pool.blocks[pool_block_id],
+        )
+
+    for hash_idx, pool_block_id in ((1, 10), (3, 11), (5, 12), (6, 13)):
+        insert(hash_idx, pool_block_id)
+
+    def find(max_length: int, drop_eagle_block: bool = False):
+        blocks, hit_length = SlidingWindowManager.find_longest_cache_hit(
+            block_hashes=hashes,
+            max_length=max_length,
+            kv_cache_group_ids=[0],
+            block_pool=block_pool,
+            kv_cache_spec=sliding_window_spec,
+            drop_eagle_block=drop_eagle_block,
+            alignment_tokens=hash_block_size,
+        )
+        return [b.block_id for b in blocks[0]], hit_length
+
+    null_id = block_pool.null_block.block_id
+
+    # The partial tail at 14 plus the window blocks before it.
+    assert find(15) == ([null_id, 11, 12, 13], 14)
+    # Eagle drops one hash unit; the tail block no longer serves the claim
+    # but the window at 12 is still covered.
+    assert find(15, drop_eagle_block=True) == ([null_id, 11, 12], 12)
+    # Capped below the tail: falls back to the block-boundary entry at 12.
+    assert find(13) == ([null_id, 11, 12], 12)
+    # Evicting block 1 breaks window coverage for 14 and 12; the longest hit
+    # becomes the standalone block-0 entry (4 tokens cover its own window).
+    block_pool.cached_block_hash_to_block.pop(
+        make_block_hash_with_group_id(hashes[3], 0), 11
+    )
+    assert find(15) == ([10], 4)
+
+
+def test_full_attention_fine_grained_eagle_drop():
+    block_size = 4
+    hash_block_size = 2
+    full_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=hash_block_size
+    )
+    hashes = [BlockHash(str(i).encode()) for i in range(7)]
+    for hash_idx, pool_block_id in ((1, 10), (3, 11), (5, 12), (6, 13)):
+        block_pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(hashes[hash_idx], 0),
+            block_pool.blocks[pool_block_id],
+        )
+
+    def find(drop_eagle_block: bool):
+        blocks, hit_length = FullAttentionManager.find_longest_cache_hit(
+            block_hashes=hashes,
+            max_length=15,
+            kv_cache_group_ids=[0],
+            block_pool=block_pool,
+            kv_cache_spec=full_spec,
+            drop_eagle_block=drop_eagle_block,
+            alignment_tokens=hash_block_size,
+        )
+        return [b.block_id for b in blocks[0]], hit_length
+
+    assert find(drop_eagle_block=False) == ([10, 11, 12, 13], 14)
+    # Eagle drops one hash unit (14 -> 12); the partial tail block is trimmed.
+    assert find(drop_eagle_block=True) == ([10, 11, 12], 12)
+    # Without the partial tail the longest hit is 12; the eagle drop lands
+    # mid-block (10) and keeps the last full block as the CoW source.
+    block_pool.cached_block_hash_to_block.pop(
+        make_block_hash_with_group_id(hashes[6], 0), 13
+    )
+    assert find(drop_eagle_block=True) == ([10, 11, 12], 10)
+
+
 def test_get_num_blocks_to_allocate():
     block_size = 2
     sliding_window_spec = SlidingWindowSpec(

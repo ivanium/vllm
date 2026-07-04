@@ -1751,6 +1751,147 @@ def test_hybrid_partial_hash_truncates_full_attention_hit_length():
     assert [len(group) for group in computed_blocks.blocks] == [2, 2]
 
 
+def _make_fa_swa_manager():
+    """FA block 4 + two SWA groups (block 4, window 8), hash_block_size 2.
+
+    hash < lcm and every group scans at hash granularity, so partial hash
+    hits are enabled without any mamba group.
+    """
+    kv_cache_config = make_kv_cache_config_hybrid_model(
+        block_size=4, num_blocks=40, sliding_window_blocks=2
+    )
+    return make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=2,
+    )
+
+
+def test_hybrid_swa_partial_hash_hit_uses_cow():
+    manager = _make_fa_swa_manager()
+    assert manager.coordinator.enable_partial_hash_hits
+
+    # 14 tokens: 3 full blocks + a 2-token tail inside block 3.
+    req0 = make_request("0", [i for i in range(7) for _ in range(2)], 2, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    assert manager.allocate_slots(req0, 14, num_computed, computed_blocks) is not None
+
+    # The prompt tail at 14 tokens is registered in every group.
+    tail_hash = req0.block_hashes[6]
+    tail_blocks = manager.block_pool.get_cached_block(
+        tail_hash, kv_cache_group_ids=[0, 1, 2]
+    )
+    assert tail_blocks is not None
+    assert all(b.block_hash_num_tokens == 14 for b in tail_blocks)
+
+    manager.free(req0)
+    manager.new_step_starts()
+
+    req1 = make_request("1", [i for i in range(8) for _ in range(2)], 2, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    assert num_computed == 14
+    assert [len(group) for group in computed_blocks.blocks] == [4, 4, 4]
+    # SWA hits pad blocks before the window with nulls.
+    assert computed_blocks.blocks[1][0] is manager.block_pool.null_block
+    assert all(
+        group[-1].block_id == tail.block_id
+        for group, tail in zip(computed_blocks.blocks, tail_blocks)
+    )
+
+    new_blocks = manager.allocate_slots(req1, 2, num_computed, computed_blocks)
+    assert new_blocks is not None
+    copies = manager.take_kv_cache_block_copies()
+    for group_id, tail in enumerate(tail_blocks):
+        cow_ids = new_blocks.get_block_ids()[group_id]
+        assert len(cow_ids) == 1
+        assert cow_ids[0] != tail.block_id
+        assert (
+            KVCacheBlockCopy(src_block_id=tail.block_id, dst_block_id=cow_ids[0])
+            in copies
+        )
+        assert manager.get_blocks("1").get_block_ids()[group_id][3] == cow_ids[0]
+
+
+def test_hybrid_swa_partial_hit_requires_window_coverage():
+    manager = _make_fa_swa_manager()
+    pool = manager.block_pool
+
+    req0 = make_request("0", [i for i in range(7) for _ in range(2)], 2, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert manager.allocate_slots(req0, 14, num_computed, computed_blocks) is not None
+    manager.free(req0)
+    manager.new_step_starts()
+
+    # Evict SWA block 1 (tokens [4, 8), key = hash at its last boundary) from
+    # both SWA groups: window coverage for the fine hits at 14 and 12 breaks.
+    for group_id in (1, 2):
+        evicted = pool.get_cached_block(req0.block_hashes[3], [group_id])
+        assert evicted is not None
+        pool.cached_block_hash_to_block.pop(
+            make_block_hash_with_group_id(req0.block_hashes[3], group_id),
+            evicted[0].block_id,
+        )
+
+    req1 = make_request("1", [i for i in range(8) for _ in range(2)], 2, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    # The longest SWA hit is now the standalone block-0 entry (4 tokens, the
+    # whole window for the token at position 4); full attention truncates to
+    # the common hit.
+    assert num_computed == 4
+    assert [len(group) for group in computed_blocks.blocks] == [1, 1, 1]
+
+
+def test_partial_hit_shared_source_two_consumers():
+    """Two requests consuming the same partial tail in one step must each get
+    a private CoW block, and the shared source must be fully released after
+    both are freed."""
+    manager = _make_fa_swa_manager()
+    pool = manager.block_pool
+
+    req0 = make_request("0", [i for i in range(7) for _ in range(2)], 2, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert manager.allocate_slots(req0, 14, num_computed, computed_blocks) is not None
+    manager.free(req0)
+    manager.new_step_starts()
+
+    tail_hash = req0.block_hashes[6]
+    src_ids = [
+        b.block_id
+        for b in pool.get_cached_block(tail_hash, kv_cache_group_ids=[0, 1, 2])
+    ]
+
+    tokens = [i for i in range(8) for _ in range(2)]
+    cow_ids_by_req = {}
+    consumers = {}
+    for req_id in ("1", "2"):
+        req = make_request(req_id, tokens, 2, sha256)
+        consumers[req_id] = req
+        computed_blocks, num_computed = manager.get_computed_blocks(req)
+        assert num_computed == 14
+        new_blocks = manager.allocate_slots(req, 2, num_computed, computed_blocks)
+        assert new_blocks is not None
+        cow_ids_by_req[req_id] = [ids[0] for ids in new_blocks.get_block_ids()]
+
+    copies = manager.take_kv_cache_block_copies()
+    for group_id, src_id in enumerate(src_ids):
+        cow1 = cow_ids_by_req["1"][group_id]
+        cow2 = cow_ids_by_req["2"][group_id]
+        assert cow1 != cow2 and src_id not in (cow1, cow2)
+        for cow_id in (cow1, cow2):
+            assert KVCacheBlockCopy(src_block_id=src_id, dst_block_id=cow_id) in copies
+
+    manager.free(consumers["1"])
+    manager.free(consumers["2"])
+    manager.new_step_starts()
+    # The shared sources' hit-refs are released after the copies ran; the
+    # entries stay in the prefix cache as eviction candidates.
+    for src_id in src_ids:
+        assert pool.blocks[src_id].ref_cnt == 0
+    assert pool.get_cached_block(tail_hash, kv_cache_group_ids=[0, 1, 2]) is not None
+
+
 def test_prefill_plp():
     """Test prefill with APC and some prompt logprobs (plp) requests.
 
