@@ -574,11 +574,20 @@ class KVCacheStoreSendingThread(KVTransferThread):
             save_start = self._saved_offset.get(req_id, 0)
 
             # Within each lcm region only per-spec relevant chunks are loaded
-            # (e.g., SWA or linear attn), so mask out irrelevant chunks
+            # (e.g., SWA or linear attn), so mask out irrelevant chunks.
+            # Clamp the boundary to this batch's end so every chunked-save
+            # batch also persists the sparse-group proof blocks for its own
+            # boundary: lookups can then hit up to the last landed batch even
+            # while later batches (incl. the prompt-end one) are still queued
+            # behind deep send backlogs. Without this, proof blocks exist only
+            # in the final batch and short-gap replays get 0 hits under load.
+            boundary_tokens = req_meta.num_prompt_tokens
+            if boundary_tokens is not None:
+                boundary_tokens = min(boundary_tokens, token_len)
             store_masks = self.coord.store_mask(
                 token_len,
                 save_start,
-                num_prompt_tokens=req_meta.num_prompt_tokens,
+                num_prompt_tokens=boundary_tokens,
             )
 
             starts: list[int] = []
