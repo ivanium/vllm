@@ -394,6 +394,41 @@ def test_sliding_window_fine_grained_cache_hit():
     assert find(15) == ([10], 4)
 
 
+def test_sliding_window_mask_replay_anchor_at_hash_granularity():
+    """With partial hits, the replay boundary sits on a hash boundary that may
+    fall inside a block; the mask must keep that block plus enough full blocks
+    to cover the whole window."""
+    spec = SlidingWindowSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4,  # need = cdiv(3, 4) = 1 contiguous block per hit
+    )
+
+    def mask(num_prompt_tokens: int, partial_anchor_tokens: int | None):
+        return SlidingWindowManager.reachable_block_mask(
+            start_block=0,
+            end_block=4,
+            alignment_tokens=8,  # lcm of a hybrid with a block-8 FA group
+            kv_cache_spec=spec,
+            use_eagle=False,
+            retention_interval=None,
+            num_prompt_tokens=num_prompt_tokens,
+            partial_anchor_tokens=partial_anchor_tokens,
+        )
+
+    # Without partial hits: only the dense segment tails (odd blocks, one
+    # `need`-sized tail per 8-token segment).
+    assert mask(15, None) == [False, True, False, True]
+    # Block-aligned fine anchor (prompt 13 -> latest boundary 12): keep the
+    # `need` blocks before block 3 on top of the segment tails.
+    assert mask(13, 2) == [False, True, True, True]
+    # Mid-block fine anchor (prompt 15 -> latest boundary 14 inside block 3):
+    # keep the partial tail block itself plus a full window before it.
+    assert mask(15, 2) == [False, True, True, True]
+
+
 def test_full_attention_fine_grained_eagle_drop():
     block_size = 4
     hash_block_size = 2

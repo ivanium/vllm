@@ -4059,9 +4059,10 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary(monkeypatch):
         use_eagle=True,
     )
 
-    # 127 tokens: latest replay boundary is floor((127 - 1) / 32) * 32 = 96.
-    # The EAGLE/MTP SWA lookup group must cache the local tail ending at
-    # 104 tokens, and that tail is two 8-token blocks wide: hashes 11 and 12.
+    # 127 tokens with partial hits (hash 8 < lcm 32): the replay boundary is
+    # the last hash boundary, 120. The EAGLE lookup lands on that boundary and
+    # claims one hash unit below (112), so retention keeps the entry block at
+    # 120 plus the window block for the 112-token claim: hashes 13 and 14.
     token_ids = [i for i in range(15) for _ in range(block_size)] + [15] * 7
     req0 = make_request("0", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
@@ -4075,7 +4076,7 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary(monkeypatch):
     assert blocks is not None
 
     pool = manager.block_pool
-    expected_swa_cached = {11, 12}
+    expected_swa_cached = {13, 14}
     for i in range(15):
         cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
         if i in expected_swa_cached:
@@ -4085,10 +4086,13 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary(monkeypatch):
 
     manager.free(req0)
 
+    # Replay: full attention serves its registered partial tail at 120; the
+    # EAGLE SWA group claims 112 via the entry at 120; the common hit is 112
+    # (mid-FA-block, served through copy-on-write of FA block 3).
     req1 = make_request("1", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
-    assert num_computed_tokens == 12 * block_size
-    assert [len(blocks) for blocks in computed_blocks.blocks] == [3, 12]
+    assert num_computed_tokens == 14 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [4, 14]
 
 
 def test_block_lookup_cache_single_block_per_key():

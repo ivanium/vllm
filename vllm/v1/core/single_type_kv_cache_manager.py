@@ -1113,13 +1113,41 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
         # (2) Replay-boundary tail. ``get_computed_blocks`` caps hits at
         # ``num_prompt - 1`` (to recompute the last token's logits), so an exact
-        # prompt replay can only land on the latest *fine*-aligned boundary.
+        # prompt replay can only land on the latest reachable boundary.
         # Sparse retention would otherwise skip it, so keep its tail explicitly.
-        if retention_interval is not None and num_prompt_tokens is not None:
-            latest = (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
-            prompt_end_block = latest // block_size + shift
+        # With partial hits and a prompt that ends inside a hash block, every
+        # group registers a partial tail at the last hash boundary, so the
+        # joint replay hit lands there: keep that (possibly mid-block) tail
+        # block plus enough full blocks to cover the whole window. With a
+        # hash-aligned prompt, the tail entry would sit at ``num_prompt``
+        # itself — past the hit cap and unusable for an exact replay — so the
+        # joint replay falls back to the coarse aligned boundary, which every
+        # group serves through its block-aligned entries.
+        if (
+            retention_interval is not None or partial_anchor_tokens is not None
+        ) and num_prompt_tokens is not None:
+            if (
+                partial_anchor_tokens is not None
+                and num_prompt_tokens % partial_anchor_tokens != 0
+            ):
+                latest = (
+                    num_prompt_tokens // partial_anchor_tokens * partial_anchor_tokens
+                )
+                # The fine anchor is the last usable boundary, so the EAGLE
+                # peek cannot go past it: the lookup lands on the anchor
+                # itself and the claim moves one hash unit down instead.
+                anchor_shift = 0
+            else:
+                latest = (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
+                anchor_shift = shift
+            if latest % block_size == 0:
+                prompt_end_block = latest // block_size + anchor_shift
+                keep = need
+            else:
+                prompt_end_block = latest // block_size + 1 + anchor_shift
+                keep = need + 1
             for i in range(
-                max(start_block, prompt_end_block - need),
+                max(start_block, prompt_end_block - keep),
                 min(end_block, prompt_end_block),
             ):
                 mask[i - start_block] = True
