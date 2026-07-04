@@ -106,7 +106,10 @@ class SingleTypeKVCacheManager(ABC):
         # determining the attention groups.
         self.use_eagle = False
 
-        # Partial-hit copy-on-write bookkeeping.
+        # Partial-hit copy-on-write bookkeeping. Instance-level switch for the
+        # generic machinery below; defaults to the class capability flag.
+        # MambaManager narrows it to the "align" cache mode.
+        self.partial_hits_enabled: bool = self.supports_fine_grained_hash_lookup
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._kv_cache_block_copies: list[KVCacheBlockCopy] = []
         # Blocks participating in a pending copy (both source and target).
@@ -215,6 +218,21 @@ class SingleTypeKVCacheManager(ABC):
         num_evictable_blocks = self._get_num_evictable_blocks(
             new_computed_blocks[num_skipped_new_computed_blocks:]
         )
+
+        if self.partial_hits_enabled and self._has_partial_local_hit(
+            new_computed_blocks, num_local_computed_tokens
+        ):
+            if (
+                new_computed_blocks[-1].block_id
+                in self._partial_blocks_cached_this_step
+            ):
+                # The partial tail's KV is only written during this step's
+                # execution, while the consumer's CoW copy runs at step start.
+                # Defer to the next step by reporting an impossible demand.
+                return self.block_pool.num_gpu_blocks + 1
+            # Reserve the copy-on-write block for the partial tail.
+            num_new_blocks += 1
+
         return num_new_blocks + num_evictable_blocks
 
     def add_local_computed_blocks(
@@ -268,6 +286,17 @@ class SingleTypeKVCacheManager(ABC):
         # them so cache_blocks() will not try to re-cache blocks that already
         # have a block_hash set.
         self.num_cached_block[request_id] = len(req_blocks)
+
+        if self.partial_hits_enabled and self._has_partial_local_hit(
+            new_computed_blocks, num_local_computed_tokens
+        ):
+            # The hit ends inside the tail block; remember it so
+            # `allocate_new_blocks` redirects the request to a private
+            # copy-on-write block, and exclude it from the cached count
+            # (its full-block content is not this request's).
+            block_idx = num_local_computed_tokens // self.block_size
+            self._partial_hit_reqs[request_id] = (block_idx, new_computed_blocks[-1])
+            self.num_cached_block[request_id] = block_idx
 
     def allocate_external_computed_blocks(
         self,
@@ -325,17 +354,29 @@ class SingleTypeKVCacheManager(ABC):
         Returns:
             The new allocated blocks.
         """
+        cow_blocks: list[KVCacheBlock] = []
+        if request_id in self._partial_hit_reqs:
+            # Consumer of a partial prefix-cache hit: redirect the tail to a
+            # private copy-on-write block before the first block table is
+            # sent to the worker.
+            block_idx, source_block = self._partial_hit_reqs.pop(request_id)
+            cow_block = self.block_pool.get_new_blocks(1)[0]
+            self._apply_cow(request_id, block_idx, source_block, cow_block)
+            if self.tracks_new_block_ids:
+                self.new_block_ids.append(cow_block.block_id)
+            cow_blocks.append(cow_block)
+
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
         num_new_blocks = num_required_blocks - len(req_blocks)
         if num_new_blocks <= 0:
-            return []
+            return cow_blocks
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
             if self.tracks_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
-            return new_blocks
+            return cow_blocks + new_blocks
 
     def take_new_block_ids(self) -> list[int]:
         """Drain and return block IDs allocated since the last call."""
@@ -410,29 +451,67 @@ class SingleTypeKVCacheManager(ABC):
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
-        if num_cached_blocks >= num_full_blocks:
+        if num_cached_blocks < num_full_blocks:
+            block_mask = self.reachable_block_mask(
+                start_block=num_cached_blocks,
+                end_block=num_full_blocks,
+                alignment_tokens=self.scheduler_block_size,
+                kv_cache_spec=self.kv_cache_spec,
+                use_eagle=self.use_eagle,
+                retention_interval=retention_interval,
+                num_prompt_tokens=request.num_prompt_tokens,
+            )
+            self.block_pool.cache_full_blocks(
+                request=request,
+                blocks=self.req_to_blocks[request.request_id],
+                num_cached_blocks=num_cached_blocks,
+                num_full_blocks=num_full_blocks,
+                block_size=self.block_size,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_mask=block_mask,
+            )
+
+            self.num_cached_block[request.request_id] = num_full_blocks
+
+        if self.partial_hits_enabled:
+            self._cache_partial_tail_block(request, num_tokens)
+
+    def _cache_partial_tail_block(
+        self,
+        request: Request,
+        num_tokens: int,
+    ) -> None:
+        """Cache the prompt tail when it ends inside a cache block.
+
+        Only the final prompt hash boundary is registered as a partial
+        prefix-cache entry; intermediate hash boundaries inside the same cache
+        block are intentionally skipped. Overridden by MambaManager, whose
+        cache entries snapshot a state rather than append-only KV.
+        """
+        hash_block_size = self.block_pool.hash_block_size
+        if self.block_size == hash_block_size:
+            return
+        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
+        if boundary_tokens == 0 or boundary_tokens > num_tokens:
+            return
+        if boundary_tokens % self.block_size == 0:
             return
 
-        block_mask = self.reachable_block_mask(
-            start_block=num_cached_blocks,
-            end_block=num_full_blocks,
-            alignment_tokens=self.scheduler_block_size,
-            kv_cache_spec=self.kv_cache_spec,
-            use_eagle=self.use_eagle,
-            retention_interval=retention_interval,
-            num_prompt_tokens=request.num_prompt_tokens,
-        )
-        self.block_pool.cache_full_blocks(
+        blocks = self.req_to_blocks[request.request_id]
+        block_idx = boundary_tokens // self.block_size
+        if block_idx >= len(blocks):
+            return
+        partial_hash = self.block_pool.cache_partial_block(
             request=request,
-            blocks=self.req_to_blocks[request.request_id],
-            num_cached_blocks=num_cached_blocks,
-            num_full_blocks=num_full_blocks,
-            block_size=self.block_size,
+            block=blocks[block_idx],
+            num_tokens=boundary_tokens,
             kv_cache_group_id=self.kv_cache_group_id,
-            block_mask=block_mask,
+            block_size=self.block_size,
         )
-
-        self.num_cached_block[request.request_id] = num_full_blocks
+        if partial_hash is not None:
+            # Newly registered: its KV is written during this step's
+            # execution, so same-step consumers must be deferred.
+            self._partial_blocks_cached_this_step.add(blocks[block_idx].block_id)
 
     @classmethod
     def reachable_block_mask(
@@ -754,120 +833,6 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                 computed.pop()
             hit_length -= block_size
         return computed_blocks, hit_length
-
-    def get_num_blocks_to_allocate(
-        self,
-        request_id: str,
-        num_tokens: int,
-        new_computed_blocks: Sequence[KVCacheBlock],
-        total_computed_tokens: int,
-        num_local_computed_tokens: int,
-        num_tokens_main_model: int,
-        apply_admission_cap: bool = False,
-    ) -> int:
-        num_blocks = super().get_num_blocks_to_allocate(
-            request_id,
-            num_tokens,
-            new_computed_blocks,
-            total_computed_tokens,
-            num_local_computed_tokens,
-            num_tokens_main_model,
-            apply_admission_cap=apply_admission_cap,
-        )
-        if request_id not in self.num_cached_block and self._has_partial_local_hit(
-            new_computed_blocks, num_local_computed_tokens
-        ):
-            if (
-                new_computed_blocks[-1].block_id
-                in self._partial_blocks_cached_this_step
-            ):
-                # The partial tail's KV is only written during this step's
-                # execution, while the consumer's CoW copy runs at step start.
-                # Defer to the next step (mirrors the mamba guard in
-                # MambaManager.get_num_blocks_to_allocate).
-                return self.block_pool.num_gpu_blocks + 1
-            num_blocks += 1
-        return num_blocks
-
-    def add_local_computed_blocks(
-        self,
-        request_id: str,
-        new_computed_blocks: Sequence[KVCacheBlock],
-        num_local_computed_tokens: int,
-        num_external_computed_tokens: int,
-    ) -> None:
-        super().add_local_computed_blocks(
-            request_id,
-            new_computed_blocks,
-            num_local_computed_tokens,
-            num_external_computed_tokens,
-        )
-        if self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens):
-            block_idx = num_local_computed_tokens // self.block_size
-            self._partial_hit_reqs[request_id] = (block_idx, new_computed_blocks[-1])
-            self.num_cached_block[request_id] = block_idx
-
-    def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
-    ) -> list[KVCacheBlock]:
-        new_blocks: list[KVCacheBlock] = []
-        if request_id in self._partial_hit_reqs:
-            block_idx, source_block = self._partial_hit_reqs.pop(request_id)
-            cow_block = self.block_pool.get_new_blocks(1)[0]
-            self._apply_cow(request_id, block_idx, source_block, cow_block)
-            self.new_block_ids.append(cow_block.block_id)
-            new_blocks.append(cow_block)
-
-        new_blocks.extend(
-            super().allocate_new_blocks(request_id, num_tokens, num_tokens_main_model)
-        )
-        return new_blocks
-
-    def cache_blocks(
-        self,
-        request: Request,
-        num_tokens: int,
-        retention_interval: int | None = None,
-    ) -> None:
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
-        hash_block_size = self.block_pool.hash_block_size
-        if self.block_size == hash_block_size:
-            return
-        self._cache_partial_tail_block(request, num_tokens)
-
-    def _cache_partial_tail_block(
-        self,
-        request: Request,
-        num_tokens: int,
-    ) -> None:
-        """Cache the prompt tail when it ends inside a cache block.
-
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
-        """
-        hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
-            return
-        if boundary_tokens % self.block_size == 0:
-            return
-
-        blocks = self.req_to_blocks[request.request_id]
-        block_idx = boundary_tokens // self.block_size
-        if block_idx >= len(blocks):
-            return
-        partial_hash = self.block_pool.cache_partial_block(
-            request=request,
-            block=blocks[block_idx],
-            num_tokens=boundary_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
-        )
-        if partial_hash is not None:
-            # Newly registered: its KV is written during this step's
-            # execution, so same-step consumers must be deferred.
-            self._partial_blocks_cached_this_step.add(blocks[block_idx].block_id)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
@@ -1262,6 +1227,7 @@ class MambaManager(SingleTypeKVCacheManager):
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
+        self.partial_hits_enabled = self.mamba_cache_mode == "align"
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
@@ -1608,10 +1574,6 @@ class MambaManager(SingleTypeKVCacheManager):
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
-        if self.mamba_cache_mode == "align":
-            partial_hash = self._cache_partial_tail_block(request, num_tokens)
-            if partial_hash is not None:
-                self.cached_blocks_this_step.add(partial_hash)
         if num_cached_blocks_after > num_cached_blocks_before:
             for block in self.req_to_blocks[request.request_id][
                 num_cached_blocks_before:num_cached_blocks_after
@@ -1629,27 +1591,31 @@ class MambaManager(SingleTypeKVCacheManager):
         self,
         request: Request,
         num_tokens: int,
-    ) -> BlockHashWithGroupId | None:
+    ) -> None:
+        """Mamba cache entries snapshot a state rather than append-only KV, so
+        the producer must be copy-on-written before it keeps decoding into the
+        registered tail: record it in ``_partial_hit_reqs``, and only register
+        when ``num_tokens`` sits exactly on the final prompt hash boundary."""
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
-            return None
+            return
         if num_tokens % self.block_size == 0:
-            return None
+            return
         if num_tokens % hash_block_size != 0:
-            return None
+            return
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
         if num_tokens != latest_prompt_hash_boundary:
-            return None
+            return
 
         block_idx = num_tokens // self.block_size
         blocks = self.req_to_blocks[request.request_id]
         if block_idx >= len(blocks):
-            return None
+            return
         source_block = blocks[block_idx]
         if source_block.is_null:
-            return None
+            return
 
         partial_hash = self.block_pool.cache_partial_block(
             request=request,
@@ -1661,27 +1627,7 @@ class MambaManager(SingleTypeKVCacheManager):
         if partial_hash is not None:
             self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
             self.num_cached_block[request.request_id] = block_idx
-        return partial_hash
-
-    def add_local_computed_blocks(
-        self,
-        request_id: str,
-        new_computed_blocks: Sequence[KVCacheBlock],
-        num_local_computed_tokens: int,
-        num_external_computed_tokens: int,
-    ) -> None:
-        super().add_local_computed_blocks(
-            request_id,
-            new_computed_blocks,
-            num_local_computed_tokens,
-            num_external_computed_tokens,
-        )
-        if self.mamba_cache_mode == "align" and self._has_partial_local_hit(
-            new_computed_blocks, num_local_computed_tokens
-        ):
-            block_idx = num_local_computed_tokens // self.block_size
-            self._partial_hit_reqs[request_id] = (block_idx, new_computed_blocks[-1])
-            self.num_cached_block[request_id] = block_idx
+            self.cached_blocks_this_step.add(partial_hash)
 
 
 class CrossAttentionManager(SingleTypeKVCacheManager):
