@@ -40,10 +40,9 @@ class SingleTypeKVCacheManager(ABC):
     logic of one specific type of attention layer.
     """
 
+    # Cache hits can use hash_block_size when it is smaller than group_block_size.
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
-
-    # Whether newly allocated block IDs are reported via `take_new_block_ids`
-    # (feeds `new_block_ids_to_zero` for worker-side zeroing).
+    # KVCacheZeroer needs to track new blocks for worker-side zeroing.
     tracks_new_block_ids: ClassVar[bool] = False
 
     def __init__(
@@ -65,6 +64,8 @@ class SingleTypeKVCacheManager(ABC):
             kv_cache_group_id: The id of the kv cache group of this manager.
             scheduler_block_size: The scheduling granularity (LCM of all group
                 block sizes); a multiple of this manager's ``block_size``.
+            dcp_world_size: The world size of decoder parallelism.
+            pcp_world_size: The world size of prefill parallelism.
             max_admission_blocks_per_request: Recycling-aware per-request
                 block cap used by `get_num_blocks_to_allocate`. Only set for
                 spec types that recycle blocks across chunks (SWA,
@@ -192,7 +193,7 @@ class SingleTypeKVCacheManager(ABC):
 
         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks
-        # Number of whole blocks that are skipped by the attention window.
+        # Number of blocks that are skipped by the attention window.
         # If nothing is skipped, this is 0.
         num_skipped_blocks = num_skipped_tokens // self.block_size
         # We need blocks for the non-skipped suffix. If there are still
@@ -367,17 +368,12 @@ class SingleTypeKVCacheManager(ABC):
         source_block: KVCacheBlock,
         cow_block: KVCacheBlock,
     ) -> None:
-        """Redirect ``req_blocks[block_idx]`` from a shared, partially-hit
-        ``source_block`` to a private ``cow_block``.
+        """Redirect a partial prefix-cache hit to a private COW block.
 
-        The request already holds a ref on ``source_block`` (from the
-        prefix-cache touch). We keep that ref and release it next step
-        (``new_step_starts``), after the worker copy has run, rather than
-        freeing it now -- this keeps the block alive and out of the free queue
-        across the step without a retain/free round-trip. ``cow_block`` gets
-        an extra retention for the same window: if the request is freed within
-        this step, the pending copy must not target a block that another
-        request could be given in the meantime.
+        The existing prefix-cache touch keeps ``source_block`` alive after the
+        request table is updated. Temporarily retain ``cow_block`` too;
+        ``new_step_starts`` releases both after the queued worker copy has run,
+        preventing same-step frees from recycling either copy endpoint.
         """
         req_blocks = self.req_to_blocks[request_id]
         assert block_idx < len(req_blocks)
@@ -409,7 +405,7 @@ class SingleTypeKVCacheManager(ABC):
             retention_interval: Sparse local-checkpoint granularity. ``None``
                 keeps dense checkpointing; ``0`` keeps only the latest replay
                 boundary; a positive multiple of ``scheduler_block_size`` keeps
-                a tail once per that-sized segment. Only SWA acts on it.
+                a tail once per that-sized segment.
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
@@ -543,12 +539,13 @@ class SingleTypeKVCacheManager(ABC):
             pcp_world_size: The world size of prefill context parallelism.
 
         Returns:
-            A tuple containing cached blocks and the exact cache-hit length in
-            tokens. The cached block tuple has skipped blocks replaced by null
-            blocks for each kv cache group in `kv_cache_group_ids`.
-            For example, sliding window manager should return a list like
-            ([NULL, NULL, KVCacheBlock(7), KVCacheBlock(8)]) for block size 4
-            and sliding window 8 and len(kv_cache_group_ids) = 1.
+            cached_blocks: Cached blocks for each KV cache group in
+                ``kv_cache_group_ids``, with skipped blocks replaced by null
+                blocks. The i-th element is the cached blocks for the i-th KV
+                cache group. For example, a sliding window manager with block
+                size 4, sliding window 8, and one KV cache group returns
+                ``[NULL, NULL, KVCacheBlock(7), KVCacheBlock(8)]``.
+            hit_length: Exact cache-hit length in tokens.
         """
 
         raise NotImplementedError
