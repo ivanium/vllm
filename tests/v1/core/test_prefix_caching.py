@@ -1263,28 +1263,44 @@ def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():
     new_blocks = manager.allocate_slots(req0, 1)
     assert new_blocks is not None
 
-    mamba_new_block_ids = new_blocks.get_block_ids()[1]
-    assert len(mamba_new_block_ids) == 1
-    assert mamba_new_block_ids[0] != partial_mamba_block_id
-    assert manager.get_blocks("0").get_block_ids()[1][1] == mamba_new_block_ids[0]
-    assert partial_mamba_block[0].block_hash is not None
-    assert get_block_hash(partial_mamba_block[0].block_hash) == partial_mamba_hash
-    assert get_group_id(partial_mamba_block[0].block_hash) == 1
-    assert partial_mamba_block[0].block_hash_num_tokens == 6
-    cow_mamba_block = manager.get_blocks("0").blocks[1][1]
-    assert cow_mamba_block.block_hash is None
-    assert cow_mamba_block.block_hash_num_tokens is None
+    # The producer keeps its own block: the worker block-table update protocol
+    # for running requests is append-only, so its table must not change.
+    assert new_blocks.get_block_ids()[1] == []
+    assert manager.get_blocks("0").get_block_ids()[1][1] == partial_mamba_block_id
+    # The prefix-cache entry moved to a private copy of the state.
+    moved = manager.block_pool.get_cached_block(
+        partial_mamba_hash, kv_cache_group_ids=[1]
+    )
+    assert moved is not None
+    cache_block = moved[0]
+    assert cache_block.block_id != partial_mamba_block_id
+    assert cache_block.block_hash is not None
+    assert get_block_hash(cache_block.block_hash) == partial_mamba_hash
+    assert get_group_id(cache_block.block_hash) == 1
+    assert cache_block.block_hash_num_tokens == 6
+    # The producer's own block no longer serves the cache entry.
+    assert partial_mamba_block[0].block_hash is None
     assert (
         KVCacheBlockCopy(
             src_block_id=partial_mamba_block_id,
-            dst_block_id=mamba_new_block_ids[0],
+            dst_block_id=cache_block.block_id,
         )
         in manager.take_kv_cache_block_copies()
     )
-    assert (
-        manager.block_pool.get_cached_block(partial_mamba_hash, kv_cache_group_ids=[1])
-        == partial_mamba_block
-    )
+    # A consumer in the same step must be deferred: the copied state only
+    # exists once this step starts executing.
+    req1 = make_request("1", [0, 0, 1, 1, 2, 2, 4, 4], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    assert num_computed == 6
+    assert manager.allocate_slots(req1, 2, num_computed, computed_blocks) is None
+
+    # The copy target is pinned until the copy has run, then becomes evictable.
+    assert cache_block.ref_cnt == 1
+    manager.new_step_starts()
+    assert cache_block.ref_cnt == 0
+    assert manager.block_pool.get_cached_block(
+        partial_mamba_hash, kv_cache_group_ids=[1]
+    ) == [cache_block]
 
 
 def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
@@ -1337,25 +1353,174 @@ def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
     req0.append_output_token_ids([3])
     assert manager.allocate_slots(req0, 1) is not None
     manager.take_kv_cache_block_copies()
+    # The entry now points at the producer's private cache copy.
+    moved = manager.block_pool.get_cached_block(
+        partial_mamba_hash, kv_cache_group_ids=[1]
+    )
+    assert moved is not None
+    cache_block_id = moved[0].block_id
+    assert cache_block_id != partial_mamba_block_id
     manager.new_step_starts()
 
     req1 = make_request("1", [0, 0, 1, 1, 2, 2, 4, 4], hash_block_size, sha256)
     computed_blocks, num_computed = manager.get_computed_blocks(req1)
     assert num_computed == 6
-    assert computed_blocks.get_block_ids()[1][1] == partial_mamba_block_id
+    assert computed_blocks.get_block_ids()[1][1] == cache_block_id
 
     new_blocks = manager.allocate_slots(req1, 2, num_computed, computed_blocks)
     assert new_blocks is not None
     mamba_new_block_ids = new_blocks.get_block_ids()[1]
     assert len(mamba_new_block_ids) == 1
-    assert mamba_new_block_ids[0] != partial_mamba_block_id
+    assert mamba_new_block_ids[0] != cache_block_id
     assert (
         KVCacheBlockCopy(
-            src_block_id=partial_mamba_block_id,
+            src_block_id=cache_block_id,
             dst_block_id=mamba_new_block_ids[0],
         )
         in manager.take_kv_cache_block_copies()
     )
+
+
+def test_hybrid_mamba_partial_tail_producer_append_only_worker_table():
+    """The worker updates a RUNNING request's block table append-only
+    (``gpu_model_runner`` extends ``block_ids`` with the newly returned IDs),
+    so the scheduler must never redirect an already-sent, non-null table
+    position. Otherwise the worker keeps writing mamba state into the block
+    the scheduler handed to the prefix cache, corrupting the cached entry.
+    """
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=24,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
+    # A new request's full block table is sent to the worker.
+    worker_table = [list(ids) for ids in manager.get_blocks("0").get_block_ids()]
+    null_id = manager.block_pool.null_block.block_id
+
+    def check_worker_view():
+        # Every non-null scheduler position must match what the append-only
+        # worker holds at that position (null positions are never read).
+        for group_ids, worker_ids in zip(
+            manager.get_blocks("0").get_block_ids(), worker_table
+        ):
+            for pos, block_id in enumerate(group_ids):
+                if block_id != null_id:
+                    assert worker_ids[pos] == block_id
+
+    # Decode steps; the first one triggers the partial-tail CoW.
+    for num_computed_tokens in (6, 7, 8):
+        req0.num_computed_tokens = num_computed_tokens
+        req0.append_output_token_ids([3])
+        manager.new_step_starts()
+        new_blocks = manager.allocate_slots(req0, 1)
+        assert new_blocks is not None
+        for worker_ids, new_ids in zip(worker_table, new_blocks.get_block_ids()):
+            worker_ids.extend(new_ids)
+        check_worker_view()
+
+
+def test_partial_hit_cow_copy_target_pinned_until_copy_runs():
+    """A consumer freed (aborted/preempted) in the same scheduling step still
+    has a pending CoW copy targeting its private block. That block must not be
+    handed to another request before the copy runs at step start, or the stale
+    copy would overwrite the new owner's freshly zeroed block."""
+    hash_block_size = 2
+    mamba_block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=20,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
+    manager.free(req0)
+    manager.new_step_starts()
+
+    req1 = make_request("1", [0, 0, 1, 1, 2, 2, 3, 3], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    assert num_computed == 6
+    assert manager.allocate_slots(req1, 2, num_computed, computed_blocks) is not None
+    cow_block = manager.get_blocks("1").blocks[1][1]
+
+    # Same step: the consumer is freed with its copy still pending.
+    manager.free(req1)
+
+    copies = manager.take_kv_cache_block_copies()
+    assert any(c.dst_block_id == cow_block.block_id for c in copies)
+    # Both ends of the pending copy stay pinned: draining the entire free
+    # queue (what same-step allocations under the memory pressure that causes
+    # preemption do) must not hand them out.
+    drained = manager.block_pool.get_new_blocks(
+        manager.block_pool.get_num_free_blocks()
+    )
+    drained_ids = {block.block_id for block in drained}
+    for block_copy in copies:
+        assert block_copy.dst_block_id not in drained_ids
+        assert block_copy.src_block_id not in drained_ids
+
+    # Once the copies have run, the pinned blocks become reusable.
+    manager.new_step_starts()
+    assert cow_block.ref_cnt == 0
+    assert manager.block_pool.get_num_free_blocks() == 2
 
 
 def test_hybrid_full_attention_partial_hash_hit_uses_cow():

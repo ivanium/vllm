@@ -156,7 +156,8 @@ def test_cache_partial_block_kv_cache_events():
         kv_cache_group_id=kv_cache_group_id,
         block_size=block_size,
     )
-    assert duplicate_entry_hash == partial_entry_hash
+    # Duplicate registration is a no-op and reports no fresh entry.
+    assert duplicate_entry_hash is None
     assert pool.take_events() == []
 
     pool.free_blocks([block])
@@ -368,7 +369,8 @@ def test_cache_partial_block_duplicate_checks_all_blocks_for_hash():
         kv_cache_group_id=kv_cache_group_id,
         block_size=block_size,
     )
-    assert duplicate_entry_hash == second_entry_hash
+    # Re-registering the same (hash, block) pair reports no fresh entry.
+    assert duplicate_entry_hash is None
     assert pool.cached_block_hashes_by_block == {}
 
 

@@ -391,8 +391,9 @@ class BlockPool:
                 entry is partial within the owning cache block.
 
         Returns:
-            The hash key with group ID if a partial entry can be registered;
-            otherwise ``None`` for null blocks.
+            The hash key with group ID if a new partial entry was registered;
+            ``None`` for null blocks or when the entry already pointed to
+            ``block`` (so callers can tell freshly registered entries apart).
         """
         if block.is_null:
             return None
@@ -410,9 +411,10 @@ class BlockPool:
                 block_hash_with_group_id, block.block_id
             )
         )
+        if already_cached:
+            return None
         if (
-            not already_cached
-            and block.block_hash is not None
+            block.block_hash is not None
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
         ):
@@ -423,7 +425,7 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
-        if self.enable_kv_cache_events and not already_cached:
+        if self.enable_kv_cache_events:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens
             )
@@ -455,6 +457,26 @@ class BlockPool:
                 )
             )
         return block_hash_with_group_id
+
+    def move_block_hashes(
+        self,
+        src_block: KVCacheBlock,
+        dst_block: KVCacheBlock,
+    ) -> None:
+        """Re-point every prefix-cache entry of ``src_block`` to ``dst_block``.
+
+        Used when the owner of a partially-hit block keeps writing into it:
+        the prefix cache keeps a private copy (``dst_block``) of the content
+        instead, so all hash keys that resolved to ``src_block`` must resolve
+        to ``dst_block``. No KV cache events are emitted; the entries stay
+        live under the same hashes.
+        """
+        assert dst_block.block_hash is None
+        assert dst_block.block_id not in self.cached_block_hashes_by_block
+        num_tokens = src_block.block_hash_num_tokens
+        for block_hash in self._remove_cached_block_hashes(src_block):
+            # `num_tokens` only applies to the first (primary) insertion.
+            self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
 
     def _get_partial_block_hash(
         self,

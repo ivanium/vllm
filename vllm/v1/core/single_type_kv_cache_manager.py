@@ -105,11 +105,18 @@ class SingleTypeKVCacheManager(ABC):
         # determining the attention groups.
         self.use_eagle = False
 
-        # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
-        # managers (full attention, mamba "align"); harmlessly empty elsewhere.
+        # Partial-hit copy-on-write bookkeeping.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._kv_cache_block_copies: list[KVCacheBlockCopy] = []
-        self._cow_sources_to_release: list[KVCacheBlock] = []
+        # Blocks participating in a pending copy (both source and target).
+        # Each holds one retention released at `new_step_starts`, after the
+        # worker copy has run, so that a request freed within the same step
+        # cannot leak either end of the copy to another request.
+        self._cow_blocks_to_release: list[KVCacheBlock] = []
+        # Blocks whose partial tail entry was newly registered this step;
+        # their content is only written during this step's execution, so
+        # same-step consumers must be deferred.
+        self._partial_blocks_cached_this_step: set[int] = set()
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -364,15 +371,18 @@ class SingleTypeKVCacheManager(ABC):
         ``source_block`` to a private ``cow_block``.
 
         The request already holds a ref on ``source_block`` (from the
-        prefix-cache touch, or from allocation for the mamba producer). We keep
-        that ref and release it next step (``new_step_starts``), after the
-        worker copy has run, rather than freeing it now -- this keeps the block
-        alive and out of the free queue across the step without a retain/free
-        round-trip.
+        prefix-cache touch). We keep that ref and release it next step
+        (``new_step_starts``), after the worker copy has run, rather than
+        freeing it now -- this keeps the block alive and out of the free queue
+        across the step without a retain/free round-trip. ``cow_block`` gets
+        an extra retention for the same window: if the request is freed within
+        this step, the pending copy must not target a block that another
+        request could be given in the meantime.
         """
         req_blocks = self.req_to_blocks[request_id]
         assert block_idx < len(req_blocks)
         assert req_blocks[block_idx] is source_block
+        assert not source_block.is_null and source_block.ref_cnt > 0
         req_blocks[block_idx] = cow_block
         self._kv_cache_block_copies.append(
             KVCacheBlockCopy(
@@ -380,7 +390,8 @@ class SingleTypeKVCacheManager(ABC):
                 dst_block_id=cow_block.block_id,
             )
         )
-        self._cow_sources_to_release.append(source_block)
+        cow_block.ref_cnt += 1
+        self._cow_blocks_to_release.extend((source_block, cow_block))
 
     def cache_blocks(
         self,
@@ -599,11 +610,12 @@ class SingleTypeKVCacheManager(ABC):
         return 0
 
     def new_step_starts(self) -> None:
-        # Release the previous step's COW source blocks; their copies have now
+        # Release the previous step's COW blocks; their copies have now
         # run on the worker. Empty (no-op) for managers without partial hits.
-        if self._cow_sources_to_release:
-            self._free_retained_blocks(self._cow_sources_to_release)
-            self._cow_sources_to_release = []
+        if self._cow_blocks_to_release:
+            self._free_retained_blocks(self._cow_blocks_to_release)
+            self._cow_blocks_to_release = []
+        self._partial_blocks_cached_this_step.clear()
 
 
 class FullAttentionManager(SingleTypeKVCacheManager):
@@ -768,6 +780,15 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if request_id not in self.num_cached_block and self._has_partial_local_hit(
             new_computed_blocks, num_local_computed_tokens
         ):
+            if (
+                new_computed_blocks[-1].block_id
+                in self._partial_blocks_cached_this_step
+            ):
+                # The partial tail's KV is only written during this step's
+                # execution, while the consumer's CoW copy runs at step start.
+                # Defer to the next step (mirrors the mamba guard in
+                # MambaManager.get_num_blocks_to_allocate).
+                return self.block_pool.num_gpu_blocks + 1
             num_blocks += 1
         return num_blocks
 
@@ -839,13 +860,17 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         block_idx = boundary_tokens // self.block_size
         if block_idx >= len(blocks):
             return
-        self.block_pool.cache_partial_block(
+        partial_hash = self.block_pool.cache_partial_block(
             request=request,
             block=blocks[block_idx],
             num_tokens=boundary_tokens,
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
         )
+        if partial_hash is not None:
+            # Newly registered: its KV is written during this step's
+            # execution, so same-step consumers must be deferred.
+            self._partial_blocks_cached_this_step.add(blocks[block_idx].block_id)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
@@ -1525,9 +1550,38 @@ class MambaManager(SingleTypeKVCacheManager):
                 if partial_hit is not None:
                     block_idx, source_block = partial_hit
                     cow_block = new_blocks[0]
-                    self._apply_cow(request_id, block_idx, source_block, cow_block)
-                    returned_blocks = [cow_block] + returned_blocks
                     new_blocks = new_blocks[1:]
+                    if blocks_allocated:
+                        # Producer (the request that registered its own prompt
+                        # tail): the worker block-table update protocol for
+                        # running requests is append-only, so we cannot
+                        # redirect req_blocks[block_idx] here. Keep the
+                        # request on its own block and hand the prefix-cache
+                        # entry a private copy of the state instead.
+                        assert req_blocks[block_idx] is source_block
+                        assert not source_block.is_null
+                        self.block_pool.move_block_hashes(source_block, cow_block)
+                        self._kv_cache_block_copies.append(
+                            KVCacheBlockCopy(
+                                src_block_id=source_block.block_id,
+                                dst_block_id=cow_block.block_id,
+                            )
+                        )
+                        # Retain both ends of the copy until it has run on the
+                        # worker; `cow_block` keeps the ref from allocation as
+                        # it is not handed to the request.
+                        source_block.ref_cnt += 1
+                        self._cow_blocks_to_release.extend((source_block, cow_block))
+                        if cow_block.block_hash is not None:
+                            # The copied state only exists once this step
+                            # starts executing; defer same-step consumers.
+                            self.cached_blocks_this_step.add(cow_block.block_hash)
+                    else:
+                        # Consumer (new request hitting someone else's partial
+                        # entry): redirect its table to a private copy before
+                        # the first table is sent to the worker.
+                        self._apply_cow(request_id, block_idx, source_block, cow_block)
+                        returned_blocks = [cow_block] + returned_blocks
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)

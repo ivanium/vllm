@@ -6,17 +6,27 @@ import random
 import pytest
 import torch
 
+from vllm.sampling_params import SamplingParams
+from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    get_request_block_hasher,
+    init_none_hash,
     make_block_hash_with_group_id,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    FullAttentionManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import ChunkedLocalAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
+    FullAttentionSpec,
+    SlidingWindowSpec,
+)
+from vllm.v1.request import Request
 
 pytestmark = pytest.mark.cpu_test
 
@@ -486,3 +496,55 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+def test_full_attention_partial_tail_same_step_guard():
+    """A partial tail entry registered this step covers KV that is only
+    written during this step's execution, while a consumer's CoW copy runs at
+    step start. Consumers hitting the fresh entry must be deferred one step
+    (mirrors the mamba guard in ``MambaManager.get_num_blocks_to_allocate``).
+    """
+    init_none_hash(sha256)
+    hash_block_size = 2
+    block_size = 4
+    block_pool = BlockPool(
+        num_gpu_blocks=20, enable_caching=True, hash_block_size=hash_block_size
+    )
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    manager = FullAttentionManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+
+    sampling_params = SamplingParams(max_tokens=17)
+    sampling_params.update_from_generation_config({}, eos_token_id=100)
+    producer = Request(
+        request_id="producer",
+        prompt_token_ids=[0, 0, 1, 1, 2, 2],
+        sampling_params=sampling_params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(hash_block_size, sha256),
+    )
+    blocks = manager.allocate_new_blocks("producer", 6, 6)
+    assert len(blocks) == 2
+    # Caches block 0 as full and freshly registers the partial tail at 6
+    # tokens on block 1.
+    manager.cache_blocks(producer, 6)
+
+    hit_blocks = list(manager.req_to_blocks["producer"])
+    # Same step: a consumer hitting the fresh partial tail must be deferred.
+    num_blocks = manager.get_num_blocks_to_allocate("consumer", 8, hit_blocks, 6, 6, 8)
+    assert num_blocks > block_pool.num_gpu_blocks
+
+    # Next step the entry's KV has been written; the hit is consumable.
+    manager.new_step_starts()
+    num_blocks = manager.get_num_blocks_to_allocate("consumer", 8, hit_blocks, 6, 6, 8)
+    assert num_blocks <= block_pool.num_gpu_blocks

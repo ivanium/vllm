@@ -201,7 +201,6 @@ class KVCacheManager:
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
-        Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
