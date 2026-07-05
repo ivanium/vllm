@@ -682,3 +682,226 @@ def test_full_attention_partial_tail_same_step_guard():
     manager.new_step_starts()
     num_blocks = manager.get_num_blocks_to_allocate("consumer", 8, hit_blocks, 6, 6, 8)
     assert num_blocks <= block_pool.num_gpu_blocks
+
+
+@pytest.mark.parametrize(
+    "pool_hash_size,alignment_tokens",
+    [
+        (2, 2),  # fine-grained partial hits
+        (2, 4),  # coarse via a block-size view (alignment == block_size)
+        (4, 4),  # coarse on raw hashes (hash_block_size == block_size)
+        (2, 8),  # coarse, alignment > block_size (hybrid page sizes)
+        (4, 8),
+    ],
+)
+@pytest.mark.parametrize("sliding_window", [3, 5, 8, 13])
+@pytest.mark.parametrize("drop_eagle_block", [False, True])
+def test_sliding_window_cache_hit_matches_naive_oracle(
+    pool_hash_size, alignment_tokens, sliding_window, drop_eagle_block
+):
+    """Randomized parity: the optimized claim walk (memoized block lookups,
+    jump-ahead on coverage failure) must match a naive walk that re-checks
+    every aligned claim from scratch."""
+    block_size = 4
+    num_hashes = 40
+    fine = alignment_tokens < block_size
+    lookup_unit = alignment_tokens if fine else block_size
+    drop_tokens = lookup_unit if drop_eagle_block else 0
+    resolved_len = (
+        num_hashes
+        if pool_hash_size == lookup_unit
+        else num_hashes * pool_hash_size // block_size
+    )
+
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=sliding_window,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=200, enable_caching=True, hash_block_size=pool_hash_size
+    )
+    null_id = block_pool.null_block.block_id
+    rng = random.Random(
+        f"{pool_hash_size}-{alignment_tokens}-{sliding_window}-{drop_eagle_block}"
+    )
+
+    for trial in range(150):
+        block_pool.cached_block_hash_to_block._cache.clear()
+        hashes = [BlockHash(f"{trial}-{i}".encode()) for i in range(num_hashes)]
+        cached: dict[int, int] = {}
+        for i in range(num_hashes):
+            if rng.random() < 0.55:
+                cached[i] = 10 + i
+                block_pool.cached_block_hash_to_block.insert(
+                    make_block_hash_with_group_id(hashes[i], 0),
+                    block_pool.blocks[10 + i],
+                )
+        max_length = rng.randrange(0, num_hashes * pool_hash_size + 5)
+
+        def entry_id(u: int, cached=cached) -> int | None:
+            # Visible entries sit on lookup_unit boundaries; the key at
+            # boundary u is the raw hash ending there.
+            if u <= 0 or u % lookup_unit != 0 or u // pool_hash_size > num_hashes:
+                return None
+            return cached.get(u // pool_hash_size - 1)
+
+        def naive(max_length=max_length, entry_id=entry_id) -> tuple[list[int], int]:
+            max_tokens = min(max_length, resolved_len * lookup_unit)
+            max_claim = (
+                (max_tokens - drop_tokens) // alignment_tokens * alignment_tokens
+            )
+            for claim in range(max_claim, 0, -alignment_tokens):
+                u = claim + drop_tokens
+                eid = entry_id(u)
+                if eid is None:
+                    continue
+                entry_block_idx = (u - 1) // block_size
+                last_block_idx = (claim - 1) // block_size
+                first_block_idx = max(claim - sliding_window + 1, 0) // block_size
+                ids = []
+                for j in range(first_block_idx, last_block_idx + 1):
+                    bid = (
+                        eid if j == entry_block_idx else entry_id((j + 1) * block_size)
+                    )
+                    if bid is None:
+                        break
+                    ids.append(bid)
+                else:
+                    return [null_id] * first_block_idx + ids, claim
+            return [], 0
+
+        blocks, hit_length = SlidingWindowManager.find_longest_cache_hit(
+            block_hashes=hashes,
+            max_length=max_length,
+            kv_cache_group_ids=[0],
+            block_pool=block_pool,
+            kv_cache_spec=spec,
+            drop_eagle_block=drop_eagle_block,
+            alignment_tokens=alignment_tokens,
+        )
+        exp_ids, exp_hit = naive()
+        assert ([b.block_id for b in blocks[0]], hit_length) == (exp_ids, exp_hit), (
+            f"trial={trial} max_length={max_length} cached={sorted(cached)}"
+        )
+
+
+@pytest.mark.parametrize(
+    "pool_hash_size,alignment_tokens",
+    [(2, 2), (2, 4), (4, 4), (2, 8), (4, 8)],
+)
+@pytest.mark.parametrize("drop_eagle_block", [False, True])
+def test_full_attention_cache_hit_matches_naive_oracle(
+    pool_hash_size, alignment_tokens, drop_eagle_block
+):
+    """Randomized parity for the unified full-attention lookup: full-block
+    prefix scan, fine-grained tail probe, eagle drop, and alignment trim."""
+    block_size = 4
+    num_hashes = 40
+    fine = alignment_tokens < block_size
+    resolved_len_blocks = num_hashes * pool_hash_size // block_size
+
+    spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=200, enable_caching=True, hash_block_size=pool_hash_size
+    )
+    rng = random.Random(f"{pool_hash_size}-{alignment_tokens}-{drop_eagle_block}")
+
+    for trial in range(150):
+        block_pool.cached_block_hash_to_block._cache.clear()
+        hashes = [BlockHash(f"{trial}-{i}".encode()) for i in range(num_hashes)]
+        cached: dict[int, int] = {}
+        for i in range(num_hashes):
+            if rng.random() < 0.55:
+                cached[i] = 10 + i
+                block_pool.cached_block_hash_to_block.insert(
+                    make_block_hash_with_group_id(hashes[i], 0),
+                    block_pool.blocks[10 + i],
+                )
+        max_length = rng.randrange(0, num_hashes * pool_hash_size + 5)
+
+        def naive(max_length=max_length, cached=cached) -> tuple[list[int], int]:
+            # Longest cached full-block prefix.
+            num_full = 0
+            while (
+                num_full < min(max_length // block_size, resolved_len_blocks)
+                and ((num_full + 1) * block_size // pool_hash_size - 1) in cached
+            ):
+                num_full += 1
+            hit = num_full * block_size
+            full_ids = [
+                cached[(j + 1) * block_size // pool_hash_size - 1]
+                for j in range(num_full)
+            ]
+            # Fine-grained: highest cached interior boundary of the first
+            # non-full block.
+            tail_id = None
+            if fine:
+                lo = num_full * block_size
+                hi = min(
+                    lo + block_size - alignment_tokens,
+                    max_length // alignment_tokens * alignment_tokens,
+                    num_hashes * alignment_tokens,
+                )
+                for u in range(hi, lo, -alignment_tokens):
+                    if (tail_id := cached.get(u // pool_hash_size - 1)) is not None:
+                        hit = u
+                        break
+            if drop_eagle_block and hit > 0:
+                hit -= min(alignment_tokens, block_size)
+            hit -= hit % alignment_tokens
+            num_blocks = -(-hit // block_size)
+            if tail_id is not None and num_blocks > num_full:
+                return full_ids + [tail_id], hit
+            return full_ids[:num_blocks], hit
+
+        blocks, hit_length = FullAttentionManager.find_longest_cache_hit(
+            block_hashes=hashes,
+            max_length=max_length,
+            kv_cache_group_ids=[0],
+            block_pool=block_pool,
+            kv_cache_spec=spec,
+            drop_eagle_block=drop_eagle_block,
+            alignment_tokens=alignment_tokens,
+        )
+        exp_ids, exp_hit = naive()
+        assert ([b.block_id for b in blocks[0]], hit_length) == (exp_ids, exp_hit), (
+            f"trial={trial} max_length={max_length} cached={sorted(cached)}"
+        )
+
+
+def test_full_attention_cache_hit_with_dcp():
+    """With DCP, block hashes are computed at block_size * dcp_world_size
+    granularity; the lookup must resolve the hash view at that scaled size
+    (regression: resolving at the unscaled size tripped an assert)."""
+    block_size, dcp_world_size = 4, 2
+    scaled = block_size * dcp_world_size
+    spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=scaled
+    )
+    hashes = [BlockHash(str(i).encode()) for i in range(4)]
+    for hash_idx, pool_block_id in ((0, 10), (1, 11)):
+        block_pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(hashes[hash_idx], 0),
+            block_pool.blocks[pool_block_id],
+        )
+
+    blocks, hit_length = FullAttentionManager.find_longest_cache_hit(
+        block_hashes=hashes,
+        max_length=30,
+        kv_cache_group_ids=[0],
+        block_pool=block_pool,
+        kv_cache_spec=spec,
+        drop_eagle_block=False,
+        alignment_tokens=scaled,
+        dcp_world_size=dcp_world_size,
+    )
+    # Each hash covers 8 tokens; two cached scaled blocks -> 16 tokens.
+    assert ([b.block_id for b in blocks[0]], hit_length) == ([10, 11], 16)

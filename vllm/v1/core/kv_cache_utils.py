@@ -634,6 +634,14 @@ def resolve_kv_cache_block_sizes(
 
     if len(groups) <= 1:  # Single group: block_size * dcp * pcp
         bs = cache_config.block_size * dcp * pcp
+        if cache_config.hash_block_size not in (None, bs):
+            raise ValueError(
+                f"hash_block_size={cache_config.hash_block_size} is not "
+                f"supported for models with a single KV cache group: block "
+                f"hashes must be computed at block_size * dcp * pcp = {bs} "
+                f"tokens. Fine-grained partial prefix-cache hits require "
+                f"multiple KV cache groups and no context parallelism."
+            )
         return bs, bs
 
     if dcp != 1 or pcp != 1:

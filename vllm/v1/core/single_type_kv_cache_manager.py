@@ -9,7 +9,6 @@ from typing import ClassVar
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
-    BlockHash,
     BlockHashList,
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
@@ -812,82 +811,6 @@ class FullAttentionManager(SingleTypeKVCacheManager):
     tracks_new_block_ids: ClassVar[bool] = True
 
     @classmethod
-    def _find_fine_grained_cache_hit(
-        cls,
-        block_hashes: list[BlockHash],
-        max_length: int,
-        kv_cache_group_ids: list[int],
-        block_pool: BlockPool,
-        block_size: int,
-        hash_block_size: int,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        # Two-phase scan. Example with block_size 4, hash_block_size 2 and a
-        # cached 6-token prefix: raw hashes [h0(2) h1(4) h2(6)], full-block
-        # keys are the view [h1] (a block's key is the chained hash at its
-        # LAST hash boundary, so h1 covers tokens 0..3).
-        #   Phase 1 matches full blocks left-to-right via the block-size view
-        #     -> 1 full block, hit 4.
-        #   Phase 2 probes the hash boundaries INSIDE the next block, right
-        #     to left (h2 first) -> partial entry at 6 -> hit 6, and the tail
-        #     block is appended after the full blocks.
-        assert block_size % hash_block_size == 0
-        scale_factor = block_size // hash_block_size
-        full_block_hashes = BlockHashListWithBlockSize(
-            block_hashes, hash_block_size, block_size
-        )
-        max_num_hash_blocks = min(
-            max_length // hash_block_size,
-            len(block_hashes),
-        )
-
-        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
-            [] for _ in range(len(kv_cache_group_ids))
-        )
-        # Phase 1: longest run of cached FULL blocks from the start. The
-        # chained-hash property makes this sound: a missing block implies
-        # every later block is missing too.
-        max_num_full_blocks = max_length // block_size
-        num_full_blocks = 0
-        for block_hash in itertools.islice(full_block_hashes, max_num_full_blocks):
-            cached_full_block = block_pool.get_cached_block(
-                block_hash, kv_cache_group_ids
-            )
-            if not cached_full_block:
-                break
-            for computed, cached in zip(computed_blocks, cached_full_block):
-                computed.append(cached)
-            num_full_blocks += 1
-
-        # Phase 2: try to extend the hit into the first non-full block by
-        # probing its interior hash boundaries from the highest one down
-        # (longest extension first). Only the final prompt tail is ever
-        # registered (see _cache_partial_tail_block), so typically at most
-        # one of these probes can succeed; `continue` (not `break`) because
-        # partial entries are point registrations, not a chain.
-        hit_length = num_full_blocks * block_size
-        first_partial_idx = num_full_blocks * scale_factor
-        max_partial_idx = min(
-            # scale_factor - 1: the block's LAST boundary is the full-block
-            # key itself, already known to miss from phase 1.
-            first_partial_idx + scale_factor - 1,
-            max_num_hash_blocks,
-        )
-        for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
-            num_tokens = (fine_idx + 1) * hash_block_size
-            cached_tail = block_pool.get_cached_block(
-                block_hashes[fine_idx], kv_cache_group_ids
-            )
-            if not cached_tail:
-                continue
-
-            for computed, cached in zip(computed_blocks, cached_tail):
-                computed.append(cached)
-            hit_length = num_tokens
-            break
-
-        return computed_blocks, hit_length
-
-    @classmethod
     def find_longest_cache_hit(
         cls,
         block_hashes: BlockHashList,
@@ -906,83 +829,91 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             "FullAttentionManager can only be used for full attention "
             "and chunked local attention groups"
         )
+        block_size = kv_cache_spec.block_size
+        if dcp_world_size * pcp_world_size > 1:
+            # Each block spans block_size * world_size tokens; block hashes
+            # are computed at that scaled granularity.
+            block_size *= dcp_world_size * pcp_world_size
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
-            kv_cache_spec.block_size,
+            block_size,
             supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
             alignment_tokens=alignment_tokens,
         )
-        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
-            [] for _ in range(len(kv_cache_group_ids))
-        )
-        block_size = kv_cache_spec.block_size
-        if dcp_world_size * pcp_world_size > 1:
-            block_size *= dcp_world_size * pcp_world_size
         # Fine-grained mode: the coordinator passes alignment_tokens ==
         # hash_block_size (< block_size) when partial hits are enabled;
         # resolve_block_hashes then kept the raw hash-granularity list.
-        # Otherwise alignment_tokens >= block_size and we take the coarse
-        # path below on a block-size view.
-        if alignment_tokens < block_size and block_size % alignment_tokens == 0:
+        # Otherwise alignment_tokens is a multiple of block_size and lookups
+        # run on a block-size view.
+        fine_grained = (
+            alignment_tokens < block_size and block_size % alignment_tokens == 0
+        )
+        if fine_grained:
             assert isinstance(block_hashes, list)
-            computed_blocks, hit_length = cls._find_fine_grained_cache_hit(
-                block_hashes=block_hashes,
-                max_length=max_length,
-                kv_cache_group_ids=kv_cache_group_ids,
-                block_pool=block_pool,
-                block_size=block_size,
-                hash_block_size=alignment_tokens,
+            full_block_hashes: BlockHashList = BlockHashListWithBlockSize(
+                block_hashes, alignment_tokens, block_size
             )
-            if drop_eagle_block and hit_length > 0:
-                # Eagle only needs the tokens right before the generation
-                # point recomputed, so drop one hash unit rather than a whole
-                # cache block. The tail block's KV is append-only, so it still
-                # covers the reduced length; trim blocks past the new tail.
-                # Three shapes (block 4, hash 2):
-                #   hit 6 (partial tail) -> claim 4: cdiv(4,4)=1, tail entry
-                #     dropped, ends on a clean block boundary;
-                #   hit 8 (2 full)       -> claim 6: cdiv(6,4)=2, both blocks
-                #     kept, block 1 becomes the CoW source for the mid-block
-                #     claim;
-                #   hit 10 (tail at 10)  -> claim 8: cdiv(8,4)=2, tail
-                #     dropped, full blocks serve exactly.
-                hit_length -= alignment_tokens
-                num_blocks = cdiv(hit_length, block_size)
-                for computed in computed_blocks:
-                    del computed[num_blocks:]
-            # Fine-grained hits land on a hash-block boundary
-            # (== alignment_tokens) by construction; no extra trim needed here
-            # (unlike the coarse branch below, which handles
-            # alignment > block_size).
-            return computed_blocks, hit_length
+        else:
+            assert alignment_tokens % block_size == 0
+            full_block_hashes = block_hashes
 
-        max_num_blocks = max_length // block_size
-        hit_length = 0
-        for block_hash in itertools.islice(block_hashes, max_num_blocks):
-            # block_hashes is a chain of block hashes. If a block hash is not
-            # in the cached_block_hash_to_id, the following block hashes are
-            # not computed yet for sure.
-            if cached_block := block_pool.get_cached_block(
-                block_hash, kv_cache_group_ids
-            ):
-                for computed, cached in zip(computed_blocks, cached_block):
-                    computed.append(cached)
-                hit_length += block_size
-            else:
+        # Phase 1: longest run of cached FULL blocks from the start. The
+        # chained-hash property makes this sound: a missing block implies
+        # every later block is missing too.
+        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [] for _ in range(len(kv_cache_group_ids))
+        )
+        num_full_blocks = 0
+        for block_hash in itertools.islice(full_block_hashes, max_length // block_size):
+            cached_block = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
+            if not cached_block:
                 break
-        if drop_eagle_block and computed_blocks[0]:
-            # Need to drop the last matched block if eagle is enabled.
-            for computed in computed_blocks:
-                computed.pop()
-            hit_length -= block_size
-        while (
-            block_size != alignment_tokens  # Faster for common case.
-            and len(computed_blocks[0]) * block_size % alignment_tokens != 0
-        ):
-            for computed in computed_blocks:
-                computed.pop()
-            hit_length -= block_size
+            for computed, cached in zip(computed_blocks, cached_block):
+                computed.append(cached)
+            num_full_blocks += 1
+        hit_length = num_full_blocks * block_size
+
+        # Phase 2 (fine-grained only): extend the hit into the first non-full
+        # block by probing its interior hash boundaries from the highest one
+        # down (longest extension first). Only the final prompt tail is ever
+        # registered (see _cache_partial_tail_block), so typically at most
+        # one of these probes can succeed; `continue` (not `break`) because
+        # partial entries are point registrations, not a chain.
+        if fine_grained:
+            scale_factor = block_size // alignment_tokens
+            first_partial_idx = num_full_blocks * scale_factor
+            max_partial_idx = min(
+                # scale_factor - 1: the block's LAST boundary is the
+                # full-block key itself, already known to miss from phase 1.
+                first_partial_idx + scale_factor - 1,
+                max_length // alignment_tokens,
+                len(block_hashes),
+            )
+            for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
+                cached_tail = block_pool.get_cached_block(
+                    block_hashes[fine_idx], kv_cache_group_ids
+                )
+                if not cached_tail:
+                    continue
+                for computed, cached in zip(computed_blocks, cached_tail):
+                    computed.append(cached)
+                hit_length = (fine_idx + 1) * alignment_tokens
+                break
+
+        # Eagle only needs the tokens right before the generation point
+        # recomputed: drop one hash unit when fine-grained (the tail block's
+        # KV is append-only, so it still covers the reduced length), else one
+        # cache block.
+        if drop_eagle_block and hit_length > 0:
+            hit_length -= min(alignment_tokens, block_size)
+        # Round down to the alignment; a no-op when fine-grained (hits land
+        # on hash boundaries by construction) and when alignment_tokens ==
+        # block_size. Then trim blocks past the new tail.
+        hit_length -= hit_length % alignment_tokens
+        num_blocks = cdiv(hit_length, block_size)
+        for computed in computed_blocks:
+            del computed[num_blocks:]
         return computed_blocks, hit_length
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -1017,31 +948,65 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return blocks
 
     @classmethod
-    def _find_fine_grained_cache_hit(
+    def find_longest_cache_hit(
         cls,
-        block_hashes: list[BlockHash],
+        block_hashes: BlockHashList,
         max_length: int,
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
-        sliding_window: int,
+        kv_cache_spec: KVCacheSpec,
         drop_eagle_block: bool,
-        block_size: int,
-        hash_block_size: int,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        """Longest hit at hash-block granularity.
+        """Longest hit as a right-to-left walk over aligned claim boundaries.
 
-        Candidate lookup boundaries walk right-to-left over hash boundaries
-        ``u``; a single lookup at ``u`` finds both full blocks (whose cache key
-        is the hash at their last hash boundary) and partial prompt tails. The
-        claimed hit is ``u`` minus the eagle drop, and the window ending at
-        the claim must be covered by cached full blocks (the entry's own block
-        covers itself: its KV is valid up to ``u`` >= claim).
+        Unlike full attention, an SWA hit at ``claim`` tokens is valid only
+        if the whole attention window ending there is present: the next token
+        (position ``claim``) attends to [claim - window + 1, claim - 1], and
+        those tokens' KV must all be in cached blocks. Claims walk multiples
+        of ``alignment_tokens`` right-to-left, so the first covered claim is
+        the longest hit. Fine-grained partial hits (``alignment_tokens <
+        block_size``) walk hash-block boundaries, where a single lookup finds
+        both full blocks and partial prompt tails; otherwise claims sit on
+        cache-block boundaries.
         """
-        assert block_size % hash_block_size == 0
-        drop_tokens = hash_block_size if drop_eagle_block else 0
-        full_view = BlockHashListWithBlockSize(
-            block_hashes, hash_block_size, block_size
+        assert isinstance(kv_cache_spec, SlidingWindowSpec), (
+            "SlidingWindowManager can only be used for sliding window groups"
         )
+        assert dcp_world_size == 1, "DCP not support sliding window attn now."
+        assert pcp_world_size == 1, "PCP not support sliding window attn now."
+        block_size = kv_cache_spec.block_size
+        sliding_window = kv_cache_spec.sliding_window
+        block_hashes = resolve_block_hashes(
+            block_hashes,
+            block_pool.hash_block_size,
+            block_size,
+            supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
+            alignment_tokens=alignment_tokens,
+        )
+        fine_grained = (
+            alignment_tokens < block_size and block_size % alignment_tokens == 0
+        )
+        # Granularity of the resolved hash list: raw hash blocks when
+        # fine-grained, else one hash per cache block.
+        if fine_grained:
+            assert isinstance(block_hashes, list)
+            lookup_unit = alignment_tokens
+            full_view: BlockHashList = BlockHashListWithBlockSize(
+                block_hashes, alignment_tokens, block_size
+            )
+        else:
+            assert alignment_tokens % block_size == 0
+            lookup_unit = block_size
+            full_view = block_hashes
+
+        # With eagle, the lookup boundary sits one unit past the claim: the
+        # entry at ``u = claim + drop_tokens`` proves KV coverage up to ``u``,
+        # and the dropped unit [claim, u) is recomputed for the drafting head.
+        drop_tokens = lookup_unit if drop_eagle_block else 0
+
         # Memoize full-block lookups: each block is checked at most once
         # across all candidates.
         full_block_cache: dict[int, list[KVCacheBlock] | None] = {}
@@ -1053,30 +1018,26 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 )
             return full_block_cache[block_idx]
 
-        # Walk candidate lookup boundaries u = k * hash right-to-left so the
-        # first success is the LONGEST hit. A single get_cached_block at the
-        # raw hash h[k-1] finds either kind of entry, because a full block's
-        # key IS the raw hash at its last boundary and a partial tail's key
-        # is the raw hash at its registration boundary.
-        max_num_units = min(max_length // hash_block_size, len(block_hashes))
-        for k in range(max_num_units, 0, -1):
-            lookup_tokens = k * hash_block_size
-            # With eagle, the claim is one hash unit below the lookup: the
-            # entry at u proves KV coverage up to u, and the dropped unit
-            # [claim, u) gets recomputed for the drafting head.
-            claim = lookup_tokens - drop_tokens
-            if claim <= 0:
-                break
-            entry = block_pool.get_cached_block(block_hashes[k - 1], kv_cache_group_ids)
+        max_tokens = min(max_length, len(block_hashes) * lookup_unit)
+        claim = (max_tokens - drop_tokens) // alignment_tokens * alignment_tokens
+        while claim > 0:
+            lookup_tokens = claim + drop_tokens
+            # A single lookup at the boundary hash finds either entry kind: a
+            # full block's key IS the hash at its last boundary and a partial
+            # tail's key is the hash at its registration boundary.
+            if lookup_tokens % block_size == 0:
+                entry = _lookup_full_block(lookup_tokens // block_size - 1)
+            else:
+                entry = block_pool.get_cached_block(
+                    block_hashes[lookup_tokens // lookup_unit - 1],
+                    kv_cache_group_ids,
+                )
             if not entry:
+                claim -= alignment_tokens
                 continue
-            # Unlike full attention, an SWA hit at `claim` is only valid if
-            # the whole attention window ending there is present: the next
-            # token (position `claim`) attends to [claim - window + 1,
-            # claim - 1], and those tokens' KV must all be in cached blocks.
             # The entry's own block covers itself (its KV is valid up to
-            # u >= claim); every other block in that range needs its own
-            # full-block entry.
+            # ``lookup_tokens`` >= claim); every other block in the window
+            # needs its own full-block entry.
             entry_block_idx = (lookup_tokens - 1) // block_size
             last_block_idx = (claim - 1) // block_size
             first_block_idx = max(claim - sliding_window + 1, 0) // block_size
@@ -1084,16 +1045,25 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             # (claim rounded down to the previous block); the entry then only
             # serves as evidence and is not part of the returned blocks.
             window_blocks: dict[int, list[KVCacheBlock]] = {}
-            covered = True
+            miss_idx = -1
             for j in range(last_block_idx, first_block_idx - 1, -1):
                 cached = entry if j == entry_block_idx else _lookup_full_block(j)
                 if not cached:
-                    covered = False
+                    miss_idx = j
                     break
                 window_blocks[j] = cached
-            if not covered:
-                # This candidate fails, but a shorter boundary may still have
-                # a fully covered (smaller) window — keep scanning.
+            if miss_idx >= 0:
+                # Every smaller claim whose window still contains the missing
+                # block fails too, unless its own entry lands inside that
+                # block (a partial tail can cover it). Jump straight to the
+                # largest claim that is not ruled out; this keeps the walk
+                # linear in the number of blocks.
+                claim = min(
+                    claim - alignment_tokens,
+                    ((miss_idx + 1) * block_size - drop_tokens)
+                    // alignment_tokens
+                    * alignment_tokens,
+                )
                 continue
             # Blocks before the window are unreachable for SWA: pad with
             # nulls so list positions still line up with block indices.
@@ -1107,116 +1077,6 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             )
             return computed_blocks, claim
         return tuple([] for _ in range(len(kv_cache_group_ids))), 0
-
-    @classmethod
-    def find_longest_cache_hit(
-        cls,
-        block_hashes: BlockHashList,
-        max_length: int,
-        kv_cache_group_ids: list[int],
-        block_pool: BlockPool,
-        kv_cache_spec: KVCacheSpec,
-        drop_eagle_block: bool,
-        alignment_tokens: int,
-        dcp_world_size: int = 1,
-        pcp_world_size: int = 1,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        assert isinstance(kv_cache_spec, SlidingWindowSpec), (
-            "SlidingWindowManager can only be used for sliding window groups"
-        )
-        assert dcp_world_size == 1, "DCP not support sliding window attn now."
-        assert pcp_world_size == 1, "PCP not support sliding window attn now."
-        block_hashes = resolve_block_hashes(
-            block_hashes,
-            block_pool.hash_block_size,
-            kv_cache_spec.block_size,
-            supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
-            alignment_tokens=alignment_tokens,
-        )
-        if (
-            alignment_tokens < kv_cache_spec.block_size
-            and kv_cache_spec.block_size % alignment_tokens == 0
-        ):
-            assert isinstance(block_hashes, list)
-            return cls._find_fine_grained_cache_hit(
-                block_hashes=block_hashes,
-                max_length=max_length,
-                kv_cache_group_ids=kv_cache_group_ids,
-                block_pool=block_pool,
-                sliding_window=kv_cache_spec.sliding_window,
-                drop_eagle_block=drop_eagle_block,
-                block_size=kv_cache_spec.block_size,
-                hash_block_size=alignment_tokens,
-            )
-
-        # The number of contiguous blocks needed for a prefix cache hit.
-        sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(
-            kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block
-        )
-
-        # TODO: reduce i by sliding_window_contiguous_blocks when cache miss, to
-        # optimize the time complexity from O(max_num_blocks) to
-        # O(max_num_blocks / sliding_window_contiguous_blocks +
-        # sliding_window_contiguous_blocks),
-        # which is good for low cache hit rate scenarios.
-        max_num_blocks = max_length // kv_cache_spec.block_size
-        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
-            [block_pool.null_block] * max_num_blocks
-            for _ in range(len(kv_cache_group_ids))
-        )
-        block_size = kv_cache_spec.block_size
-        num_contiguous_blocks = 0
-        match_found = False
-        # Search from right to left and early stop when a match is found.
-        for i in range(max_num_blocks - 1, -1, -1):
-            if cached_block := block_pool.get_cached_block(
-                block_hashes[i], kv_cache_group_ids
-            ):
-                # Skip prefix matching check if the block is not aligned with
-                # `alignment_tokens`.
-                if num_contiguous_blocks == 0 and block_size != alignment_tokens:
-                    post_pop_blocks = i if drop_eagle_block else i + 1
-                    if (post_pop_blocks * block_size) % alignment_tokens != 0:
-                        continue
-                # Add the cached block to the computed blocks.
-                for computed, cached in zip(computed_blocks, cached_block):
-                    computed[i] = cached
-                num_contiguous_blocks += 1
-                if num_contiguous_blocks >= sliding_window_contiguous_blocks:
-                    # Trim the trailing blocks.
-                    # E.g., [NULL, NULL, 8, 3, NULL, 9] -> [NULL, NULL, 8, 3]
-                    # when sliding_window_contiguous_blocks=2.
-                    for computed in computed_blocks:
-                        del computed[i + num_contiguous_blocks :]
-                    match_found = True
-                    break
-            else:
-                num_contiguous_blocks = 0
-        if not match_found:
-            # The first `num_contiguous_blocks` is a cache hit even if
-            # `num_contiguous_blocks < sliding_window_contiguous_blocks`.
-            for computed in computed_blocks:
-                del computed[num_contiguous_blocks:]
-            while (
-                block_size != alignment_tokens  # Faster for common case.
-                and len(computed_blocks[0]) * block_size % alignment_tokens != 0
-            ):
-                for computed in computed_blocks:
-                    computed.pop()
-        if drop_eagle_block and computed_blocks[0]:
-            for computed in computed_blocks:
-                computed.pop()
-            # Re-align after eagle pop: the pop may break the alignment
-            # when block_size != alignment_tokens (hybrid models with
-            # different page sizes, e.g. Gemma4).
-            while (
-                block_size != alignment_tokens
-                and len(computed_blocks[0]) * block_size % alignment_tokens != 0
-            ):
-                for computed in computed_blocks:
-                    computed.pop()
-        hit_length = len(computed_blocks[0]) * block_size
-        return computed_blocks, hit_length
 
     @classmethod
     def reachable_block_mask(

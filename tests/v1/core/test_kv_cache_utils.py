@@ -2572,3 +2572,27 @@ def test_resolve_block_hashes_rejects_mismatched_view():
     mismatched = BlockHashListWithBlockSize(raw, 2, 8)
     with pytest.raises(AssertionError):
         resolve_block_hashes(mismatched, 2, 4)
+
+
+def test_resolve_kv_cache_block_sizes_rejects_single_group_hash_override():
+    """A single KV cache group has nothing to gain from a finer hash block
+    size (fine-grained partial hits are hybrid-only), and with context
+    parallelism hashes must be computed at the scaled block size — fail fast
+    instead of silently ignoring the override."""
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    kv_cache_config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer1"], new_kv_cache_spec())],
+    )
+    block_size = vllm_config.cache_config.block_size
+
+    # A matching value is a no-op and passes.
+    vllm_config.cache_config.hash_block_size = block_size
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    ) == (block_size, block_size)
+
+    vllm_config.cache_config.hash_block_size = block_size // 2
+    with pytest.raises(ValueError, match="single KV cache group"):
+        kv_cache_utils.resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
