@@ -27,7 +27,7 @@ use tracing::warn;
 use crate::middleware;
 use crate::state::AppState;
 
-const DEFAULT_JSON_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_JSON_BODY_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 
 fn server_dev_mode_enabled() -> bool {
     std::env::var("VLLM_SERVER_DEV_MODE")
