@@ -293,6 +293,53 @@ def test_sync_fail_invalid_blocks_evicted(fail_scheduler: Scheduler):
     assert conn_stats.hits == num_external_computed_tokens
 
 
+def test_multigroup_invalid_blocks_truncate_at_earliest_group(
+    recompute_scheduler: Scheduler,
+):
+    """Hybrid KV cache manager: ``get_block_ids`` returns one block-id list
+    per KV cache group. A logical position is invalid if ANY group's block
+    there failed, so the request must truncate at the earliest such position
+    and evict downstream blocks in EVERY group.
+
+    Regression for the single-group unpack
+    ``(req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)`` which
+    raised ``ValueError: too many values to unpack`` whenever more than one
+    KV cache group was configured.
+    """
+    bs = recompute_scheduler.block_size
+    num_blocks = 10
+    request = create_request(num_tokens=num_blocks * bs)
+    request.num_computed_tokens = num_blocks * bs
+
+    # Two KV cache groups with disjoint physical block ids for the same
+    # logical positions.
+    group0 = list(range(0, num_blocks))  # 0..9
+    group1 = list(range(100, 100 + num_blocks))  # 100..109
+    recompute_scheduler.kv_cache_manager.get_block_ids = Mock(
+        return_value=(group0, group1)
+    )
+
+    # Invalid block only in the SECOND group at position 5 (the exact case
+    # that used to crash), plus a later invalid in the first group at pos 7.
+    invalid_block_ids = {group1[5], group0[7]}
+
+    affected, total_affected, to_evict = (
+        recompute_scheduler._update_requests_with_invalid_blocks(
+            [request],
+            invalid_block_ids,
+            num_scheduled_tokens={},
+            evict_blocks=True,
+        )
+    )
+
+    assert affected == {request.request_id}
+    # Truncated at the earliest invalid position across all groups (idx 5).
+    assert request.num_computed_tokens == 5 * bs
+    assert total_affected == (num_blocks - 5) * bs
+    # Downstream blocks (positions 5..9) from BOTH groups are evicted.
+    assert to_evict == set(group0[5:]) | set(group1[5:])
+
+
 def test_async_recompute_blocks_not_cached_when_invalid(
     recompute_scheduler: Scheduler,
 ):

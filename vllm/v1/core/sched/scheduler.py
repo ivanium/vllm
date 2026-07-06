@@ -2559,8 +2559,14 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            # With the hybrid KV cache manager a request holds one block per
+            # KV cache group at each logical position; get_block_ids returns
+            # one block-id list per group (a 1-tuple in the non-hybrid case).
+            # A logical position is invalid if ANY group's block there failed
+            # to load, so we scan positions across all groups and truncate at
+            # the earliest invalid one. Assumes a uniform block size across
+            # groups (self.block_size), as elsewhere in the scheduler.
+            block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
@@ -2570,22 +2576,30 @@ class Scheduler(SchedulerInterface):
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
             ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
+            for idx in range(req_num_computed_blocks):
+                # Physical block ids at this logical position, across all KV
+                # cache groups, that are invalid.
+                invalid_here = [
+                    group_block_ids[idx]
+                    for group_block_ids in block_ids_per_group
+                    if idx < len(group_block_ids)
+                    and group_block_ids[idx] in invalid_block_ids
+                ]
+                if not invalid_here:
                     continue
 
                 is_affected = True
 
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
+                if all(bid in marked_invalid_block_ids for bid in invalid_here):
+                    # Every invalid block at this position is shared with a
+                    # previous request and was already marked for
+                    # recomputation, so this request can still consider this
+                    # position computed when rescheduled.
                     # Currently this only applies to sync loading; Async
                     # loading does not yet support block sharing
                     continue
 
-                marked_invalid_block_ids.add(block_id)
+                marked_invalid_block_ids.update(invalid_here)
 
                 if marked_invalid_block:
                     # This request has already marked an invalid block for
@@ -2593,16 +2607,18 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 marked_invalid_block = True
-                # Truncate the computed tokens at the first failed block
+                # Truncate the computed tokens at the first failed position
                 request.num_computed_tokens = idx * self.block_size
                 num_affected_tokens = (
                     req_num_computed_tokens - request.num_computed_tokens
                 )
                 total_affected_tokens += num_affected_tokens
 
-                # collect invalid block and all downstream dependent blocks
+                # collect invalid blocks and all downstream dependent blocks
+                # across every group
                 if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    for group_block_ids in block_ids_per_group:
+                        blocks_to_evict.update(group_block_ids[idx:])
 
             if is_affected:
                 if not marked_invalid_block:
