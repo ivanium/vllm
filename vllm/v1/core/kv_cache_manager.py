@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -179,6 +179,15 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+        # Optional hook for the CoW copy retentions handed back by
+        # `new_step_starts`. The scheduler installs it to defer the free
+        # while the step that runs the queued copy may still be in flight
+        # (see Scheduler._free_cow_retained_blocks). When unset, the
+        # retained blocks are freed immediately.
+        self.cow_retained_block_free_handler: (
+            Callable[[list[KVCacheBlock]], None] | None
+        ) = None
 
     @property
     def usage(self) -> float:
@@ -624,5 +633,17 @@ class KVCacheManager:
         return copies
 
     def new_step_starts(self) -> None:
-        """Called when a new step is started."""
-        self.coordinator.new_step_starts()
+        """Called when a new step is started.
+
+        CoW copy retentions from the previous step are handed to
+        `cow_retained_block_free_handler` when the scheduler installed one
+        (to fence the free against the copy's step still being in flight);
+        otherwise they are released immediately.
+        """
+        retained_blocks = self.coordinator.new_step_starts()
+        if not retained_blocks:
+            return
+        if self.cow_retained_block_free_handler is not None:
+            self.cow_retained_block_free_handler(retained_blocks)
+        else:
+            self.block_pool.free_blocks(retained_blocks)

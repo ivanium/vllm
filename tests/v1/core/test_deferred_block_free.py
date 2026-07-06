@@ -412,3 +412,114 @@ def test_non_async_abort_defers_via_last_sched_seq():
     scheduler.update_from_output(out0, _make_model_runner_output(out0))
     assert not scheduler.deferred_frees
     assert pool.get_num_free_blocks() == num_free_initially
+
+
+def _inject_cow_retentions(scheduler, num_blocks: int = 2):
+    """Simulate a partial-hit CoW from the last scheduled step: the manager
+    holds one retention ref per copy endpoint in `_cow_blocks_to_release`,
+    handed back at the next `new_step_starts`. schedule() records the fence
+    when it emits the copies; mirror that here."""
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    blocks = scheduler.kv_cache_manager.block_pool.get_new_blocks(num_blocks)
+    manager._cow_blocks_to_release.extend(blocks)
+    scheduler.cow_copy_fence_seq = scheduler.sched_step_seq
+    return blocks
+
+
+def test_cow_retention_release_deferred_while_step_inflight():
+    """CoW copy retentions ride the same fence as request-level frees: the
+    step that runs the queued block copy may still be in flight when the next
+    schedule() hands the retentions back, and a consumer connector could
+    otherwise reallocate a copy endpoint as a load destination.
+    """
+    scheduler = _create_deferring_scheduler()
+    pool = scheduler.kv_cache_manager.block_pool
+    request, out0, out1 = _setup_request_with_inflight_step(scheduler)
+
+    _inject_cow_retentions(scheduler)
+    num_free = pool.get_num_free_blocks()
+    scheduler.kv_cache_manager.new_step_starts()
+
+    # Withheld from the pool until the newest in-flight step (which carried
+    # the copies) is processed.
+    assert len(scheduler.deferred_frees) == 1
+    assert scheduler.deferred_frees[0][0] == scheduler.sched_step_seq
+    assert pool.get_num_free_blocks() == num_free
+
+    scheduler.update_from_output(out0, _make_model_runner_output(out0))
+    assert len(scheduler.deferred_frees) == 1
+    assert pool.get_num_free_blocks() == num_free
+
+    scheduler.update_from_output(out1, _make_model_runner_output(out1))
+    assert not scheduler.deferred_frees
+    assert pool.get_num_free_blocks() == num_free + 2
+
+
+def test_cow_retention_release_immediate_when_quiescent():
+    # Deferral gate on, but the newest scheduled step has already been
+    # processed: the copies have run, release immediately.
+    scheduler = _create_deferring_scheduler()
+    pool = scheduler.kv_cache_manager.block_pool
+    request = create_requests(
+        num_requests=1,
+        num_tokens=NUM_PROMPT_TOKENS,
+        max_tokens=5,
+        stop_token_ids=[STOP_TOKEN_ID],
+    )[0]
+    scheduler.add_request(request)
+    out0 = scheduler.schedule()
+    scheduler.update_from_output(out0, _make_model_runner_output(out0))
+
+    _inject_cow_retentions(scheduler)
+    num_free = pool.get_num_free_blocks()
+    scheduler.kv_cache_manager.new_step_starts()
+    assert not scheduler.deferred_frees
+    assert pool.get_num_free_blocks() == num_free + 2
+
+
+def test_cow_retention_release_deferred_when_copies_rode_empty_step():
+    """Copies can ride a 0-token step (async KV loads only), which never
+    advances sched_step_seq: the retention fence must point at the next
+    non-empty step instead of the already-satisfied current seq."""
+    scheduler = _create_deferring_scheduler()
+    pool = scheduler.kv_cache_manager.block_pool
+    request = create_requests(
+        num_requests=1,
+        num_tokens=NUM_PROMPT_TOKENS,
+        max_tokens=5,
+        stop_token_ids=[STOP_TOKEN_ID],
+    )[0]
+    scheduler.add_request(request)
+    out0 = scheduler.schedule()
+    scheduler.update_from_output(out0, _make_model_runner_output(out0))
+
+    # Quiescent (sched == processed), then copies emitted by a 0-token step:
+    # schedule() fences them one step ahead.
+    _inject_cow_retentions(scheduler)
+    scheduler.cow_copy_fence_seq = scheduler.sched_step_seq + 1
+    num_free = pool.get_num_free_blocks()
+    scheduler.kv_cache_manager.new_step_starts()
+    assert len(scheduler.deferred_frees) == 1
+    assert pool.get_num_free_blocks() == num_free
+
+    # The next non-empty step completing implies the copies have run.
+    out1 = scheduler.schedule()
+    scheduler.update_from_output(out1, _make_model_runner_output(out1))
+    assert not scheduler.deferred_frees
+    assert pool.get_num_free_blocks() == num_free + 2
+
+
+def test_cow_retention_release_immediate_when_gate_off():
+    # Without the deferral gate, retention releases stay immediate even with
+    # an in-flight step: GPU-stream writers of a reallocated block are
+    # ordered after the in-flight copy.
+    scheduler = create_scheduler(model=MODEL, async_scheduling=True)
+    assert not scheduler.defer_block_free
+    pool = scheduler.kv_cache_manager.block_pool
+    _setup_request_with_inflight_step(scheduler)
+
+    _inject_cow_retentions(scheduler)
+    num_free = pool.get_num_free_blocks()
+    scheduler.kv_cache_manager.new_step_starts()
+    assert not scheduler.deferred_frees
+    assert pool.get_num_free_blocks() == num_free + 2

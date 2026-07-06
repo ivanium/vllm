@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 from abc import ABC, abstractmethod
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
@@ -131,8 +131,9 @@ class SingleTypeKVCacheManager(ABC):
         #     5. The scheduler drains take_kv_cache_block_copies() into
         #        SchedulerOutput; the worker executes the copies after
         #        zeroing new blocks and before the forward pass.
-        #     6. new_step_starts (next step) releases the retentions taken
-        #        in _apply_cow — by then the copy has run on the worker.
+        #     6. new_step_starts (next step) hands the retentions taken in
+        #        _apply_cow back to the caller; the scheduler frees them once
+        #        the step that ran the copy is no longer in flight.
         # ------------------------------------------------------------------
         # Instance-level switch for the generic machinery below; defaults to
         # the class capability flag. MambaManager narrows it to the "align"
@@ -144,9 +145,10 @@ class SingleTypeKVCacheManager(ABC):
         # Pending copies queued at step 4, drained by the scheduler at step 5.
         self._kv_cache_block_copies: list[KVCacheBlockCopy] = []
         # Blocks participating in a pending copy (both source and target).
-        # Each holds one retention released at `new_step_starts`, after the
-        # worker copy has run, so that a request freed within the same step
-        # cannot leak either end of the copy to another request.
+        # Each holds one retention handed back at `new_step_starts` and
+        # released once the worker copy has run, so that a request freed
+        # within the same step cannot leak either end of the copy to
+        # another request.
         self._cow_blocks_to_release: list[KVCacheBlock] = []
         # Blocks whose partial tail entry was newly registered this step;
         # their content is only written during this step's execution, so
@@ -458,18 +460,6 @@ class SingleTypeKVCacheManager(ABC):
         self._kv_cache_block_copies = []
         return copies
 
-    def _free_retained_blocks(self, blocks: Sequence[KVCacheBlock]) -> None:
-        freed_blocks: list[KVCacheBlock] = []
-        ref_counts_by_id = Counter(block.block_id for block in blocks)
-        blocks_by_id = {block.block_id: block for block in blocks}
-        for block_id, count in ref_counts_by_id.items():
-            block = blocks_by_id[block_id]
-            assert block.ref_cnt >= count
-            block.ref_cnt -= count
-            if block.ref_cnt == 0 and not block.is_null:
-                freed_blocks.append(block)
-        self.block_pool.free_block_queue.append_n(freed_blocks)
-
     def _apply_cow(
         self,
         request_id: str,
@@ -481,15 +471,17 @@ class SingleTypeKVCacheManager(ABC):
 
         The existing prefix-cache touch keeps ``source_block`` alive after the
         request table is updated. Temporarily retain ``cow_block`` too;
-        ``new_step_starts`` releases both after the queued worker copy has run,
-        preventing same-step frees from recycling either copy endpoint.
+        ``new_step_starts`` hands both back for release after the queued
+        worker copy has run, preventing same-step frees from recycling
+        either copy endpoint.
 
         Ref-count timeline for ``source_block`` (single consumer):
           before hit:            R      (its own refs; >= 0, in cache)
           touch (add_local):     R + 1  <- the hit-ref this method inherits
           swap out of the table: R + 1  (the table no longer points at it,
                                          but the hit-ref is NOT dropped here)
-          next new_step_starts:  R      (hit-ref released; copy has run)
+          next new_step_starts:  R      (hit-ref released once the copy's
+                                         step is no longer in flight)
         ``cow_block`` symmetrically: allocation ref (1) is handed to the
         request via the table; the +1 below is the copy retention, released
         at the same new_step_starts. If the request is freed within this
@@ -790,20 +782,23 @@ class SingleTypeKVCacheManager(ABC):
         # The default behavior is to not skip any tokens.
         return 0
 
-    def new_step_starts(self) -> None:
+    def new_step_starts(self) -> list[KVCacheBlock]:
         # Called at the start of every scheduler step. Two duties:
-        # 1. Release the previous step's CoW retentions: the worker executed
-        #    the queued copies during that step, so neither endpoint needs
-        #    protection anymore. Sources whose refs drop to 0 rejoin the
-        #    free queue but keep their cache entries (eviction candidates).
-        #    _free_retained_blocks handles the same block appearing multiple
-        #    times (several consumers CoW-ing one source in one step).
+        # 1. Hand back the previous step's CoW retentions for release: the
+        #    worker runs the queued copies during that step, so neither
+        #    endpoint needs protection once that step completes. The caller
+        #    frees them, fencing against the step still being in flight on
+        #    the GPU (see Scheduler._free_cow_retained_blocks). Sources whose
+        #    refs drop to 0 rejoin the free queue but keep their cache
+        #    entries (eviction candidates). The same block may appear
+        #    multiple times (several consumers CoW-ing one source in one
+        #    step); each occurrence carries one retention ref.
         # 2. Reset the same-step producer guard: entries registered last
         #    step are now backed by computed KV and safe to consume.
-        if self._cow_blocks_to_release:
-            self._free_retained_blocks(self._cow_blocks_to_release)
-            self._cow_blocks_to_release = []
+        blocks_to_release = self._cow_blocks_to_release
+        self._cow_blocks_to_release = []
         self._partial_blocks_cached_this_step.clear()
+        return blocks_to_release
 
 
 class FullAttentionManager(SingleTypeKVCacheManager):
@@ -1744,9 +1739,10 @@ class MambaManager(SingleTypeKVCacheManager):
                 assert block.block_hash is not None
                 self.cached_blocks_this_step.add(block.block_hash)
 
-    def new_step_starts(self) -> None:
-        super().new_step_starts()
+    def new_step_starts(self) -> list[KVCacheBlock]:
+        blocks_to_release = super().new_step_starts()
         self.cached_blocks_this_step.clear()
+        return blocks_to_release
 
     def _cache_partial_tail_block(
         self,
