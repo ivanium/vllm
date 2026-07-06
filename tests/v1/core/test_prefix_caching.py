@@ -27,6 +27,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
     KVCacheBlock,
+    KVCacheBlockCopy,
     get_block_hash,
     get_group_id,
     get_request_block_hasher,
@@ -1067,7 +1068,9 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
     # Next, validate scheduler logic for num_uncached_common_prefix_tokens > 0
     # Create minimal mock with just the needed attributes
     mock = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=block_size), use_eagle=False
+        cache_config=SimpleNamespace(block_size=block_size),
+        use_eagle=False,
+        mamba_partial_tail_stop=False,
     )
     num_new_tokens_adjusted = Scheduler._mamba_block_aligned_split(
         self=mock,
@@ -1134,6 +1137,761 @@ def test_hybrid_model_mamba_align_with_dynamic_draft_tokens():
     assert blocks is not None and all(len(group) == 0 for group in blocks.blocks)
 
     manager.free(req0)
+
+
+def test_hybrid_mamba_align_partial_hash_hit():
+    hash_block_size = 2
+    mamba_block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=20,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    blocks = manager.allocate_slots(req0, 6, num_computed, computed_blocks)
+    assert blocks is not None
+    manager.free(req0)
+    manager.new_step_starts()
+
+    partial_mamba_hash = req0.block_hashes[6 // hash_block_size - 1]
+    partial_mamba_block = manager.block_pool.get_cached_block(
+        partial_mamba_hash, kv_cache_group_ids=[1]
+    )
+    assert partial_mamba_block is not None
+    assert partial_mamba_block[0].block_hash_num_tokens == 6
+
+    req1 = make_request("1", [0, 0, 1, 1, 2, 2, 3, 3], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    assert num_computed == 6
+    assert [len(group) for group in computed_blocks.blocks] == [3, 2]
+
+    new_blocks = manager.allocate_slots(req1, 2, num_computed, computed_blocks)
+    assert new_blocks is not None
+    mamba_new_block_ids = new_blocks.get_block_ids()[1]
+    assert len(mamba_new_block_ids) == 1
+    assert mamba_new_block_ids[0] != partial_mamba_block[0].block_id
+    assert manager.get_blocks("1").get_block_ids()[1][1] == mamba_new_block_ids[0]
+    assert partial_mamba_block[0].block_hash is not None
+    assert get_block_hash(partial_mamba_block[0].block_hash) == partial_mamba_hash
+    assert get_group_id(partial_mamba_block[0].block_hash) == 1
+    assert partial_mamba_block[0].block_hash_num_tokens == 6
+    assert (
+        KVCacheBlockCopy(
+            src_block_id=partial_mamba_block[0].block_id,
+            dst_block_id=mamba_new_block_ids[0],
+        )
+        in manager.take_kv_cache_block_copies()
+    )
+    assert manager.get_blocks("1").blocks[1][1].block_hash_num_tokens == 8
+
+
+def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=24,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
+
+    partial_mamba_hash = req0.block_hashes[6 // hash_block_size - 1]
+    partial_mamba_block = manager.block_pool.get_cached_block(
+        partial_mamba_hash, kv_cache_group_ids=[1]
+    )
+    assert partial_mamba_block is not None
+    partial_mamba_block_id = partial_mamba_block[0].block_id
+    assert manager.get_blocks("0").get_block_ids()[1][1] == partial_mamba_block_id
+
+    req0.num_computed_tokens = 6
+    req0.append_output_token_ids([3])
+    new_blocks = manager.allocate_slots(req0, 1)
+    assert new_blocks is not None
+
+    # The producer keeps its own block: the worker block-table update protocol
+    # for running requests is append-only, so its table must not change.
+    assert new_blocks.get_block_ids()[1] == []
+    assert manager.get_blocks("0").get_block_ids()[1][1] == partial_mamba_block_id
+    # The prefix-cache entry moved to a private copy of the state.
+    moved = manager.block_pool.get_cached_block(
+        partial_mamba_hash, kv_cache_group_ids=[1]
+    )
+    assert moved is not None
+    cache_block = moved[0]
+    assert cache_block.block_id != partial_mamba_block_id
+    assert cache_block.block_hash is not None
+    assert get_block_hash(cache_block.block_hash) == partial_mamba_hash
+    assert get_group_id(cache_block.block_hash) == 1
+    assert cache_block.block_hash_num_tokens == 6
+    # The producer's own block no longer serves the cache entry.
+    assert partial_mamba_block[0].block_hash is None
+    assert (
+        KVCacheBlockCopy(
+            src_block_id=partial_mamba_block_id,
+            dst_block_id=cache_block.block_id,
+        )
+        in manager.take_kv_cache_block_copies()
+    )
+    # A consumer in the same step must be deferred: the copied state only
+    # exists once this step starts executing.
+    req1 = make_request("1", [0, 0, 1, 1, 2, 2, 4, 4], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    assert num_computed == 6
+    assert manager.allocate_slots(req1, 2, num_computed, computed_blocks) is None
+
+    # The copy target is pinned until the copy has run, then becomes evictable.
+    assert cache_block.ref_cnt == 1
+    manager.new_step_starts()
+    assert cache_block.ref_cnt == 0
+    assert manager.block_pool.get_cached_block(
+        partial_mamba_hash, kv_cache_group_ids=[1]
+    ) == [cache_block]
+
+
+def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
+
+    partial_mamba_hash = req0.block_hashes[6 // hash_block_size - 1]
+    partial_mamba_block = manager.block_pool.get_cached_block(
+        partial_mamba_hash, kv_cache_group_ids=[1]
+    )
+    assert partial_mamba_block is not None
+    partial_mamba_block_id = partial_mamba_block[0].block_id
+
+    req0.num_computed_tokens = 6
+    req0.append_output_token_ids([3])
+    assert manager.allocate_slots(req0, 1) is not None
+    manager.take_kv_cache_block_copies()
+    # The entry now points at the producer's private cache copy.
+    moved = manager.block_pool.get_cached_block(
+        partial_mamba_hash, kv_cache_group_ids=[1]
+    )
+    assert moved is not None
+    cache_block_id = moved[0].block_id
+    assert cache_block_id != partial_mamba_block_id
+    manager.new_step_starts()
+
+    req1 = make_request("1", [0, 0, 1, 1, 2, 2, 4, 4], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    assert num_computed == 6
+    assert computed_blocks.get_block_ids()[1][1] == cache_block_id
+
+    new_blocks = manager.allocate_slots(req1, 2, num_computed, computed_blocks)
+    assert new_blocks is not None
+    mamba_new_block_ids = new_blocks.get_block_ids()[1]
+    assert len(mamba_new_block_ids) == 1
+    assert mamba_new_block_ids[0] != cache_block_id
+    assert (
+        KVCacheBlockCopy(
+            src_block_id=cache_block_id,
+            dst_block_id=mamba_new_block_ids[0],
+        )
+        in manager.take_kv_cache_block_copies()
+    )
+
+
+def test_hybrid_mamba_partial_tail_producer_append_only_worker_table():
+    """The worker updates a RUNNING request's block table append-only
+    (``gpu_model_runner`` extends ``block_ids`` with the newly returned IDs),
+    so the scheduler must never redirect an already-sent, non-null table
+    position. Otherwise the worker keeps writing mamba state into the block
+    the scheduler handed to the prefix cache, corrupting the cached entry.
+    """
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=24,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
+    # A new request's full block table is sent to the worker.
+    worker_table = [list(ids) for ids in manager.get_blocks("0").get_block_ids()]
+    null_id = manager.block_pool.null_block.block_id
+
+    def check_worker_view():
+        # Every non-null scheduler position must match what the append-only
+        # worker holds at that position (null positions are never read).
+        for group_ids, worker_ids in zip(
+            manager.get_blocks("0").get_block_ids(), worker_table
+        ):
+            for pos, block_id in enumerate(group_ids):
+                if block_id != null_id:
+                    assert worker_ids[pos] == block_id
+
+    # Decode steps; the first one triggers the partial-tail CoW.
+    for num_computed_tokens in (6, 7, 8):
+        req0.num_computed_tokens = num_computed_tokens
+        req0.append_output_token_ids([3])
+        manager.new_step_starts()
+        new_blocks = manager.allocate_slots(req0, 1)
+        assert new_blocks is not None
+        for worker_ids, new_ids in zip(worker_table, new_blocks.get_block_ids()):
+            worker_ids.extend(new_ids)
+        check_worker_view()
+
+
+def test_partial_hit_cow_copy_target_pinned_until_copy_runs():
+    """A consumer freed (aborted/preempted) in the same scheduling step still
+    has a pending CoW copy targeting its private block. That block must not be
+    handed to another request before the copy runs at step start, or the stale
+    copy would overwrite the new owner's freshly zeroed block."""
+    hash_block_size = 2
+    mamba_block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=20,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
+    manager.free(req0)
+    manager.new_step_starts()
+
+    req1 = make_request("1", [0, 0, 1, 1, 2, 2, 3, 3], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    assert num_computed == 6
+    assert manager.allocate_slots(req1, 2, num_computed, computed_blocks) is not None
+    cow_block = manager.get_blocks("1").blocks[1][1]
+
+    # Same step: the consumer is freed with its copy still pending.
+    manager.free(req1)
+
+    copies = manager.take_kv_cache_block_copies()
+    assert any(c.dst_block_id == cow_block.block_id for c in copies)
+    # Both ends of the pending copy stay pinned: draining the entire free
+    # queue (what same-step allocations under the memory pressure that causes
+    # preemption do) must not hand them out.
+    drained = manager.block_pool.get_new_blocks(
+        manager.block_pool.get_num_free_blocks()
+    )
+    drained_ids = {block.block_id for block in drained}
+    for block_copy in copies:
+        assert block_copy.dst_block_id not in drained_ids
+        assert block_copy.src_block_id not in drained_ids
+
+    # Once the copies have run, the pinned blocks become reusable.
+    manager.new_step_starts()
+    assert cow_block.ref_cnt == 0
+    assert manager.block_pool.get_num_free_blocks() == 2
+
+
+def test_hybrid_full_attention_partial_hash_hit_uses_cow():
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=24,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
+    manager.free(req0)
+    manager.new_step_starts()
+
+    partial_full_hash = req0.block_hashes[6 // hash_block_size - 1]
+    partial_full_block = manager.block_pool.get_cached_block(
+        partial_full_hash, kv_cache_group_ids=[0]
+    )
+    assert partial_full_block is not None
+
+    req1 = make_request("1", [0, 0, 1, 1, 2, 2, 3, 3], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    assert num_computed == 6
+    assert [len(group) for group in computed_blocks.blocks] == [2, 2]
+
+    new_blocks = manager.allocate_slots(req1, 2, num_computed, computed_blocks)
+    assert new_blocks is not None
+    full_new_block_ids = new_blocks.get_block_ids()[0]
+    assert len(full_new_block_ids) == 1
+    assert full_new_block_ids[0] != partial_full_block[0].block_id
+    assert partial_full_block[0].block_hash is not None
+    assert get_block_hash(partial_full_block[0].block_hash) == partial_full_hash
+    assert get_group_id(partial_full_block[0].block_hash) == 0
+    assert partial_full_block[0].block_hash_num_tokens == 6
+    assert (
+        KVCacheBlockCopy(
+            src_block_id=partial_full_block[0].block_id,
+            dst_block_id=full_new_block_ids[0],
+        )
+        in manager.take_kv_cache_block_copies()
+    )
+    assert partial_full_block[0].ref_cnt == 1
+    manager.new_step_starts()
+    assert partial_full_block[0].ref_cnt == 0
+
+
+def test_hybrid_partial_hit_cow_target_starts_uncached():
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
+    manager.free(req0)
+    manager.new_step_starts()
+
+    partial_hash = req0.block_hashes[6 // hash_block_size - 1]
+    partial_full_block = manager.block_pool.get_cached_block(
+        partial_hash, kv_cache_group_ids=[0]
+    )
+    partial_mamba_block = manager.block_pool.get_cached_block(
+        partial_hash, kv_cache_group_ids=[1]
+    )
+    assert partial_full_block is not None
+    assert partial_mamba_block is not None
+
+    req1 = make_request("1", [0, 0, 1, 1, 2, 2, 3, 3], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    assert num_computed == 6
+
+    new_blocks = manager.allocate_slots(
+        req1,
+        2,
+        num_computed,
+        computed_blocks,
+        delay_cache_blocks=True,
+    )
+    assert new_blocks is not None
+
+    full_cow_block = manager.get_blocks("1").blocks[0][1]
+    mamba_cow_block = manager.get_blocks("1").blocks[1][1]
+    assert full_cow_block.block_id != partial_full_block[0].block_id
+    assert mamba_cow_block.block_id != partial_mamba_block[0].block_id
+    assert full_cow_block.block_hash is None
+    assert full_cow_block.block_hash_num_tokens is None
+    assert mamba_cow_block.block_hash is None
+    assert mamba_cow_block.block_hash_num_tokens is None
+
+    assert partial_full_block[0].block_hash is not None
+    assert get_block_hash(partial_full_block[0].block_hash) == partial_hash
+    assert get_group_id(partial_full_block[0].block_hash) == 0
+    assert partial_full_block[0].block_hash_num_tokens == 6
+    assert partial_mamba_block[0].block_hash is not None
+    assert get_block_hash(partial_mamba_block[0].block_hash) == partial_hash
+    assert get_group_id(partial_mamba_block[0].block_hash) == 1
+    assert partial_mamba_block[0].block_hash_num_tokens == 6
+
+
+def test_hybrid_partial_hash_truncates_full_attention_hit_length():
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=24,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    pool = manager.block_pool
+    req = make_request(
+        "0",
+        [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+        hash_block_size,
+        sha256,
+    )
+
+    full_blocks = pool.get_new_blocks(3)
+    pool.cache_full_blocks(
+        request=req,
+        blocks=full_blocks,
+        num_cached_blocks=0,
+        num_full_blocks=2,
+        block_size=block_size,
+        kv_cache_group_id=0,
+    )
+    pool.cache_partial_block(
+        request=req,
+        block=full_blocks[2],
+        num_tokens=10,
+        kv_cache_group_id=0,
+        block_size=block_size,
+    )
+
+    mamba_block = pool.get_new_blocks(1)[0]
+    pool.cache_partial_block(
+        request=req,
+        block=mamba_block,
+        num_tokens=6,
+        kv_cache_group_id=1,
+        block_size=block_size,
+    )
+
+    computed_blocks, num_computed = manager.get_computed_blocks(req)
+    assert num_computed == 6
+    assert [len(group) for group in computed_blocks.blocks] == [2, 2]
+
+
+def _make_fa_swa_manager():
+    """FA block 4 + two SWA groups (block 4, window 8), hash_block_size 2.
+
+    hash < lcm and every group scans at hash granularity, so partial hash
+    hits are enabled without any mamba group.
+    """
+    kv_cache_config = make_kv_cache_config_hybrid_model(
+        block_size=4, num_blocks=40, sliding_window_blocks=2
+    )
+    return make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=2,
+    )
+
+
+def test_hybrid_swa_partial_hash_hit_uses_cow():
+    manager = _make_fa_swa_manager()
+    assert manager.coordinator.enable_partial_hash_hits
+
+    # 14 tokens: 3 full blocks + a 2-token tail inside block 3.
+    req0 = make_request("0", [i for i in range(7) for _ in range(2)], 2, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    assert manager.allocate_slots(req0, 14, num_computed, computed_blocks) is not None
+
+    # The prompt tail at 14 tokens is registered in every group.
+    tail_hash = req0.block_hashes[6]
+    tail_blocks = manager.block_pool.get_cached_block(
+        tail_hash, kv_cache_group_ids=[0, 1, 2]
+    )
+    assert tail_blocks is not None
+    assert all(b.block_hash_num_tokens == 14 for b in tail_blocks)
+
+    manager.free(req0)
+    manager.new_step_starts()
+
+    req1 = make_request("1", [i for i in range(8) for _ in range(2)], 2, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    assert num_computed == 14
+    assert [len(group) for group in computed_blocks.blocks] == [4, 4, 4]
+    # SWA hits pad blocks before the window with nulls.
+    assert computed_blocks.blocks[1][0] is manager.block_pool.null_block
+    assert all(
+        group[-1].block_id == tail.block_id
+        for group, tail in zip(computed_blocks.blocks, tail_blocks)
+    )
+
+    new_blocks = manager.allocate_slots(req1, 2, num_computed, computed_blocks)
+    assert new_blocks is not None
+    copies = manager.take_kv_cache_block_copies()
+    for group_id, tail in enumerate(tail_blocks):
+        cow_ids = new_blocks.get_block_ids()[group_id]
+        assert len(cow_ids) == 1
+        assert cow_ids[0] != tail.block_id
+        assert (
+            KVCacheBlockCopy(src_block_id=tail.block_id, dst_block_id=cow_ids[0])
+            in copies
+        )
+        assert manager.get_blocks("1").get_block_ids()[group_id][3] == cow_ids[0]
+
+
+def test_hybrid_swa_partial_hit_requires_window_coverage():
+    manager = _make_fa_swa_manager()
+    pool = manager.block_pool
+
+    req0 = make_request("0", [i for i in range(7) for _ in range(2)], 2, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert manager.allocate_slots(req0, 14, num_computed, computed_blocks) is not None
+    manager.free(req0)
+    manager.new_step_starts()
+
+    # Evict SWA block 1 (tokens [4, 8), key = hash at its last boundary) from
+    # both SWA groups: window coverage for the fine hits at 14 and 12 breaks.
+    for group_id in (1, 2):
+        evicted = pool.get_cached_block(req0.block_hashes[3], [group_id])
+        assert evicted is not None
+        pool.cached_block_hash_to_block.pop(
+            make_block_hash_with_group_id(req0.block_hashes[3], group_id),
+            evicted[0].block_id,
+        )
+
+    req1 = make_request("1", [i for i in range(8) for _ in range(2)], 2, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    # The longest SWA hit is now the standalone block-0 entry (4 tokens, the
+    # whole window for the token at position 4); full attention truncates to
+    # the common hit.
+    assert num_computed == 4
+    assert [len(group) for group in computed_blocks.blocks] == [1, 1, 1]
+
+
+def test_partial_hit_shared_source_two_consumers():
+    """Two requests consuming the same partial tail in one step must each get
+    a private CoW block, and the shared source must be fully released after
+    both are freed."""
+    manager = _make_fa_swa_manager()
+    pool = manager.block_pool
+
+    req0 = make_request("0", [i for i in range(7) for _ in range(2)], 2, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert manager.allocate_slots(req0, 14, num_computed, computed_blocks) is not None
+    manager.free(req0)
+    manager.new_step_starts()
+
+    tail_hash = req0.block_hashes[6]
+    src_ids = [
+        b.block_id
+        for b in pool.get_cached_block(tail_hash, kv_cache_group_ids=[0, 1, 2])
+    ]
+
+    tokens = [i for i in range(8) for _ in range(2)]
+    cow_ids_by_req = {}
+    consumers = {}
+    for req_id in ("1", "2"):
+        req = make_request(req_id, tokens, 2, sha256)
+        consumers[req_id] = req
+        computed_blocks, num_computed = manager.get_computed_blocks(req)
+        assert num_computed == 14
+        new_blocks = manager.allocate_slots(req, 2, num_computed, computed_blocks)
+        assert new_blocks is not None
+        cow_ids_by_req[req_id] = [ids[0] for ids in new_blocks.get_block_ids()]
+
+    copies = manager.take_kv_cache_block_copies()
+    for group_id, src_id in enumerate(src_ids):
+        cow1 = cow_ids_by_req["1"][group_id]
+        cow2 = cow_ids_by_req["2"][group_id]
+        assert cow1 != cow2 and src_id not in (cow1, cow2)
+        for cow_id in (cow1, cow2):
+            assert KVCacheBlockCopy(src_block_id=src_id, dst_block_id=cow_id) in copies
+
+    manager.free(consumers["1"])
+    manager.free(consumers["2"])
+    manager.new_step_starts()
+    # The shared sources' hit-refs are released after the copies ran; the
+    # entries stay in the prefix cache as eviction candidates.
+    for src_id in src_ids:
+        assert pool.blocks[src_id].ref_cnt == 0
+    assert pool.get_cached_block(tail_hash, kv_cache_group_ids=[0, 1, 2]) is not None
 
 
 def test_prefill_plp():
@@ -2838,9 +3596,11 @@ def test_different_block_size():
     assert len(computed_blocks.blocks[1]) == 6
     assert num_computed_tokens == 6 * 16
 
-    # Evict some blocks to make sliding window cache hit length 5*16
-    # But should return 4 * 16 because full attention cache hit length must be
-    # a multiple of 32
+    # Evict some blocks to make sliding window cache hit length 5*16.
+    # hash_block_size (16) < lcm (32) enables partial hits for this FA+SWA
+    # config, so the common hit stays at 5*16: full attention serves the
+    # mid-block tail with a copy-on-write of its third block (kept in the
+    # returned blocks), instead of clamping down to a 32-aligned 4*16.
     manager.block_pool.cached_block_hash_to_block.pop(
         make_block_hash_with_group_id(req1.block_hashes[6], 1), 11
     )
@@ -2848,9 +3608,9 @@ def test_different_block_size():
         make_block_hash_with_group_id(req1.block_hashes[5], 1), 10
     )
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
-    assert len(computed_blocks.blocks[0]) == 2
-    assert len(computed_blocks.blocks[1]) == 4
-    assert num_computed_tokens == 4 * 16
+    assert len(computed_blocks.blocks[0]) == 3
+    assert len(computed_blocks.blocks[1]) == 5
+    assert num_computed_tokens == 5 * 16
 
 
 def test_hybrid_cache_blocks_swa_tail_window_only():
@@ -2925,12 +3685,11 @@ def test_hybrid_cache_blocks_swa_tail_window_only():
             )
 
 
-def test_hybrid_cache_blocks_clamped_to_lcm():
-    """HybridKVCacheCoordinator.cache_blocks() clamps to scheduler_block_size.
-    Chunks past the last lcm-aligned boundary can never participate in a
-    cache hit (find_longest_cache_hit always returns lcm-aligned hits), so
-    caching them only pollutes the prefix-cache hash map and keeps blocks
-    on the LRU list that could otherwise return to the free pool."""
+def test_hybrid_cache_blocks_fine_tail_cached():
+    """With hash_block_size < lcm, partial hash hits are enabled for FA+SWA
+    hybrids, so HybridKVCacheCoordinator.cache_blocks() no longer clamps to
+    scheduler_block_size: chunks past the last lcm-aligned boundary are now
+    legitimate fine-grained hit targets and must be cached."""
     block_size = 16
     # Full attn block_size=32, SWA block_size=16 -> lcm=32.
     kv_cache_config = KVCacheConfig(
@@ -2980,16 +3739,14 @@ def test_hybrid_cache_blocks_clamped_to_lcm():
     assert len(req.block_hashes) == 7
 
     pool = manager.block_pool
-    # SWA group_id=1: hashes 0..5 cached (6 blocks * 16 tokens = 96), hash 6
-    # spans tokens [96, 112) past the lcm boundary and must NOT be cached.
-    for i in range(6):
+    # SWA group_id=1: with partial hits enabled, all 7 hashes are cached —
+    # including hash 6 spanning tokens [96, 112) past the lcm boundary, which
+    # a fine-grained lookup can now hit directly.
+    for i in range(7):
         assert (
             pool.get_cached_block(req.block_hashes[i], kv_cache_group_ids=[1])
             is not None
         ), f"SWA hash {i} should be cached"
-    assert pool.get_cached_block(req.block_hashes[6], kv_cache_group_ids=[1]) is None, (
-        "SWA hash 6 spans tokens past the lcm boundary; should not be cached"
-    )
 
 
 def test_hybrid_local_kv_retention_interval_aligns_in_manager(monkeypatch):
@@ -3304,9 +4061,10 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary(monkeypatch):
         use_eagle=True,
     )
 
-    # 127 tokens: latest replay boundary is floor((127 - 1) / 32) * 32 = 96.
-    # The EAGLE/MTP SWA lookup group must cache the local tail ending at
-    # 104 tokens, and that tail is two 8-token blocks wide: hashes 11 and 12.
+    # 127 tokens with partial hits (hash 8 < lcm 32): the replay boundary is
+    # the last hash boundary, 120. The EAGLE lookup lands on that boundary and
+    # claims one hash unit below (112), so retention keeps the entry block at
+    # 120 plus the window block for the 112-token claim: hashes 13 and 14.
     token_ids = [i for i in range(15) for _ in range(block_size)] + [15] * 7
     req0 = make_request("0", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
@@ -3320,7 +4078,7 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary(monkeypatch):
     assert blocks is not None
 
     pool = manager.block_pool
-    expected_swa_cached = {11, 12}
+    expected_swa_cached = {13, 14}
     for i in range(15):
         cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
         if i in expected_swa_cached:
@@ -3330,10 +4088,13 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary(monkeypatch):
 
     manager.free(req0)
 
+    # Replay: full attention serves its registered partial tail at 120; the
+    # EAGLE SWA group claims 112 via the entry at 120; the common hit is 112
+    # (mid-FA-block, served through copy-on-write of FA block 3).
     req1 = make_request("1", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
-    assert num_computed_tokens == 12 * block_size
-    assert [len(blocks) for blocks in computed_blocks.blocks] == [3, 12]
+    assert num_computed_tokens == 14 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [4, 14]
 
 
 def test_block_lookup_cache_single_block_per_key():

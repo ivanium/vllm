@@ -6,17 +6,27 @@ import random
 import pytest
 import torch
 
+from vllm.sampling_params import SamplingParams
+from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    get_request_block_hasher,
+    init_none_hash,
     make_block_hash_with_group_id,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    FullAttentionManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import ChunkedLocalAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
+    FullAttentionSpec,
+    SlidingWindowSpec,
+)
+from vllm.v1.request import Request
 
 pytestmark = pytest.mark.cpu_test
 
@@ -88,7 +98,7 @@ def test_chunked_local_attention_possible_cached_prefix():
             kv_cache_spec=chunked_local_attention_spec,
             drop_eagle_block=False,
             alignment_tokens=block_size,
-        )[0]
+        )[0][0]
         assert len(computed_blocks) == expect_length
 
         assert all(
@@ -159,7 +169,7 @@ def test_sliding_window_possible_cached_prefix():
             kv_cache_spec=sliding_window_spec,
             drop_eagle_block=False,
             alignment_tokens=block_size,
-        )[0]
+        )[0][0]
         assert len(computed_blocks) == expect_length
 
         assert all(
@@ -327,6 +337,140 @@ def test_sliding_window_remove_skipped_blocks():
     assert_block_id(block_table, [null_block_id] * 4 + original_block_ids[4:])
 
 
+def test_sliding_window_fine_grained_cache_hit():
+    block_size = 4
+    hash_block_size = 2
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=8,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=hash_block_size
+    )
+
+    # 7 hash blocks = 14 tokens. Full-block keys are the hashes at each
+    # block's last hash boundary (indices 1, 3, 5 -> blocks 0, 1, 2); index 6
+    # is a partial prompt tail at 14 tokens inside block 3.
+    hashes = [BlockHash(str(i).encode()) for i in range(7)]
+
+    def insert(hash_idx: int, pool_block_id: int) -> None:
+        block_pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(hashes[hash_idx], 0),
+            block_pool.blocks[pool_block_id],
+        )
+
+    for hash_idx, pool_block_id in ((1, 10), (3, 11), (5, 12), (6, 13)):
+        insert(hash_idx, pool_block_id)
+
+    def find(max_length: int, drop_eagle_block: bool = False):
+        blocks, hit_length = SlidingWindowManager.find_longest_cache_hit(
+            block_hashes=hashes,
+            max_length=max_length,
+            kv_cache_group_ids=[0],
+            block_pool=block_pool,
+            kv_cache_spec=sliding_window_spec,
+            drop_eagle_block=drop_eagle_block,
+            alignment_tokens=hash_block_size,
+        )
+        return [b.block_id for b in blocks[0]], hit_length
+
+    null_id = block_pool.null_block.block_id
+
+    # The partial tail at 14 plus the window blocks before it.
+    assert find(15) == ([null_id, 11, 12, 13], 14)
+    # Eagle drops one hash unit; the tail block no longer serves the claim
+    # but the window at 12 is still covered.
+    assert find(15, drop_eagle_block=True) == ([null_id, 11, 12], 12)
+    # Capped below the tail: falls back to the block-boundary entry at 12.
+    assert find(13) == ([null_id, 11, 12], 12)
+    # Evicting block 1 breaks window coverage for 14 and 12; the longest hit
+    # becomes the standalone block-0 entry (4 tokens cover its own window).
+    block_pool.cached_block_hash_to_block.pop(
+        make_block_hash_with_group_id(hashes[3], 0), 11
+    )
+    assert find(15) == ([10], 4)
+
+
+def test_sliding_window_mask_replay_anchor_at_hash_granularity():
+    """With partial hits, the replay boundary sits on a hash boundary that may
+    fall inside a block; the mask must keep that block plus enough full blocks
+    to cover the whole window."""
+    spec = SlidingWindowSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4,  # need = cdiv(3, 4) = 1 contiguous block per hit
+    )
+
+    def mask(num_prompt_tokens: int, partial_anchor_tokens: int | None):
+        return SlidingWindowManager.reachable_block_mask(
+            start_block=0,
+            end_block=4,
+            alignment_tokens=8,  # lcm of a hybrid with a block-8 FA group
+            kv_cache_spec=spec,
+            use_eagle=False,
+            retention_interval=None,
+            num_prompt_tokens=num_prompt_tokens,
+            partial_anchor_tokens=partial_anchor_tokens,
+        )
+
+    # Without partial hits: only the dense segment tails (odd blocks, one
+    # `need`-sized tail per 8-token segment).
+    assert mask(15, None) == [False, True, False, True]
+    # Block-aligned fine anchor (prompt 13 -> latest boundary 12): keep the
+    # `need` blocks before block 3 on top of the segment tails.
+    assert mask(13, 2) == [False, True, True, True]
+    # Mid-block fine anchor (prompt 15 -> latest boundary 14 inside block 3):
+    # keep the partial tail block itself plus a full window before it.
+    assert mask(15, 2) == [False, True, True, True]
+
+
+def test_full_attention_fine_grained_eagle_drop():
+    block_size = 4
+    hash_block_size = 2
+    full_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=hash_block_size
+    )
+    hashes = [BlockHash(str(i).encode()) for i in range(7)]
+    for hash_idx, pool_block_id in ((1, 10), (3, 11), (5, 12), (6, 13)):
+        block_pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(hashes[hash_idx], 0),
+            block_pool.blocks[pool_block_id],
+        )
+
+    def find(drop_eagle_block: bool):
+        blocks, hit_length = FullAttentionManager.find_longest_cache_hit(
+            block_hashes=hashes,
+            max_length=15,
+            kv_cache_group_ids=[0],
+            block_pool=block_pool,
+            kv_cache_spec=full_spec,
+            drop_eagle_block=drop_eagle_block,
+            alignment_tokens=hash_block_size,
+        )
+        return [b.block_id for b in blocks[0]], hit_length
+
+    assert find(drop_eagle_block=False) == ([10, 11, 12, 13], 14)
+    # Eagle drops one hash unit (14 -> 12); the partial tail block is trimmed.
+    assert find(drop_eagle_block=True) == ([10, 11, 12], 12)
+    # Without the partial tail the longest hit is 12; the eagle drop lands
+    # mid-block (10) and keeps the last full block as the CoW source.
+    block_pool.cached_block_hash_to_block.pop(
+        make_block_hash_with_group_id(hashes[6], 0), 13
+    )
+    assert find(drop_eagle_block=True) == ([10, 11, 12], 10)
+
+
 def test_get_num_blocks_to_allocate():
     block_size = 2
     sliding_window_spec = SlidingWindowSpec(
@@ -348,13 +492,13 @@ def test_get_num_blocks_to_allocate():
 
     assert (
         manager.get_num_blocks_to_allocate(
-            "1", 20 * block_size, cached_blocks_1, 0, 20 * block_size
+            "1", 20 * block_size, cached_blocks_1, 0, 0, 20 * block_size
         )
         == 20
     )
     assert (
         manager.get_num_blocks_to_allocate(
-            "2", 20 * block_size, cached_blocks_2, 0, 20 * block_size
+            "2", 20 * block_size, cached_blocks_2, 0, 0, 20 * block_size
         )
         == 15
     )
@@ -384,6 +528,7 @@ def test_evictable_cached_blocks_not_double_allocated():
         num_tokens=2 * block_size,
         new_computed_blocks=[evictable_block],
         total_computed_tokens=block_size,
+        num_local_computed_tokens=block_size,
         num_tokens_main_model=2 * block_size,
     )
     # Free capacity check should count evictable cached blocks, but allocation
@@ -424,13 +569,13 @@ def test_chunked_local_attention_get_num_blocks_to_allocate():
 
     assert (
         manager.get_num_blocks_to_allocate(
-            "1", 20 * block_size, cached_blocks_1, 0, 20 * block_size
+            "1", 20 * block_size, cached_blocks_1, 0, 0, 20 * block_size
         )
         == 20
     )
     assert (
         manager.get_num_blocks_to_allocate(
-            "2", 20 * block_size, cached_blocks_2, 0, 20 * block_size
+            "2", 20 * block_size, cached_blocks_2, 0, 0, 20 * block_size
         )
         == 15
     )
@@ -474,6 +619,7 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             num_tokens=num_tokens,
             new_computed_blocks=[],
             total_computed_tokens=total_computed,
+            num_local_computed_tokens=0,
             num_tokens_main_model=num_tokens,
         )
         new_blocks = manager.allocate_new_blocks(
@@ -484,3 +630,278 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+def test_full_attention_partial_tail_same_step_guard():
+    """A partial tail entry registered this step covers KV that is only
+    written during this step's execution, while a consumer's CoW copy runs at
+    step start. Consumers hitting the fresh entry must be deferred one step
+    (mirrors the mamba guard in ``MambaManager.get_num_blocks_to_allocate``).
+    """
+    init_none_hash(sha256)
+    hash_block_size = 2
+    block_size = 4
+    block_pool = BlockPool(
+        num_gpu_blocks=20, enable_caching=True, hash_block_size=hash_block_size
+    )
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    manager = FullAttentionManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+
+    sampling_params = SamplingParams(max_tokens=17)
+    sampling_params.update_from_generation_config({}, eos_token_id=100)
+    producer = Request(
+        request_id="producer",
+        prompt_token_ids=[0, 0, 1, 1, 2, 2],
+        sampling_params=sampling_params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(hash_block_size, sha256),
+    )
+    blocks = manager.allocate_new_blocks("producer", 6, 6)
+    assert len(blocks) == 2
+    # Caches block 0 as full and freshly registers the partial tail at 6
+    # tokens on block 1.
+    manager.cache_blocks(producer, 6)
+
+    hit_blocks = list(manager.req_to_blocks["producer"])
+    # Same step: a consumer hitting the fresh partial tail must be deferred.
+    num_blocks = manager.get_num_blocks_to_allocate("consumer", 8, hit_blocks, 6, 6, 8)
+    assert num_blocks > block_pool.num_gpu_blocks
+
+    # Next step the entry's KV has been written; the hit is consumable.
+    manager.new_step_starts()
+    num_blocks = manager.get_num_blocks_to_allocate("consumer", 8, hit_blocks, 6, 6, 8)
+    assert num_blocks <= block_pool.num_gpu_blocks
+
+
+@pytest.mark.parametrize(
+    "pool_hash_size,alignment_tokens",
+    [
+        (2, 2),  # fine-grained partial hits
+        (2, 4),  # coarse via a block-size view (alignment == block_size)
+        (4, 4),  # coarse on raw hashes (hash_block_size == block_size)
+        (2, 8),  # coarse, alignment > block_size (hybrid page sizes)
+        (4, 8),
+    ],
+)
+@pytest.mark.parametrize("sliding_window", [3, 5, 8, 13])
+@pytest.mark.parametrize("drop_eagle_block", [False, True])
+def test_sliding_window_cache_hit_matches_naive_oracle(
+    pool_hash_size, alignment_tokens, sliding_window, drop_eagle_block
+):
+    """Randomized parity: the optimized claim walk (memoized block lookups,
+    jump-ahead on coverage failure) must match a naive walk that re-checks
+    every aligned claim from scratch."""
+    block_size = 4
+    num_hashes = 40
+    fine = alignment_tokens < block_size
+    lookup_unit = alignment_tokens if fine else block_size
+    drop_tokens = lookup_unit if drop_eagle_block else 0
+    resolved_len = (
+        num_hashes
+        if pool_hash_size == lookup_unit
+        else num_hashes * pool_hash_size // block_size
+    )
+
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=sliding_window,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=200, enable_caching=True, hash_block_size=pool_hash_size
+    )
+    null_id = block_pool.null_block.block_id
+    rng = random.Random(
+        f"{pool_hash_size}-{alignment_tokens}-{sliding_window}-{drop_eagle_block}"
+    )
+
+    for trial in range(150):
+        block_pool.cached_block_hash_to_block._cache.clear()
+        hashes = [BlockHash(f"{trial}-{i}".encode()) for i in range(num_hashes)]
+        cached: dict[int, int] = {}
+        for i in range(num_hashes):
+            if rng.random() < 0.55:
+                cached[i] = 10 + i
+                block_pool.cached_block_hash_to_block.insert(
+                    make_block_hash_with_group_id(hashes[i], 0),
+                    block_pool.blocks[10 + i],
+                )
+        max_length = rng.randrange(0, num_hashes * pool_hash_size + 5)
+
+        def entry_id(u: int, cached=cached) -> int | None:
+            # Visible entries sit on lookup_unit boundaries; the key at
+            # boundary u is the raw hash ending there.
+            if u <= 0 or u % lookup_unit != 0 or u // pool_hash_size > num_hashes:
+                return None
+            return cached.get(u // pool_hash_size - 1)
+
+        def naive(max_length=max_length, entry_id=entry_id) -> tuple[list[int], int]:
+            max_tokens = min(max_length, resolved_len * lookup_unit)
+            max_claim = (
+                (max_tokens - drop_tokens) // alignment_tokens * alignment_tokens
+            )
+            for claim in range(max_claim, 0, -alignment_tokens):
+                u = claim + drop_tokens
+                eid = entry_id(u)
+                if eid is None:
+                    continue
+                entry_block_idx = (u - 1) // block_size
+                last_block_idx = (claim - 1) // block_size
+                first_block_idx = max(claim - sliding_window + 1, 0) // block_size
+                ids = []
+                for j in range(first_block_idx, last_block_idx + 1):
+                    bid = (
+                        eid if j == entry_block_idx else entry_id((j + 1) * block_size)
+                    )
+                    if bid is None:
+                        break
+                    ids.append(bid)
+                else:
+                    return [null_id] * first_block_idx + ids, claim
+            return [], 0
+
+        blocks, hit_length = SlidingWindowManager.find_longest_cache_hit(
+            block_hashes=hashes,
+            max_length=max_length,
+            kv_cache_group_ids=[0],
+            block_pool=block_pool,
+            kv_cache_spec=spec,
+            drop_eagle_block=drop_eagle_block,
+            alignment_tokens=alignment_tokens,
+        )
+        exp_ids, exp_hit = naive()
+        assert ([b.block_id for b in blocks[0]], hit_length) == (exp_ids, exp_hit), (
+            f"trial={trial} max_length={max_length} cached={sorted(cached)}"
+        )
+
+
+@pytest.mark.parametrize(
+    "pool_hash_size,alignment_tokens",
+    [(2, 2), (2, 4), (4, 4), (2, 8), (4, 8)],
+)
+@pytest.mark.parametrize("drop_eagle_block", [False, True])
+def test_full_attention_cache_hit_matches_naive_oracle(
+    pool_hash_size, alignment_tokens, drop_eagle_block
+):
+    """Randomized parity for the unified full-attention lookup: full-block
+    prefix scan, fine-grained tail probe, eagle drop, and alignment trim."""
+    block_size = 4
+    num_hashes = 40
+    fine = alignment_tokens < block_size
+    resolved_len_blocks = num_hashes * pool_hash_size // block_size
+
+    spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=200, enable_caching=True, hash_block_size=pool_hash_size
+    )
+    rng = random.Random(f"{pool_hash_size}-{alignment_tokens}-{drop_eagle_block}")
+
+    for trial in range(150):
+        block_pool.cached_block_hash_to_block._cache.clear()
+        hashes = [BlockHash(f"{trial}-{i}".encode()) for i in range(num_hashes)]
+        cached: dict[int, int] = {}
+        for i in range(num_hashes):
+            if rng.random() < 0.55:
+                cached[i] = 10 + i
+                block_pool.cached_block_hash_to_block.insert(
+                    make_block_hash_with_group_id(hashes[i], 0),
+                    block_pool.blocks[10 + i],
+                )
+        max_length = rng.randrange(0, num_hashes * pool_hash_size + 5)
+
+        def naive(max_length=max_length, cached=cached) -> tuple[list[int], int]:
+            # Longest cached full-block prefix.
+            num_full = 0
+            while (
+                num_full < min(max_length // block_size, resolved_len_blocks)
+                and ((num_full + 1) * block_size // pool_hash_size - 1) in cached
+            ):
+                num_full += 1
+            hit = num_full * block_size
+            full_ids = [
+                cached[(j + 1) * block_size // pool_hash_size - 1]
+                for j in range(num_full)
+            ]
+            # Fine-grained: highest cached interior boundary of the first
+            # non-full block.
+            tail_id = None
+            if fine:
+                lo = num_full * block_size
+                hi = min(
+                    lo + block_size - alignment_tokens,
+                    max_length // alignment_tokens * alignment_tokens,
+                    num_hashes * alignment_tokens,
+                )
+                for u in range(hi, lo, -alignment_tokens):
+                    if (tail_id := cached.get(u // pool_hash_size - 1)) is not None:
+                        hit = u
+                        break
+            if drop_eagle_block and hit > 0:
+                hit -= min(alignment_tokens, block_size)
+            hit -= hit % alignment_tokens
+            num_blocks = -(-hit // block_size)
+            if tail_id is not None and num_blocks > num_full:
+                return full_ids + [tail_id], hit
+            return full_ids[:num_blocks], hit
+
+        blocks, hit_length = FullAttentionManager.find_longest_cache_hit(
+            block_hashes=hashes,
+            max_length=max_length,
+            kv_cache_group_ids=[0],
+            block_pool=block_pool,
+            kv_cache_spec=spec,
+            drop_eagle_block=drop_eagle_block,
+            alignment_tokens=alignment_tokens,
+        )
+        exp_ids, exp_hit = naive()
+        assert ([b.block_id for b in blocks[0]], hit_length) == (exp_ids, exp_hit), (
+            f"trial={trial} max_length={max_length} cached={sorted(cached)}"
+        )
+
+
+def test_full_attention_cache_hit_with_dcp():
+    """With DCP, block hashes are computed at block_size * dcp_world_size
+    granularity; the lookup must resolve the hash view at that scaled size
+    (regression: resolving at the unscaled size tripped an assert)."""
+    block_size, dcp_world_size = 4, 2
+    scaled = block_size * dcp_world_size
+    spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=scaled
+    )
+    hashes = [BlockHash(str(i).encode()) for i in range(4)]
+    for hash_idx, pool_block_id in ((0, 10), (1, 11)):
+        block_pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(hashes[hash_idx], 0),
+            block_pool.blocks[pool_block_id],
+        )
+
+    blocks, hit_length = FullAttentionManager.find_longest_cache_hit(
+        block_hashes=hashes,
+        max_length=30,
+        kv_cache_group_ids=[0],
+        block_pool=block_pool,
+        kv_cache_spec=spec,
+        drop_eagle_block=False,
+        alignment_tokens=scaled,
+        dcp_world_size=dcp_world_size,
+    )
+    # Each hash covers 8 tokens; two cached scaled blocks -> 16 tokens.
+    assert ([b.block_id for b in blocks[0]], hit_length) == ([10, 11], 16)

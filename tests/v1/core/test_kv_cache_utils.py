@@ -1404,12 +1404,15 @@ def test_get_max_concurrency_for_kv_cache_config():
         enable_chunked_prefill=True,
         max_model_len=model_config.max_model_len,
         is_encoder_decoder=model_config.is_encoder_decoder,
+        # Pin to sync: SWA per-request bounds grow with overlapping batches.
+        async_scheduling=False,
     )
 
     vllm_config = VllmConfig(
         model_config=model_config,
         scheduler_config=scheduler_config,
     )
+    assert vllm_config.max_concurrent_batches == 1
 
     full_attention_spec = FullAttentionSpec(
         block_size=16,
@@ -2509,3 +2512,87 @@ def test_hma_not_disabled_when_kv_events_enabled():
     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
         "kv_events_config must not force-disable the hybrid KV cache manager."
     )
+
+
+def test_resolve_block_hashes_gate():
+    # Resolve symbols through the module so they stay consistent with each other
+    # even after other tests reload ``kv_cache_utils``.
+    resolve_block_hashes = kv_cache_utils.resolve_block_hashes
+    BlockHashListWithBlockSize = kv_cache_utils.BlockHashListWithBlockSize
+    # Raw, hash_block_size-granularity hashes (contents are opaque here).
+    raw = [BlockHash(bytes([i])) for i in range(8)]
+
+    # block_size == hash_block_size: always reuse the raw hashes.
+    assert resolve_block_hashes(raw, 2, 2, alignment_tokens=2) is raw
+    assert (
+        resolve_block_hashes(
+            raw, 2, 2, supports_fine_grained_hash_lookup=True, alignment_tokens=2
+        )
+        is raw
+    )
+
+    # Fine-grained manager, partial hits ON (alignment_tokens == hash_block_size
+    # < block_size): keep raw hashes so the manager can scan at hash granularity.
+    assert (
+        resolve_block_hashes(
+            raw, 2, 4, supports_fine_grained_hash_lookup=True, alignment_tokens=2
+        )
+        is raw
+    )
+
+    # Fine-grained manager, partial hits OFF (alignment_tokens ==
+    # scheduler_block_size >= block_size): must fall back to a block-size view,
+    # exactly like the pre-refactor coordinator did.
+    off = resolve_block_hashes(
+        raw, 2, 4, supports_fine_grained_hash_lookup=True, alignment_tokens=4
+    )
+    assert isinstance(off, BlockHashListWithBlockSize)
+    assert off.scale_factor == 2
+
+    # Non-fine-grained manager (e.g. sliding window): always a block-size view
+    # when block_size != hash_block_size, regardless of alignment_tokens.
+    swa = resolve_block_hashes(
+        raw, 2, 4, supports_fine_grained_hash_lookup=False, alignment_tokens=2
+    )
+    assert isinstance(swa, BlockHashListWithBlockSize)
+    assert swa.scale_factor == 2
+
+
+def test_resolve_block_hashes_rejects_mismatched_view():
+    resolve_block_hashes = kv_cache_utils.resolve_block_hashes
+    BlockHashListWithBlockSize = kv_cache_utils.BlockHashListWithBlockSize
+    raw = [BlockHash(bytes([i])) for i in range(8)]
+
+    # A view built at this block_size is returned as-is (idempotent).
+    view = BlockHashListWithBlockSize(raw, 2, 4)
+    assert resolve_block_hashes(view, 2, 4) is view
+
+    # A view built at a different block_size must fail loudly rather than be
+    # silently reinterpreted at the wrong granularity.
+    mismatched = BlockHashListWithBlockSize(raw, 2, 8)
+    with pytest.raises(AssertionError):
+        resolve_block_hashes(mismatched, 2, 4)
+
+
+def test_resolve_kv_cache_block_sizes_rejects_single_group_hash_override():
+    """A single KV cache group has nothing to gain from a finer hash block
+    size (fine-grained partial hits are hybrid-only), and with context
+    parallelism hashes must be computed at the scaled block size — fail fast
+    instead of silently ignoring the override."""
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    kv_cache_config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer1"], new_kv_cache_spec())],
+    )
+    block_size = vllm_config.cache_config.block_size
+
+    # A matching value is a no-op and passes.
+    vllm_config.cache_config.hash_block_size = block_size
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    ) == (block_size, block_size)
+
+    vllm_config.cache_config.hash_block_size = block_size // 2
+    with pytest.raises(ValueError, match="single KV cache group"):
+        kv_cache_utils.resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)

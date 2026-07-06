@@ -251,6 +251,7 @@ class Scheduler(SchedulerInterface):
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
+        self.hash_block_size = hash_block_size
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -265,6 +266,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            max_concurrent_batches=vllm_config.max_concurrent_batches,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -289,6 +291,17 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        # Fine-grained partial prefix-cache entries for mamba can only be
+        # registered by a step that ends EXACTLY at the prompt's last hash
+        # boundary (the state block is rewritten in place afterwards). When
+        # partial hits are on, the split adds that stop so every prompt gets
+        # a partial tail entry, not just prompts that are hash-aligned.
+        self.mamba_partial_tail_stop = bool(
+            self.need_mamba_block_aligned_split
+            and getattr(
+                self.kv_cache_manager.coordinator, "enable_partial_hash_hits", False
+            )
+        )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -297,6 +310,21 @@ class Scheduler(SchedulerInterface):
         # FIFO of (fence_seq, blocks): blocks become safe to free once
         # processed_step_seq >= fence_seq.
         self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
+        # Fence for the most recently emitted KV block copies: the seq of the
+        # first non-empty step whose completion implies the copies have run
+        # (same-stream ordering). Copies riding a 0-token step (async KV
+        # loads only) never advance sched_step_seq themselves, so this can
+        # point one step past it.
+        self.cow_copy_fence_seq = 0
+        # Fence partial-hit CoW retention releases like request-level frees: the step
+        # that runs the queued block copy may still be in flight when the
+        # next schedule() releases the retentions, and a KV-consumer
+        # connector could otherwise reallocate a copy endpoint as a load
+        # destination and overwrite it via a transfer that is not ordered
+        # against the copy.
+        self.kv_cache_manager.cow_retained_block_free_handler = (
+            self._free_cow_retained_blocks
+        )
 
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -360,9 +388,29 @@ class Scheduler(SchedulerInterface):
             if self.use_eagle:
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
-            if num_computed_tokens_after_sched < last_cache_position:
-                # align to block_size
-                num_new_tokens = num_new_tokens // block_size * block_size
+            next_boundary = (num_computed_tokens // block_size + 1) * block_size
+            if (
+                num_computed_tokens % block_size != 0
+                and next_boundary <= last_cache_position
+                and num_computed_tokens_after_sched > next_boundary
+            ):
+                # Resumed mid-block (fine-grained partial prefix-cache hit):
+                # the resumed block's boundary state must be materialized
+                # before running past it — align-mode caching registers that
+                # block under its block-end hash, and the state is only
+                # written when a step ends exactly at the boundary. Stop the
+                # first chunk there; subsequent chunks are aligned again.
+                num_new_tokens = next_boundary - num_computed_tokens
+            elif num_computed_tokens_after_sched < last_cache_position:
+                # Align the chunk END (not its length) to block_size:
+                # num_computed_tokens can sit mid-block after a fine-grained
+                # partial hit, and flooring only the length would keep every
+                # subsequent step end unaligned. Identical to the previous
+                # behavior when num_computed_tokens is aligned. May yield 0
+                # (insufficient budget to reach the next boundary); the
+                # caller then skips the request for this step.
+                aligned_end = num_computed_tokens_after_sched // block_size * block_size
+                num_new_tokens = max(aligned_end - num_computed_tokens, 0)
             elif (
                 num_computed_tokens
                 < last_cache_position
@@ -371,8 +419,23 @@ class Scheduler(SchedulerInterface):
                 # force to cache the last chunk
                 num_new_tokens = last_cache_position - num_computed_tokens
             else:
-                # prefill the last few tokens
-                pass
+                # Prefill of the final partial block. When fine-grained
+                # partial hits are on, stop once more at the prompt's last
+                # hash boundary: the mamba partial tail entry can only be
+                # registered by a step ending exactly there (the state block
+                # is rewritten in place afterwards). Without this stop only
+                # hash-aligned prompts ever produce a mamba partial entry.
+                if self.mamba_partial_tail_stop:
+                    hash_bs = self.hash_block_size
+                    tail_boundary = request.num_prompt_tokens // hash_bs * hash_bs
+                    if (
+                        num_computed_tokens
+                        < tail_boundary
+                        < num_computed_tokens_after_sched
+                        and tail_boundary < request.num_prompt_tokens
+                        and tail_boundary > last_cache_position
+                    ):
+                        num_new_tokens = tail_boundary - num_computed_tokens
 
             # Marconi cache admission optimization:
             # cache common prefixes by scheduling num_new_tokens = common prefix length
@@ -1072,6 +1135,15 @@ class Scheduler(SchedulerInterface):
             if self.needs_kv_cache_zeroing
             else None
         )
+        kv_cache_block_copies = (
+            self.kv_cache_manager.take_kv_cache_block_copies() or None
+        )
+        if kv_cache_block_copies:
+            # The copies are dispatched with this step; the first non-empty
+            # step at or after it gets seq `sched_step_seq + 1` (0-token
+            # steps do not advance the seq), and its completion implies the
+            # copies have run.
+            self.cow_copy_fence_seq = self.sched_step_seq + 1
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -1096,6 +1168,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            kv_cache_block_copies=kv_cache_block_copies,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
 
@@ -1165,6 +1238,7 @@ class Scheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
+            request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
                 request.last_sched_seq = self.sched_step_seq
@@ -1550,10 +1624,12 @@ class Scheduler(SchedulerInterface):
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
+            request = self.requests.get(req_id)
+            if request is not None:
+                request.num_in_flight_tokens -= num_tokens_scheduled
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
-            request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
@@ -2118,11 +2194,28 @@ class Scheduler(SchedulerInterface):
         if blocks:
             self.deferred_frees.append((self.sched_step_seq, blocks))
 
+    def _free_cow_retained_blocks(self, blocks: list[KVCacheBlock]):
+        """Release the previous step's CoW copy retentions
+        (`new_step_starts`), deferring the return to the block pool while the
+        step that runs the queued copy may still be in flight on the GPU.
+        """
+        if not blocks:
+            return
+        # `cow_copy_fence_seq` was recorded when the copies were emitted; it
+        # is the seq of the first non-empty step ordered after them.
+        if not self.defer_block_free or (
+            self.cow_copy_fence_seq <= self.processed_step_seq
+        ):
+            self.kv_cache_manager.block_pool.free_blocks(blocks)
+            return
+        self.deferred_frees.append((self.cow_copy_fence_seq, blocks[::-1]))
+
     def _drain_deferred_frees(self):
         """Return deferred blocks whose fence step has completed.
 
-        Entries are appended with monotonically non-decreasing fences, so
-        stop at the first one that is still pending.
+        Fences are appended in near-monotonic order (a CoW retention fence
+        can lead request-free fences by one step), so stop at the first
+        pending one; any satisfied entry behind it is merely freed later.
         """
         while self.deferred_frees:
             fence, _ = self.deferred_frees[0]
@@ -2338,10 +2431,12 @@ class Scheduler(SchedulerInterface):
             return False, None
 
         # Free any out-of-window prefix blocks before we hand the block table to
-        # the connector.
+        # the connector, on the processed-token basis (see `allocate_slots`).
         self.kv_cache_manager.remove_skipped_blocks(
             request_id=request.request_id,
-            total_computed_tokens=request.num_computed_tokens,
+            total_computed_tokens=max(
+                0, request.num_computed_tokens - request.num_in_flight_tokens
+            ),
         )
 
         block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
@@ -2365,6 +2460,7 @@ class Scheduler(SchedulerInterface):
             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
             num_encoder_tokens=0,
             total_computed_tokens=request.num_computed_tokens,
+            num_local_computed_tokens=request.num_computed_tokens,
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
         )

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -10,7 +10,7 @@ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -123,6 +123,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        max_concurrent_batches: int = 1,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -152,6 +153,7 @@ class KVCacheManager:
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            max_concurrent_batches=max_concurrent_batches,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -178,6 +180,15 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+        # Optional hook for the CoW copy retentions handed back by
+        # `new_step_starts`. The scheduler installs it to defer the free
+        # while the step that runs the queued copy may still be in flight
+        # (see Scheduler._free_cow_retained_blocks). When unset, the
+        # retained blocks are freed immediately.
+        self.cow_retained_block_free_handler: (
+            Callable[[list[KVCacheBlock]], None] | None
+        ) = None
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -201,7 +212,6 @@ class KVCacheManager:
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
-        Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
@@ -379,6 +389,7 @@ class KVCacheManager:
                 new_computed_blocks=new_computed_block_list,
                 num_encoder_tokens=num_encoder_tokens,
                 total_computed_tokens=total_computed_tokens,
+                num_local_computed_tokens=num_local_computed_tokens,
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
@@ -397,8 +408,12 @@ class KVCacheManager:
         # insufficient free blocks.
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
+        # Free on the processed-token basis: in-flight steps' attention windows
+        # still read blocks below the optimistic boundary, and rejected spec
+        # tokens can roll it back.
         self.coordinator.remove_skipped_blocks(
-            request.request_id, total_computed_tokens
+            request.request_id,
+            max(0, total_computed_tokens - request.num_in_flight_tokens),
         )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
@@ -408,6 +423,7 @@ class KVCacheManager:
             num_encoder_tokens=num_encoder_tokens,
             total_computed_tokens=num_local_computed_tokens
             + num_external_computed_tokens,
+            num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
         )
 
@@ -609,6 +625,25 @@ class KVCacheManager:
             ids.extend(mgr.take_new_block_ids())
         return ids
 
+    def take_kv_cache_block_copies(self) -> list[KVCacheBlockCopy]:
+        """Drain and return pending KV cache block copies."""
+        copies: list[KVCacheBlockCopy] = []
+        for mgr in self.coordinator.single_type_managers:
+            copies.extend(mgr.take_kv_cache_block_copies())
+        return copies
+
     def new_step_starts(self) -> None:
-        """Called when a new step is started."""
-        self.coordinator.new_step_starts()
+        """Called when a new step is started.
+
+        CoW copy retentions from the previous step are handed to
+        `cow_retained_block_free_handler` when the scheduler installed one
+        (to fence the free against the copy's step still being in flight);
+        otherwise they are released immediately.
+        """
+        retained_blocks = self.coordinator.new_step_starts()
+        if not retained_blocks:
+            return
+        if self.cow_retained_block_free_handler is not None:
+            self.cow_retained_block_free_handler(retained_blocks)
+        else:
+            self.block_pool.free_blocks(retained_blocks)
