@@ -6,10 +6,11 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Worker-side logic for MooncakeStoreConnector.
 
-Includes the store worker, transfer threads, lookup server,
-and MooncakeDistributedStore integration.
+Includes the store worker, transfer threads, the admin (reset) server, the
+lookup subprocess, and MooncakeDistributedStore integration.
 """
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -19,7 +20,6 @@ import threading
 import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Literal, TypeVar
 
@@ -51,6 +51,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
+    RECORD_BP_MSG,
     RESET_MSG,
     RESP_ERR,
     RESP_OK,
@@ -98,6 +99,93 @@ class SessionBreakpoint:
 
     aligned_token_len: int
     boundary_block_hash: bytes
+
+
+class SessionBreakpointTracker:
+    """Per-session history of stored boundaries for the lookup fast path.
+
+    Owned by the lookup subprocess (single-threaded REP loop, so no
+    locking). Entries are hints, not truth: every fast-path result is
+    re-verified against the store, so entries staled by eviction, a store
+    reset, or a not-yet-landed save self-heal by falling back to the full
+    scan.
+    """
+
+    def __init__(
+        self,
+        hash_block_size: int,
+        lcm_block_size: int,
+        history_size: int,
+    ):
+        self._hash_block_size = hash_block_size
+        self._lcm_block_size = lcm_block_size
+        self._history_size = history_size
+        self._sessions: OrderedDict[str, list[SessionBreakpoint]] = OrderedDict()
+
+    def record(
+        self,
+        session_id: str | None,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+    ) -> None:
+        if not session_id or token_len <= 0 or self._hash_block_size <= 0:
+            return
+        aligned_token_len = token_len // self._lcm_block_size * self._lcm_block_size
+        if aligned_token_len <= 0:
+            return
+        boundary_block_idx = aligned_token_len // self._hash_block_size - 1
+        if boundary_block_idx < 0 or boundary_block_idx >= len(block_hashes):
+            return
+        session_breakpoint = SessionBreakpoint(
+            aligned_token_len=aligned_token_len,
+            boundary_block_hash=bytes(block_hashes[boundary_block_idx]),
+        )
+        breakpoints = self._sessions.pop(session_id, [])
+        breakpoints = [
+            existing
+            for existing in breakpoints
+            if not (
+                existing.aligned_token_len == session_breakpoint.aligned_token_len
+                and existing.boundary_block_hash
+                == session_breakpoint.boundary_block_hash
+            )
+        ]
+        breakpoints.insert(0, session_breakpoint)
+        del breakpoints[self._history_size :]
+        self._sessions[session_id] = breakpoints
+        while len(self._sessions) > SESSION_BREAKPOINT_MAX_SESSIONS:
+            self._sessions.popitem(last=False)
+
+    def best_len(
+        self,
+        session_id: str | None,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+    ) -> int | None:
+        """Longest recorded boundary whose anchor hash still matches."""
+        if not session_id or token_len <= 0 or self._hash_block_size <= 0:
+            return None
+        breakpoints = self._sessions.get(session_id)
+        if not breakpoints:
+            return None
+        self._sessions.move_to_end(session_id)
+
+        best_breakpoint_len: int | None = None
+        for session_breakpoint in breakpoints:
+            if session_breakpoint.aligned_token_len > token_len:
+                continue
+            breakpoint_len = session_breakpoint.aligned_token_len
+            boundary_block_idx = breakpoint_len // self._hash_block_size - 1
+            if boundary_block_idx < 0 or boundary_block_idx >= len(block_hashes):
+                continue
+            if (
+                bytes(block_hashes[boundary_block_idx])
+                != session_breakpoint.boundary_block_hash
+            ):
+                continue
+            if best_breakpoint_len is None or breakpoint_len > best_breakpoint_len:
+                best_breakpoint_len = breakpoint_len
+        return best_breakpoint_len
 
 
 @dataclass
@@ -460,10 +548,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
         enable_kv_event: bool = False,
         replicate_config: Any = None,
         record_operation: Callable[..., None] | None = None,
-        record_session_breakpoint: Callable[
-            [str | None, int, Sequence[BlockHash]], None
-        ]
-        | None = None,
     ):
         super().__init__(
             store,
@@ -482,7 +566,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Caller always passes a non-None ReplicateConfig — see
         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
         self.replicate_config = replicate_config
-        self._record_session_breakpoint_cb = record_session_breakpoint
 
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
@@ -509,10 +592,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._saved_offset.pop(req_id, None)
 
     def _record_saved(self, req_id: str, token_len: int) -> None:
-        # Guard on liveness so a concurrent finish/preempt pop isn't recreated.
+        # Guard on liveness so a concurrent finish/preempt pop isn't
+        # recreated. max(): the event requeue can reorder batches, and a
+        # stale lower batch must not roll back the high-water mark (that
+        # would re-enqueue redundant exist checks for already-saved ranges).
         with self.done_task_lock:
             if req_id in self.stored_requests:
-                self._saved_offset[req_id] = token_len
+                self._saved_offset[req_id] = max(
+                    self._saved_offset.get(req_id, 0), token_len
+                )
 
     def _should_skip_request(self, req_id: str) -> bool:
         with self.done_task_lock:
@@ -532,15 +620,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._store_pressure_active = False
             self._skip_store_requests.clear()
         return True
-
-    def _record_session_breakpoint(self, req_meta: ReqMeta, token_len: int) -> None:
-        if self._record_session_breakpoint_cb is None:
-            return
-        self._record_session_breakpoint_cb(
-            req_meta.session_id,
-            token_len,
-            req_meta.block_hashes,
-        )
 
     def _handle_request(self, req_meta: ReqMeta):
         # Cache hits are always a multiple of ``lcm_block_size`` tokens, which
@@ -641,7 +720,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             if not missing_indices:
                 self._record_saved(req_id, token_len)
-                self._record_session_breakpoint(req_meta, token_len)
                 return
 
             if len(missing_indices) != len(keys):
@@ -745,7 +823,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         )
                 else:
                     self._record_saved(req_id, token_len)
-                    self._record_session_breakpoint(req_meta, token_len)
                     if self._clear_store_pressure():
                         logger.info(
                             "Mooncake CPU/disk offloading pressure cleared "
@@ -1046,17 +1123,12 @@ class MooncakeStoreWorker:
             self.head_or_tp_rank = self.tp_rank
             self.put_step = 1
 
-        self.metadata = KeyMetadata(
-            model_name=model_config.model.rstrip("/").split("/")[-1],
+        self.metadata = build_key_metadata(
+            vllm_config,
             tp_rank=self.head_or_tp_rank,
             pcp_rank=self.pcp_rank,
             dcp_rank=self.dcp_rank,
             pp_rank=self.pp_rank,
-            cache_prefix=str(
-                vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-                    "cache_prefix", ""
-                )
-            ),
         )
 
         # Initialize MooncakeDistributedStore with its own TransferEngine
@@ -1124,21 +1196,11 @@ class MooncakeStoreWorker:
             if store_config.enable_offload
             else None
         )
-        self._session_breakpoints_enabled = (
-            envs.VLLM_MOONCAKE_SESSION_BREAKPOINTS and self.kv_role != "kv_consumer"
-        )
-        self._session_breakpoint_history_size = (
-            envs.VLLM_MOONCAKE_SESSION_BREAKPOINT_HISTORY_SIZE
-        )
-        self._session_breakpoints: OrderedDict[str, list[SessionBreakpoint]] = (
-            OrderedDict()
-        )
-        self._session_breakpoints_lock = threading.Lock()
-
-        # Start lookup server on rank 0 for scheduler-side prefix queries
-        self.lookup_server: LookupKeyServer | None = None
+        # Admin (reset) server on rank 0; prefix lookups are served by the
+        # scheduler-owned lookup subprocess, not the worker.
+        self.admin_server: StoreAdminServer | None = None
         if vllm_config.parallel_config.rank == 0:
-            self.lookup_server = LookupKeyServer(self, vllm_config)
+            self.admin_server = StoreAdminServer(self, vllm_config)
 
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = False
@@ -1155,33 +1217,8 @@ class MooncakeStoreWorker:
         self.kv_connector_stats = MooncakeStoreConnectorStats()
 
         self._kv_cache_config = kv_cache_config
-        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
-        # self.block_size (= scheduler_block_size) so the coordinator's
-        # ``block_size % hash_block_size == 0`` invariant holds.
-        groups = list(kv_cache_config.kv_cache_groups)
-        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
-            g = groups[0]
-            groups = [
-                dataclasses.replace(
-                    g,
-                    kv_cache_spec=dataclasses.replace(
-                        g.kv_cache_spec, block_size=self.block_size
-                    ),
-                )
-            ]
-        self._kv_cache_groups: list[KVCacheGroupSpec] = groups
-        spec_cfg = getattr(vllm_config, "speculative_config", None)
-        use_eagle = bool(
-            spec_cfg.use_eagle()
-            if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
-            else False
-        )
-        self.coord = MooncakeStoreCoordinator(
-            self._kv_cache_groups,
-            scheduler_block_size=self.block_size,
-            hash_block_size=self.hash_block_size,
-            use_eagle=use_eagle,
-            retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
+        self._kv_cache_groups, self.coord = build_store_coordinator(
+            vllm_config, kv_cache_config, self.block_size, self.hash_block_size
         )
         # One ChunkedTokenDatabase per group; addresses populated in
         # register_kv_caches once the kv-cache layout is known.
@@ -1193,46 +1230,6 @@ class MooncakeStoreWorker:
             )
             for g_idx, g in enumerate(self._kv_cache_groups)
         ]
-        self._init_lookup_key_prefixes()
-
-    def _init_lookup_key_prefixes(self) -> None:
-        """Prepare per-group key prefixes across parallel rank namespaces."""
-        # (tp_rank, pcp_rank, dcp_rank, pp_rank) namespaces
-        if self.dcp_size > 1:
-            # DCP reuses the TP workers and splits each TP group into
-            # contiguous DCP groups, so dcp_rank == tp_rank % dcp_size.
-            # Store/load paths do not apply KV-head dedup under DCP
-            rank_namespaces = tuple(
-                (tp_rank, pcp_rank, tp_rank % self.dcp_size, pp_rank)
-                for pcp_rank in range(self.pcp_size)
-                for tp_rank in range(self.tp_size)
-                for pp_rank in range(self.pp_size)
-            )
-        else:
-            # Without DCP, TP ranks that share a KV head write identical KV, so
-            # lookup only needs one TP namespace per unique KV head.
-            tp_count = min(self.tp_size, self.num_kv_head)
-            rank_namespaces = tuple(
-                (tp_rank, pcp_rank, 0, pp_rank)
-                for pcp_rank in range(self.pcp_size)
-                for tp_rank in range(tp_count)
-                for pp_rank in range(self.pp_size)
-            )
-
-        self._lookup_key_prefixes = tuple(
-            tuple(
-                PoolKey.build_prefix(
-                    db.metadata,
-                    tp_rank=tp_rank,
-                    pcp_rank=pcp_rank,
-                    dcp_rank=dcp_rank,
-                    pp_rank=pp_rank,
-                )
-                for tp_rank, pcp_rank, dcp_rank, pp_rank in rank_namespaces
-            )
-            for db in self.token_dbs
-        )
-        self._lookup_expected_per_key = len(rank_namespaces)
 
     def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
         """Register a cross-layers KV cache tensor.
@@ -1331,14 +1328,6 @@ class MooncakeStoreWorker:
                 self.enable_kv_events,
                 self.store_replicate_config,
                 record_operation=self._record_kv_connector_operation,
-                record_session_breakpoint=(
-                    self._record_session_breakpoint
-                    if (
-                        self._session_breakpoints_enabled
-                        and self.lookup_server is not None
-                    )
-                    else None
-                ),
             )
             self.kv_send_thread.start()
 
@@ -1504,212 +1493,6 @@ class MooncakeStoreWorker:
 
         return finished_sending
 
-    def _record_session_breakpoint(
-        self,
-        session_id: str | None,
-        token_len: int,
-        block_hashes: Sequence[BlockHash],
-    ) -> None:
-        if not self._session_breakpoints_enabled or not session_id or token_len <= 0:
-            return
-
-        lcm_block_size = self.coord.lcm_block_size
-        aligned_token_len = token_len // lcm_block_size * lcm_block_size
-        if aligned_token_len <= 0 or self.hash_block_size <= 0:
-            return
-
-        boundary_block_idx = aligned_token_len // self.hash_block_size - 1
-        if boundary_block_idx < 0 or boundary_block_idx >= len(block_hashes):
-            return
-
-        session_breakpoint = SessionBreakpoint(
-            aligned_token_len=aligned_token_len,
-            boundary_block_hash=bytes(block_hashes[boundary_block_idx]),
-        )
-        with self._session_breakpoints_lock:
-            breakpoints = self._session_breakpoints.pop(session_id, [])
-            breakpoints = [
-                existing
-                for existing in breakpoints
-                if not (
-                    existing.aligned_token_len == session_breakpoint.aligned_token_len
-                    and existing.boundary_block_hash
-                    == session_breakpoint.boundary_block_hash
-                )
-            ]
-            breakpoints.insert(0, session_breakpoint)
-            del breakpoints[self._session_breakpoint_history_size :]
-            self._session_breakpoints[session_id] = breakpoints
-            while len(self._session_breakpoints) > SESSION_BREAKPOINT_MAX_SESSIONS:
-                self._session_breakpoints.popitem(last=False)
-
-    def _get_session_breakpoint_len(
-        self,
-        session_id: str | None,
-        token_len: int,
-        block_hashes: Sequence[BlockHash],
-    ) -> int | None:
-        if not self._session_breakpoints_enabled or not session_id or token_len <= 0:
-            return None
-
-        with self._session_breakpoints_lock:
-            breakpoints = self._session_breakpoints.get(session_id)
-            if not breakpoints:
-                return None
-            breakpoint_snapshot = tuple(breakpoints)
-            self._session_breakpoints.move_to_end(session_id)
-
-        if self.hash_block_size <= 0:
-            return None
-
-        best_breakpoint_len: int | None = None
-        for session_breakpoint in breakpoint_snapshot:
-            if session_breakpoint.aligned_token_len > token_len:
-                continue
-            breakpoint_len = session_breakpoint.aligned_token_len
-            boundary_block_idx = breakpoint_len // self.hash_block_size - 1
-            if boundary_block_idx < 0 or boundary_block_idx >= len(block_hashes):
-                continue
-            if (
-                bytes(block_hashes[boundary_block_idx])
-                != session_breakpoint.boundary_block_hash
-            ):
-                continue
-            if best_breakpoint_len is None or breakpoint_len > best_breakpoint_len:
-                best_breakpoint_len = breakpoint_len
-        return best_breakpoint_len
-
-    def clear_session_breakpoints(self) -> None:
-        with self._session_breakpoints_lock:
-            self._session_breakpoints.clear()
-
-    def _session_breakpoint_lookup_is_dense(self, token_len: int) -> bool:
-        return all(
-            mask is None
-            for mask in self.coord.lookup_mask(
-                token_len,
-                aligned_boundary_token_len=token_len,
-            )
-        )
-
-    def _lookup_full(
-        self,
-        token_len: int,
-        block_hashes: Sequence[BlockHash],
-        aligned_boundary_token_len: int | None = None,
-    ) -> int:
-        """Check how many prefix tokens exist in the store.
-
-        Checks across all rank-specific key namespaces that may be loaded.
-        ``aligned_boundary_token_len`` narrows sparse (SWA) groups to the
-        blocks needed to prove one exact boundary, cutting candidate keys;
-        dense groups are unchanged.
-        """
-        if not block_hashes or token_len <= 0:
-            return 0
-
-        # Build per-(group, hash) candidate keys expanded across rank namespaces.
-        # candidate_meta stores the (group, hash_bytes) for key slice.
-        candidate_keys: list[str] = []
-        candidate_meta: list[tuple[int, bytes]] = []
-        lookup_masks = self.coord.lookup_mask(
-            token_len,
-            aligned_boundary_token_len=aligned_boundary_token_len,
-        )
-        for g_idx, db in enumerate(self.token_dbs):
-            spec_block_size = db.block_size
-            lookup_mask = lookup_masks[g_idx]
-            key_prefixes = self._lookup_key_prefixes[g_idx]
-            group_hashes = self.coord.block_hashes_for_spec(
-                block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
-            )
-            max_chunks = min(len(group_hashes), cdiv(token_len, spec_block_size))
-            mask_limit = (
-                max_chunks if lookup_mask is None else min(max_chunks, len(lookup_mask))
-            )
-            for chunk_id in range(mask_limit):
-                if lookup_mask is not None and not lookup_mask[chunk_id]:
-                    continue
-                h = group_hashes[chunk_id]
-                hash_hex = h.hex()
-                for key_prefix in key_prefixes:
-                    candidate_keys.append(
-                        PoolKey.build_key_string(key_prefix, hash_hex)
-                    )
-                candidate_meta.append((g_idx, bytes(h)))
-
-        if not candidate_keys:
-            return 0
-
-        lookup_start = time.perf_counter()
-        try:
-            res = self.store.batch_is_exist(candidate_keys)
-            self._record_kv_connector_operation(
-                "lookup_exists",
-                time.perf_counter() - lookup_start,
-                len(candidate_keys),
-            )
-        except Exception as e:
-            self._record_kv_connector_operation(
-                "lookup_exists",
-                time.perf_counter() - lookup_start,
-                len(candidate_keys),
-                status="error",
-                num_failed_keys=len(candidate_keys),
-            )
-            logger.error("Remote connection failed in lookup: %s", e)
-            return 0
-
-        # A (group, hash) is "present" only when every TP*PP rank has it.
-        ranks_per_candidate = self._lookup_expected_per_key
-        exists_set = {
-            (g_idx, hash_bytes)
-            for i, (g_idx, hash_bytes) in enumerate(candidate_meta)
-            if all(
-                res[i * ranks_per_candidate + j] == 1
-                for j in range(ranks_per_candidate)
-            )
-        }
-
-        _masks, hit_length = self.coord.find_longest_cache_hit(
-            block_hashes, token_len, ExternalCachedBlockPool(exists_set)
-        )
-        return hit_length
-
-    def lookup(
-        self,
-        token_len: int,
-        block_hashes: Sequence[BlockHash],
-        session_id: str | None = None,
-    ) -> int:
-        if not block_hashes or token_len <= 0:
-            return 0
-
-        breakpoint_len = self._get_session_breakpoint_len(
-            session_id,
-            token_len,
-            block_hashes,
-        )
-        if breakpoint_len is not None:
-            # TODO: Make this fast path EAGLE/MTP-aware. EAGLE may prune one
-            # matched block, and sparse groups may need a peek block outside the
-            # clamped boundary to validate a breakpoint.
-            breakpoint_hit = self._lookup_full(
-                breakpoint_len,
-                block_hashes,
-                aligned_boundary_token_len=breakpoint_len,
-            )
-            if breakpoint_hit == breakpoint_len or (
-                breakpoint_len == token_len
-                and self._session_breakpoint_lookup_is_dense(breakpoint_len)
-            ):
-                # A full breakpoint hit can skip the new tail. Exact-length
-                # partial hits are only final when the clamped scan is dense;
-                # sparse groups may have an earlier boundary for fallback.
-                return breakpoint_hit
-
-        return self._lookup_full(token_len, block_hashes)
-
     def get_kv_events(self) -> list[BlockStored]:
         if self.enable_kv_events and self.kv_send_thread is not None:
             return self.kv_send_thread.get_kv_events()
@@ -1722,6 +1505,16 @@ class MooncakeStoreWorker:
         buffers, and the connection to the master server. Idempotent so it is
         safe to call from both the explicit shutdown path and ``__del__``.
         """
+        admin_server = getattr(self, "admin_server", None)
+        if admin_server is not None:
+            if not admin_server.close():
+                # A wedged RESET handler is still using the store; leak both
+                # to process teardown rather than close the store under it.
+                # Keeping the admin_server reference lets a later close()
+                # (e.g. __del__ after shutdown) finish the job if the
+                # handler has exited by then.
+                return
+            self.admin_server = None
         store = getattr(self, "store", None)
         if store is None:
             return
@@ -1733,18 +1526,362 @@ class MooncakeStoreWorker:
 
 
 # ============================================================
-# Lookup Key Server
+# Prefix-hit lookup
+#
+# Served by a dedicated subprocess. Lookups are pure-Python heavy
+# (candidate-key construction + find_longest_cache_hit over up to ~100k
+# chunk hashes), and every in-engine home for that work starves on the GIL
+# under load: a worker-side thread competes with model execution (measured
+# ~72s per lookup at high concurrency vs milliseconds when idle), an
+# EngineCore thread competes with the scheduling loop, and even a
+# ProcessPoolExecutor stalls because its manager thread lives in
+# EngineCore. Hence: a spawn subprocess that owns its GIL, driven directly
+# over ZMQ (the client's send is C-level, no dispatch thread), with its own
+# store client so exist checks go straight to the master.
 # ============================================================
 
 
-class LookupKeyServer:
-    """ZMQ server on worker rank 0 for the LookupKey admin channel.
+@dataclass
+class LookupContext:
+    """Everything the lookup subprocess needs to answer prefix-hit queries."""
 
-    Handles two request types, tagged at frame 0:
-    - ``LOOKUP_MSG``: prefix-cache hit query, returns hit count.
+    coord: MooncakeStoreCoordinator
+    kv_cache_groups: list[KVCacheGroupSpec]
+    group_block_sizes: list[int]
+    lookup_key_prefixes: tuple[tuple[str, ...], ...]
+    # Keys per (group, hash) candidate; a hash counts as present only when
+    # every TP/PP-expanded key exists.
+    expected_per_key: int
+    breakpoints: SessionBreakpointTracker
+
+
+def build_key_metadata(
+    vllm_config: VllmConfig,
+    *,
+    tp_rank: int = 0,
+    pcp_rank: int = 0,
+    dcp_rank: int = 0,
+    pp_rank: int = 0,
+) -> KeyMetadata:
+    """Pool-key metadata, shared by the worker (real ranks) and the lookup
+    subprocess (rank 0 everywhere, matching the worker-rank-0 placement of
+    the lookup path it replaced)."""
+    assert vllm_config.kv_transfer_config is not None
+    return KeyMetadata(
+        model_name=vllm_config.model_config.model.rstrip("/").split("/")[-1],
+        tp_rank=tp_rank,
+        pcp_rank=pcp_rank,
+        dcp_rank=dcp_rank,
+        pp_rank=pp_rank,
+        cache_prefix=str(
+            vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+                "cache_prefix", ""
+            )
+        ),
+    )
+
+
+def build_store_coordinator(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+    scheduler_block_size: int,
+    hash_block_size: int,
+) -> tuple[list[KVCacheGroupSpec], MooncakeStoreCoordinator]:
+    """Normalized KV groups + coordinator, shared by the worker and the
+    lookup subprocess so the two can never disagree on group layout."""
+    # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
+    # scheduler_block_size so the coordinator's
+    # ``block_size % hash_block_size == 0`` invariant holds.
+    groups = list(kv_cache_config.kv_cache_groups)
+    if len(groups) == 1 and groups[0].kv_cache_spec.block_size != scheduler_block_size:
+        g = groups[0]
+        groups = [
+            dataclasses.replace(
+                g,
+                kv_cache_spec=dataclasses.replace(
+                    g.kv_cache_spec, block_size=scheduler_block_size
+                ),
+            )
+        ]
+    spec_cfg = getattr(vllm_config, "speculative_config", None)
+    use_eagle = bool(
+        spec_cfg.use_eagle()
+        if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
+        else False
+    )
+    coord = MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
+        use_eagle=use_eagle,
+        retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
+    )
+    return groups, coord
+
+
+def build_lookup_context(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+) -> LookupContext:
+    scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    )
+    groups, coord = build_store_coordinator(
+        vllm_config, kv_cache_config, scheduler_block_size, hash_block_size
+    )
+    metadata = build_key_metadata(vllm_config)
+    model_config = vllm_config.model_config
+    num_kv_head = (
+        1
+        if getattr(model_config, "use_mla", False)
+        else model_config.get_total_num_kv_heads()
+    )
+    parallel_config = vllm_config.parallel_config
+    tp_size = parallel_config.tensor_parallel_size
+    pp_size = parallel_config.pipeline_parallel_size
+    pcp_size = parallel_config.prefill_context_parallel_size
+    dcp_size = parallel_config.decode_context_parallel_size
+    # (tp_rank, pcp_rank, dcp_rank, pp_rank) namespaces
+    if dcp_size > 1:
+        # DCP reuses the TP workers and splits each TP group into
+        # contiguous DCP groups, so dcp_rank == tp_rank % dcp_size.
+        # Store/load paths do not apply KV-head dedup under DCP
+        rank_namespaces = tuple(
+            (tp_rank, pcp_rank, tp_rank % dcp_size, pp_rank)
+            for pcp_rank in range(pcp_size)
+            for tp_rank in range(tp_size)
+            for pp_rank in range(pp_size)
+        )
+    else:
+        # Without DCP, TP ranks that share a KV head write identical KV, so
+        # lookup only needs one TP namespace per unique KV head.
+        tp_count = min(tp_size, num_kv_head)
+        rank_namespaces = tuple(
+            (tp_rank, pcp_rank, 0, pp_rank)
+            for pcp_rank in range(pcp_size)
+            for tp_rank in range(tp_count)
+            for pp_rank in range(pp_size)
+        )
+    prefixes = tuple(
+        tuple(
+            PoolKey.build_prefix(
+                dataclasses.replace(metadata, group_id=g_idx),
+                tp_rank=tp_rank,
+                pcp_rank=pcp_rank,
+                dcp_rank=dcp_rank,
+                pp_rank=pp_rank,
+            )
+            for tp_rank, pcp_rank, dcp_rank, pp_rank in rank_namespaces
+        )
+        for g_idx in range(len(groups))
+    )
+    return LookupContext(
+        coord=coord,
+        kv_cache_groups=groups,
+        group_block_sizes=[g.kv_cache_spec.block_size for g in groups],
+        lookup_key_prefixes=prefixes,
+        expected_per_key=len(rank_namespaces),
+        breakpoints=SessionBreakpointTracker(
+            hash_block_size,
+            coord.lcm_block_size,
+            envs.VLLM_MOONCAKE_SESSION_BREAKPOINT_HISTORY_SIZE,
+        ),
+    )
+
+
+def run_lookup(
+    ctx: LookupContext,
+    exist_fn: Callable[[list[str]], list[int]],
+    token_len: int,
+    block_hashes: Sequence[BlockHash],
+    session_id: str | None = None,
+) -> int:
+    """Prefix-hit lookup with the session-breakpoint fast path.
+
+    A recorded breakpoint clamps the scan to one known boundary, cutting
+    candidate keys. The clamped result is trusted only when fully verified
+    against the store (or when the clamped scan is dense); otherwise fall
+    back to the full scan.
+    """
+    if not block_hashes or token_len <= 0:
+        return 0
+
+    breakpoint_len = ctx.breakpoints.best_len(session_id, token_len, block_hashes)
+    if breakpoint_len is not None:
+        # TODO: Make this fast path EAGLE/MTP-aware. EAGLE may prune one
+        # matched block, and sparse groups may need a peek block outside the
+        # clamped boundary to validate a breakpoint.
+        breakpoint_hit = _exist_lookup(
+            ctx,
+            exist_fn,
+            breakpoint_len,
+            block_hashes,
+            aligned_boundary_token_len=breakpoint_len,
+        )
+        if breakpoint_hit == breakpoint_len or (
+            breakpoint_len == token_len and _lookup_is_dense(ctx.coord, breakpoint_len)
+        ):
+            # A full breakpoint hit can skip the new tail. Exact-length
+            # partial hits are only final when the clamped scan is dense;
+            # sparse groups may have an earlier boundary for fallback.
+            return breakpoint_hit
+
+    return _exist_lookup(ctx, exist_fn, token_len, block_hashes)
+
+
+def _exist_lookup(
+    ctx: LookupContext,
+    exist_fn: Callable[[list[str]], list[int]],
+    token_len: int,
+    block_hashes: Sequence[BlockHash],
+    aligned_boundary_token_len: int | None = None,
+) -> int:
+    """How many prefix tokens exist in the store, across all TP/PP shards.
+
+    ``aligned_boundary_token_len`` narrows sparse (SWA) groups to the blocks
+    needed to prove one exact boundary; dense groups are unchanged.
+    """
+    # Per-(group, hash) candidate keys expanded across TP/PP;
+    # candidate_meta keeps (group, hash_bytes) so the exist result slices
+    # back to candidates.
+    candidate_keys: list[str] = []
+    candidate_meta: list[tuple[int, bytes]] = []
+    lookup_masks = ctx.coord.lookup_mask(
+        token_len,
+        aligned_boundary_token_len=aligned_boundary_token_len,
+    )
+    for g_idx, spec_block_size in enumerate(ctx.group_block_sizes):
+        lookup_mask = lookup_masks[g_idx]
+        key_prefixes = ctx.lookup_key_prefixes[g_idx]
+        group_hashes = ctx.coord.block_hashes_for_spec(
+            block_hashes, ctx.kv_cache_groups[g_idx].kv_cache_spec
+        )
+        max_chunks = min(len(group_hashes), cdiv(token_len, spec_block_size))
+        mask_limit = (
+            max_chunks if lookup_mask is None else min(max_chunks, len(lookup_mask))
+        )
+        for chunk_id in range(mask_limit):
+            if lookup_mask is not None and not lookup_mask[chunk_id]:
+                continue
+            h = group_hashes[chunk_id]
+            hash_hex = h.hex()
+            for key_prefix in key_prefixes:
+                candidate_keys.append(PoolKey.build_key_string(key_prefix, hash_hex))
+            candidate_meta.append((g_idx, bytes(h)))
+
+    if not candidate_keys:
+        return 0
+
+    try:
+        res = exist_fn(candidate_keys)
+    except Exception as e:
+        logger.error("Remote connection failed in lookup: %s", e)
+        return 0
+
+    ranks_per_candidate = ctx.expected_per_key
+    exists_set = {
+        (g_idx, hash_bytes)
+        for i, (g_idx, hash_bytes) in enumerate(candidate_meta)
+        if all(
+            res[i * ranks_per_candidate + j] == 1 for j in range(ranks_per_candidate)
+        )
+    }
+    _masks, hit_length = ctx.coord.find_longest_cache_hit(
+        block_hashes, token_len, ExternalCachedBlockPool(exists_set)
+    )
+    return hit_length
+
+
+def _lookup_is_dense(coord: MooncakeStoreCoordinator, token_len: int) -> bool:
+    return all(
+        mask is None
+        for mask in coord.lookup_mask(
+            token_len,
+            aligned_boundary_token_len=token_len,
+        )
+    )
+
+
+def _lookup_server_main(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+    ipc_path: str,
+) -> None:
+    """Entry point of the lookup subprocess (see the section comment above
+    for why this must be a subprocess)."""
+    lookup_ctx = build_lookup_context(vllm_config, kv_cache_config)
+
+    # Own store client straight to the master: batch_is_exist is a C++
+    # master RPC, so lookups never touch a GIL-saturated engine process.
+    # The tiny local segment is the price of a client handle.
+    from mooncake.store import MooncakeDistributedStore
+
+    store_config = MooncakeStoreConfig.load_from_config()
+    store = MooncakeDistributedStore()
+    local_hostname = rdma_utils.get_requester_local_hostname(get_ip())
+    ret = store.setup(
+        local_hostname,
+        store_config.metadata_server,
+        64 * 1024 * 1024,
+        64 * 1024 * 1024,
+        store_config.protocol,
+        store_config.device_name,
+        store_config.master_server_address,
+    )
+    if ret != 0:
+        raise RuntimeError(f"lookup subprocess store setup failed: {ret}")
+
+    ctx = zmq.Context()  # type: ignore[attr-defined]
+    sock = make_zmq_socket(ctx, ipc_path, zmq.REP, bind=True)  # type: ignore[attr-defined]
+    logger.info("Mooncake lookup subprocess serving on %s", ipc_path)
+    _serve_lookup_requests(sock, lookup_ctx, store.batch_is_exist)
+
+
+def _serve_lookup_requests(
+    sock: Any,
+    ctx: LookupContext,
+    exist_fn: Callable[[list[str]], list[int]],
+) -> None:
+    """REP loop over the lookup wire format (see ``protocol.py``)."""
+    while True:
+        frames = sock.recv_multipart(copy=False)
+        req_id = bytes(frames[0])
+        msg_type = bytes(frames[1])
+        token_len = int.from_bytes(bytes(frames[2]), "big")
+        hash_len = int.from_bytes(bytes(frames[3]), "big")
+        session_id = bytes(frames[5]).decode() or None
+        block_hashes: Sequence[BlockHash] = (
+            BlobBlockHashes(frames[4].buffer, hash_len) if hash_len else []
+        )
+        hit = 0
+        try:
+            if msg_type == LOOKUP_MSG:
+                hit = run_lookup(
+                    ctx, exist_fn, token_len, block_hashes, session_id=session_id
+                )
+            elif msg_type == RECORD_BP_MSG:
+                ctx.breakpoints.record(session_id, token_len, block_hashes)
+            else:
+                logger.warning("Lookup subprocess: unknown msg_type %r", msg_type)
+        except Exception:
+            logger.exception("Lookup subprocess: %r handler failed", msg_type)
+        sock.send_multipart([req_id, hit.to_bytes(4, "big")])
+
+
+# ============================================================
+# Store admin server (worker rank 0)
+# ============================================================
+
+
+class StoreAdminServer:
+    """ZMQ REP server on worker rank 0 for admin commands.
+
+    Currently handles one request type, tagged at frame 0:
     - ``RESET_MSG``: drains the send thread queue, then runs
       ``store.remove_all(force=True)``. Caller must have paused the
-      scheduler first.
+      scheduler first. Session breakpoints in the lookup subprocess need no
+      reset: they are re-verified against the (now empty) store on every
+      fast-path hit, so stale ones self-heal.
     """
 
     def __init__(
@@ -1766,28 +1903,20 @@ class LookupKeyServer:
 
         self.store_worker = store_worker
         self.running = True
+        self._closed = False
+        # Periodic recv timeout so close() can stop the loop and then close
+        # the socket from its own thread (zmq sockets are not thread-safe).
+        self.socket.setsockopt(zmq.RCVTIMEO, 1000)  # type: ignore[attr-defined]
 
         def process_request():
             while self.running:
-                all_frames = self.socket.recv_multipart(copy=False)
+                try:
+                    all_frames = self.socket.recv_multipart(copy=False)
+                except zmq.Again:  # type: ignore[attr-defined]
+                    continue
                 msg_type = bytes(all_frames[0])
 
-                if msg_type == LOOKUP_MSG:
-                    token_len = int.from_bytes(all_frames[1], byteorder="big")
-                    hash_len = int.from_bytes(all_frames[2], byteorder="big")
-                    blob = all_frames[3].buffer
-                    block_hashes = BlobBlockHashes(blob, hash_len)
-                    session_id = None
-                    if len(all_frames) > 4:
-                        session_id = bytes(all_frames[4]).decode() or None
-                    result = self.store_worker.lookup(
-                        token_len,
-                        block_hashes,
-                        session_id=session_id,
-                    )
-                    self.socket.send(result.to_bytes(4, "big"))
-
-                elif msg_type == RESET_MSG:
+                if msg_type == RESET_MSG:
                     try:
                         # Drain in-flight puts before wiping the master;
                         # otherwise stale puts can repopulate it post-reset.
@@ -1796,7 +1925,6 @@ class LookupKeyServer:
                         if self.store_worker.kv_send_thread is not None:
                             self.store_worker.kv_send_thread.request_queue.join()
                         self.store_worker.store.remove_all(force=True)
-                        self.store_worker.clear_session_breakpoints()
                         logger.info("Mooncake store reset via remove_all succeeded.")
                         self.socket.send(RESP_OK)
                     except Exception as e:
@@ -1805,7 +1933,7 @@ class LookupKeyServer:
 
                 else:
                     logger.warning(
-                        "LookupKeyServer received unknown msg_type: %r",
+                        "StoreAdminServer received unknown msg_type: %r",
                         msg_type,
                     )
                     self.socket.send(RESP_ERR)
@@ -1813,10 +1941,35 @@ class LookupKeyServer:
         self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()
 
-    def close(self):
-        self.socket.close(linger=0)
-        if os.path.exists(self._ipc_path):
-            os.unlink(self._ipc_path)
+    def close(self) -> bool:
+        """Idempotent: stop the REP loop, then release the socket/path.
+
+        Waits for the loop thread to exit before touching the socket (zmq
+        sockets are not thread-safe): an idle loop exits within RCVTIMEO,
+        and an in-flight RESET is given time to finish so the socket and
+        the worker's store aren't torn down under a live handler.
+
+        Returns True once the thread has exited (resources released);
+        False while it is still wedged in a handler (e.g. a stuck store
+        RPC) — the caller must then leave shared state (the store handle)
+        alone and may retry later. A wedged thread leaks its socket to
+        process teardown rather than having it closed from another thread.
+        """
+        self.running = False
+        self.thread.join(timeout=60)
+        if self.thread.is_alive():
+            logger.warning(
+                "StoreAdminServer thread still busy after 60s (in-flight "
+                "reset?); leaving its socket and the store to process "
+                "teardown."
+            )
+            return False
+        if not self._closed:
+            self._closed = True
+            self.socket.close(linger=0)
+            if os.path.exists(self._ipc_path):
+                os.unlink(self._ipc_path)
+        return True
 
 
 # ============================================================
@@ -1825,11 +1978,13 @@ class LookupKeyServer:
 
 
 class LookupKeyClient:
-    """ZMQ client for the LookupKey admin channel.
+    """Scheduler-side client for both MooncakeStoreConnector channels.
 
-    Routes both prefix-cache lookups and admin commands (currently:
-    ``reset``) to ``LookupKeyServer`` on worker rank 0. The first frame
-    of every request is a named tag from ``protocol.py``.
+    - Lookup channel: DEALER to the lookup subprocess for prefix-hit
+      queries and session-breakpoint records. Sending is a single C-level
+      zmq call — deliberately no dispatch thread in this process, which
+      would starve on the EngineCore GIL under load.
+    - Admin channel: REQ to ``StoreAdminServer`` on worker rank 0 (reset).
     """
 
     def __init__(self, vllm_config: VllmConfig):
@@ -1842,67 +1997,183 @@ class LookupKeyClient:
             bind=False,
         )
 
-        # Async lookup support
-        self.executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="MooncakeLookupClient"
-        )
-        self.futures: dict[str, Future[int]] = {}
+        self._proc: Any = None
+        self._sock: Any = None
+        self._ipc_path: str | None = None
+        self._proc_dead = False
+        # Bound wait for blocking lookups: if the subprocess is alive but
+        # unresponsive (still importing/binding, or the master is
+        # unreachable), fail open instead of stalling the scheduler forever.
+        self._block_timeout_s = 120.0
+        # req_id -> wire id of the current in-flight attempt. Replies are
+        # matched on the wire id (``<seq>|<req_id>``), so a reply from a
+        # discarded attempt can't be served to a later request that reuses
+        # the same request id.
+        self._pending: dict[str, bytes] = {}
+        self._results: dict[str, int] = {}
+        self._lookup_seq = 0
 
-    def _lookup(
+    def start_lookup_subprocess(
         self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        """Spawn the lookup subprocess and connect a DEALER socket to it.
+
+        The IPC path is unique per spawn (not just per parent PID): a
+        terminated child may leave its bound socket file behind, and a new
+        subprocess binding the same path would fail with EADDRINUSE.
+        """
+        import multiprocessing as mp
+        import uuid
+
+        ipc_path = (
+            f"{get_zmq_rpc_path_lookup(vllm_config)}_lookup_"
+            f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        )
+        proc = mp.get_context("spawn").Process(
+            target=_lookup_server_main,
+            args=(vllm_config, kv_cache_config, ipc_path),
+            daemon=True,
+        )
+        proc.start()
+        self.connect_lookup(ipc_path, proc)
+
+    def connect_lookup(self, ipc_path: str, proc: Any) -> None:
+        self._proc = proc
+        self._ipc_path = ipc_path
+        self._sock = make_zmq_socket(
+            self.ctx,
+            ipc_path,
+            zmq.DEALER,  # type: ignore[attr-defined]
+            bind=False,
+        )
+
+    def _lookup_alive(self) -> bool:
+        if self._proc_dead:
+            return False
+        if self._proc is None or not self._proc.is_alive():
+            self._proc_dead = True
+            logger.error(
+                "Mooncake lookup subprocess is gone; external prefix-cache "
+                "lookups disabled (failing open with 0 hits)."
+            )
+        return not self._proc_dead
+
+    def _send(
+        self,
+        wire_id: bytes,
+        msg_type: bytes,
         token_len: int,
-        block_hashes: list[BlockHash],
+        block_hashes: Sequence[BlockHash],
         session_id: str | None,
-    ) -> int:
-        hash_len = len(block_hashes[0]) if block_hashes else 0
-        all_frames = [
-            LOOKUP_MSG,
-            token_len.to_bytes(4, byteorder="big"),
-            hash_len.to_bytes(2, byteorder="big"),
-            b"".join(block_hashes),
-        ]
-        if session_id is not None:
-            all_frames.append(session_id.encode())
-        self.socket.send_multipart(all_frames, copy=False)
-        resp = self.socket.recv()
-        return int.from_bytes(resp, "big")
+    ) -> None:
+        hash_len = len(bytes(block_hashes[0])) if block_hashes else 0
+        # Leading empty frame: the REQ/REP envelope delimiter a DEALER must
+        # add by hand.
+        self._sock.send_multipart(
+            [
+                b"",
+                wire_id,
+                msg_type,
+                token_len.to_bytes(4, "big"),
+                hash_len.to_bytes(2, "big"),
+                b"".join(bytes(h) for h in block_hashes),
+                (session_id or "").encode(),
+            ],
+            copy=False,
+        )
+
+    def _collect(self, timeout_ms: int) -> None:
+        """File arrived replies under their req_id. Replies whose wire id is
+        not the current attempt for that req_id — discarded/superseded
+        attempts and breakpoint-record acks (empty wire id) — are dropped."""
+        while self._sock.poll(timeout_ms):
+            frames = self._sock.recv_multipart()
+            timeout_ms = 0
+            wire_id = bytes(frames[1])
+            _seq, _, req_id_bytes = wire_id.partition(b"|")
+            req_id = req_id_bytes.decode()
+            if req_id and self._pending.get(req_id) == wire_id:
+                del self._pending[req_id]
+                self._results[req_id] = int.from_bytes(frames[2], "big")
 
     def lookup(
         self,
         req_id: str,
         token_len: int,
-        block_hashes: list[BlockHash],
+        block_hashes: Sequence[BlockHash],
         session_id: str | None = None,
         non_block: bool = False,
     ) -> int | None:
-        """If non_block is True, will return None until the result is ready,
-        so the caller retries on a later step."""
-        future = self.futures.get(req_id)
-        if future is None:
-            future = self.executor.submit(
-                self._lookup,
-                token_len,
-                list(block_hashes),
-                session_id,
-            )
-            self.futures[req_id] = future
-        if non_block and not future.done():
-            return None
-        try:
-            return future.result()
-        except Exception as e:
-            logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
+        """Prefix-hit lookup in the lookup subprocess.
+
+        With ``non_block`` returns None until the reply arrives, so the
+        caller retries on a later scheduler step. Fails open to 0 if the
+        subprocess dies.
+        """
+        if not block_hashes or token_len <= 0:
             return 0
-        finally:
-            del self.futures[req_id]
+        if not self._lookup_alive():
+            self._pending.pop(req_id, None)
+            return 0
+        self._collect(0)
+        if req_id in self._results:
+            return self._results.pop(req_id)
+        if req_id not in self._pending:
+            self._lookup_seq += 1
+            wire_id = f"{self._lookup_seq}|{req_id}".encode()
+            self._send(wire_id, LOOKUP_MSG, token_len, block_hashes, session_id)
+            self._pending[req_id] = wire_id
+        if non_block:
+            return None
+        deadline = time.monotonic() + self._block_timeout_s
+        while req_id not in self._results:
+            self._collect(1000)
+            if req_id in self._results:
+                break
+            if not self._lookup_alive():
+                self._pending.pop(req_id, None)
+                return 0
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "Mooncake lookup for %s timed out after %.0fs (subprocess "
+                    "alive but unresponsive — still starting up, or the "
+                    "master is unreachable); failing open with 0 hits.",
+                    req_id,
+                    self._block_timeout_s,
+                )
+                self._pending.pop(req_id, None)
+                return 0
+        return self._results.pop(req_id)
+
+    def record_session_breakpoint(
+        self,
+        session_id: str | None,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+    ) -> None:
+        """Fire-and-forget session-breakpoint record; the subprocess's reply
+        (empty req_id) is dropped by ``_collect``."""
+        if not session_id or not block_hashes or token_len <= 0:
+            return
+        if not self._lookup_alive():
+            return
+        # Drain any queued replies (incl. earlier record acks) so
+        # record-heavy phases with no interleaved lookups can't grow the
+        # DEALER receive queue without bound.
+        self._collect(0)
+        self._send(b"", RECORD_BP_MSG, token_len, block_hashes, session_id)
 
     def discard(self, req_id: str) -> None:
-        """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort)."""
-        future = self.futures.pop(req_id, None)
-        if future is not None:
-            future.cancel()
+        """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort).
 
-    def _reset(self) -> bool:
+        The in-flight attempt's wire id is forgotten, so its late reply is
+        dropped even if a new request reuses the same request id."""
+        self._pending.pop(req_id, None)
+        self._results.pop(req_id, None)
+
+    def reset(self) -> bool:
         """Trigger ``store.remove_all(force=True)`` on worker rank 0.
 
         Ordering assumption: caller MUST ensure no in-flight Mooncake
@@ -1914,12 +2185,27 @@ class LookupKeyClient:
         resp = self.socket.recv()
         return bytes(resp) == RESP_OK
 
-    def reset(self) -> bool:
-        return self.executor.submit(self._reset).result()
-
     def close(self):
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        """Idempotent: close both channels and reap the lookup subprocess
+        (terminate, join, then kill) so repeated engine create/shutdown in
+        one process doesn't accumulate zombie children or IPC sockets."""
         self.socket.close(linger=0)
+        if self._sock is not None:
+            self._sock.close(linger=0)
+            self._sock = None
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            proc.terminate()
+            proc.join(timeout=2)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=2)
+        ipc_path, self._ipc_path = self._ipc_path, None
+        if ipc_path:
+            path = ipc_path.removeprefix("ipc://")
+            if os.path.exists(path):
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
 
 
 def get_zmq_rpc_path_lookup(vllm_config: VllmConfig) -> str:

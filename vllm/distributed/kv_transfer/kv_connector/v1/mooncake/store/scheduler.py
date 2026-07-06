@@ -72,6 +72,10 @@ class MooncakeStoreScheduler:
             envs.VLLM_MOONCAKE_SESSION_BREAKPOINTS and self.kv_role != "kv_consumer"
         )
         self.client = LookupKeyClient(vllm_config)
+        # Prefix lookups run in a dedicated subprocess: their pure-Python
+        # work starves on the GIL in any engine process under load (see the
+        # lookup section in worker.py).
+        self.client.start_lookup_subprocess(vllm_config, kv_cache_config)
 
         # Align with the engine's own scheduler_block_size and hash_block_size.
         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
@@ -233,7 +237,6 @@ class MooncakeStoreScheduler:
                 num_saved_tokens=0,
                 token_ids=prefill_tokens[:num_tokens_to_compute],
                 prefill_end_tokens=len(prefill_tokens),
-                session_id=_session_id_from_request(request_real),
             )
             self._request_trackers[request.req_id] = request_tracker
 
@@ -284,7 +287,6 @@ class MooncakeStoreScheduler:
                         num_saved_tokens=0,
                         token_ids=prefill_tokens[:num_tokens_to_compute].copy(),
                         prefill_end_tokens=len(prefill_tokens),
-                        session_id=_session_id_from_request(request_real),
                     )
                     self._request_trackers[req_id] = request_tracker
 
@@ -358,7 +360,6 @@ class MooncakeStoreScheduler:
                     token_len=num_tokens_to_compute,
                     allocated_block_ids=block_ids,
                     num_saved_tokens=0,
-                    session_id=_session_id_from_request(unfinished_req),
                 )
                 self._request_trackers[request_id] = request_tracker
                 req_meta = ReqMeta.from_request_tracker(
@@ -387,6 +388,15 @@ class MooncakeStoreScheduler:
         # before finishing.
         if tracker is None or tracker.num_saved_tokens <= 0:
             return False, None
+        if self._session_breakpoints_enabled:
+            # Optimistically record the session boundary now; the lookup fast
+            # path re-verifies against the store, so a boundary whose blocks
+            # are still queued for save just falls back to the full scan.
+            self.client.record_session_breakpoint(
+                _session_id_from_request(request),
+                tracker.num_saved_tokens,
+                request.block_hashes,
+            )
         total_blocks = sum(len(g) for g in block_ids)
         delay_free_blocks = total_blocks > 0
         if delay_free_blocks:
@@ -396,6 +406,10 @@ class MooncakeStoreScheduler:
                 request.request_id,
             )
         return delay_free_blocks, None
+
+    def close(self) -> None:
+        """Release the lookup subprocess and ZMQ sockets on teardown."""
+        self.client.close()
 
     def reset_store(self) -> bool:
         """Trigger a global ``remove_all(force=True)`` on the Mooncake master.

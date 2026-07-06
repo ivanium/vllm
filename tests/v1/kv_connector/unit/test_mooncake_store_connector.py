@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
-import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import zmq
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_events import BlockStored
@@ -24,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
 )
+from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -358,6 +361,27 @@ def test_reset_cache_worker_role_returns_none():
     assert conn.reset_cache() is None
 
 
+def test_connector_shutdown_closes_scheduler_side():
+    """Scheduler-role shutdown must reap the lookup subprocess (via
+    MooncakeStoreScheduler.close), not just the worker store handle."""
+    vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "connector.MooncakeStoreScheduler"
+        ) as mock_scheduler_cls,
+    ):
+        conn = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config
+        )
+
+    conn.shutdown()
+    mock_scheduler_cls.return_value.close.assert_called_once_with()
+
+
 def test_scheduler_reset_store_returns_client_reset_result():
     """MooncakeStoreScheduler.reset_store() returns LookupKeyClient.reset()."""
     vllm_config = _make_vllm_config()
@@ -395,26 +419,219 @@ def test_scheduler_reset_store_handles_rpc_exception():
     assert sched.reset_store() is False
 
 
-def test_lookup_key_client_lookup_prepends_typed_tag():
-    """LookupKeyClient.lookup() puts LOOKUP_MSG tag at frame 0."""
-    vllm_config = _make_vllm_config()
-
+def _make_lookup_test_client(vllm_config):
+    """Client with a mocked admin socket and a mocked DEALER lookup socket
+    attached to an always-alive fake subprocess."""
     with patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
         "worker.make_zmq_socket"
     ) as mock_make_socket:
         client = worker.LookupKeyClient(vllm_config)
+        lookup_socket = MagicMock()
+        mock_make_socket.return_value = lookup_socket
+        client.connect_lookup(
+            "ipc://test-lookup", SimpleNamespace(is_alive=lambda: True)
+        )
+    lookup_socket.poll.return_value = 0
+    return client, lookup_socket
 
-    fake_socket = mock_make_socket.return_value
-    fake_socket.recv.return_value = (5).to_bytes(4, "big")
 
-    # Blocking lookup (non_block defaults to False) runs on the executor and
-    # returns the resolved hit length.
-    assert client.lookup("req0", token_len=128, block_hashes=[]) == 5
+def test_lookup_client_sends_typed_frames_over_dealer():
+    """lookup() speaks the DEALER wire format: empty delimiter frame, then
+    req_id, LOOKUP_MSG tag, token_len, hash_len, hash blob, session id."""
+    client, sock = _make_lookup_test_client(_make_vllm_config())
 
-    sent_frames = fake_socket.send_multipart.call_args[0][0]
-    assert sent_frames[0] == protocol.LOOKUP_MSG
-    assert int.from_bytes(sent_frames[1], "big") == 128
+    result = client.lookup(
+        "req0", 128, [b"\x01" * 4], session_id="conv", non_block=True
+    )
+
+    assert result is None
+    frames = sock.send_multipart.call_args[0][0]
+    assert frames[0] == b""
+    # Wire id is <seq>|<request_id>, unique per attempt.
+    assert frames[1].endswith(b"|req0")
+    assert frames[2] == protocol.LOOKUP_MSG
+    assert int.from_bytes(frames[3], "big") == 128
+    assert int.from_bytes(frames[4], "big") == 4
+    assert frames[5] == b"\x01" * 4
+    assert frames[6] == b"conv"
+
+
+def test_lookup_client_non_block_defers_then_reports():
+    client, sock = _make_lookup_test_client(_make_vllm_config())
+
+    # First query sends the request and defers while no reply is available.
+    assert client.lookup("req1", 128, [b"h" * 4], non_block=True) is None
+    assert sock.send_multipart.call_count == 1
+
+    # Reply arrives: the next poll files it and the lookup resolves, without
+    # re-sending.
+    wire_id = sock.send_multipart.call_args[0][0][1]
+    sock.poll.side_effect = [1, 0]
+    sock.recv_multipart.return_value = [b"", wire_id, (7).to_bytes(4, "big")]
+    assert client.lookup("req1", 128, [b"h" * 4], non_block=True) == 7
+    assert sock.send_multipart.call_count == 1
+    # Result is consumed on read.
+    assert "req1" not in client._results
+
+
+def test_lookup_client_blocking_waits_for_reply():
+    client, sock = _make_lookup_test_client(_make_vllm_config())
+
+    def _reply_to_last_send():
+        wire_id = sock.send_multipart.call_args[0][0][1]
+        return [b"", wire_id, (9).to_bytes(4, "big")]
+
+    sock.poll.side_effect = [0, 1, 0]
+    sock.recv_multipart.side_effect = lambda: _reply_to_last_send()
+
+    assert client.lookup("req2", 128, [b"h" * 4]) == 9
+
+
+def test_lookup_client_discard_drops_pending_lookup():
+    """discard() prevents a stale reply from being served to a reused id,
+    even after a new request with the same request id is already in flight
+    (replies are matched on the per-attempt wire id)."""
+    client, sock = _make_lookup_test_client(_make_vllm_config())
+
+    assert client.lookup("req3", 128, [b"h" * 4], non_block=True) is None
+    stale_wire = sock.send_multipart.call_args[0][0][1]
+    client.discard("req3")
+
+    # The stale reply is dropped and the fresh query re-sends under a new
+    # wire id instead of consuming the stale value.
+    sock.poll.side_effect = [1, 0, 0]
+    sock.recv_multipart.return_value = [b"", stale_wire, (9).to_bytes(4, "big")]
+    assert client.lookup("req3", 128, [b"h" * 4], non_block=True) is None
+    assert sock.send_multipart.call_count == 2
+    new_wire = sock.send_multipart.call_args[0][0][1]
+    assert new_wire != stale_wire
+    assert client._results == {}
+
+    # The stale reply arriving *after* the new attempt is in flight is
+    # dropped too; only the new attempt's reply resolves the lookup.
+    sock.poll.side_effect = [1, 1, 0]
+    sock.recv_multipart.side_effect = [
+        [b"", stale_wire, (9).to_bytes(4, "big")],
+        [b"", new_wire, (5).to_bytes(4, "big")],
+    ]
+    assert client.lookup("req3", 128, [b"h" * 4], non_block=True) == 5
+
+
+def test_lookup_client_fails_open_when_subprocess_dies():
+    """A dead lookup subprocess must not wedge the scheduler: lookups fail
+    open with 0 hits instead of deferring forever."""
+    client, sock = _make_lookup_test_client(_make_vllm_config())
+    client._proc = SimpleNamespace(is_alive=lambda: False)
+
+    assert client.lookup("req4", 128, [b"h" * 4], non_block=True) == 0
+    # Blocking mode fails open too instead of waiting forever.
+    assert client.lookup("req5", 128, [b"h" * 4]) == 0
+    sock.send_multipart.assert_not_called()
+
+
+def test_lookup_client_record_breakpoint_is_fire_and_forget():
+    client, sock = _make_lookup_test_client(_make_vllm_config())
+
+    # A stale queued reply is drained (and dropped) before the record is
+    # sent, so record-heavy phases can't grow the receive queue unbounded.
+    sock.poll.side_effect = [1, 0]
+    sock.recv_multipart.return_value = [b"", b"9|stale", (1).to_bytes(4, "big")]
+
+    client.record_session_breakpoint("conv", 32, [b"h" * 4])
+
+    assert sock.recv_multipart.call_count == 1
+    assert client._results == {}
+    frames = sock.send_multipart.call_args[0][0]
+    assert frames[1] == b""
+    assert frames[2] == protocol.RECORD_BP_MSG
+    assert int.from_bytes(frames[3], "big") == 32
+    assert frames[6] == b"conv"
+
+
+class _FakeLookupProc:
+    """Records the reaping sequence LookupKeyClient.close() performs."""
+
+    def __init__(self, dies_on_terminate: bool):
+        self._alive = True
+        self._dies_on_terminate = dies_on_terminate
+        self.calls: list[str] = []
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def terminate(self) -> None:
+        self.calls.append("terminate")
+        if self._dies_on_terminate:
+            self._alive = False
+
+    def join(self, timeout=None) -> None:
+        self.calls.append("join")
+
+    def kill(self) -> None:
+        self.calls.append("kill")
+        self._alive = False
+
+
+def test_lookup_client_close_reaps_subprocess():
+    client, _sock = _make_lookup_test_client(_make_vllm_config())
+    proc = _FakeLookupProc(dies_on_terminate=True)
+    client._proc = proc
+
+    client.close()
+    assert proc.calls == ["terminate", "join"]
+
+    # Idempotent: a second close (e.g. shutdown + __del__) is a no-op.
+    client.close()
+    assert proc.calls == ["terminate", "join"]
+
+
+def test_lookup_client_close_kills_stubborn_subprocess():
+    client, _sock = _make_lookup_test_client(_make_vllm_config())
+    proc = _FakeLookupProc(dies_on_terminate=False)
+    client._proc = proc
+
+    client.close()
+
+    assert proc.calls == ["terminate", "join", "kill", "join"]
+
+
+def test_lookup_client_blocking_fails_open_on_unresponsive_subprocess():
+    """An alive-but-unresponsive subprocess (stuck startup, unreachable
+    master) must not stall a blocking lookup forever."""
+    client, sock = _make_lookup_test_client(_make_vllm_config())
+    client._block_timeout_s = 0.05
+    sock.poll.return_value = 0
+
+    assert client.lookup("req9", 128, [b"h" * 4]) == 0
+    assert "req9" not in client._pending
+
+
+def test_lookup_channel_end_to_end_over_zmq(tmp_path):
+    """Real DEALER<->REP round trip through ``_serve_lookup_requests``:
+    verifies the hand-built REQ/REP envelope (empty delimiter frame) and the
+    hit path against a LookupContext built from the connector configs."""
+    vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
+    lookup_ctx = worker.build_lookup_context(vllm_config, kv_cache_config)
+
+    ipc_path = f"ipc://{tmp_path}/lookup"
+    zctx = zmq.Context()
+    rep = make_zmq_socket(zctx, ipc_path, zmq.REP, bind=True)
+    threading.Thread(
+        target=worker._serve_lookup_requests,
+        args=(rep, lookup_ctx, lambda keys: [1] * len(keys)),
+        daemon=True,
+    ).start()
+
+    client = worker.LookupKeyClient(vllm_config)
+    client.connect_lookup(ipc_path, SimpleNamespace(is_alive=lambda: True))
+
+    hashes = [bytes([i + 1]) * 16 for i in range(4)]
+    # Breakpoint records and lookups interleave on the same socket; the
+    # record's ack (empty req_id) must be dropped, not served as a hit.
+    client.record_session_breakpoint("conv", 64, hashes)
+    assert client.lookup("req0", 64, hashes, session_id="conv") == 64
 
 
 def test_lookup_key_client_reset_uses_typed_protocol():
@@ -437,86 +654,6 @@ def test_lookup_key_client_reset_uses_typed_protocol():
     # NACK path: server returns RESP_ERR -> client returns False.
     fake_socket.recv.return_value = protocol.RESP_ERR
     assert client.reset() is False
-
-
-def _poll_lookup(client, req_id, token_len=128, block_hashes=(), timeout=5.0):
-    """Drive non-blocking lookup until the executor completes it."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        result = client.lookup(req_id, token_len, list(block_hashes), non_block=True)
-        if result is not None:
-            return result
-        time.sleep(0.005)
-    return None
-
-
-def _gated_recv(gate: threading.Event, value: int):
-    """Mock recv side-effect that blocks until ``gate`` is set, so the
-    executor's lookup can be held pending deterministically."""
-
-    def recv():
-        gate.wait()
-        return value.to_bytes(4, "big")
-
-    return recv
-
-
-def test_lookup_key_client_non_block_lookup_async():
-    """Non-blocking lookup defers to the executor: None first, hit once the
-    Future resolves."""
-    vllm_config = _make_vllm_config()
-
-    with patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
-        "worker.make_zmq_socket"
-    ) as mock_make_socket:
-        client = worker.LookupKeyClient(vllm_config)
-
-    fake_socket = mock_make_socket.return_value
-    # Hold the executor's lookup pending until we release the gate.
-    gate = threading.Event()
-    fake_socket.recv.side_effect = _gated_recv(gate, 7)
-
-    # First query submits the lookup and returns None while it is in flight.
-    assert client.lookup("req1", 128, [], non_block=True) is None
-    # Release the executor; a later poll returns the hit length.
-    gate.set()
-    assert _poll_lookup(client, "req1") == 7
-    # Future is consumed (popped) on read.
-    assert "req1" not in client.futures
-
-
-def test_lookup_key_client_discard_clears_state():
-    """discard() drops a completed lookup Future so it is not served stale."""
-    vllm_config = _make_vllm_config()
-
-    with patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
-        "worker.make_zmq_socket"
-    ) as mock_make_socket:
-        client = worker.LookupKeyClient(vllm_config)
-
-    fake_socket = mock_make_socket.return_value
-    gate = threading.Event()
-    fake_socket.recv.side_effect = _gated_recv(gate, 9)
-
-    # Submit while gated so the call returns None and the Future stays in
-    # `futures` (unconsumed) once it resolves.
-    assert client.lookup("req2", 128, [], non_block=True) is None
-    gate.set()
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if client.futures["req2"].done():
-            break
-        time.sleep(0.005)
-    # discard() drops the completed result before any lookup consumes it.
-    client.discard("req2")
-    assert "req2" not in client.futures
-    # A fresh query re-submits rather than returning a stale value: hold the
-    # gate so the resubmitted lookup stays in flight.
-    gate.clear()
-    assert client.lookup("req2", 128, [], non_block=True) is None
-    gate.set()  # release the executor so the worker thread can drain
 
 
 def test_get_num_new_matched_tokens_async_defers_then_reports():
@@ -562,8 +699,8 @@ def test_get_num_new_matched_tokens_async_defers_then_reports():
 
 def test_protocol_tags_are_distinct_and_non_empty():
     """Protocol tags must be unique and non-empty to avoid collision."""
-    tags = {protocol.LOOKUP_MSG, protocol.RESET_MSG}
-    assert len(tags) == 2
+    tags = {protocol.LOOKUP_MSG, protocol.RECORD_BP_MSG, protocol.RESET_MSG}
+    assert len(tags) == 3
     for tag in tags:
         assert isinstance(tag, bytes)
         assert len(tag) > 0
@@ -650,8 +787,8 @@ def test_reset_cache_scheduler_role_clears_local_state():
     assert conn._kv_cache_events is None
 
 
-def test_lookup_key_server_reset_drains_send_queue_before_remove_all():
-    """LookupKeyServer RESET handler must drain the send thread's
+def test_store_admin_server_reset_drains_send_queue_before_remove_all():
+    """StoreAdminServer RESET handler must drain the send thread's
     request_queue BEFORE calling store.remove_all -- otherwise stale
     puts that were already in flight when the caller paused generation
     can land on the master AFTER remove_all and silently repopulate it
@@ -660,7 +797,7 @@ def test_lookup_key_server_reset_drains_send_queue_before_remove_all():
     # Exercise the handler logic directly with mocks for the send thread
     # and store. We assert (a) join() is called, (b) remove_all is called,
     # and (c) join() comes BEFORE remove_all in the call order. The full
-    # LookupKeyServer is heavy (binds a real ZMQ REP socket), so we drive
+    # StoreAdminServer is heavy (binds a real ZMQ REP socket), so we drive
     # just the dispatch branch here via a stub equivalent.
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
         protocol,
@@ -687,7 +824,7 @@ def test_lookup_key_server_reset_drains_send_queue_before_remove_all():
     sent: list[bytes] = []
     fake_socket.send.side_effect = lambda frame: sent.append(frame)
 
-    # Mirror the body of LookupKeyServer.process_request RESET_MSG branch.
+    # Mirror the body of StoreAdminServer.process_request RESET_MSG branch.
     # Keeping this inline (instead of importing the closure) keeps the
     # test independent of the live thread lifecycle.
     msg_type = protocol.RESET_MSG
@@ -706,7 +843,7 @@ def test_lookup_key_server_reset_drains_send_queue_before_remove_all():
     assert sent == [protocol.RESP_OK]
 
 
-def test_lookup_key_server_reset_skips_drain_when_no_send_thread():
+def test_store_admin_server_reset_skips_drain_when_no_send_thread():
     """When the worker has no send thread (e.g. consumer-only role
     configurations), the RESET handler must still call remove_all
     instead of dereferencing a None send thread.

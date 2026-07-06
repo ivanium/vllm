@@ -1,37 +1,51 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Wire-format constants for the LookupKey ZMQ admin channel.
+"""Wire-format constants for the MooncakeStoreConnector ZMQ channels.
 
-This is the single source of truth shared by ``LookupKeyClient`` and
-``LookupKeyServer`` on the scheduler<->worker rank-0 admin channel.
+Two channels share these constants:
 
-Wire format (REQ/REP over IPC):
+1. Admin channel (scheduler -> worker rank 0, REQ/REP), served by
+   ``StoreAdminServer``:
 
-    Request: [msg_type: bytes] [payload_frames...]
+      Request: [RESET_MSG]
+        Drains the send queue, then runs ``store.remove_all(force=True)``.
+      Response: [RESP_OK] or [RESP_ERR]
 
-      msg_type == LOOKUP_MSG:
-          frame 1: token_len (u32 big-endian, 4 bytes)
-          frame 2: hash_len (u16 big-endian, 2 bytes) — byte length of each
-                   fixed-size block hash (0 when there are no hashes)
-          frame 3: raw block hashes concatenated back-to-back (each hash_len
-                   bytes); the server splits on hash_len
-        Response: [hit_count: u32 big-endian, 4 bytes]
+2. Lookup channel (scheduler -> lookup subprocess, DEALER/REP), served by
+   ``_lookup_server_main``:
 
-      msg_type == RESET_MSG:
-          (no payload frames)
-        Response: [RESP_OK] or [RESP_ERR]
+      Request: [b""] [wire_id: utf-8] [msg_type: bytes]
+               [token_len: u32 big-endian]
+               [hash_len: u16 big-endian — byte length of each fixed-size
+                block hash, 0 when there are no hashes]
+               [raw block hashes concatenated back-to-back]
+               [session_id: utf-8, may be empty]
 
-The first frame of every request is a named bytes tag (not a numeric
-sentinel that aliases the data field) so the protocol stays
-self-describing and extensible: adding new admin commands requires
-only a new tag and a new dispatch branch.
+        The leading empty frame is the REQ/REP envelope delimiter that a
+        DEALER socket must add by hand; the REP server never sees it.
 
-Mirrors the named-tag convention used by the NIXL connector (see
+        msg_type == LOOKUP_MSG: prefix-cache hit query. ``wire_id`` is
+          ``<seq>|<request_id>`` — unique per lookup attempt, so a reply
+          from a discarded attempt can't be matched to a later request
+          reusing the same request id.
+        msg_type == RECORD_BP_MSG: record a session breakpoint
+          (fire-and-forget; ``wire_id`` is empty so the client drops the
+          reply).
+
+      Response (REP application frames): [wire_id] [hit_count: u32
+        big-endian]. On the DEALER side the reply surfaces with the
+        envelope delimiter prepended: [b""] [wire_id] [hit_count].
+
+Message types are named bytes tags (not numeric sentinels that alias the
+data field) so the protocol stays self-describing and extensible: adding a
+new command requires only a new tag and a new dispatch branch. Mirrors the
+named-tag convention used by the NIXL connector (see
 ``vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py``).
 """
 
-# Request message-type tags. Frame 0 of every request.
+# Request message-type tags.
 LOOKUP_MSG: bytes = b"lookup"
+RECORD_BP_MSG: bytes = b"record_bp"
 RESET_MSG: bytes = b"reset"
 
 # Single-byte response status codes for admin commands.
