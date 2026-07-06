@@ -1075,13 +1075,8 @@ class MambaManager(SingleTypeKVCacheManager):
     def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
-        # NOTE (tdoublep) with async scheduling, the num_computed_tokens can contain
-        # draft tokens from the previous step that may or may not be rejected later.
-        # This can make us think we are further ahead in the sequence than we actually
-        # are, so let's assume that all tokens are rejected so we don't free blocks
-        # that we might actually need.
-        num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
-
+        # Spec-rollback safety: callers pass the processed-token basis, which
+        # excludes possibly-rejected in-flight tokens.
         super().remove_skipped_blocks(request_id, num_computed_tokens)
         if self.mamba_cache_mode == "align":
             # `last_state_block_idx` refers to the block index allocated two steps ago.
@@ -1381,6 +1376,7 @@ def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec,
     max_num_batched_tokens: int,
     max_model_len: int,
+    max_concurrent_batches: int = 1,
     **kwargs,
 ) -> SingleTypeKVCacheManager:
     """
@@ -1394,6 +1390,8 @@ def get_manager_for_kv_cache_spec(
         kv_cache_spec: The KVCacheSpec instance
         max_num_batched_tokens: The maximum number of tokens in a batch
         max_model_len: The maximum context length the model could serve
+        max_concurrent_batches: The maximum number of scheduler steps that can
+            overlap on the GPU (async scheduling / pipeline parallelism)
     Returns:
         An instance of the appropriate SingleTypeKVCacheManager subclass
     """
@@ -1409,6 +1407,7 @@ def get_manager_for_kv_cache_spec(
             kv_cache_spec.max_admission_blocks_per_request(
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
+                max_concurrent_batches=max_concurrent_batches,
             )
         )
     manager = manager_class(kv_cache_spec, **kwargs)

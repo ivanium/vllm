@@ -76,6 +76,7 @@ class KVCacheCoordinator(ABC):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        max_concurrent_batches: int = 1,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -109,6 +110,7 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
+                max_concurrent_batches=max_concurrent_batches,
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
@@ -386,6 +388,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        max_concurrent_batches: int = 1,
     ):
         super().__init__(
             kv_cache_config,
@@ -399,6 +402,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            max_concurrent_batches=max_concurrent_batches,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -436,6 +440,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        max_concurrent_batches: int = 1,
     ):
         super().__init__(
             kv_cache_config,
@@ -449,6 +454,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            max_concurrent_batches=max_concurrent_batches,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -522,6 +528,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        max_concurrent_batches: int = 1,
     ):
         super().__init__(
             kv_cache_config,
@@ -535,6 +542,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            max_concurrent_batches=max_concurrent_batches,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -783,6 +791,7 @@ def get_kv_cache_coordinator(
     scheduler_block_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
+    max_concurrent_batches: int = 1,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -796,6 +805,7 @@ def get_kv_cache_coordinator(
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            max_concurrent_batches=max_concurrent_batches,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -810,6 +820,7 @@ def get_kv_cache_coordinator(
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            max_concurrent_batches=max_concurrent_batches,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -823,4 +834,5 @@ def get_kv_cache_coordinator(
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
+        max_concurrent_batches=max_concurrent_batches,
     )
