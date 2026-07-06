@@ -2,14 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashListWithBlockSize,
@@ -17,6 +20,14 @@ from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     hash_block_tokens,
     init_none_hash,
+)
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+    MLAAttentionSpec,
 )
 from vllm.v1.request import Request
 
@@ -460,3 +471,145 @@ def test_partial_block_promotes_to_direct_full_block_hash():
     )
     assert pool.get_cached_block(promoted_full_hash, [kv_cache_group_id]) == [blocks[1]]
     assert pool.get_cached_block(partial_hash_10, [kv_cache_group_id]) is None
+
+
+def _partial_hit_coordinator(groups, scheduler_block_size, hash_block_size):
+    cfg = KVCacheConfig(num_blocks=64, kv_cache_tensors=[], kv_cache_groups=groups)
+    return get_kv_cache_coordinator(
+        cfg,
+        max_model_len=1024,
+        max_num_batched_tokens=1024,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
+    )
+
+
+def _full_spec(block_size: int) -> FullAttentionSpec:
+    return FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=8, dtype=torch.float32
+    )
+
+
+def _mla_spec(block_size: int) -> MLAAttentionSpec:
+    # Kimi-style MLA: bf16 latent, no fp8/compression.
+    return MLAAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+    )
+
+
+def _mamba_spec(block_size: int) -> MambaSpec:
+    return MambaSpec(block_size=block_size, shapes=(1, 1), dtypes=(torch.float32,))
+
+
+def test_fine_grained_partial_hits_enabled_for_mla_hybrid():
+    """MLA hybrids (e.g. Kimi-Linear: MLA + KDA) keep fine-grained partial
+    hits. The Kimi-Linear gsm8k regression (0.87 -> 0.68) originally blamed
+    on MLA was really an engine crash caused by unaligned prefill chunk ends
+    after a mid-block resume (see test_mamba_align_split_*): the whole-page
+    CoW copy is layout-agnostic, so MLA needs no exclusion."""
+    # MLA attention + linear (mamba) hybrid, hash granularity finer than block.
+    mla_hybrid = _partial_hit_coordinator(
+        [
+            KVCacheGroupSpec(["attn"], _mla_spec(32)),
+            KVCacheGroupSpec(["lin"], _mamba_spec(32)),
+        ],
+        scheduler_block_size=32,
+        hash_block_size=16,
+    )
+    assert mla_hybrid.enable_partial_hash_hits is True
+
+    # Standard full attention + linear (Qwen3-Next-like) likewise.
+    std_hybrid = _partial_hit_coordinator(
+        [
+            KVCacheGroupSpec(["attn"], _full_spec(32)),
+            KVCacheGroupSpec(["lin"], _mamba_spec(32)),
+        ],
+        scheduler_block_size=32,
+        hash_block_size=16,
+    )
+    assert std_hybrid.enable_partial_hash_hits is True
+
+
+class _SplitSchedulerStub:
+    """Just enough Scheduler state for _mamba_block_aligned_split."""
+
+    def __init__(
+        self,
+        block_size: int,
+        use_eagle: bool = False,
+        hash_block_size: int | None = None,
+    ):
+        self.cache_config = SimpleNamespace(block_size=block_size)
+        self.hash_block_size = (
+            hash_block_size if hash_block_size is not None else block_size
+        )
+        self.use_eagle = use_eagle
+        self.mamba_partial_tail_stop = hash_block_size is not None
+
+
+class _SplitRequestStub:
+    def __init__(self, num_computed_tokens: int, num_prompt_tokens: int):
+        self.num_computed_tokens = num_computed_tokens
+        self.num_prompt_tokens = num_prompt_tokens
+        self.num_tokens = num_prompt_tokens
+
+
+def _split(computed, num_new, prompt, block_size=24, hash_block_size=None):
+    return Scheduler._mamba_block_aligned_split(
+        _SplitSchedulerStub(block_size, hash_block_size=hash_block_size),
+        _SplitRequestStub(computed, prompt),
+        num_new,
+    )
+
+
+def test_mamba_align_split_end_aligned_after_partial_hit():
+    """After a fine-grained partial hit, num_computed_tokens sits mid-block.
+    Align-mode caching requires every mid-prefill chunk to END on a block
+    boundary (frozen state blocks are registered under their block-end hash),
+    and the resumed block must materialize its own boundary state before the
+    request runs past it. Regression: flooring only the chunk LENGTH kept
+    every subsequent step end unaligned, registering mamba state blocks under
+    boundary hashes they never held — later hits then resumed from wrong-length
+    states and crashed the Kimi-Linear KDA/MLA kernels (CUDA illegal memory
+    access, gsm8k 0.87 -> 0.68 from failed requests)."""
+    # Aligned resume: legacy behavior unchanged (floor to block multiples).
+    assert _split(0, 60, 1000) == 48
+    assert _split(48, 60, 1000) == 48
+    # Mid-block resume (partial hit): the first chunk stops exactly at the
+    # next boundary so the resumed (CoW) block freezes its block-end state.
+    assert _split(16, 60, 1000) == 8  # 16 -> 24
+    assert _split(4, 44, 1000) == 20  # 4 -> 24, NOT 4 -> 48
+    # After realignment, chunk ends stay aligned.
+    assert _split(24, 60, 1000) == 48  # 24 -> 72
+    # Not enough budget to reach the next boundary: skip this step.
+    assert _split(16, 4, 1000) == 0
+    # Mid-block resume already inside the final partial block: plain tail
+    # prefill, nothing cacheable ahead, unchanged.
+    assert _split(100, 10, 110) == 10
+    # Mid-block resume with a huge chunk: still stops at the next boundary
+    # first; later chunks then snap to last_cache_position as before.
+    assert _split(16, 500, 100) == 8
+    assert _split(24, 500, 100) == 96 - 24
+
+
+def test_mamba_align_split_partial_tail_stop():
+    """With fine-grained partial hits on, the final prefill chunk stops once
+    more at the prompt's last hash boundary so the mamba partial tail entry
+    (which requires a step ending exactly there) is registered for EVERY
+    prompt, not only hash-aligned ones."""
+    # prompt 110, block 24, hash 4: last_cache_position=96, tail boundary=108.
+    # Final chunk from 96 stops at 108 first, then finishes 108 -> 110.
+    assert _split(96, 500, 110, hash_block_size=4) == 108 - 96
+    assert _split(108, 2, 110, hash_block_size=4) == 2
+    # Hash-aligned prompt: boundary == prompt end, no extra stop needed.
+    assert _split(96, 12, 108, hash_block_size=4) == 12
+    # Without the feature flag, unchanged tail behavior.
+    assert _split(96, 500, 110) == 500
+    # Boundary at/below last_cache_position: already covered by the aligned
+    # stop, no duplicate stop.
+    assert _split(72, 500, 97, hash_block_size=4) == 96 - 72
