@@ -927,6 +927,20 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 size_list.append(size)
                 block_id_list.append(block_id)
 
+        # Nothing to fetch on this rank: the scheduler's global lookup found
+        # an external hit, but this consumer's per-group load_mask (SWA /
+        # sparse specs) skips every chunk in the loadable range. Report the
+        # request finished anyway. The KVOutputAggregator only completes a
+        # WAITING_FOR_REMOTE_KVS request once every TP rank reports it; a rank
+        # that returned here without reporting would strand the request
+        # forever (and leak its blocks), which under TP>1 deadlocks admission
+        # (Running=0, Waiting>0). Also guards the modulo below against an empty
+        # key_list.
+        if not key_list:
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
+
         # Rotate aligned lists by tp_rank for load balancing.
         rotation = self.tp_rank % len(key_list)
         key_list_c = _rotate_list(key_list, rotation)
@@ -2012,6 +2026,14 @@ class LookupKeyClient:
         self._pending: dict[str, bytes] = {}
         self._results: dict[str, int] = {}
         self._lookup_seq = 0
+        # req_id -> monotonic time its current in-flight attempt was sent.
+        # Async (non_block) lookups have no caller-side wait, so without this
+        # a subprocess that falls behind or stalls (slow/stuck master RPC,
+        # long session-breakpoint scan) would make get_num_new_matched_tokens
+        # return None forever, permanently stalling scheduler admission with
+        # free KV cache (Running=0, Waiting>0). This deadline lets the async
+        # path fail open the same way the blocking path already does.
+        self._pending_since: dict[str, float] = {}
 
     def start_lookup_subprocess(
         self,
@@ -2096,6 +2118,7 @@ class LookupKeyClient:
             req_id = req_id_bytes.decode()
             if req_id and self._pending.get(req_id) == wire_id:
                 del self._pending[req_id]
+                self._pending_since.pop(req_id, None)
                 self._results[req_id] = int.from_bytes(frames[2], "big")
 
     def lookup(
@@ -2116,6 +2139,7 @@ class LookupKeyClient:
             return 0
         if not self._lookup_alive():
             self._pending.pop(req_id, None)
+            self._pending_since.pop(req_id, None)
             return 0
         self._collect(0)
         if req_id in self._results:
@@ -2125,7 +2149,26 @@ class LookupKeyClient:
             wire_id = f"{self._lookup_seq}|{req_id}".encode()
             self._send(wire_id, LOOKUP_MSG, token_len, block_hashes, session_id)
             self._pending[req_id] = wire_id
+            self._pending_since[req_id] = time.monotonic()
         if non_block:
+            # Fail open if this attempt has been pending too long: the async
+            # path has no caller-side wait, so an unresponsive subprocess would
+            # otherwise return None forever and stall admission. Admitting with
+            # 0 external hits just recomputes locally (correct, only slower).
+            started = self._pending_since.get(req_id)
+            elapsed = None if started is None else time.monotonic() - started
+            if elapsed is not None and elapsed > self._block_timeout_s:
+                logger.warning(
+                    "Mooncake async lookup for %s pending > %.0fs (subprocess "
+                    "alive but unresponsive — slow/stuck master RPC or a "
+                    "backed-up lookup queue); failing open with 0 hits so the "
+                    "request can be admitted instead of stalling admission.",
+                    req_id,
+                    self._block_timeout_s,
+                )
+                self._pending.pop(req_id, None)
+                self._pending_since.pop(req_id, None)
+                return 0
             return None
         deadline = time.monotonic() + self._block_timeout_s
         while req_id not in self._results:
@@ -2134,6 +2177,7 @@ class LookupKeyClient:
                 break
             if not self._lookup_alive():
                 self._pending.pop(req_id, None)
+                self._pending_since.pop(req_id, None)
                 return 0
             if time.monotonic() > deadline:
                 logger.warning(
@@ -2144,6 +2188,7 @@ class LookupKeyClient:
                     self._block_timeout_s,
                 )
                 self._pending.pop(req_id, None)
+                self._pending_since.pop(req_id, None)
                 return 0
         return self._results.pop(req_id)
 
@@ -2171,6 +2216,7 @@ class LookupKeyClient:
         The in-flight attempt's wire id is forgotten, so its late reply is
         dropped even if a new request reuses the same request id."""
         self._pending.pop(req_id, None)
+        self._pending_since.pop(req_id, None)
         self._results.pop(req_id, None)
 
     def reset(self) -> bool:
