@@ -1398,7 +1398,8 @@ class MooncakeStoreWorker:
             current_event = None
             for request in meta.requests:
                 if request.can_save:
-                    current_event = torch.cuda.Event()
+                    # blocking=True: synchronize() sleeps instead of spinning.
+                    current_event = torch.cuda.Event(blocking=True)
                     current_event.record()
                     break
 
