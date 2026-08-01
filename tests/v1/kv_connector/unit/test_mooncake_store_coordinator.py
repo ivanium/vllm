@@ -516,3 +516,43 @@ def test_eagle_flag_propagates_to_all_merged_swa_groups():
         hs, max_length=128, cached_block_pool=ExternalCachedBlockPool(16, exists)
     )
     assert hit == 64
+
+
+def test_dsv4_five_group_eagle_store_lookup_round_trip():
+    """Cover the five KV groups observed with DeepSeek-V4-Flash + MTP.
+
+    The two 64-token SWA groups have identical specs, but only one owns the
+    EAGLE layer. Saving each group through its store mask must still leave a
+    prefix that the merged SWA lookup can consume.
+    """
+    swa_64_sw128 = _swa(block_size=64, sliding_window=128)
+    groups = [
+        KVCacheGroupSpec(["full_mla"], _full(block_size=256)),
+        KVCacheGroupSpec(["swa"], swa_64_sw128),
+        KVCacheGroupSpec(["mtp"], swa_64_sw128, is_eagle_group=True),
+        KVCacheGroupSpec(["c4_state"], _swa(block_size=4, sliding_window=8)),
+        KVCacheGroupSpec(["c128_state"], _swa(block_size=8, sliding_window=128)),
+    ]
+    coord = _make_coord(groups, hash_block_size=4, use_eagle=True)
+    token_len = 768
+    hashes = _hashes(token_len // coord.hash_block_size)
+
+    # Mirror MooncakeStoreWorker's aligned save: only keys selected by each
+    # group's store mask are visible to the external lookup.
+    exists: set[tuple[int, bytes]] = set()
+    store_masks = coord.store_mask(token_len)
+    for gid, (group, mask) in enumerate(zip(groups, store_masks, strict=True)):
+        group_hashes = coord.block_hashes_for_spec(hashes, group.kv_cache_spec)
+        for chunk_id, block_hash in enumerate(group_hashes):
+            if mask is None or mask[chunk_id]:
+                exists.add((gid, bytes(block_hash)))
+
+    _masks, hit = coord.find_longest_cache_hit(
+        hashes,
+        max_length=token_len,
+        cached_block_pool=ExternalCachedBlockPool(coord.hash_block_size, exists),
+    )
+
+    # The final 256-token segment has no lookahead block, so EAGLE falls back
+    # to the previous aligned boundary instead of consuming all 768 tokens.
+    assert hit == 512
