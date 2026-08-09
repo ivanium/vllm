@@ -31,7 +31,7 @@ from vllm.v1.simple_kv_offload.metadata import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+    from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId, KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -335,10 +335,6 @@ class SimpleCPUOffloadScheduler:
 
         cpu_hit_blocks_full, _ = pending
 
-        # ``num_external_tokens`` is LCM-aligned (checked per-group below),
-        # so this counts whole scheduler-aligned chunks of incoming tokens.
-        num_blocks_to_load = num_external_tokens // self.block_size
-        assert num_blocks_to_load > 0
         num_cached_fa_blocks = sum(
             blk.block_hash is not None for blk in blocks.blocks[self.fa_gidx]
         )
@@ -358,11 +354,7 @@ class SimpleCPUOffloadScheduler:
             g_block_size = (
                 kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
             )
-            assert num_external_tokens % g_block_size == 0, (
-                f"num_external_tokens={num_external_tokens} not aligned to "
-                f"group {g} block_size={g_block_size}"
-            )
-            n_take_g = num_external_tokens // g_block_size
+            n_take_g = cdiv(num_external_tokens, g_block_size)
             cpu_hit_blocks.append(cpu_hit_blocks_full[g][:n_take_g])
 
         gpu_block_ids: list[int] = []
@@ -466,11 +458,94 @@ class SimpleCPUOffloadScheduler:
     def prepare_store_specs(
         self, scheduler_output: SchedulerOutput
     ) -> tuple[list[int], list[int], list[str]]:
-        """Prepare store specs for the store event."""
-        if self._lazy_mode:
-            return self._prepare_lazy_store_specs()
-        else:
-            return self._prepare_eager_store_specs(scheduler_output)
+        """Prepare regular and exact-boundary stores for one event."""
+        regular = (
+            self._prepare_lazy_store_specs()
+            if self._lazy_mode
+            else self._prepare_eager_store_specs(scheduler_output)
+        )
+        boundary = self._prepare_boundary_store_specs(scheduler_output)
+        return (
+            regular[0] + boundary[0],
+            regular[1] + boundary[1],
+            list(dict.fromkeys(regular[2] + boundary[2])),
+        )
+
+    def _prepare_boundary_store_specs(
+        self, scheduler_output: SchedulerOutput
+    ) -> tuple[list[int], list[int], list[str]]:
+        handoffs = scheduler_output.boundary_state_offloads
+        gpu_pool = self._gpu_block_pool
+        if not handoffs or gpu_pool is None:
+            return [], [], []
+
+        groups = self.cpu_kv_cache_config.kv_cache_groups
+        boundaries: dict[tuple[str, int], dict[int, int]] = {}
+        for req_id, entries in handoffs.items():
+            for group_idx, block_id, boundary in entries:
+                boundaries.setdefault((req_id, boundary), {})[group_idx] = block_id
+
+        gpu_ids: list[int] = []
+        cpu_ids: list[int] = []
+        req_ids: list[str] = []
+        for (req_id, boundary), exact_sources in boundaries.items():
+            state = self._reqs_to_store.get(req_id)
+            sources: list[int] = []
+            complete = True
+            for group_idx, group in enumerate(groups):
+                spec = group.kv_cache_spec
+                if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
+                    exact_block_id = exact_sources.get(group_idx)
+                    if exact_block_id is None:
+                        if state is not None:
+                            complete = False
+                            break
+                        continue
+                    sources.append(exact_block_id)
+                elif state is not None:
+                    group_block_size = spec.block_size * self.cp_world_size
+                    end = cdiv(boundary, group_block_size)
+                    if end > len(state.block_ids[group_idx]):
+                        complete = False
+                        break
+                    start = state.num_stored_blocks[group_idx]
+                    sources.extend(state.block_ids[group_idx][start:end])
+
+            blocks = []
+            for block_id in sources:
+                block = gpu_pool.blocks[block_id]
+                if block.is_null or block.block_hash is None:
+                    complete = False
+                    break
+                if (
+                    block.block_id not in self._in_flight_store_gpu_blocks
+                    and self.cpu_block_pool.cached_block_hash_to_block.get_one_block(
+                        block.block_hash
+                    )
+                    is None
+                ):
+                    blocks.append(block)
+            if not complete or len(blocks) > self.cpu_block_pool.get_num_free_blocks():
+                continue
+            if not blocks:
+                continue
+
+            cpu_blocks = self.cpu_block_pool.get_new_blocks(len(blocks))
+            for cpu_block, gpu_block in zip(cpu_blocks, blocks, strict=True):
+                assert gpu_block.block_hash is not None
+                cpu_block.set_block_hash(
+                    gpu_block.block_hash,
+                    num_tokens=gpu_block.block_hash_num_tokens,
+                )
+            block_ids = [block.block_id for block in blocks]
+            gpu_pool.touch(blocks)
+            self._in_flight_store_gpu_blocks.update(block_ids)
+            gpu_ids.extend(block_ids)
+            cpu_ids.extend(block.block_id for block in cpu_blocks)
+            if state is not None:
+                req_ids.append(req_id)
+
+        return gpu_ids, cpu_ids, req_ids
 
     def _prepare_lazy_store_specs(
         self,
@@ -494,7 +569,8 @@ class SimpleCPUOffloadScheduler:
             self._cursor = None
 
         gpu_ids: list[int] = []
-        block_hashes: list[bytes] = []
+        block_hashes: list[BlockHashWithGroupId] = []
+        block_hash_num_tokens: list[int | None] = []
         last_visited = self._cursor
 
         for covered, node in enumerate(free_queue.iter_blocks_after(self._cursor)):
@@ -511,6 +587,7 @@ class SimpleCPUOffloadScheduler:
             ):
                 gpu_ids.append(node.block_id)
                 block_hashes.append(bhash)
+                block_hash_num_tokens.append(node.block_hash_num_tokens)
 
         self._cursor = last_visited
 
@@ -518,8 +595,10 @@ class SimpleCPUOffloadScheduler:
         if gpu_ids:
             cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
             cpu_ids = [blk.block_id for blk in cpu_blocks]
-            for cpu_blk, bhash in zip(cpu_blocks, block_hashes):  # type: ignore[assignment]
-                cpu_blk._block_hash = bhash  # type: ignore[assignment]
+            for cpu_blk, block_hash, num_tokens in zip(
+                cpu_blocks, block_hashes, block_hash_num_tokens, strict=True
+            ):
+                cpu_blk.set_block_hash(block_hash, num_tokens=num_tokens)
             # Touch GPU blocks to prevent eviction during async copy.
             gpu_pool.touch([gpu_pool.blocks[bid] for bid in gpu_ids])
         else:
@@ -579,7 +658,8 @@ class SimpleCPUOffloadScheduler:
 
             # --- Phase 1: Scan blocks, classify as cached vs to-store ---
             gpu_block_ids: list[int] = []
-            block_hashes_to_store: list[bytes] = []
+            block_hashes_to_store: list[BlockHashWithGroupId] = []
+            block_hash_num_tokens: list[int | None] = []
             advanced_per_group: list[int] = [0] * num_groups
             out_of_space = False
             # Confirmed tokens: KV data written and visible to all streams.
@@ -595,10 +675,12 @@ class SimpleCPUOffloadScheduler:
                 already_stored_g = state.num_stored_blocks[g]
                 group_gpu_ids = block_ids_by_group[g]
 
-                g_block_size = (
-                    kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
-                )
+                spec = kv_cache_groups[g].kv_cache_spec
+                g_block_size = spec.block_size * self.cp_world_size
                 ready_blocks_g = aligned_tokens // g_block_size
+                if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
+                    advanced_per_group[g] += max(0, ready_blocks_g - already_stored_g)
+                    continue
                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
 
                 for gpu_block_id in scannable:
@@ -632,6 +714,7 @@ class SimpleCPUOffloadScheduler:
 
                     gpu_block_ids.append(gpu_block_id)
                     block_hashes_to_store.append(bhash_with_group)
+                    block_hash_num_tokens.append(gpu_block.block_hash_num_tokens)
                     advanced_per_group[g] += 1
 
                 if out_of_space:
@@ -642,8 +725,13 @@ class SimpleCPUOffloadScheduler:
             if n_to_alloc > 0:
                 cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
                 cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
-                for cpu_blk, bhash in zip(cpu_blocks_alloc, block_hashes_to_store):
-                    cpu_blk._block_hash = bhash  # type: ignore[assignment]
+                for cpu_blk, bhash, num_tokens in zip(
+                    cpu_blocks_alloc,
+                    block_hashes_to_store,
+                    block_hash_num_tokens,
+                    strict=True,
+                ):
+                    cpu_blk.set_block_hash(bhash, num_tokens=num_tokens)
             else:
                 cpu_block_ids = []
 
@@ -705,8 +793,7 @@ class SimpleCPUOffloadScheduler:
             self._release_transfer_refs(transfer)
             return
 
-        if not self._lazy_mode:
-            self._in_flight_store_gpu_blocks.difference_update(transfer.gpu_block_ids)
+        self._in_flight_store_gpu_blocks.difference_update(transfer.gpu_block_ids)
 
         self._process_store_completion(transfer.gpu_block_ids, transfer.cpu_block_ids)
         logger.debug(

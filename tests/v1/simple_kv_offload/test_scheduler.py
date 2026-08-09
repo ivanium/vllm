@@ -39,6 +39,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
+    MLAAttentionSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -1831,3 +1833,167 @@ def test_cp_lazy_target_blocks_scaling(cp_world_size: int) -> None:
             f"cp_world_size={cp_world_size}: target_cp={target_cp} should be "
             f"less than target_base={target_base}"
         )
+
+
+FINE_HASH_SIZE = 4
+HYBRID_BLOCK_SIZE = 32
+
+
+def _make_partial_boundary_case(*, lazy: bool = False):
+    attention_specs = [
+        MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=num_heads,
+            head_size=8,
+            dtype=DTYPE,
+        )
+        for num_heads in (1, 2)
+    ]
+    mamba_specs = [
+        MambaSpec(
+            block_size=HYBRID_BLOCK_SIZE,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+        for _ in range(2)
+    ]
+    specs = [*attention_specs, *mamba_specs]
+    names = ["target_mla", "dspark_draft_mla", "kda_0", "kda_1"]
+    num_blocks = 64
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(spec.page_size_bytes * num_blocks, [name])
+            for name, spec in zip(names, specs, strict=True)
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec([name], spec)
+            for name, spec in zip(names, specs, strict=True)
+        ],
+    )
+    bytes_per_block = sum(spec.page_size_bytes for spec in specs)
+    scheduler = SimpleCPUOffloadScheduler(
+        vllm_config=_make_vllm_config(block_size=FINE_HASH_SIZE),
+        kv_cache_config=kv_cache_config,
+        cpu_capacity_bytes=bytes_per_block * 32,
+        scheduler_block_size=HYBRID_BLOCK_SIZE,
+        hash_block_size=FINE_HASH_SIZE,
+        lazy_offload=lazy,
+    )
+    gpu_pool = BlockPool(
+        num_gpu_blocks=num_blocks,
+        enable_caching=True,
+        hash_block_size=FINE_HASH_SIZE,
+    )
+    scheduler.bind_gpu_block_pool(gpu_pool)
+
+    boundary = 3 * FINE_HASH_SIZE
+    request = Request(
+        request_id=f"partial-boundary-{lazy}",
+        prompt_token_ids=list(range(boundary + 1)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=get_request_block_hasher(FINE_HASH_SIZE, sha256),
+    )
+    group_blocks = (
+        gpu_pool.get_new_blocks(1),
+        gpu_pool.get_new_blocks(1),
+        gpu_pool.get_new_blocks(1),
+        gpu_pool.get_new_blocks(1),
+    )
+    blocks = KVCacheBlocks(blocks=group_blocks)
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+    for group_idx in range(2):
+        gpu_pool.cache_partial_block(
+            request=request,
+            block=group_blocks[group_idx][0],
+            num_tokens=boundary,
+            kv_cache_group_id=group_idx,
+            block_size=16,
+        )
+
+    exact_sources = gpu_pool.get_new_blocks(2)
+    for group_idx, block in enumerate(exact_sources, start=2):
+        gpu_pool.cache_partial_block(
+            request=request,
+            block=block,
+            num_tokens=boundary,
+            kv_cache_group_id=group_idx,
+            block_size=HYBRID_BLOCK_SIZE,
+        )
+    request.num_computed_tokens = boundary
+    output = make_scheduler_output(
+        {request.request_id: boundary},
+        new_reqs={request.request_id: blocks.get_block_ids()},
+    )
+    output.boundary_state_offloads = {
+        request.request_id: [
+            (group_idx, block.block_id, boundary)
+            for group_idx, block in enumerate(exact_sources, start=2)
+        ]
+    }
+    return scheduler, gpu_pool, request, group_blocks, exact_sources, output
+
+
+def test_partial_boundary_roundtrip_k3_dspark_groups() -> None:
+    scheduler, gpu_pool, request, group_blocks, exact_sources, output = (
+        _make_partial_boundary_case()
+    )
+
+    store_meta = scheduler.build_connector_meta(output)
+
+    expected_sources = [
+        block.block_id for blocks in group_blocks[:2] for block in blocks
+    ] + [block.block_id for block in exact_sources]
+    assert store_meta.store_gpu_blocks == expected_sources
+    simulate_store_completion(scheduler, store_meta.store_event)
+    assert all(
+        scheduler.cpu_block_pool.blocks[block_id].block_hash_num_tokens
+        == 3 * FINE_HASH_SIZE
+        for block_id in store_meta.store_cpu_blocks
+    )
+
+    consumer = Request(
+        request_id="partial-boundary-consumer",
+        prompt_token_ids=request.prompt_token_ids,
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=request._block_hasher,
+    )
+    hit_tokens, is_async = scheduler.get_num_new_matched_tokens(
+        consumer, num_computed_tokens=0
+    )
+    assert (hit_tokens, is_async) == (3 * FINE_HASH_SIZE, True)
+
+    destination = KVCacheBlocks(
+        blocks=(
+            gpu_pool.get_new_blocks(4),
+            gpu_pool.get_new_blocks(4),
+            gpu_pool.get_new_blocks(1),
+            gpu_pool.get_new_blocks(1),
+        )
+    )
+    scheduler.update_state_after_alloc(
+        consumer, destination, num_external_tokens=hit_tokens
+    )
+    load_meta = scheduler.build_connector_meta(
+        make_scheduler_output(
+            {consumer.request_id: 1},
+            new_reqs={consumer.request_id: destination.get_block_ids()},
+        )
+    )
+    assert len(load_meta.load_gpu_blocks) == len(expected_sources)
+    assert len(load_meta.load_cpu_blocks) == len(expected_sources)
+
+
+def test_partial_boundary_exact_sources_in_lazy_mode() -> None:
+    scheduler, _, _, _, exact_sources, output = _make_partial_boundary_case(lazy=True)
+
+    metadata = scheduler.build_connector_meta(output)
+
+    assert metadata.store_gpu_blocks == [block.block_id for block in exact_sources]
+    simulate_store_completion(scheduler, metadata.store_event)
+    assert all(block.ref_cnt == 1 for block in exact_sources)
