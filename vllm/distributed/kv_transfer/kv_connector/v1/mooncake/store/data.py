@@ -259,11 +259,11 @@ class RankLocalStoreLayout(StoreLayout):
             for tp_rank, pcp_rank, dcp_rank, pp_rank in rank_namespaces
         )
 
-    def set_kv_caches_base_addr(self, base_addrs: list[int]) -> None:
-        self.kv_caches_base_addr = base_addrs
+    def set_kv_caches_base_addr(self, kv_caches_base_addr: list[int]) -> None:
+        self.kv_caches_base_addr = kv_caches_base_addr
 
-    def set_block_len(self, block_lens: list[int]) -> None:
-        self.block_len = block_lens
+    def set_block_len(self, block_len: list[int]) -> None:
+        self.block_len = block_len
 
     def register_kv_caches(
         self,
@@ -278,6 +278,8 @@ class RankLocalStoreLayout(StoreLayout):
             storage_addr = storage.data_ptr()
             storage_len = storage.nbytes()
             if not is_non_overlapping_and_dense(cache[0]):
+                # A block is scattered across per-head regions; each region's
+                # blocks are contiguous.
                 for head_idx in range(cache.shape[1]):
                     head_cache = cache[:, head_idx]
                     assert is_non_overlapping_and_dense(head_cache[0])
@@ -288,6 +290,11 @@ class RankLocalStoreLayout(StoreLayout):
                     base_addrs.append(region_addr)
                     block_lens.append(head_cache.stride(0) * head_cache.element_size())
             elif cache.stride(0) * cache.element_size() * num_blocks == storage_len:
+                # The block stride spans the whole per-block window
+                # (block-outermost and packed layouts, and single-layer
+                # tensors), which may hold other layers' pages at higher
+                # offsets. Register the storage once as one whole-window
+                # region.
                 if storage_addr in seen_region_ptrs:
                     continue
                 seen_region_ptrs.add(storage_addr)
@@ -309,6 +316,11 @@ class RankLocalStoreLayout(StoreLayout):
         block_ids: list[int],
         shard_ids: Sequence[StoreShardId],
     ) -> tuple[list[list[int]], list[list[int]], list[int]]:
+        """Compute memory addresses and sizes for multiple token ranges.
+
+        Returns:
+            (addr_lists, size_lists, chunk_block_ids), one entry per chunk.
+        """
         if not chunks:
             return [], [], []
         assert len(chunks) == len(shard_ids) and all(
@@ -323,7 +335,7 @@ class RankLocalStoreLayout(StoreLayout):
         n = len(chunks)
         starts = np.fromiter((c[0] for c in chunks), dtype=np.int64, count=n)
         spans = np.fromiter((c[1] for c in chunks), dtype=np.int64, count=n) - starts
-        assert np.all(spans % self.hash_block_size == 0)
+        assert not (spans % self.hash_block_size).any()
         bids = np.fromiter(
             (block_ids[i] for i in (starts // self.block_size).tolist()),
             dtype=np.int64,
@@ -335,17 +347,15 @@ class RankLocalStoreLayout(StoreLayout):
         return addrs.tolist(), sizes.tolist(), bids.tolist()
 
     def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
+        """Return addresses and sizes for one physical block slot."""
+        addr_list = []
+        size_list = []
         length = len(self.block_len)
-        return (
-            [
-                base_addr + block_id * self.block_len[index % length]
-                for index, base_addr in enumerate(self.kv_caches_base_addr)
-            ],
-            [
-                self.block_len[index % length]
-                for index in range(len(self.kv_caches_base_addr))
-            ],
-        )
+        for index, base_addr in enumerate(self.kv_caches_base_addr):
+            addr = base_addr + block_id * self.block_len[index % length]
+            addr_list.append(addr)
+            size_list.append(self.block_len[index % length])
+        return addr_list, size_list
 
 
 class TPShardedStoreLayout(StoreLayout):
@@ -420,6 +430,61 @@ class TPShardedStoreLayout(StoreLayout):
             [template[2] for template in templates], dtype=np.uint64
         )
 
+    def _has_packed_strides(
+        self, head_stride: int, token_stride: int, content_bytes: int
+    ) -> bool:
+        """Whether the (head, token) byte strides match this native format."""
+        raise NotImplementedError
+
+    def _shard_segments(
+        self, head_start: int, head_stride: int, token_stride: int, content_bytes: int
+    ) -> Iterable[tuple[int, int]]:
+        """Yield (byte offset from the cache base, segment bytes) per shard."""
+        raise NotImplementedError
+
+    def register_kv_caches(
+        self,
+        kv_caches: Sequence[torch.Tensor],
+        num_blocks: int,
+    ) -> None:
+        templates: list[tuple[list[int], list[int], list[int]]] = [
+            ([], [], []) for _ in range(self.shards_per_rank)
+        ]
+        for cache in kv_caches:
+            if cache.ndim != 4 or tuple(cache.shape[:3]) != (
+                num_blocks,
+                self.local_num_kv_heads,
+                self.block_size,
+            ):
+                raise ValueError(
+                    "TP-shared Mooncake store requires packed KV caches with "
+                    "logical shape (num_blocks, local_kv_heads, block_size, content)"
+                )
+
+            element_size = cache.element_size()
+            block_stride, head_stride, token_stride, content_stride = (
+                stride * element_size for stride in cache.stride()
+            )
+            content_bytes = cache.shape[3] * element_size
+            if content_stride != element_size or not self._has_packed_strides(
+                head_stride, token_stride, content_bytes
+            ):
+                raise ValueError(
+                    "TP-shared Mooncake store requires the packed "
+                    f"{self.store_format} KV layout"
+                )
+
+            for local_shard, (addr_bases, block_strides, sizes) in enumerate(templates):
+                head_start = local_shard * self.heads_per_store_shard
+                for offset, size in self._shard_segments(
+                    head_start, head_stride, token_stride, content_bytes
+                ):
+                    addr_bases.append(cache.data_ptr() + offset)
+                    block_strides.append(block_stride)
+                    sizes.append(size)
+
+        self._set_segment_templates(templates)
+
     def prepare_values(
         self,
         chunks: Sequence[tuple[int, int]],
@@ -464,46 +529,19 @@ class LBHNCStoreLayout(TPShardedStoreLayout):
 
     store_format = "tp_shared_lbhnc"
 
-    def register_kv_caches(
-        self,
-        kv_caches: Sequence[torch.Tensor],
-        num_blocks: int,
-    ) -> None:
-        templates: list[tuple[list[int], list[int], list[int]]] = [
-            ([], [], []) for _ in range(self.shards_per_rank)
-        ]
-        for cache in kv_caches:
-            if cache.ndim != 4 or tuple(cache.shape[:3]) != (
-                num_blocks,
-                self.local_num_kv_heads,
-                self.block_size,
-            ):
-                raise ValueError(
-                    "TP-shared Mooncake store requires packed KV caches with "
-                    "logical shape (num_blocks, local_kv_heads, block_size, content)"
-                )
+    def _has_packed_strides(
+        self, head_stride: int, token_stride: int, content_bytes: int
+    ) -> bool:
+        return (
+            token_stride == content_bytes
+            and head_stride == self.block_size * content_bytes
+        )
 
-            element_size = cache.element_size()
-            block_stride, head_stride, token_stride, content_stride = (
-                stride * element_size for stride in cache.stride()
-            )
-            content_bytes = cache.shape[3] * element_size
-            if not (
-                content_stride == element_size
-                and token_stride == content_bytes
-                and head_stride == self.block_size * content_bytes
-            ):
-                raise ValueError(
-                    "TP-shared Mooncake store requires packed LBHNC KV layout"
-                )
-
-            for local_shard, (addr_bases, block_strides, sizes) in enumerate(templates):
-                head_start = local_shard * self.heads_per_store_shard
-                addr_bases.append(cache.data_ptr() + head_start * head_stride)
-                block_strides.append(block_stride)
-                sizes.append(self.heads_per_store_shard * head_stride)
-
-        self._set_segment_templates(templates)
+    def _shard_segments(
+        self, head_start: int, head_stride: int, token_stride: int, content_bytes: int
+    ) -> Iterable[tuple[int, int]]:
+        # A shard's head range is one contiguous span per block.
+        yield head_start * head_stride, self.heads_per_store_shard * head_stride
 
 
 class LBNHCStoreLayout(TPShardedStoreLayout):
@@ -511,51 +549,23 @@ class LBNHCStoreLayout(TPShardedStoreLayout):
 
     store_format = "tp_shared_lbnhc"
 
-    def register_kv_caches(
-        self,
-        kv_caches: Sequence[torch.Tensor],
-        num_blocks: int,
-    ) -> None:
-        templates: list[tuple[list[int], list[int], list[int]]] = [
-            ([], [], []) for _ in range(self.shards_per_rank)
-        ]
-        for cache in kv_caches:
-            if cache.ndim != 4 or tuple(cache.shape[:3]) != (
-                num_blocks,
-                self.local_num_kv_heads,
-                self.block_size,
-            ):
-                raise ValueError(
-                    "TP-shared Mooncake store requires packed KV caches with "
-                    "logical shape (num_blocks, local_kv_heads, block_size, content)"
-                )
+    def _has_packed_strides(
+        self, head_stride: int, token_stride: int, content_bytes: int
+    ) -> bool:
+        return (
+            head_stride == content_bytes
+            and token_stride == self.local_num_kv_heads * content_bytes
+        )
 
-            element_size = cache.element_size()
-            block_stride, head_stride, token_stride, content_stride = (
-                stride * element_size for stride in cache.stride()
+    def _shard_segments(
+        self, head_start: int, head_stride: int, token_stride: int, content_bytes: int
+    ) -> Iterable[tuple[int, int]]:
+        # A shard's head range recurs once per token row within the block.
+        for token_idx in range(self.block_size):
+            yield (
+                token_idx * token_stride + head_start * head_stride,
+                self.heads_per_store_shard * content_bytes,
             )
-            content_bytes = cache.shape[3] * element_size
-            if not (
-                content_stride == element_size
-                and head_stride == content_bytes
-                and token_stride == self.local_num_kv_heads * content_bytes
-            ):
-                raise ValueError(
-                    "TP-shared Mooncake store requires packed LBNHC KV layout"
-                )
-
-            for local_shard, (addr_bases, block_strides, sizes) in enumerate(templates):
-                head_start = local_shard * self.heads_per_store_shard
-                for token_idx in range(self.block_size):
-                    addr_bases.append(
-                        cache.data_ptr()
-                        + token_idx * token_stride
-                        + head_start * head_stride
-                    )
-                    block_strides.append(block_stride)
-                    sizes.append(self.heads_per_store_shard * content_bytes)
-
-        self._set_segment_templates(templates)
 
 
 class ChunkedTokenDatabase:
