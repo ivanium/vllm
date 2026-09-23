@@ -625,6 +625,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
+        if (
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.use_dflash()
+        ):
+            from vllm.models.glm5next.dflash import configure_dflash
+
+            configure_dflash(vllm_config.speculative_config.draft_model_config)
+
         config = vllm_config.model_config.hf_config
         self.config = config
 

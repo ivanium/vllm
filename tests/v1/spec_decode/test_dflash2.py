@@ -169,13 +169,16 @@ def test_selector_asks_for_fp32_proposal_logits():
 
 
 @pytest.mark.skip_global_cleanup
-def test_dflash2_model_decoder_layer_cls(monkeypatch):
+@pytest.mark.parametrize("glm_target", [False, True], ids=["generic", "glm5next"])
+def test_dflash2_model_preserves_swa_with_glm_full_kv_allocation(
+    monkeypatch, glm_target
+):
     from types import SimpleNamespace
 
     from vllm.config import set_current_vllm_config
     from vllm.model_executor.models.qwen3_dflash2 import (
         DFlash2Qwen3DecoderLayer,
-        DFlash2Qwen3Model,
+        DFlash2Qwen3ForCausalLM,
     )
 
     # 1. Mock get_current_vllm_config and TP groups
@@ -187,7 +190,9 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
             cache_dtype="auto",
             sliding_window=None,
             enable_prefix_caching=False,
+            skip_page_size_padded=None,
         ),
+        use_v2_model_runner=True,
         kv_transfer_config=None,
         speculative_config=None,
         attention_config=SimpleNamespace(
@@ -210,6 +215,7 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
             dtype=torch.float32,
             is_mm_prefix_lm=False,
             rswa_window=None,
+            head_dtype=None,
         ),
         kernel_config=SimpleNamespace(
             linear_backend="auto",
@@ -236,6 +242,7 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
 
     # 2. Mock vllm_config
     hf_config = SimpleNamespace(
+        architectures=["DFlash2DraftModel"],
         vocab_size=1000,
         hidden_size=256,
         num_hidden_layers=2,
@@ -246,6 +253,8 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
         rope_parameters={},
         intermediate_size=512,
         hidden_act="silu",
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=128,
         dflash_config={
             "selector_rank": 4,
             "selector_top_k": 3,
@@ -259,6 +268,10 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
             draft_model_config=SimpleNamespace(
                 hf_config=hf_config,
                 quantization=None,
+                architectures=hf_config.architectures,
+                model_arch_config=SimpleNamespace(
+                    architectures=hf_config.architectures
+                ),
             ),
             num_speculative_tokens=4,
             enable_adaptive_verification=False,
@@ -266,6 +279,8 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
         model_config=SimpleNamespace(
             dtype=torch.float32,
             is_mm_prefix_lm=False,
+            get_total_num_hidden_layers=lambda: 4,
+            get_vocab_size=lambda: 1000,
         ),
         load_config=SimpleNamespace(
             quantization=None,
@@ -275,10 +290,58 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
     mock_current_vllm_config.speculative_config = vllm_config.speculative_config
     vllm_config.compilation_config = mock_current_vllm_config.compilation_config
 
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.models.glm5next.dflash import (
+        Glm5NextDFlash2ForCausalLM,
+        configure_dflash,
+    )
+
+    monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
+    draft_config = vllm_config.speculative_config.draft_model_config
+    if glm_target:
+        configure_dflash(draft_config)
+        configure_dflash(draft_config)  # Repeated setup must not duplicate the alias.
+        assert draft_config.hf_config.architectures == [
+            "Glm5NextDFlash2DraftModel",
+            "DFlash2DraftModel",
+        ]
+        assert (
+            draft_config.model_arch_config.architectures
+            == draft_config.hf_config.architectures
+        )
+    model_cls, _ = ModelRegistry.resolve_model_cls(
+        draft_config.hf_config.architectures,
+        SimpleNamespace(model_impl="vllm"),
+    )
+    assert model_cls is (
+        Glm5NextDFlash2ForCausalLM if glm_target else DFlash2Qwen3ForCausalLM
+    )
+    generic_cls, _ = ModelRegistry.resolve_model_cls(
+        ["DFlash2DraftModel"], SimpleNamespace(model_impl="vllm")
+    )
+    assert generic_cls is DFlash2Qwen3ForCausalLM
+
     # 3. Instantiate the model under meta device to avoid parameter allocation issues
     with set_current_vllm_config(mock_current_vllm_config), torch.device("meta"):
-        model = DFlash2Qwen3Model(vllm_config=vllm_config)
+        model = model_cls(vllm_config=vllm_config).model
 
     # 4. Assert that the layers are DFlash2Qwen3DecoderLayer (the subclass)
     assert len(model.layers) == 2
     assert isinstance(model.layers[0], DFlash2Qwen3DecoderLayer)
+
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    # Allocation uses the finalized block size, without changing SWA compute.
+    mock_current_vllm_config.cache_config.block_size = 64
+    swa = model.layers[0].self_attn.attn
+    spec = swa.get_kv_cache_spec(mock_current_vllm_config)
+    expected_type = FullAttentionSpec if glm_target else SlidingWindowSpec
+    assert type(spec) is expected_type
+    assert spec.sliding_window == swa.sliding_window == 128
+    assert spec.block_size == 64
+    assert swa.impl.sliding_window == 128
+    full = model.layers[1].self_attn.attn
+    from vllm.model_executor.layers.attention import Attention
+
+    assert type(full) is Attention
+    assert type(full.get_kv_cache_spec(mock_current_vllm_config)) is FullAttentionSpec
