@@ -303,6 +303,7 @@ def combine_case(
     replay_starts: list[int] | None = None,
     combine_fn=combine_topk_swa_indices,
     query_start_base: int = 0,
+    invalid_topk: bool = False,
 ):
     """Run combine_topk_swa_indices and return (indices, lens, expected)."""
     device = torch.device("cuda")
@@ -328,9 +329,13 @@ def combine_case(
     M = N + int(gather_lens.max()) + 8
     gen = torch.Generator(device="cpu").manual_seed(0)
     topk_indices = torch.randint(
-        0, 4096, (num_tokens, max(topk, 1)), generator=gen, dtype=torch.int32
-    ).to(device)
-    topk_indices = topk_indices[:, : max(topk, 1)]
+        0, max(N, 1), (num_tokens, max(topk, 1)), generator=gen, dtype=torch.int32
+    )
+    if invalid_topk:
+        # The indexer's -1 pad and an index past the compressed region.
+        topk_indices[:, 0::3] = -1
+        topk_indices[:, 1::3] = N
+    topk_indices = topk_indices.to(device)
 
     if with_image:
         lefts, rights = ref_left_right(seq_lens, query_lens, spans, MAX_IMG)
@@ -384,7 +389,8 @@ def combine_case(
             swa_len = end - start
             row = [-1] * combined_topk
             for j in range(topk_len):
-                row[j] = int(topk_cpu[token, j]) + M * b
+                idx = int(topk_cpu[token, j])
+                row[j] = idx + M * b if 0 <= idx < N else -1
             for j in range(swa_len):
                 row[topk_len + j] = M * b + N + start + j - gather_start
             rows.append(row)
@@ -440,6 +446,28 @@ def test_v41_combine_topk_swa_stops_at_replay_start(
         replay_starts=[16, 0],
         combine_fn=combine_v41,
         query_start_base=query_start_base,
+    )
+    assert lens.cpu().tolist() == exp_lens
+    assert indices.cpu().tolist() == rows
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_v41_combine_topk_swa_drops_invalid_topk():
+    """An invalid local topk index stays -1: offset by the request's slab it
+    would alias the rows of a neighboring request (request 1 here)."""
+    from vllm.models.deepseek_v41.common.ops.cache_utils import (
+        combine_topk_swa_indices as combine_v41,
+    )
+
+    indices, lens, rows, exp_lens = combine_case(
+        compress_ratio=1,
+        topk=16,
+        seq_lens=[40, 40],
+        query_lens=[24, 24],
+        spans=[[], []],
+        with_image=False,
+        combine_fn=combine_v41,
+        invalid_topk=True,
     )
     assert lens.cpu().tolist() == exp_lens
     assert indices.cpu().tolist() == rows
