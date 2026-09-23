@@ -302,6 +302,7 @@ def combine_case(
     with_image: bool,
     replay_starts: list[int] | None = None,
     combine_fn=combine_topk_swa_indices,
+    query_start_base: int = 0,
 ):
     """Run combine_topk_swa_indices and return (indices, lens, expected)."""
     device = torch.device("cuda")
@@ -312,6 +313,7 @@ def combine_case(
         query_lens, dtype=torch.int32, device=device
     ).cumsum(0)
     num_tokens = int(query_start_loc[-1])
+    query_start_loc += query_start_base
     seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     # The builder's gather covers only the context above the replay start.
     gather_lens = torch.tensor(
@@ -322,7 +324,7 @@ def combine_case(
         dtype=torch.int32,
         device=device,
     )
-    N = (max(seq_lens) + compress_ratio - 1) // compress_ratio
+    N = (max(seq_lens) + compress_ratio - 1) // compress_ratio if compress_ratio else 0
     M = N + int(gather_lens.max()) + 8
     gen = torch.Generator(device="cpu").manual_seed(0)
     topk_indices = torch.randint(
@@ -375,7 +377,7 @@ def combine_case(
         gather_start = seq_len - int(gather_lens[b])
         for i in range(query_len):
             pos = prefix_len + i
-            topk_len = min((pos + 1) // compress_ratio, topk)
+            topk_len = min((pos + 1) // compress_ratio, topk) if compress_ratio else 0
             start, end = ref_swa_bounds(pos, WINDOW, lefts[token], rights[token])
             # The window never reaches below the gathered buffer.
             start = max(start, gather_start)
@@ -414,25 +416,30 @@ def test_combine_topk_swa_with_image_spans(cfg):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("cfg", COMBINE_CASES)
-def test_v41_combine_topk_swa_stops_at_replay_start(cfg):
+@pytest.mark.parametrize("compress_ratio", [0, 1, 2])
+@pytest.mark.parametrize("query_start_base", [0, 3])
+@pytest.mark.parametrize("query_len", [24, 513])
+def test_v41_combine_topk_swa_stops_at_replay_start(
+    compress_ratio, query_start_base, query_len
+):
     """SWA bounded replay: the gathered buffer starts at replay_start, so the
     window never indexes below it."""
     from vllm.models.deepseek_v41.common.ops.cache_utils import (
         combine_topk_swa_indices as combine_v41,
     )
 
-    # Request 0 replays [16, 40): the windows of its first rows would
-    # otherwise reach below 16.
+    # Request 0 replays from 16; request 1 is a cold prefill. A nonzero
+    # query_start_base represents a chunk following decode or prefill rows.
     indices, lens, rows, exp_lens = combine_case(
-        cfg["compress_ratio"],
-        cfg["topk"],
-        seq_lens=[40, 12],
-        query_lens=[24, 12],
+        compress_ratio,
+        topk=16 if compress_ratio else 0,
+        seq_lens=[16 + query_len, 12],
+        query_lens=[query_len, 12],
         spans=[[], []],
         with_image=False,
         replay_starts=[16, 0],
         combine_fn=combine_v41,
+        query_start_base=query_start_base,
     )
     assert lens.cpu().tolist() == exp_lens
     assert indices.cpu().tolist() == rows
