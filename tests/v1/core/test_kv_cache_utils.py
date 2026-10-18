@@ -6,7 +6,7 @@ import importlib
 from collections.abc import Callable
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -28,6 +28,7 @@ from vllm.config import (
 )
 from vllm.config.attention import HiSparseConfig
 from vllm.config.kv_events import KVEventsConfig
+from vllm.config.speculative import SpeculativeConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -48,9 +49,11 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_capacity,
     get_max_concurrency_for_kv_cache_config,
+    get_num_hash_lookahead_tokens,
     get_request_block_hasher,
     hash_block_tokens,
     init_none_hash,
+    is_lookahead_block_hashing_enabled,
     make_block_hash_with_group_id,
     null_head_len,
     tensor_data,
@@ -261,6 +264,7 @@ def make_request(
     mm_hashes: list[str] | None = None,
     cache_salt: str | None = None,
     prompt_embeds: torch.Tensor | None = None,
+    use_lookahead_block_hashes: bool = False,
 ):
     mm_features = []
     if mm_positions is not None:
@@ -285,7 +289,9 @@ def make_request(
         pooling_params=None,
         lora_request=None,
         cache_salt=cache_salt,
-        block_hasher=get_request_block_hasher(block_size, hash_fn),
+        block_hasher=get_request_block_hasher(
+            block_size, hash_fn, use_lookahead_block_hashes
+        ),
         prompt_embeds=prompt_embeds,
     )
 
@@ -1041,34 +1047,122 @@ def test_request_block_hasher(hash_fn):
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
-def test_request_block_hasher_incremental_append_with_multiple_mm_features(hash_fn):
+@pytest.mark.parametrize("lookahead", [False, True])
+def test_request_block_hasher_incremental_append_with_multiple_mm_features(
+    hash_fn, lookahead
+):
     mm_positions = [
         PlaceholderRange(offset=4, length=2),
         PlaceholderRange(offset=6, length=1),
     ]
+    num_tokens = 7 + lookahead
     incremental = make_request(
         request_id="incremental",
-        prompt_token_ids=list(range(7)),
+        prompt_token_ids=list(range(num_tokens)),
         block_size=4,
         hash_fn=hash_fn,
         mm_positions=mm_positions,
         mm_hashes=["A", "B"],
+        use_lookahead_block_hashes=lookahead,
     )
-    incremental.append_output_token_ids(7)
+    incremental.append_output_token_ids(num_tokens)
     fresh = make_request(
         request_id="fresh",
-        prompt_token_ids=list(range(8)),
+        prompt_token_ids=list(range(num_tokens + 1)),
         block_size=4,
         hash_fn=hash_fn,
         mm_positions=mm_positions,
         mm_hashes=["A", "B"],
+        use_lookahead_block_hashes=lookahead,
     )
 
+    mm_keys = (("mm", "A", 0), ("mm", "B", 2))
+    extra_keys = (mm_keys, (8,), None) if lookahead else mm_keys
     expected_second_hash = hash_fn(
-        (incremental.block_hashes[0], (4, 5, 6, 7), (("mm", "A", 0), ("mm", "B", 2)))
+        (incremental.block_hashes[0], (4, 5, 6, 7), extra_keys)
     )
     assert incremental.block_hashes[1] == expected_second_hash
     assert incremental.block_hashes == fresh.block_hashes
+
+
+def test_lookahead_hash_covers_each_module_lookahead():
+    request = Request(
+        request_id="request",
+        prompt_token_ids=list(range(9)),
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(4, sha256, 2),
+    )
+    # The second block's hash waits for both tokens after it.
+    assert len(request.block_hashes) == 1
+    request.append_output_token_ids(9)
+    assert request.block_hashes[1] == sha256(
+        (request.block_hashes[0], (4, 5, 6, 7), (None, (8, 9), None))
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        *(
+            pytest.param({"method": method}, True, id=method)
+            for method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+        ),
+        pytest.param({"method": "ngram"}, False, id="not-eagle"),
+        pytest.param({"enable_prefix_caching": False}, False, id="no-prefix-caching"),
+        pytest.param({"num_prefill_lookahead_tokens": 2}, True, id="multi-module-mtp"),
+        pytest.param(
+            {"disable_lookahead_block_hashes": True}, False, id="disabled-by-config"
+        ),
+        pytest.param({"kv_connector": True}, False, id="kv-connector"),
+        pytest.param({"hisparse": True}, False, id="hisparse"),
+    ],
+)
+def test_lookahead_block_hashing_enabled(overrides: dict[str, Any], expected: bool):
+    speculative_config = object.__new__(SpeculativeConfig)
+    object.__setattr__(speculative_config, "method", overrides.get("method", "mtp"))
+    object.__setattr__(
+        speculative_config,
+        "disable_lookahead_block_hashes",
+        overrides.get("disable_lookahead_block_hashes", False),
+    )
+    vllm_config = cast(
+        VllmConfig,
+        SimpleNamespace(
+            cache_config=SimpleNamespace(
+                enable_prefix_caching=overrides.get("enable_prefix_caching", True)
+            ),
+            speculative_config=speculative_config,
+            num_prefill_lookahead_tokens=overrides.get(
+                "num_prefill_lookahead_tokens", 1
+            ),
+            kv_transfer_config=object() if overrides.get("kv_connector") else None,
+            attention_config=SimpleNamespace(
+                hisparse_config=object() if overrides.get("hisparse") else None
+            ),
+        ),
+    )
+
+    assert is_lookahead_block_hashing_enabled(vllm_config) == expected
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"), [("eagle3", 1), ("dflash", 0), ("dspark", 0)]
+)
+def test_num_hash_lookahead_tokens(monkeypatch, method: str, expected: int):
+    speculative_config = object.__new__(SpeculativeConfig)
+    object.__setattr__(speculative_config, "method", method)
+    object.__setattr__(speculative_config, "draft_model_config", None)
+    vllm_config = cast(
+        VllmConfig,
+        SimpleNamespace(
+            speculative_config=speculative_config, num_prefill_lookahead_tokens=1
+        ),
+    )
+    monkeypatch.setattr(
+        kv_cache_utils, "is_lookahead_block_hashing_enabled", lambda _: True
+    )
+    assert get_num_hash_lookahead_tokens(vllm_config) == expected
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
