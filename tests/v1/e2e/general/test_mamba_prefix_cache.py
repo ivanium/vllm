@@ -28,7 +28,10 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine.core_client import InprocClient
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    get_mamba_prefill_checkpoint_position,
+)
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.request import Request
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -1329,13 +1332,19 @@ def _run_mamba_prefix_cache_mrv2(
         assert engine.llm_engine.engine_core.engine_core.scheduler.reset_prefix_cache()
 
         if internal_checkpoints:
-            # The checkpoint a 2B + 10 prefill exports at B (column 1) is the
-            # final state of a prefill that stops at B (column 0). Distinct
-            # tokens make a shifted conv window visible.
+            # The checkpoint a 2B + 10 prefill exports (column 1) is the final
+            # state of a prefill that stops there. Distinct tokens make a
+            # shifted conv window visible.
             tokens = [(i * 7919) % 30000 + 1 for i in range(BLOCK_SIZE * 2 + 10)]
             scheduler = engine.llm_engine.engine_core.engine_core.scheduler
+            checkpoint = get_mamba_prefill_checkpoint_position(
+                len(tokens), BLOCK_SIZE, scheduler.use_eagle_block_drop
+            )
             states = []
-            for num_tokens, col in ((BLOCK_SIZE, 0), (len(tokens), 1)):
+            for num_tokens, col in (
+                (checkpoint, checkpoint // BLOCK_SIZE - 1),
+                (len(tokens), 1),
+            ):
                 captured["snapshot_col"] = col
                 _ = engine.generate(
                     [TokensPrompt(prompt_token_ids=tokens[:num_tokens])],
