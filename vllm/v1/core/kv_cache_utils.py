@@ -700,22 +700,22 @@ def to_event_extra_keys(
 
 
 def to_request_event_extra_keys(
-    extra_keys: Iterable[tuple[Any, ...] | None] | None,
-    use_lookahead_block_hashes: bool,
-) -> list[tuple[Any, ...] | None] | None:
-    """`to_event_extra_keys` for keys from
-    `generate_request_block_hash_extra_keys`. Lookahead keys keep the lookahead
-    token and untag the block and lookahead extra keys."""
-    if not use_lookahead_block_hashes:
-        return to_event_extra_keys(extra_keys)
-    if not extra_keys:
-        return None
-    return [
-        None
-        if keys is None
-        else (_untag_extra_keys(keys[0]), keys[1], _untag_extra_keys(keys[2]))
-        for keys in extra_keys
-    ] or None
+    extra_keys: list[Any], num_hash_lookahead_tokens: int
+) -> tuple[
+    list[tuple[Any, ...] | None] | None,
+    list[list[int]] | None,
+    list[tuple[Any, ...] | None] | None,
+]:
+    """Split keys from `generate_request_block_hash_extra_keys` into the
+    `extra_keys`, `lookahead_token_ids` and `lookahead_extra_keys` fields of
+    `BlockStored`."""
+    if not num_hash_lookahead_tokens:
+        return to_event_extra_keys(extra_keys), None, None
+    return (
+        to_event_extra_keys([keys[0] for keys in extra_keys]),
+        [list(keys[1]) for keys in extra_keys],
+        to_event_extra_keys([keys[2] for keys in extra_keys]),
+    )
 
 
 def _untag_extra_keys(keys: tuple[Any, ...] | None) -> tuple[Any, ...] | None:

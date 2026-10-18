@@ -92,6 +92,12 @@ class BlockStored(KVCacheEvent):
     ownership of the underlying block, which may be shared across sessions.
     """
     session_id: str | None = None
+    """Per block, the tokens after it that its lookahead hash also covers."""
+    lookahead_token_ids: list[list[int]] | None = None
+    """Per block, the extra keys of `lookahead_token_ids`, untagged as in
+    `extra_keys`. A lookahead hash uses `(block keys, tuple(lookahead token
+    ids), lookahead keys)` as its extra keys, each tagged or None."""
+    lookahead_extra_keys: list[tuple[Any, ...] | None] | None = None
 
     def __hash__(self) -> int:
         return hash(
@@ -109,6 +115,10 @@ class BlockStored(KVCacheEvent):
                 self.locality,
                 self.ownership,
                 self.session_id,
+                tuple(map(tuple, self.lookahead_token_ids))
+                if self.lookahead_token_ids
+                else None,
+                tuple(self.lookahead_extra_keys) if self.lookahead_extra_keys else None,
             )
         )
 

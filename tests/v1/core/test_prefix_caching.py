@@ -4316,17 +4316,17 @@ def test_kv_events_reconstruct_lookahead_block_hashes():
     ]
     reconstructed_hashes = []
     parent_hash = events[0].parent_block_hash
-    assert events[0].extra_keys is not None
-    for block_start, extra_keys in zip(
+    assert events[0].extra_keys == [None, None]
+    for block_start, lookahead_token_ids in zip(
         range(0, len(events[0].token_ids), block_size),
-        events[0].extra_keys,
+        events[0].lookahead_token_ids,
         strict=True,
     ):
         parent_hash = kv_cache_utils.hash_block_tokens(
             sha256,
             parent_hash,
             events[0].token_ids[block_start : block_start + block_size],
-            extra_keys,
+            (None, tuple(lookahead_token_ids), None),
         )
         reconstructed_hashes.append(parent_hash)
     assert reconstructed_hashes == request.block_hashes
