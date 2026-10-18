@@ -1076,12 +1076,28 @@ def test_request_block_hasher_incremental_append_with_multiple_mm_features(
     )
 
     mm_keys = (("mm", "A", 0), ("mm", "B", 2))
-    extra_keys = (mm_keys, 8, None) if lookahead else mm_keys
+    extra_keys = (mm_keys, (8,), None) if lookahead else mm_keys
     expected_second_hash = hash_fn(
         (incremental.block_hashes[0], (4, 5, 6, 7), extra_keys)
     )
     assert incremental.block_hashes[1] == expected_second_hash
     assert incremental.block_hashes == fresh.block_hashes
+
+
+def test_lookahead_hash_covers_each_module_lookahead():
+    request = Request(
+        request_id="request",
+        prompt_token_ids=list(range(9)),
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(4, sha256, 2),
+    )
+    # The second block's hash waits for both tokens after it.
+    assert len(request.block_hashes) == 1
+    request.append_output_token_ids(9)
+    assert request.block_hashes[1] == sha256(
+        (request.block_hashes[0], (4, 5, 6, 7), (None, (8, 9), None))
+    )
 
 
 @pytest.mark.parametrize(
@@ -1093,7 +1109,7 @@ def test_request_block_hasher_incremental_append_with_multiple_mm_features(
         ),
         pytest.param({"method": "ngram"}, False, id="not-eagle"),
         pytest.param({"enable_prefix_caching": False}, False, id="no-prefix-caching"),
-        pytest.param({"num_prefill_lookahead_tokens": 2}, False, id="multi-module-mtp"),
+        pytest.param({"num_prefill_lookahead_tokens": 2}, True, id="multi-module-mtp"),
         pytest.param(
             {"disable_lookahead_block_hashes": True}, False, id="disabled-by-config"
         ),

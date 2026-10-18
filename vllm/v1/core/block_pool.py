@@ -161,7 +161,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        use_lookahead_block_hashes: bool = False,
+        num_hash_lookahead_tokens: int = 0,
         medium: str = MEDIUM_GPU,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
@@ -169,7 +169,7 @@ class BlockPool:
         self.medium = medium
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
-        self.use_lookahead_block_hashes = use_lookahead_block_hashes
+        self.num_hash_lookahead_tokens = num_hash_lookahead_tokens
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
@@ -332,7 +332,7 @@ class BlockPool:
                     block_start,
                     block_end,
                     curr_mm_idx,
-                    self.use_lookahead_block_hashes,
+                    self.num_hash_lookahead_tokens,
                 )
                 extra_keys_list.append(extra_keys)
 
@@ -375,7 +375,7 @@ class BlockPool:
             medium=self.medium,
             lora_name=request.lora_request.name if request.lora_request else None,
             extra_keys=to_request_event_extra_keys(
-                extra_keys_list, self.use_lookahead_block_hashes
+                extra_keys_list, bool(self.num_hash_lookahead_tokens)
             ),
             group_idx=kv_cache_group_id,
             session_id=request.session_id,
@@ -421,7 +421,7 @@ class BlockPool:
                 block_start,
                 block_end,
                 curr_mm_idx,
-                self.use_lookahead_block_hashes,
+                self.num_hash_lookahead_tokens,
             )
             extra_keys_list.append(extra_keys)
 
@@ -499,10 +499,14 @@ class BlockPool:
 
         Returns:
             The hash key with group ID if a partial entry can be registered;
-            otherwise ``None`` for null blocks.
+            otherwise ``None`` for null blocks and lookahead hashes not yet
+            computed.
 
         """
-        if block.is_null:
+        # Lookahead hashes lag their blocks.
+        if block.is_null or num_tokens // self.hash_block_size > len(
+            request.block_hashes
+        ):
             return None
 
         assert block_size % self.hash_block_size == 0
@@ -556,7 +560,7 @@ class BlockPool:
                 block_start,
                 block_end,
                 curr_mm_idx,
-                self.use_lookahead_block_hashes,
+                self.num_hash_lookahead_tokens,
             )
             self.kv_event_queue.append(
                 BlockStored(
@@ -572,7 +576,7 @@ class BlockPool:
                     if request.lora_request
                     else None,
                     extra_keys=to_request_event_extra_keys(
-                        [extra_keys], self.use_lookahead_block_hashes
+                        [extra_keys], bool(self.num_hash_lookahead_tokens)
                     ),
                     group_idx=kv_cache_group_id,
                     session_id=request.session_id,

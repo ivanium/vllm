@@ -83,7 +83,7 @@ pytestmark = pytest.mark.cpu_test
 
 def _enable_lookahead_block_hashes(scheduler: Scheduler) -> None:
     scheduler.use_lookahead_block_hashes = True
-    scheduler.kv_cache_manager.block_pool.use_lookahead_block_hashes = True
+    scheduler.kv_cache_manager.block_pool.num_hash_lookahead_tokens = 1
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

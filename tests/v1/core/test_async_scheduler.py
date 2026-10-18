@@ -42,7 +42,7 @@ def _make_model_runner_output(
 
 def _enable_lookahead_block_hashes(scheduler: AsyncScheduler) -> None:
     scheduler.use_lookahead_block_hashes = True
-    scheduler.kv_cache_manager.block_pool.use_lookahead_block_hashes = True
+    scheduler.kv_cache_manager.block_pool.num_hash_lookahead_tokens = 1
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2, 3, 5])

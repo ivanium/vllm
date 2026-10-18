@@ -978,9 +978,6 @@ def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
         or speculative_config.disable_lookahead_block_hashes
     ):
         return False
-    # The hash covers only the next token; multi-module MTP reads further ahead.
-    if vllm_config.num_prefill_lookahead_tokens > 1:
-        return False
     # HiSparse is not validated with lookahead hashes.
     if vllm_config.attention_config.hisparse_config is not None:
         return False
@@ -990,10 +987,17 @@ def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
     return vllm_config.cache_config.enable_prefix_caching
 
 
+def get_num_hash_lookahead_tokens(vllm_config: VllmConfig) -> int:
+    """Tokens after each block that its hash also covers (0 for plain hashes)."""
+    if not is_lookahead_block_hashing_enabled(vllm_config):
+        return 0
+    return vllm_config.num_prefill_lookahead_tokens
+
+
 def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
-    use_lookahead_block_hashes: bool = False,
+    num_hash_lookahead_tokens: int = 0,
 ) -> Callable[[Request], list[BlockHash]]:
     """Returns a function which computes the list of un-computed block hashes
     of a request.
@@ -1003,14 +1007,14 @@ def get_request_block_hasher(
     boundary. Coarser group block sizes and partial-cache boundaries reuse
     these hashes directly (see ``BlockHashListWithBlockSize``).
 
-    With ``use_lookahead_block_hashes``, each hash also covers the token right
-    after its block, which the EAGLE draft KV at the block's last position
-    depends on, so it is emitted only once that token exists.
+    With ``num_hash_lookahead_tokens``, each hash also covers that many tokens
+    after its block, which the EAGLE draft KV at the block's last positions
+    depends on, so it is emitted only once those tokens exist.
     """
 
     def request_block_hasher(request: Request) -> list[BlockHash]:
         start_token_idx = len(request.block_hashes) * hash_block_size
-        num_tokens = request.num_tokens - int(use_lookahead_block_hashes)
+        num_tokens = request.num_tokens - num_hash_lookahead_tokens
 
         if start_token_idx + hash_block_size > num_tokens:
             # Early stop when there no new full blocks created.
@@ -1043,7 +1047,7 @@ def get_request_block_hasher(
                 start_token_idx,
                 end_token_idx,
                 curr_mm_idx,
-                use_lookahead_block_hashes,
+                num_hash_lookahead_tokens,
             )
 
             # Compute the hash of the current block
@@ -1066,6 +1070,7 @@ def generate_lookahead_block_hash_extra_keys(
     start_token_idx: int,
     end_token_idx: int,
     start_mm_idx: int,
+    num_hash_lookahead_tokens: int,
 ) -> tuple[tuple[Any, ...], int]:
     block_extra_keys, next_block_mm_idx = generate_block_hash_extra_keys(
         request,
@@ -1073,16 +1078,17 @@ def generate_lookahead_block_hash_extra_keys(
         end_token_idx,
         start_mm_idx,
     )
+    lookahead_end_idx = end_token_idx + num_hash_lookahead_tokens
     lookahead_extra_keys, _ = generate_block_hash_extra_keys(
         request,
         end_token_idx,
-        end_token_idx + 1,
+        lookahead_end_idx,
         next_block_mm_idx,
     )
     return (
         (
             block_extra_keys,
-            request.all_token_ids[end_token_idx],
+            tuple(request.all_token_ids[end_token_idx:lookahead_end_idx]),
             lookahead_extra_keys,
         ),
         next_block_mm_idx,
@@ -1094,14 +1100,15 @@ def generate_request_block_hash_extra_keys(
     start_token_idx: int,
     end_token_idx: int,
     start_mm_idx: int,
-    use_lookahead_block_hashes: bool,
+    num_hash_lookahead_tokens: int,
 ) -> tuple[tuple[Any, ...] | None, int]:
-    if use_lookahead_block_hashes:
+    if num_hash_lookahead_tokens:
         return generate_lookahead_block_hash_extra_keys(
             request,
             start_token_idx,
             end_token_idx,
             start_mm_idx,
+            num_hash_lookahead_tokens,
         )
     return generate_block_hash_extra_keys(
         request,
