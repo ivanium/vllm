@@ -2281,12 +2281,11 @@ class Scheduler(SchedulerInterface):
 
             if (
                 self.use_lookahead_block_hashes
-                and stopped
+                and new_token_ids
                 and status_before_stop == RequestStatus.RUNNING
                 and not output_is_stale
             ):
-                # The last sampled token is the lookahead token of the block
-                # before it, which no later allocation will publish.
+                # Publish blocks the new tokens complete before a stop or abort.
                 self.kv_cache_manager.cache_blocks(
                     request,
                     request.num_computed_tokens - request.num_in_flight_tokens,

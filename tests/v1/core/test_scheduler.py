@@ -374,7 +374,8 @@ def test_scheduler_publishes_lookahead_blocks_at_allocation():
     assert num_cached_tokens([0, 1, 2, 3, 6, 7]) == block_size
 
 
-def test_finished_request_publishes_block_ending_at_last_sampled_token():
+@pytest.mark.parametrize("abort", [False, True])
+def test_finished_request_publishes_block_ending_at_last_sampled_token(abort: bool):
     """The last sampled token is never computed, but it is the lookahead token
     of the block ending right before it, whose draft KV the finishing step
     wrote. That block must be published before the request is freed."""
@@ -389,7 +390,7 @@ def test_finished_request_publishes_block_ending_at_last_sampled_token():
     request = Request(
         request_id="request",
         prompt_token_ids=[0, 1, 2],
-        sampling_params=SamplingParams(max_tokens=2, ignore_eos=True),
+        sampling_params=SamplingParams(max_tokens=3 if abort else 2, ignore_eos=True),
         pooling_params=None,
         block_hasher=get_request_block_hasher(block_size, sha256, True),
     )
@@ -405,6 +406,8 @@ def test_finished_request_publishes_block_ending_at_last_sampled_token():
                 sampled_token_ids=[[token_id]],
             ),
         )
+    if abort:
+        scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
     assert request.is_finished()
     # Tokens 0-3 were computed; token 4 is the lookahead of block [2, 4).
     assert request.num_computed_tokens == 4
