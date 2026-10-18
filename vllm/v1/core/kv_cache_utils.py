@@ -991,6 +991,15 @@ def get_num_hash_lookahead_tokens(vllm_config: VllmConfig) -> int:
     """Tokens after each block that its hash also covers (0 for plain hashes)."""
     if not is_lookahead_block_hashing_enabled(vllm_config):
         return 0
+    spec_config = vllm_config.speculative_config
+    assert spec_config is not None
+    # DFlash/DSpark cache KV from target hidden states; Gemma4 MTP caches none.
+    if (
+        spec_config.use_dflash()
+        or spec_config.use_dspark()
+        or spec_config.use_gemma4_mtp()
+    ):
+        return 0
     return vllm_config.num_prefill_lookahead_tokens
 
 

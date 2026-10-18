@@ -49,6 +49,7 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_capacity,
     get_max_concurrency_for_kv_cache_config,
+    get_num_hash_lookahead_tokens,
     get_request_block_hasher,
     hash_block_tokens,
     init_none_hash,
@@ -1143,6 +1144,25 @@ def test_lookahead_block_hashing_enabled(overrides: dict[str, Any], expected: bo
     )
 
     assert is_lookahead_block_hashing_enabled(vllm_config) == expected
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"), [("eagle3", 1), ("dflash", 0), ("dspark", 0)]
+)
+def test_num_hash_lookahead_tokens(monkeypatch, method: str, expected: int):
+    speculative_config = object.__new__(SpeculativeConfig)
+    object.__setattr__(speculative_config, "method", method)
+    object.__setattr__(speculative_config, "draft_model_config", None)
+    vllm_config = cast(
+        VllmConfig,
+        SimpleNamespace(
+            speculative_config=speculative_config, num_prefill_lookahead_tokens=1
+        ),
+    )
+    monkeypatch.setattr(
+        kv_cache_utils, "is_lookahead_block_hashing_enabled", lambda _: True
+    )
+    assert get_num_hash_lookahead_tokens(vllm_config) == expected
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
