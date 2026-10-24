@@ -9,9 +9,6 @@ import random
 import pytest
 import torch
 
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
-    ChunkedTokenDatabase,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.layout import (  # noqa: E501
     AttentionStoreLayout,
     HeadMajorStoreLayout,
@@ -296,23 +293,6 @@ def test_rank_local_descriptors_handle_empty_and_invalid_chunks():
     assert layout.prepare_values([], [1, 2, 3], []) == ([], [], [])
     with pytest.raises(AssertionError):
         layout.prepare_values([(0, BLOCK_SIZE + 1)], [0, 1], [0])
-
-
-def test_rank_local_database_api_rejects_tp_shared_layout():
-    metadata = KeyMetadata("test-model", 0, 0, 0, 0)
-    layout = HeadMajorStoreLayout(
-        metadata,
-        block_size=16,
-        hash_block_size=16,
-        local_tp_size=2,
-        store_tp_size=4,
-        tp_rank=0,
-        layer_specs=_attention_specs(1, 16, 4),
-    )
-    database = ChunkedTokenDatabase(metadata, 16, store_layout=layout)
-
-    with pytest.raises(RuntimeError, match="rank-local"):
-        database.prepare_value_for_block(0)
 
 
 _SHARED_LAYOUTS = [

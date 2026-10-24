@@ -136,18 +136,11 @@ class ChunkedTokenDatabase:
             raise RuntimeError("This operation requires a rank-local Store layout")
         return self.store_layout
 
-    def key_for(self, chunk_hash: BlockHash) -> str:
-        return self._rank_local_layout().key_for(0, chunk_hash)
-
     def set_kv_caches_base_addr(self, kv_caches_base_addr: list[int]):
         self._rank_local_layout().set_kv_caches_base_addr(kv_caches_base_addr)
 
     def set_block_len(self, block_len: list[int]):
         self._rank_local_layout().set_block_len(block_len)
-
-    def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
-        """Return addresses and sizes for one physical block slot."""
-        return self._rank_local_layout().prepare_value_for_block(block_id)
 
     def process_tokens(
         self,
