@@ -130,3 +130,7 @@ Current push PP + HMA limitations:
 - **Static quantization** (scales loaded from checkpoint): ✅ Supported. Scales are loaded independently by each instance from the model checkpoint.
 - **Dynamic quantization** (scales computed at runtime): ❌ Not supported. Per-block scales are not transferred alongside KV cache data.
 - **Packed-layout scales** (scales stored inline with weights): ✅ Supported. Scales are transferred together with the KV cache blocks.
+
+The NVIDIA MiniMax-M3 MSA backend supports NVFP4 transfers that split KV heads across different TP sizes. Each head's K/V data and scales occupy one contiguous run. Both instances must use `--kv-cache-dtype nvfp4` and `VLLM_KV_CACHE_LAYOUT=LBHNC`, the layout supported by this backend. The other TP, PP, and HMA restrictions above still apply.
+
+FlashInfer NVFP4 stores all heads' data before all heads' scales. NIXL rejects transfers that split KV heads for this format. Use matching TP sizes on prefill and decode.

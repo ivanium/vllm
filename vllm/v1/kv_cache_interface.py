@@ -567,9 +567,9 @@ class AttentionSpec(KVCacheSpec):
     state_content_bytes: int | None = None
     """C in bytes when packed; None means dense K/V content."""
     kv_head_major_slots: bool = False
-    """Whether ``num_head_slots`` slots are grouped by KV head (``H2ND``: head
-    ``h``'s K and V slots are adjacent), so every KV head is one contiguous run
-    of the page and the page re-shards across TP by byte offset."""
+    """Whether packed slots are grouped by KV head (``H2ND``), with each
+    head's K/V data and scales in one contiguous run. False means this
+    ordering is not declared."""
     tokens_per_state: int | Fraction = 1
     """Tokens covered by one stored state. Ints > 1 compress multiple tokens
     into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
