@@ -609,6 +609,8 @@ class ChunkedTokenDatabase:
         mask_num: int = 0,
         *,
         chunk_mask: list[bool] | None = None,
+        chunk_mask_start: int | None = None,
+        tail_key_boundary: int | None = None,
         put_step: int = 1,
         put_step_rank: int = 0,
     ) -> Iterable[tuple[int, int, BlockHash]]:
@@ -628,6 +630,9 @@ class ChunkedTokenDatabase:
             mask_num: Number of tokens to skip from the beginning.
             chunk_mask: Optional mask relative to the first chunk after
                 ``mask_num``. False entries are skipped before hash access.
+            chunk_mask_start: Absolute chunk index of the first mask entry.
+                Defaults to the first chunk after ``mask_num``.
+            tail_key_boundary: Token boundary identifying the stored tail key.
             put_step: Stride for distributing chunks across ranks.
             put_step_rank: ``chunk_id % put_step`` value this rank stores.
 
@@ -639,16 +644,23 @@ class ChunkedTokenDatabase:
         assert token_len // self.hash_block_size <= len(block_hashes)
         start_chunk = max(0, cdiv(mask_num, self.block_size))
         max_chunks = cdiv(token_len, self.block_size)
+        if chunk_mask_start is None:
+            chunk_mask_start = start_chunk
         if chunk_mask is not None:
-            max_chunks = min(max_chunks, start_chunk + len(chunk_mask))
+            max_chunks = min(max_chunks, chunk_mask_start + len(chunk_mask))
         for chunk_id in range(start_chunk, max_chunks):
-            if chunk_mask is not None and not chunk_mask[chunk_id - start_chunk]:
+            if chunk_mask is not None and not chunk_mask[chunk_id - chunk_mask_start]:
                 continue
             if chunk_id % put_step != put_step_rank:
                 continue
             start_idx = chunk_id * self.block_size
             end_idx = min(start_idx + self.block_size, token_len)
-            h = block_hashes[end_idx // self.hash_block_size - 1]
+            key_end = (
+                tail_key_boundary
+                if end_idx == token_len and tail_key_boundary is not None
+                else end_idx
+            )
+            h = block_hashes[key_end // self.hash_block_size - 1]
             yield start_idx, end_idx, h
 
 

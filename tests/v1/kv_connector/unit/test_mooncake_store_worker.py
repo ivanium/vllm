@@ -780,7 +780,13 @@ def test_process_tokens_uses_mask_num_as_start_chunk():
     assert results == [(64, 96, bytes([11]))]
 
 
-def test_process_tokens_applies_chunk_mask_before_hash_access():
+@pytest.mark.parametrize(
+    ("chunk_mask", "chunk_mask_start"),
+    [([False, True], None), ([True, True, False, True], 0)],
+)
+def test_process_tokens_applies_chunk_mask_before_hash_access(
+    chunk_mask, chunk_mask_start
+):
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
         block_size=32,
@@ -793,7 +799,8 @@ def test_process_tokens_applies_chunk_mask_before_hash_access():
             token_len=128,
             block_hashes=block_hashes,
             mask_num=64,
-            chunk_mask=[False, True],
+            chunk_mask=chunk_mask,
+            chunk_mask_start=chunk_mask_start,
         )
     )
 

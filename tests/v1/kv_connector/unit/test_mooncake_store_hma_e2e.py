@@ -383,6 +383,19 @@ def test_chunked_token_database_hash_block_size_smaller_than_block_size():
     assert out[0][2].hex() == fine_hashes[3].hex()
     assert out[1][2].hex() == fine_hashes[6].hex()
 
+    # Loading a suffix can use a stored boundary beyond the reusable tail.
+    out = list(
+        db.process_tokens(
+            token_len=28,
+            block_hashes=fine_hashes,
+            mask_num=16,
+            chunk_mask=[False, True],
+            chunk_mask_start=0,
+            tail_key_boundary=32,
+        )
+    )
+    assert out == [(16, 28, fine_hashes[7])]
+
 
 def _resolve_partial_tail(thread, req: ReqMeta) -> ReqMeta:
     """Add the tail's non-Mamba puts as the scheduler does before the worker."""

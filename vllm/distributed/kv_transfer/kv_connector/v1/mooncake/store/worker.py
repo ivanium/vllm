@@ -1154,18 +1154,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             chunks: list[tuple[int, int]] = []
             store_shard_ids: list[StoreShardId] = []
             for start, end, block_hash in db.process_tokens(
-                token_len, req_meta.block_hashes, mask_num
+                token_len,
+                req_meta.block_hashes,
+                mask_num,
+                chunk_mask=mask,
+                chunk_mask_start=0,
+                tail_key_boundary=tail_key_boundaries.get(g_idx),
             ):
-                chunk_idx = start // db.block_size
-                if chunk_idx >= len(mask) or not mask[chunk_idx]:
-                    continue
-                boundary_tokens = (
-                    tail_key_boundaries.get(g_idx) if end == token_len else None
-                )
-                if boundary_tokens is not None:
-                    block_hash = req_meta.block_hashes[
-                        boundary_tokens // db.hash_block_size - 1
-                    ]
                 for store_shard_id in db.store_layout.local_shard_ids:
                     key_list.append(db.store_layout.key_for(store_shard_id, block_hash))
                     chunks.append((start, end))
@@ -1541,7 +1536,6 @@ class MooncakeStoreWorker:
         if envs.VLLM_MOONCAKE_STORE_SELECTIVE_LEASE:
             self._selective_lease = SelectiveLookupLease(
                 self.store,
-                self.coord,
                 self.token_dbs,
                 self._kv_cache_groups,
                 self._lookup_key_prefixes,
@@ -2200,12 +2194,15 @@ class MooncakeStoreWorker:
                 exists_set.add((g_idx, hash_bytes))
             pos += count
 
-        hit = self._longest_hit(num_tokens, token_len, block_hashes, exists_set)
+        hit, load_masks = self._longest_hit(
+            num_tokens, token_len, block_hashes, exists_set
+        )
         if self._selective_lease is None:
             return hit
         return self._selective_lease.lease_hit(
             block_hashes,
             hit,
+            load_masks,
             exists_set,
             functools.partial(self._longest_hit, num_tokens, token_len, block_hashes),
         )
@@ -2216,13 +2213,13 @@ class MooncakeStoreWorker:
         token_len: int,
         block_hashes: Sequence[BlockHash],
         exists_set: set[tuple[int, bytes]],
-    ) -> MooncakeLookupResult:
-        """Longest prefix hit over the ``(group, hash)`` pairs in the store."""
+    ) -> tuple[MooncakeLookupResult, tuple[list[bool], ...]]:
+        """Longest prefix hit and its load masks over the stored group/hash pairs."""
         cached_block_pool = ExternalCachedBlockPool(
             self.hash_block_size,
             exists_set,
         )
-        _, hit_length = self.coord.find_longest_cache_hit(
+        load_masks, hit_length = self.coord.find_longest_cache_hit(
             block_hashes,
             token_len,
             cached_block_pool,
@@ -2230,19 +2227,22 @@ class MooncakeStoreWorker:
         if hit_length >= num_tokens:
             usable_length = self.coord.align_lookup_length(num_tokens - 1)
             if usable_length <= 0:
-                return MooncakeLookupResult(0)
-            _, hit_length = self.coord.find_longest_cache_hit(
+                return MooncakeLookupResult(0), ()
+            load_masks, hit_length = self.coord.find_longest_cache_hit(
                 block_hashes,
                 usable_length,
                 cached_block_pool,
             )
-        return MooncakeLookupResult(
-            hit_length,
-            self._tail_key_boundaries(
-                block_hashes,
+        return (
+            MooncakeLookupResult(
                 hit_length,
-                cached_block_pool,
+                self._tail_key_boundaries(
+                    block_hashes,
+                    hit_length,
+                    cached_block_pool,
+                ),
             ),
+            load_masks,
         )
 
     def _tail_key_boundaries(

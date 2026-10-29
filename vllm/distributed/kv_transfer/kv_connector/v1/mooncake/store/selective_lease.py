@@ -13,9 +13,6 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
-    MooncakeStoreCoordinator,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     ChunkedTokenDatabase,
     MooncakeLookupResult,
@@ -59,7 +56,6 @@ class SelectiveLookupLease:
     def __init__(
         self,
         store: Any,
-        coord: MooncakeStoreCoordinator,
         token_dbs: Sequence[ChunkedTokenDatabase],
         kv_cache_groups: Sequence[KVCacheGroupSpec],
         lookup_key_prefixes: Sequence[Sequence[str]],
@@ -67,7 +63,6 @@ class SelectiveLookupLease:
     ):
         self._check_supported(store)
         self.store = store
-        self.coord = coord
         self.token_dbs = token_dbs
         self.kv_cache_groups = kv_cache_groups
         self.lookup_key_prefixes = lookup_key_prefixes
@@ -90,8 +85,12 @@ class SelectiveLookupLease:
         self,
         block_hashes: Sequence[BlockHash],
         hit: MooncakeLookupResult,
+        load_masks: tuple[list[bool], ...],
         exists_set: set[tuple[int, bytes]],
-        longest_hit: Callable[[set[tuple[int, bytes]]], MooncakeLookupResult],
+        longest_hit: Callable[
+            [set[tuple[int, bytes]]],
+            tuple[MooncakeLookupResult, tuple[list[bool], ...]],
+        ],
     ) -> MooncakeLookupResult:
         """Lease the keys a load of ``hit`` reads and return the hit to load.
 
@@ -107,11 +106,11 @@ class SelectiveLookupLease:
             for _ in range(_LEASE_ROUNDS):
                 if hit.hit_length <= 0:
                     return hit
-                evicted = self._lease(block_hashes, hit)
+                evicted = self._lease(block_hashes, hit, load_masks)
                 if not evicted:
                     return hit
                 exists_set = exists_set - evicted
-                hit = longest_hit(exists_set)
+                hit, load_masks = longest_hit(exists_set)
         except _LeaseFailedError as e:
             logger.error("Failed to lease a Mooncake lookup hit: %s", e)
         except Exception:
@@ -124,33 +123,30 @@ class SelectiveLookupLease:
         self,
         block_hashes: Sequence[BlockHash],
         hit: MooncakeLookupResult,
+        load_masks: tuple[list[bool], ...],
     ) -> tuple[list[str], list[tuple[int, bytes]]]:
         """Keys a load of ``hit`` reads, in every rank namespace, and their
         ``(group, hash)`` pairs.
 
-        Mirrors ``KVCacheStoreRecvingThread._handle_request``: each group's
-        load mask, with the tail chunk keyed by the hit's tail boundary.
+        Uses the same chunk iterator and tail keys as the receive path.
         """
         hit_length = hit.hit_length
-        load_masks = self.coord.load_mask(block_hashes, hit_length)
         tail_tokens = {b.group_id: b.num_tokens for b in hit.tail_key_boundaries}
         keys: list[str] = []
         key_meta: list[tuple[int, bytes]] = []
         for g_idx, db in enumerate(self.token_dbs):
             if not self.kv_cache_groups[g_idx].kv_cache_spec.prefix_cacheable:
                 continue
-            mask = load_masks[g_idx]
             key_prefixes = self.lookup_key_prefixes[g_idx]
-            for start, end, block_hash in db.process_tokens(hit_length, block_hashes):
-                chunk_idx = start // db.block_size
-                if chunk_idx >= len(mask) or not mask[chunk_idx]:
-                    continue
-                if end == hit_length and g_idx in tail_tokens:
-                    block_hash = block_hashes[
-                        tail_tokens[g_idx] // db.hash_block_size - 1
-                    ]
+            for _, _, block_hash in db.process_tokens(
+                hit_length,
+                block_hashes,
+                chunk_mask=load_masks[g_idx],
+                tail_key_boundary=tail_tokens.get(g_idx),
+            ):
+                hash_hex = block_hash.hex()
                 keys.extend(
-                    PoolKey.build_key_string(key_prefix, block_hash.hex())
+                    PoolKey.build_key_string(key_prefix, hash_hex)
                     for key_prefix in key_prefixes
                 )
                 key_meta.extend([(g_idx, bytes(block_hash))] * len(key_prefixes))
@@ -160,6 +156,7 @@ class SelectiveLookupLease:
         self,
         block_hashes: Sequence[BlockHash],
         hit: MooncakeLookupResult,
+        load_masks: tuple[list[bool], ...],
     ) -> set[tuple[int, bytes]]:
         """Lease the keys a load of ``hit`` reads.
 
@@ -167,7 +164,7 @@ class SelectiveLookupLease:
         ``_LeaseFailedError`` when the lease RPC fails, including per-key error
         results.
         """
-        keys, key_meta = self.loaded_keys(block_hashes, hit)
+        keys, key_meta = self.loaded_keys(block_hashes, hit, load_masks)
         if not keys:
             return set()
         start = time.perf_counter()
