@@ -1,6 +1,6 @@
 # [RFC]: Large-page KV cache allocator: one KV cache group per spec
 
-**Status:** draft · **Branches:** PR1 `slab-pool` (opt-in), PR2 `lp-only` (stacked; large pages become the only allocator) · **Related:** [#62100](https://github.com/vllm-project/vllm/issues/62100) (pluggable KV cache planning)
+**Status:** draft · **Implementation:** two stacked PRs to follow (PR1 opt-in, PR2 large pages only) · **Related:** [#62100](https://github.com/vllm-project/vllm/issues/62100) (pluggable KV cache planning)
 
 ## TL;DR
 
@@ -103,6 +103,8 @@ We propose to merge PR1 first and run it opt-in on the hybrid models for one rel
 ## 7. Alternatives
 
 **Keep the equal-page rule and make grouping pluggable ([#62100](https://github.com/vllm-project/vllm/issues/62100)).** This lets a model or platform fix its own plan, but each new model still needs a plan, and core still needs `hash_block_size` for mixed block sizes. The two proposals compose: with one group per spec, a planner override is needed only for placement, not for grouping.
+
+**Pack unequal pages into one block slot ([#64307](https://github.com/vllm-project/vllm/issues/64307), [#56156](https://github.com/vllm-project/vllm/pull/56156)).** These proposals give one block id a slot that holds every group's page at its exact size, so padding goes away. One block id still spans all groups, so the layer-count grouping and `hash_block_size` stay. This RFC removes the shared block id instead.
 
 **Per-group pools with fixed sizes.** A static split of memory between groups is simple, but the right split depends on the workload. A wrong split wastes memory that the other group needs. Shared large pages move memory between groups at run time.
 
