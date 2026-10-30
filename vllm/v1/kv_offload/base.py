@@ -522,6 +522,7 @@ class BlockIDsLoadStoreSpec(LoadStoreSpec, ABC):
 class GPULoadStoreSpec(BlockIDsLoadStoreSpec):
     """Spec for loading/storing a KV block to GPU memory.
 
+    Block ids are group-local: unique only within their KV cache group.
     If there are multiple KV groups, the blocks are expected to be
     ordered by the group index.
     In that case, group_sizes[i] determines the number of blocks
@@ -610,8 +611,8 @@ class CanonicalPageMapping:
 
 @dataclass
 class CanonicalKVCacheRef:
-    """Per-layer (or group of layers) reference to a specific (by index)
-    CanonicalKVCacheTensor and records the un-padded page size used by that layer.
+    """Per-group reference to a specific (by index) CanonicalKVCacheTensor,
+    recording the un-padded page size copied per manager block.
     """
 
     # Index into the list of CanonicalKVCacheTensor objects
@@ -627,17 +628,15 @@ class CanonicalKVCaches:
     """Canonicalized block-level representation of the KV caches.
 
     Composed of:
-        - Unique list of KV cache data tensors,
-          each with shape (num_blocks, page_size_in_bytes) and int8 dtype.
-        - Per-group data references of the tensors.
-          i.e. how each KV cache group maps to the tensors.
+        - Unique list of KV cache data tensors, each a 2D int8 view of
+          one KV cache group's row region.
+        - Per-KV-cache-group list of data references that map the group
+          to the appropriate entries in the tensors list.
     """
 
-    # Ordered list of unique block tensors, each with shape
-    # (num_blocks, ...).
+    # Ordered list of unique block tensors.
     tensors: list[CanonicalKVCacheTensor]
-    # Per-KV-cache-group list of data references that map each layer
-    # in the group to the appropriate entry in the tensors list.
+    # Per-KV-cache-group list of data references into the tensors list.
     group_data_refs: list[list[CanonicalKVCacheRef]]
 
 
