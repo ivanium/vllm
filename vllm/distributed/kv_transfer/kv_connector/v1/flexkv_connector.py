@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -10,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
@@ -32,12 +34,54 @@ logger = init_logger(__name__)
 # GitHub: https://github.com/taco-project/FlexKV
 # Install: git clone git@github.com:taco-project/FlexKV.git \
 #          && cd FlexKV && bash build.sh
-class FlexKVConnectorV1(KVConnectorBase_V1):
+def _check_flexkv_impl(impl_cls: Any) -> None:
+    """Require a FlexKV revision with the large-page-aware interface.
+
+    The wrapper needs a 3-arg ``FlexKVConnectorV1Impl(vllm_config, role,
+    kv_cache_config)`` constructor and per-group ``request_finished_all_groups``
+    / ``get_block_ids_with_load_errors`` hooks. A pre-large-page FlexKV has
+    neither; reject it here instead of failing with a bare TypeError or
+    AttributeError on first use.
+    """
+    try:
+        params = dict(inspect.signature(impl_cls).parameters)
+    except (TypeError, ValueError):
+        params = {}
+    takes_kv_cache_config = len(params) >= 3 or any(
+        p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        for p in params.values()
+    )
+    missing_hooks = [
+        name
+        for name in ("request_finished_all_groups", "get_block_ids_with_load_errors")
+        if not hasattr(impl_cls, name)
+    ]
+    if not takes_kv_cache_config or missing_hooks:
+        raise RuntimeError(
+            "The installed FlexKV package is too old for FlexKVConnectorV1: "
+            "flexkv.integration.vllm.vllm_v1_adapter.FlexKVConnectorV1Impl must "
+            "take (vllm_config, role, kv_cache_config) and provide "
+            "request_finished_all_groups() and get_block_ids_with_load_errors() "
+            "returning (group_id, block_id) pairs. Missing: "
+            + ", ".join(
+                ([] if takes_kv_cache_config else ["kv_cache_config ctor arg"])
+                + missing_hooks
+            )
+            + ". Update FlexKV; see https://github.com/taco-project/FlexKV."
+        )
+
+
+class FlexKVConnectorV1(KVConnectorBase_V1, SupportsHMA):
     """KV Connector that offloads KV cache to FlexKV.
 
     FlexKV is a distributed KV Store and multi-level cache management system
     designed for ultra-large-scale LLM inference. It supports offloading KV
     cache to CPU memory, SSD, and remote storage.
+
+    Requires a FlexKV revision whose ``FlexKVConnectorV1Impl`` takes
+    ``(vllm_config, role, kv_cache_config)`` and provides
+    ``request_finished_all_groups()`` / ``get_block_ids_with_load_errors()``
+    (the large-page-aware interface); older revisions are rejected at init.
 
     Installation:
         See https://github.com/taco-project/FlexKV for installation instructions.
@@ -71,7 +115,10 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
                 "for installation instructions."
             ) from e
 
-        self._flexkv_connector = FlexKVConnectorV1Impl(vllm_config, role)
+        _check_flexkv_impl(FlexKVConnectorV1Impl)
+        self._flexkv_connector = FlexKVConnectorV1Impl(
+            vllm_config, role, kv_cache_config
+        )
 
     def shutdown(self):
         self._flexkv_connector.shutdown()
@@ -252,6 +299,23 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
         """
         return self._flexkv_connector.request_finished(request, block_ids)
 
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Called when a request has finished, before its blocks are freed.
+
+        Args:
+            request (Request): the request object.
+            block_ids: group-local block ids, one list per KV cache group.
+
+        Returns:
+            Same contract as :meth:`request_finished`.
+
+        """
+        return self._flexkv_connector.request_finished_all_groups(request, block_ids)
+
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """Collect buffered KV cache events.
 
@@ -265,6 +329,6 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
         """Get the KV connector stats collected during the last interval."""
         return self._flexkv_connector.get_kv_connector_stats()
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
-        """Get the block ids that have failed to load."""
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
+        """Get the ``(group_id, block_id)`` pairs that have failed to load."""
         return self._flexkv_connector.get_block_ids_with_load_errors()

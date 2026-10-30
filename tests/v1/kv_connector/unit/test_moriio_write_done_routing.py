@@ -722,4 +722,6 @@ def test_hybrid_write_requires_exactly_one_running_state_slot(local_state):
     task.local_block_ids = [[], local_state]
 
     with pytest.raises(MoRIIOError, match="one running-state slot"):
-        writer._prepare_mamba_transfer_plans(task, RemoteAllocInfo(block_ids=[[], [9]]))
+        writer._prepare_mamba_transfer_plans(
+            task, RemoteAllocInfo(block_ids=[[], [9]]), SimpleNamespace()
+        )

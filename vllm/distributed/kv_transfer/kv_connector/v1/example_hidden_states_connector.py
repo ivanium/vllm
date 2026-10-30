@@ -13,6 +13,7 @@ from packaging.version import Version
 from safetensors.torch import load_file, save_file
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.distributed.kv_transfer.kv_connector.utils import group_slot_mapping
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -148,10 +149,10 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         kv_cache_config: "KVCacheConfig | None",
         cache_kv_group_id: int,
     ) -> int:
-        """Block size of the hidden-states group, read from its own spec.
+        """Manager block size of the hidden-states group, from its own spec.
 
-        cache_config.block_size is bumped to a common multiple for hybrid
-        verifiers; the page-aligned hidden-states group keeps a smaller one.
+        A manager block of the group covers ``block_size`` tokens, split into
+        ``kernel_rows_per_block`` kernel rows.
         """
         if kv_cache_config is None:
             return vllm_config.cache_config.block_size
@@ -169,8 +170,7 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             role=role,
             kv_cache_config=kv_cache_config,
         )
-        # Read the hidden-states group and its block size from the group spec;
-        # cache_config.block_size is bumped (wrong) for hybrid verifiers.
+        # Read the hidden-states group and its block size from the group spec.
         self._cache_kv_group_id = self._find_cache_kv_group_id(kv_cache_config)
         self._block_size = self._get_cache_block_size(
             vllm_config, kv_cache_config, self._cache_kv_group_id
@@ -314,15 +314,18 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self._kv_cache = kv_caches[self.cache_layers[0]]
 
-        # Block size must match the indexed buffer, else reads hit the wrong
-        # slots. Raise (not assert) so the check survives `python -O`.
-        # Views are [num_blocks, num_heads, block_size, head_size], matching what
-        # extract_from_kv_cache() indexes.
-        if self._block_size != self._kv_cache.shape[2]:
+        # Kernel block size must match the indexed buffer, else reads hit the
+        # wrong slots. Raise (not assert) so the check survives `python -O`.
+        # Views are [num_rows, num_heads, kernel_block_size, head_size],
+        # matching what extract_from_kv_cache() indexes.
+        group = self._kv_cache_config.kv_cache_groups[self._cache_kv_group_id]
+        kernel_block_size = group.kernel_block_size
+        if kernel_block_size != self._kv_cache.shape[2]:
             raise ValueError(
-                f"Hidden-states block-size mismatch: derived {self._block_size} "
-                f"but buffer block size is {self._kv_cache.shape[2]}; read slots "
-                "would be wrong (likely a hybrid block-size resolution bug)."
+                f"Hidden-states kernel block-size mismatch: derived "
+                f"{kernel_block_size} but buffer block size is "
+                f"{self._kv_cache.shape[2]}; read slots would be wrong "
+                "(likely a hybrid block-size resolution bug)."
             )
 
     @staticmethod
@@ -368,17 +371,10 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             return
         assert self._kv_cache is not None
 
-        # Compute slot mapping from block_ids
-        block_ids_t = torch.tensor(pending.block_ids, dtype=torch.long)
-        num_blocks = block_ids_t.shape[0]
-        block_offsets = torch.arange(0, self._block_size, dtype=torch.long)
-        slot_mapping = (
-            block_offsets.reshape((1, self._block_size))
-            + block_ids_t.reshape((num_blocks, 1)) * self._block_size
-        )
-        slot_mapping = slot_mapping.flatten()
-
         num_tokens = pending.token_ids.shape[0]
+        slot_mapping = group_slot_mapping(
+            self._block_size, pending.block_ids, num_tokens
+        )
 
         copy_stream = self._get_copy_stream()
 

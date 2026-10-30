@@ -31,7 +31,10 @@ class LoadBlockInfo:
 
     num_computed_blocks: int
     num_blocks_to_load: int
-    need_fetch_block_ids: list[int]
+    # Per-group manager block ids of the load targets; ids are unique only
+    # within a group. A group that holds no block for a token position
+    # (e.g. a sliding-window skip) carries its null block id there.
+    need_fetch_block_ids: list[list[int]]
 
 
 @dataclass
@@ -48,9 +51,10 @@ class RequestSchedulingState:
     request_id: str
     request: Request | None = None
 
-    # Token and block tracking
+    # Token and block tracking. Block ids are kept per KV cache group,
+    # index-aligned by token block across groups (null-padded).
     token_ids: list[int] = field(default_factory=list)
-    allocated_block_ids: list[int] = field(default_factory=list)
+    allocated_block_ids: list[list[int]] = field(default_factory=list)
     num_saved_blocks: int = 0
 
     # Load operation info
@@ -67,24 +71,31 @@ class RequestSchedulingState:
         """Check if request is ready for loading."""
         return self.phase == "WAITING_TO_LOAD" and self.needs_loading()
 
-    def update_tokens_and_blocks(self, new_token_ids: list[int], new_block_ids) -> None:
-        """Update with new tokens and blocks."""
+    def update_tokens_and_blocks(
+        self,
+        new_token_ids: list[int],
+        new_block_ids: tuple[list[int], ...] | None,
+        replace_blocks: bool = False,
+    ) -> None:
+        """Update with new tokens and per-group blocks.
+
+        Args:
+            new_token_ids: Newly scheduled token ids.
+            new_block_ids: Per-group block ids; the full per-group lists for
+                resumed requests, the newly allocated blocks otherwise.
+            replace_blocks: Replace the tracked ids instead of appending.
+
+        """
         if new_token_ids:
             self.token_ids.extend(new_token_ids)
 
-        if new_block_ids is not None:
-            normalized_block_ids = self._normalize_block_ids(new_block_ids)
-            self.allocated_block_ids.extend(normalized_block_ids)
-
-    def _normalize_block_ids(self, block_ids) -> list[int]:
-        """Normalize block_ids to list format."""
-        if not block_ids:
-            return []
-        if isinstance(block_ids, tuple):
-            return block_ids[0] if block_ids else []
-        if isinstance(block_ids, list):
-            return block_ids
-        return []
+        if new_block_ids is None:
+            return
+        if replace_blocks:
+            self.allocated_block_ids = [list(ids) for ids in new_block_ids]
+        else:
+            for group_ids, new_ids in zip(self.allocated_block_ids, new_block_ids):
+                group_ids.extend(new_ids)
 
 
 @dataclass
@@ -93,7 +104,8 @@ class HF3FSRequestMetadata:
 
     request_id: str
     token_ids: list[int]
-    block_ids: list[int]
+    # Per-group manager block ids, index-aligned by token block.
+    block_ids: list[list[int]]
     load_block_op: LoadBlockInfo | None = None
     save_block_op: SaveBlockInfo | None = None
 

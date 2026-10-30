@@ -3,11 +3,13 @@
 """Mock end-to-end MoRIIO WRITE between prefill and decode of any TP sizes.
 
 Every prefill rank runs the real writer and connector offset code on real
-cache views; a fake MoRI transport copies the planned bytes into the decode
-ranks' caches, and each decode rank counts write_done with the real wrapper.
-Checks that every decode rank ends up with exactly its shard of every block
-and recurrent-state slot, nothing else is touched, every prefill rank frees
-its blocks, and a decode rank completes only after all its writers did.
+large-page cache views (kernel-row [K, H, N, C] views over a per-rank pool,
+manager blocks expanded through each side's own group geometry); a fake MoRI
+transport copies the planned bytes into the decode ranks' caches, and each
+decode rank counts write_done with the real wrapper. Checks that every decode
+rank ends up with exactly its shard of every block and recurrent-state slot,
+nothing else is touched, every prefill rank frees its blocks, and a decode
+rank completes only after all its writers did.
 """
 
 import threading
@@ -23,9 +25,9 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1 import ssm_conv_transfer_utils
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio import moriio_engine
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+    MORIIO_CONNECTOR_VERSION,
     ROLE,
     MoRIIOAgentMetadata,
-    MoRIIOError,
     RemoteAllocInfo,
     WriteTask,
 )
@@ -36,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
     MoRIIOWrapper,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_layout import (
+    expand_block_kernel_rows,
     kda_conv_ssm,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_tp_mapping import (
@@ -47,6 +50,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    GroupGeometry,
+    KVCacheConfig,
+    KVCacheGroupSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -58,12 +64,16 @@ from .utils import make_moriio_writer
 
 pytestmark = pytest.mark.cpu_test
 
-NUM_BLOCKS = 6
-BLOCK_SIZE = 4
+BLOCK_SIZE = 4  # manager block, tokens
+# Kernel rows per manager block: attention groups split their 4-token block
+# into 2-token rows, so row expansion is exercised; mamba states are one row.
+ROWS_PER_ATTN_BLOCK = 2
+KERNEL_TOKENS = BLOCK_SIZE // ROWS_PER_ATTN_BLOCK
 NOTIFY_PORT = 20000
 # Prefill blocks and the decode blocks they land in, per transfer group.
 PREFILL_BLOCKS = {"full": [1, 4], "swa": [3], "mamba": [2]}
 DECODE_BLOCKS = {"full": [5, 2], "swa": [0], "mamba": [3]}
+MIN_BLOCKS = 6
 # GDN state: Q and K are KEY_DIM channels, V is V_HEADS * V_DIM channels.
 KEY_DIM, V_HEADS, V_DIM, K_DIM, CONV_ROWS = 4, 4, 2, 2, 2
 
@@ -132,11 +142,11 @@ def _global_state(layers: list[Layer], heads: int) -> dict[str, torch.Tensor]:
     for layer in layers:
         if layer.kind == "mamba":
             n = (2 * KEY_DIM + V_HEADS * V_DIM) * CONV_ROWS + V_HEADS * V_DIM * K_DIM
-            shape: tuple[int, ...] = (NUM_BLOCKS, n)
+            shape: tuple[int, ...] = (MIN_BLOCKS, n)
         else:
             spec = _spec(layer, 1 if layer.kind == "mla" else heads, 1)
             shape = (
-                NUM_BLOCKS,
+                MIN_BLOCKS,
                 spec.num_heads,
                 spec.num_states,
                 spec.state_content_size_bytes,
@@ -167,51 +177,137 @@ class Rank:
     caches: dict[str, torch.Tensor]  # registered tensor per layer
     regions: list[torch.Tensor]  # registered byte regions, in session order
     worker: MoRIIOConnectorWorker
+    group_geometry: dict[str, GroupGeometry] = field(default_factory=dict)
+    group_num_blocks: dict[str, int] = field(default_factory=dict)
     wrapper: Any = None
     sent: list = field(default_factory=list)
+
+    def first_row(self, group: str, block_id: int) -> int:
+        return expand_block_kernel_rows(
+            self.group_geometry[group], self.group_num_blocks[group], [block_id]
+        )[0]
+
+
+def _byte_alias(view: torch.Tensor, pool: torch.Tensor, row_bytes: int) -> torch.Tensor:
+    """Contiguous byte region covering ``view``'s rows of the pool."""
+    offset = view.storage_offset()
+    row_content = view[0].numel() * view.element_size()
+    extent = (view.shape[0] - 1) * row_bytes + row_content
+    return pool[offset : offset + extent]
 
 
 def _build_rank(model, tp_rank, tp_size, layout, hma, state, is_producer) -> Rank:
     heads, layers = MODELS[model]
     groups = _groups(model, hma)
-    caches, regions, specs, meta_counts = {}, [], {}, {}
-    for layer in layers:
-        layer_heads = len(_rank_heads(tp_rank, tp_size, heads))
-        spec = _spec(layer, layer_heads, tp_size)
-        specs[layer.name] = spec
-        buffer = torch.zeros(spec.page_size_bytes * NUM_BLOCKS, dtype=torch.uint8)
-        if layer.kind == "mamba":
-            cache = buffer.view(NUM_BLOCKS, 1, 1, spec.page_size_bytes)
-            conv, ssm = kda_conv_ssm(cache, spec)
-            if is_producer:
-                for slot in range(NUM_BLOCKS):
-                    c, s = _mamba_shard(state[layer.name][slot], tp_rank, tp_size)
-                    conv[slot].view(-1).copy_(c)
-                    ssm[slot].view(-1).copy_(s)
-            regions += [
-                MoRIIOConnectorWorker._contiguous_byte_alias(conv),
-                MoRIIOConnectorWorker._contiguous_byte_alias(ssm),
-            ]
-            meta_counts[layer.name] = 2
-        else:
-            strides = compute_layout_strides(spec, NUM_BLOCKS, 1, layout)[1:]
-            shape = (
-                NUM_BLOCKS,
-                spec.num_heads,
-                spec.num_states,
-                spec.state_content_size_bytes,
-            )
-            cache = torch.as_strided(buffer, shape, strides)
-            if is_producer:
-                held = (
-                    slice(None)
-                    if layer.kind == "mla"
-                    else _rank_heads(tp_rank, tp_size, heads)
+    specs = {
+        layer.name: _spec(layer, len(_rank_heads(tp_rank, tp_size, heads)), tp_size)
+        for layer in layers
+    }
+    group_layers = {
+        g: [layer for layer in layers if (layer.group if hma else "full") == g]
+        for g in groups
+    }
+    # A group's row is the concatenation of its layers' row content.
+    row_bytes = {
+        g: sum(
+            specs[layer.name].page_size_bytes
+            if layer.kind == "mamba"
+            else specs[layer.name].page_size_bytes // ROWS_PER_ATTN_BLOCK
+            for layer in members
+        )
+        for g, members in group_layers.items()
+    }
+    # One page size per rank (4.5x the largest row), so some blocks cross
+    # page ends; block b of a group sits at b * block_bytes of its pool.
+    large_page_bytes = 9 * max(row_bytes.values()) // 2
+    group_geometry = {
+        g: GroupGeometry(1 if g == "mamba" else ROWS_PER_ATTN_BLOCK, row_bytes[g])
+        for g in groups
+    }
+    num_pages = max(
+        -(-MIN_BLOCKS * gp.block_bytes // large_page_bytes)
+        for gp in group_geometry.values()
+    )
+    group_num_blocks = {
+        g: num_pages * large_page_bytes // gp.block_bytes
+        for g, gp in group_geometry.items()
+    }
+
+    # One pool per group: a large page is owned by a single group at a time,
+    # so co-locating two groups' live blocks in one pool would alias them.
+    caches, regions, meta_counts = {}, [], {}
+    for g in groups:
+        gp = group_geometry[g]
+        pool = torch.zeros(num_pages * large_page_bytes, dtype=torch.uint8)
+        num_rows = pool.numel() // gp.row_bytes
+        layer_offset = 0
+        for layer in group_layers[g]:
+            spec = specs[layer.name]
+            if layer.kind == "mamba":
+                cache = torch.as_strided(
+                    pool,
+                    (num_rows, 1, 1, spec.page_size_bytes),
+                    (gp.row_bytes, spec.page_size_bytes, spec.page_size_bytes, 1),
+                    storage_offset=layer_offset,
                 )
-                cache.copy_(state[layer.name][:, held])
-            regions.append(buffer)
-            meta_counts[layer.name] = 1
-        caches[layer.name] = cache
+                conv, ssm = kda_conv_ssm(cache, spec)
+                if is_producer:
+                    for slot in PREFILL_BLOCKS[g]:
+                        row = expand_block_kernel_rows(gp, group_num_blocks[g], [slot])[
+                            0
+                        ]
+                        c, s = _mamba_shard(state[layer.name][slot], tp_rank, tp_size)
+                        conv[row].view(-1).copy_(c)
+                        ssm[row].view(-1).copy_(s)
+                regions += [
+                    MoRIIOConnectorWorker._contiguous_byte_alias(conv),
+                    MoRIIOConnectorWorker._contiguous_byte_alias(ssm),
+                ]
+                meta_counts[layer.name] = 2
+                layer_offset += spec.page_size_bytes
+            else:
+                kernel_spec = spec.copy_with_new_block_size(KERNEL_TOKENS)
+                strides = compute_layout_strides(
+                    kernel_spec,
+                    num_rows,
+                    1,
+                    layout,
+                    fixed_strides=(gp.row_bytes, gp.row_bytes, None, None, None),
+                )
+                shape = (
+                    num_rows,
+                    spec.num_heads,
+                    KERNEL_TOKENS,
+                    spec.state_content_size_bytes,
+                )
+                cache = torch.as_strided(
+                    pool, shape, strides[1:], storage_offset=layer_offset
+                )
+                if is_producer:
+                    held = (
+                        slice(None)
+                        if layer.kind == "mla"
+                        else _rank_heads(tp_rank, tp_size, heads)
+                    )
+                    for block in PREFILL_BLOCKS[g]:
+                        row = expand_block_kernel_rows(
+                            gp, group_num_blocks[g], [block]
+                        )[0]
+                        # [H, R * N, C] -> rows [R, H, N, C]
+                        cache[row : row + gp.kernel_rows_per_block] = (
+                            state[layer.name][block, held]
+                            .reshape(
+                                cache.shape[1],
+                                gp.kernel_rows_per_block,
+                                KERNEL_TOKENS,
+                                -1,
+                            )
+                            .permute(1, 0, 2, 3)
+                        )
+                regions.append(_byte_alias(cache, pool, gp.row_bytes))
+                meta_counts[layer.name] = 1
+                layer_offset += spec.page_size_bytes // ROWS_PER_ATTN_BLOCK
+            caches[layer.name] = cache
 
     worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
     worker.tp_rank = tp_rank
@@ -224,6 +320,22 @@ def _build_rank(model, tp_rank, tp_size, layout, hma, state, is_producer) -> Ran
     worker.layer_to_group = {
         layer.name: groups.index(layer.group if hma else "full") for layer in layers
     }
+    worker.kv_cache_config = KVCacheConfig(
+        num_pages=num_pages,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [layer.name for layer in group_layers[g]],
+                specs[group_layers[g][0].name],
+                num_blocks=group_num_blocks[g],
+                kernel_rows_per_block=group_geometry[g].kernel_rows_per_block,
+                row_bytes=group_geometry[g].row_bytes,
+            )
+            for g in groups
+        ],
+        large_page_bytes=large_page_bytes,
+        block_size=BLOCK_SIZE,
+    )
     worker._mamba_payload_index_by_layer = {
         layer.name: groups.index("mamba") for layer in layers if layer.kind == "mamba"
     }
@@ -244,7 +356,9 @@ def _build_rank(model, tp_rank, tp_size, layout, hma, state, is_producer) -> Ran
     worker._record_slice_layouts(caches)
     # Built without __init__: there is no engine to shut down.
     worker.shutdown = lambda: None
-    return Rank(tp_rank, tp_size, caches, regions, worker)
+    return Rank(
+        tp_rank, tp_size, caches, regions, worker, group_geometry, group_num_blocks
+    )
 
 
 class _Session:
@@ -255,13 +369,15 @@ class _Session:
 def _connect(producer: Rank, consumers: list[Rank], dp_engine: str) -> None:
     """Route the producer's sessions and notifications to the decode ranks."""
     consumer = consumers[0].worker
+    consumer_groups = consumer.kv_cache_config.transfer_groups
     metadata = MoRIIOAgentMetadata(
+        version=MORIIO_CONNECTOR_VERSION,
         engine_id="decode",
         agent_metadata=b"",
         kv_caches_base_addr=[],
-        num_blocks=NUM_BLOCKS,
-        block_len=0,
         attn_backend_name="test",
+        group_num_blocks=[group.num_blocks for group in consumer_groups],
+        group_geometries=consumer.kv_cache_config.transfer_group_geometries,
         kv_head_layouts={
             name: layout.to_wire() for name, layout in consumer.kv_head_layouts.items()
         },
@@ -325,20 +441,35 @@ def _consumer_wrapper() -> MoRIIOWrapper:
 
 
 def _expected(
-    layer: Layer, group: str, state, heads, tp_rank, tp_size, cache
+    layer: Layer,
+    group_name: str,
+    group: GroupGeometry,
+    num_blocks: int,
+    state,
+    heads,
+    tp_rank,
+    tp_size,
+    cache,
 ) -> torch.Tensor:
     """What the decode cache must hold after the transfer."""
-    expected = torch.zeros_like(cache)
-    pairs = zip(PREFILL_BLOCKS[group], DECODE_BLOCKS[group])
+    pairs = zip(PREFILL_BLOCKS[group_name], DECODE_BLOCKS[group_name])
     if layer.kind == "mamba":
-        expected = torch.zeros(NUM_BLOCKS, cache.shape[-1], dtype=torch.uint8)
+        expected = torch.zeros(cache.shape[0], cache.shape[-1], dtype=torch.uint8)
         for src, dst in pairs:
             conv, ssm = _mamba_shard(state[layer.name][src], tp_rank, tp_size)
-            expected[dst, : conv.numel() + ssm.numel()] = torch.cat([conv, ssm])
+            row = expand_block_kernel_rows(group, num_blocks, [dst])[0]
+            expected[row, : conv.numel() + ssm.numel()] = torch.cat([conv, ssm])
         return expected
     held = slice(None) if layer.kind == "mla" else _rank_heads(tp_rank, tp_size, heads)
+    expected = torch.zeros_like(cache)
     for src, dst in pairs:
-        expected[dst] = state[layer.name][src, held]
+        row = expand_block_kernel_rows(group, num_blocks, [dst])[0]
+        # [H, R * N, C] -> rows [R, H, N, C]
+        expected[row : row + group.kernel_rows_per_block] = (
+            state[layer.name][src, held]
+            .reshape(cache.shape[1], group.kernel_rows_per_block, cache.shape[2], -1)
+            .permute(1, 0, 2, 3)
+        )
     return expected
 
 
@@ -356,10 +487,10 @@ SCENARIOS = [
     ("layouts"),
     [
         (KVCacheLayout.LBNHC, KVCacheLayout.LBNHC),
-        (KVCacheLayout.LBHNC, KVCacheLayout.LBHNC),
         (KVCacheLayout.LBNHC, KVCacheLayout.LBHNC),
+        (KVCacheLayout.LBHNC, KVCacheLayout.LBHNC),
     ],
-    ids=["token-major", "head-major", "mixed"],
+    ids=["token-major", "mixed", "head-major"],
 )
 @pytest.mark.parametrize(("model", "producer_tp", "consumer_tp", "hma"), SCENARIOS)
 def test_write_lands_every_shard_byte_exact(
@@ -429,10 +560,15 @@ def test_write_lands_every_shard_byte_exact(
     for consumer in consumers:
         for layer in layers:
             cache = consumer.caches[layer.name]
-            received = cache.view(NUM_BLOCKS, -1) if layer.kind == "mamba" else cache
+            received = (
+                cache.view(cache.shape[0], -1) if layer.kind == "mamba" else cache
+            )
+            group_name = layer.group if hma else "full"
             expected = _expected(
                 layer,
-                layer.group if hma else "full",
+                group_name,
+                consumer.group_geometry[group_name],
+                consumer.group_num_blocks[group_name],
                 state,
                 heads,
                 consumer.tp_rank,
@@ -440,39 +576,3 @@ def test_write_lands_every_shard_byte_exact(
                 received,
             )
             assert torch.equal(received, expected), (layer.name, consumer.tp_rank)
-
-
-def test_write_refuses_peer_with_different_block_size(monkeypatch):
-    """Hybrid MLA models get TP-dependent attention block sizes; copying blocks
-    between them would misplace tokens, so the write must refuse."""
-    monkeypatch.setattr(
-        ssm_conv_transfer_utils, "is_conv_state_dim_first", lambda: True
-    )
-    monkeypatch.setattr(moriio_engine, "get_role", lambda: ROLE.CONSUMER)
-    heads, layers = MODELS["mla"]
-    state = _global_state(layers, heads)
-    consumers = [_build_rank("mla", 0, 1, KVCacheLayout.LBNHC, True, state, False)]
-    consumers[0].wrapper = _consumer_wrapper()
-    for layer in layers:
-        consumers[0].worker.attention_block_sizes[layer.name] = 2 * BLOCK_SIZE
-    producer = _build_rank("mla", 0, 2, KVCacheLayout.LBNHC, True, state, True)
-    _connect(producer, consumers, "decode")
-    info = RemoteAllocInfo(block_ids=[DECODE_BLOCKS["full"]])
-    producer.wrapper.done_remote_allocate_req_dict["t"] = info
-    writer = make_moriio_writer(producer.worker)
-    with pytest.raises(MoRIIOError, match="same --block-size"):
-        writer._execute_write_task(
-            WriteTask(
-                request_id="req",
-                transfer_id="t",
-                dst_engine_id="decode",
-                local_block_ids=[PREFILL_BLOCKS["full"]],
-                remote_block_ids_hint=None,
-                layer_name=layers[0].name,
-                event=SimpleNamespace(synchronize=lambda: None),
-                remote_notify_port=NOTIFY_PORT,
-                remote_ip="decode",
-                remote_tp_size=1,
-                tp_mapping=producer.worker._write_tp_mapping(1),
-            )
-        )

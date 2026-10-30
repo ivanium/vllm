@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.metadata import (
+    validate_transfer_groups,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -29,6 +34,34 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _assert_external_impl_supports_groups(impl_cls: type) -> None:
+    """Probe the external LMCache impl for the group-aware interface.
+
+    The default path hands the impl the KVCacheConfig (per-group large-page
+    geometry) and calls ``request_finished_all_groups``. Released lmcache
+    versions have neither and would misaddress the KV pools, so fail at
+    construction with the missing capability named.
+
+    Raises:
+        RuntimeError: if the impl lacks the co-released interface.
+
+    """
+    missing = []
+    init_params = inspect.signature(impl_cls).parameters
+    if "kv_cache_config" not in init_params:
+        missing.append("__init__ accepting the kv_cache_config argument")
+    if not callable(getattr(impl_cls, "request_finished_all_groups", None)):
+        missing.append("request_finished_all_groups")
+    if missing:
+        raise RuntimeError(
+            "The default LMCache connector path requires the lmcache version "
+            "co-released with this vLLM; the installed lmcache's "
+            f"LMCacheConnectorV1Impl lacks: {', '.join(missing)}. "
+            "Upgrade lmcache, or set the kv_transfer_config extra_config "
+            "'use_native': True to use the builtin adapter."
+        )
 
 
 class LMCacheKVEvents(KVConnectorKVEvents):
@@ -65,7 +98,7 @@ class LMCacheKVEvents(KVConnectorKVEvents):
         return f"<LMCacheKVEvents events={self.get_all_events()}>"
 
 
-class LMCacheConnectorV1(KVConnectorBase_V1):
+class LMCacheConnectorV1(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """LMCache requires PIECEWISE CUDA graph mode when layerwise
@@ -85,6 +118,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
         )
         assert vllm_config.kv_transfer_config is not None
+        validate_transfer_groups(kv_cache_config)
         use_native = vllm_config.kv_transfer_config.get_from_extra_config(
             "use_native", False
         )
@@ -103,9 +137,10 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                 LMCacheConnectorV1Impl as LMCacheConnectorLatestImpl,
             )
 
+            _assert_external_impl_supports_groups(LMCacheConnectorLatestImpl)
             cls = LMCacheConnectorLatestImpl
 
-        self._lmcache_engine = cls(vllm_config, role, self)
+        self._lmcache_engine = cls(vllm_config, role, self, kv_cache_config)
 
         self._kv_cache_events: LMCacheKVEvents | None = None
 
@@ -142,7 +177,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                 engine.current_layer = 0
             if hasattr(engine, "layerwise_retrievers"):
                 engine.layerwise_retrievers = []
-            engine.layerwise_storers = []
+            if hasattr(engine, "layerwise_storers"):
+                engine.layerwise_storers = []
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """Start loading the KV cache from the connector to vLLM's paged
@@ -221,11 +257,11 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         return self._lmcache_engine.get_finished(finished_req_ids)
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
         """Get the set of block IDs that failed to load.
 
         Returns:
-            Set of block IDs that encountered load errors.
+            Set of (group_id, block_id) pairs that encountered load errors.
             Empty set if no load errors occurred.
 
         """
@@ -233,7 +269,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         if callable(method):
             return method()
 
-        # Fallback for older versions that don't support this method
+        # The builtin adapter has no load-error reporting channel
         return set()
 
     def get_kv_connector_kv_cache_events(self) -> LMCacheKVEvents | None:
@@ -326,12 +362,13 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             )
         return
 
-    def request_finished(
+    def request_finished_all_groups(
         self,
         request: "Request",
-        block_ids: list[int],
+        block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Called when a request has finished, before its blocks are freed.
+        """Called exactly once when a request has finished, before its blocks
+        are freed for each KV cache group.
 
         Returns:
             True if the request is being saved/sent asynchronously and blocks
@@ -341,7 +378,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             returned by the engine.
 
         """
-        return self._lmcache_engine.request_finished(request, block_ids)
+        return self._lmcache_engine.request_finished_all_groups(request, block_ids)
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """Take the KV cache events from the connector.
