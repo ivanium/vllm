@@ -12,7 +12,7 @@ from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
 from math import prod
-from typing import TYPE_CHECKING, Self, TypeVar
+from typing import TYPE_CHECKING, Literal, Self, TypeVar
 
 import torch
 
@@ -200,6 +200,13 @@ class KVCacheSpec:
     is_draft: bool = field(default=False, kw_only=True, compare=False)
     """Whether a draft model owns this layer; excluded from equality so it never
     affects grouping."""
+
+    kernel_block_sizes: tuple[int | MultipleOf, ...] = field(
+        default=(), kw_only=True, compare=False
+    )
+    """Kernel block sizes (tokens) the layer's attention backend supports, set
+    on the worker. The large-page planner picks the global block size from them.
+    Empty: no constraint."""
 
     def __post_init__(self):
         alignment = self.block_stride_alignment
@@ -1489,7 +1496,10 @@ class KVCacheGroupSpec:
 
     # The names of model layers in this group
     layer_names: list[str]
-    # The KV cache spec of this manager layer
+    # The KV cache spec of this manager layer. For a DCP-sharded group its
+    # block_size is per rank (the token-space block size B // dcp_world_size);
+    # token-space accounting must use the manager's block_size
+    # (block_size * dcp_world_size), not this value.
     kv_cache_spec: KVCacheSpec
     # Whether this group holds draft layers and takes the EAGLE last-block drop.
     is_eagle_group: bool = False
@@ -1500,6 +1510,49 @@ class KVCacheGroupSpec:
     # source group after a connector load.
     enable_kv_transfer: bool = True
     role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT
+    # Large-page allocator only (see `KVCacheConfig.allocator`).
+    # Size of this group's block id space: the page count * large_page_bytes
+    # // block_bytes (see large_page_block_range).
+    num_blocks: int = 0
+    # Fewest blocks of this group that one large page holds (n_g).
+    slots_per_large_page: int = 1
+    # Kernel blocks per manager block (R_g).
+    kernel_rows_per_block: int = 1
+    # Bytes of one kernel block of all layers of this group (row_g), the same on
+    # every rank.
+    row_bytes: int = 0
+    # Per-layer specs at the group's final block size, with each layer's own
+    # block_stride_alignment. Kept for large-page placement; never merged.
+    layer_kv_cache_specs: dict[str, KVCacheSpec] | None = None
+
+    @property
+    def block_bytes(self) -> int:
+        """Bytes one block of this group spans in each of its layer views."""
+        return self.kernel_rows_per_block * self.row_bytes
+
+
+def large_page_block_range(page: int, page_bytes: int, block_bytes: int) -> range:
+    """Block ids of a group that lie wholly in large page ``page``.
+
+    Block ``b`` spans bytes ``[b * block_bytes, (b + 1) * block_bytes)`` of the
+    pool, so a block that crosses a page end belongs to no page and is never
+    allocated.
+    """
+    return range(
+        cdiv(page * page_bytes, block_bytes), (page + 1) * page_bytes // block_bytes
+    )
+
+
+def min_blocks_per_large_page(page_bytes: int, block_bytes: int) -> int:
+    """Fewest blocks ``large_page_block_range`` gives any page.
+
+    A page starting ``f`` bytes past a block boundary loses its first partial
+    block; the smallest such ``f`` is ``gcd(page_bytes, block_bytes)``.
+    """
+    num_blocks, rest = divmod(page_bytes, block_bytes)
+    if rest and rest + math.gcd(page_bytes, block_bytes) < block_bytes:
+        return num_blocks - 1
+    return num_blocks
 
 
 @dataclass
@@ -1507,7 +1560,9 @@ class KVCacheConfig:
     """The KV cache configuration of a model."""
 
     num_blocks: int
-    """The number of KV cache blocks"""
+    """The number of KV cache blocks. Under the large_page allocator, the
+    number of large pages: a page holds at least
+    ``slots_per_large_page`` blocks of its group."""
     kv_cache_tensors: list[KVCacheTensor]
     """How should model runner initialize the KV cache tensors for each layer"""
     kv_cache_groups: list[KVCacheGroupSpec]
@@ -1537,6 +1592,15 @@ class KVCacheConfig:
 
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
+
+    allocator: Literal["uniform_page", "large_page"] = "uniform_page"
+    """Block allocator. ``large_page``: the pool is ``num_blocks`` pages of
+    ``large_page_bytes``; each page belongs to one group at a time and holds
+    at least ``slots_per_large_page`` blocks of it. Block ids are unique within
+    a group."""
+
+    large_page_bytes: int = 0
+    """Bytes of one large page (S), the same on every rank."""
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
@@ -1612,6 +1676,19 @@ class KVCacheConfig:
             isinstance(spec, MambaSpec)
             for group in self.kv_cache_groups
             for spec in iter_layer_specs(group.kv_cache_spec)
+        )
+
+    @property
+    def num_mamba_blocks(self) -> int:
+        """Blocks each Mamba group can hold: a page holds at least
+        ``slots_per_large_page`` blocks of its group."""
+        return min(
+            self.num_blocks * group.slots_per_large_page
+            for group in self.kv_cache_groups
+            if any(
+                isinstance(spec, MambaSpec)
+                for spec in iter_layer_specs(group.kv_cache_spec)
+            )
         )
 
     @property

@@ -1353,6 +1353,13 @@ class Platform:
         return False
 
     @classmethod
+    def support_large_page_kv_cache(cls) -> bool:
+        """Returns if the platform's model runners and attention kernels handle
+        ``kv_cache_allocator='large_page'`` caches: per-group strided layer
+        views, group-local block ids and block offsets beyond int32."""
+        return False
+
+    @classmethod
     def support_static_graph_mode(cls) -> bool:
         """Returns if the graph mode is supported by the current platform."""
         return False

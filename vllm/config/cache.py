@@ -209,6 +209,14 @@ class CacheConfig:
 
     This equals to the `hash_block_size` used throughout the KV cache code.
     """
+    kv_cache_allocator: Literal["uniform_page", "large_page"] = "uniform_page"
+    """KV cache block allocator.
+
+    - "uniform_page": all KV cache groups share one pool of equal-size blocks,
+    so the planner equalizes page sizes across groups.
+    - "large_page": the pool is a set of large pages; each page belongs to one
+    group at a time and holds whole blocks of that group. Groups are formed
+    per KV cache spec and all token-paged groups use one block size."""
     gpu_memory_utilization: float = Field(default=0.92, gt=0, le=1)
     """The fraction of GPU memory to be used for the model executor, which can
     range from 0 to 1. For example, a value of 0.5 would imply 50% GPU memory
@@ -246,8 +254,9 @@ class CacheConfig:
     """Whether the model is attention-free. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
     num_gpu_blocks_override: int | None = None
-    """Number of GPU blocks to use. This overrides the profiled `num_gpu_blocks`
-    if specified. Does nothing if `None`. Used for testing preemption."""
+    """Number of GPU blocks (large pages under the large_page allocator) to
+    use. This overrides the profiled `num_gpu_blocks` if specified. Does
+    nothing if `None`. Used for testing preemption."""
     sliding_window: int | None = None
     """Sliding window size for the KV cache. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
@@ -328,7 +337,8 @@ class CacheConfig:
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
-    """The number of blocks to allocate for GPU memory."""
+    """The number of blocks to allocate for GPU memory
+    (`KVCacheConfig.num_blocks`): large pages under the large_page allocator."""
     num_cpu_blocks: int | None = field(default=None, init=False)
     """The number of blocks to allocate for CPU memory."""
 

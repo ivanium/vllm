@@ -1071,7 +1071,7 @@ def test_late_piecewise_restrictions_without_compilation(monkeypatch, engine_kwa
 def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():
     """Cudagraph memory profiling uses a minimal KV cache, so the Mamba
     block-count guard must only fire for the real cache sizing."""
-    kv_cache_config = SimpleNamespace(has_mamba_layers=True, num_blocks=4)
+    kv_cache_config = SimpleNamespace(has_mamba_layers=True, num_mamba_blocks=4)
 
     compilation_config = CompilationConfig(
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,

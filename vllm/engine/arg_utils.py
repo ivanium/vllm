@@ -810,6 +810,9 @@ class EngineArgs:
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     prefix_match_unit: int | None = get_field(CacheConfig, "prefix_match_unit")
+    kv_cache_allocator: Literal["uniform_page", "large_page"] = (
+        CacheConfig.kv_cache_allocator
+    )
     mamba_cache_mode: MambaCacheMode | None = None
     enable_mamba_shared_prefix_checkpoint: bool = (
         CacheConfig.enable_mamba_shared_prefix_checkpoint
@@ -1422,6 +1425,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--prefix-match-unit", **cache_kwargs["prefix_match_unit"]
+        )
+        cache_group.add_argument(
+            "--kv-cache-allocator", **cache_kwargs["kv_cache_allocator"]
         )
         cache_group.add_argument(
             "--mamba-cache-mode",
@@ -2311,6 +2317,7 @@ class EngineArgs:
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
             prefix_match_unit=self.prefix_match_unit,
+            kv_cache_allocator=self.kv_cache_allocator,
             enable_mamba_shared_prefix_checkpoint=(
                 self.enable_mamba_shared_prefix_checkpoint
             ),

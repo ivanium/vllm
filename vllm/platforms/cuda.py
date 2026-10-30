@@ -684,6 +684,10 @@ class CudaPlatformBase(Platform):
         return True
 
     @classmethod
+    def support_large_page_kv_cache(cls) -> bool:
+        return True
+
+    @classmethod
     def support_static_graph_mode(cls) -> bool:
         return True
 

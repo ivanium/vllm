@@ -2282,6 +2282,8 @@ class VllmConfig:
                 "support HMA."
             )
 
+        self._verify_large_page_allocator()
+
         if self.compilation_config.debug_dump_path:
             self.compilation_config.debug_dump_path = (
                 self.compilation_config.debug_dump_path.absolute().expanduser()
@@ -3345,6 +3347,76 @@ class VllmConfig:
                 dcp_size,
                 interleave,
                 local_block_size,
+            )
+
+    def _verify_large_page_allocator(self) -> None:
+        """Reject features the large-page KV cache allocator does not support.
+
+        Runs after the hybrid-manager and connector configs are resolved. The
+        ``prefix_match_unit`` check against the resolved global block size
+        happens in the planner (``get_kv_cache_groups``).
+        """
+        if self.cache_config.kv_cache_allocator != "large_page":
+            return
+        from vllm.platforms import current_platform
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        if not current_platform.support_large_page_kv_cache():
+            raise ValueError(
+                "kv_cache_allocator='large_page' is not supported on "
+                f"{type(current_platform).__name__}."
+            )
+        if self.attention_config.hisparse_config is not None:
+            raise ValueError(
+                "kv_cache_allocator='large_page' does not support HiSparse."
+            )
+        attention_backends = {
+            self.attention_config.backend,
+            *self.attention_config.backend_per_kind.values(),
+        }
+        if AttentionBackendEnum.FLEX_ATTENTION in attention_backends:
+            # FlexAttention reshapes the paged cache with .view(), which needs
+            # the dense per-layer blocks the large-page row layout does not have.
+            raise ValueError(
+                "kv_cache_allocator='large_page' does not support FLEX_ATTENTION."
+            )
+        kv_transfer_config = self.kv_transfer_config
+        if kv_transfer_config is None or kv_transfer_config.kv_connector is None:
+            return
+        supported = {"NixlConnector", "SimpleCPUOffloadConnector"}
+        buffer_devices = {kv_transfer_config.kv_buffer_device}
+        if kv_transfer_config.kv_connector == "MultiConnector":
+            connectors = kv_transfer_config.kv_connector_extra_config.get(
+                "connectors", []
+            )
+            buffer_devices.update(
+                conn["kv_buffer_device"]
+                for conn in connectors
+                if "kv_buffer_device" in conn
+            )
+            unsupported = {
+                str(conn.get("kv_connector"))
+                for conn in connectors
+                if conn.get("kv_connector") not in supported
+            }
+        else:
+            unsupported = (
+                set()
+                if kv_transfer_config.kv_connector in supported
+                else {kv_transfer_config.kv_connector}
+            )
+        if unsupported:
+            raise ValueError(
+                "kv_cache_allocator='large_page' supports only NixlConnector "
+                "and SimpleCPUOffloadConnector KV connectors; got "
+                f"{sorted(unsupported)}."
+            )
+        if buffer_devices != {"cuda"}:
+            # NIXL host staging buffers are dense per layer, so their strides
+            # are not the device row grid that peers map block ids with.
+            raise ValueError(
+                "kv_cache_allocator='large_page' does not support "
+                f"kv_buffer_device other than 'cuda'; got {sorted(buffer_devices)}."
             )
 
     def validate_block_size(self) -> None:

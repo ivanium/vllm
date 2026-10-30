@@ -632,6 +632,12 @@ class CpuPlatform(Platform):
         return True
 
     @classmethod
+    def support_large_page_kv_cache(cls) -> bool:
+        # The CPU runner binds views through the GPU runner's code; CPU
+        # kernels that need dense pages (e.g. CPU MLA) fail loudly.
+        return True
+
+    @classmethod
     def num_compute_units(cls, device_id: int = 0) -> int:
         return torch.get_num_threads()
 
