@@ -572,15 +572,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             block_size=32,
             packed_bytes_per_token=self.swa_bytes_per_token,
             packed_page_alignment=self.kv_page_alignment,
-            # uniform_page interleaves the SWA and compressed pages in one
-            # packed row, so the packed block has to hold whole rows of both.
-            # Under large_page each group strides its own row grid and the
-            # coupling would only pad the SWA row, so it is dropped.
-            packed_block_stride_alignment=(
-                math.lcm(self.swa_bytes_per_token, self.compressed_bytes_per_token)
-                if self.kv_mxfp8 and cache_config.kv_cache_allocator == "uniform_page"
-                else None
-            ),
             bounded_replay=swa_bounded_replay,
         )
 
@@ -1280,16 +1271,11 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             head_size=self.head_dim,
             dtype=self.dtype,
             tokens_per_state=self.compress_ratio,
-            # uniform_page: the indexer page shares a physical block with the
-            # main KV cache (the block stride is the sum of every page in the
-            # group), so it has to carry the same padding: the packed KV
-            # pages' alignment, else 512B for FlashInfer sparse (#44577).
-            # large_page: a per-layer row-stride constraint of the indexer's
-            # own group.
+            # The packed KV pages' alignment, else 512B for FlashInfer sparse
+            # (#44577).
             alignment=page_alignment,
-            # DeepGEMM's paged sparse logits need a 256B-aligned block stride
-            # (under large_page, a per-layer row-stride constraint); V4
-            # records keep their TMA stride (V4.1's is on the SWA spec).
+            # DeepGEMM's paged sparse logits need a 256B-aligned block stride;
+            # V4 records keep their TMA stride (V4.1's is on the SWA spec).
             block_stride_alignment=(
                 math.lcm(
                     256,

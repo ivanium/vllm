@@ -168,8 +168,10 @@ def gather_mla_context_cache_cpu(
     starts: torch.Tensor,
     cu_seq_lens: torch.Tensor,
 ) -> None:
+    from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+
     page_size = src_cache.shape[1]
-    flat_cache = src_cache.view(-1, src_cache.shape[-1])
+    flat_cache, block_stride_rows = flat_kv_row_view(src_cache, page_size)
     seq_lens = cu_seq_lens[1:] - cu_seq_lens[:-1]
 
     out_start = 0
@@ -179,7 +181,7 @@ def gather_mla_context_cache_cpu(
         positions = torch.arange(start, start + seq_len, device=block_table.device)
         block_ids = block_table[req_idx, positions // page_size].to(torch.long)
         offsets = positions % page_size
-        slots = block_ids * page_size + offsets
+        slots = block_ids * block_stride_rows + offsets
         out_end = out_start + seq_len
         dst[out_start:out_end].copy_(flat_cache[slots])
         out_start = out_end

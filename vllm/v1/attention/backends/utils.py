@@ -23,7 +23,6 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d, np_to_pinned_tensor
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
@@ -214,12 +213,21 @@ def get_supported_kv_cache_layouts(
 
     Every backend declares the layouts its kernels support, most preferred first
     (``supported_kv_cache_layouts``), or None when any layout works; workers where
-    nothing declares follow the default preference. Identical declarations keep
-    their order; otherwise the layout the most backends put first wins, ties
-    keeping the enum order. An empty intersection is a hard error.
+    nothing declares follow the default preference. A declared layout also admits
+    every layout with the same ``row_layout``, right after it, since the pool
+    stores them identically. Identical declarations keep their order; otherwise
+    the layout the most backends put first wins, ties keeping the enum order. An
+    empty intersection is a hard error.
     """
     supported_layouts_lists: list[Sequence[KVCacheLayout]] = [
-        layouts
+        tuple(
+            dict.fromkeys(
+                same
+                for layout in layouts
+                for same in (layout, *KVCacheLayout)
+                if same.row_layout is layout.row_layout
+            )
+        )
         for backend in backends
         if (layouts := backend.supported_kv_cache_layouts()) is not None
     ] or [_DEFAULT_LAYOUT_PREFERENCE]
@@ -249,7 +257,9 @@ def record_kv_cache_layout(cache_config: CacheConfig, layout_name: str) -> None:
     """Adopt a layout resolved elsewhere (the engine core) in this process."""
     layout = _layout_from_name(layout_name)
     existing = cache_config.kv_cache_layout
-    if existing is not None and existing != layout.name:
+    if existing is not None and (
+        _store_head_planes_in_block(_layout_from_name(existing)) is not layout
+    ):
         raise ValueError(
             f"KV cache layout is already resolved to {existing}; "
             f"cannot change it to {layout.name}."
@@ -260,25 +270,28 @@ def record_kv_cache_layout(cache_config: CacheConfig, layout_name: str) -> None:
 def resolve_kv_cache_layout(
     vllm_config: VllmConfig,
     supported_layouts: list[list[str]],
-    kv_cache_specs: Iterable[KVCacheSpec] | None = None,
 ) -> KVCacheLayout:
     """Resolve one KV cache layout for the whole model.
 
     Runs once in the engine core. Every worker reports the layouts its backends
     support, most preferred first (``get_supported_kv_cache_layouts``); all
-    ranks run the same backends, so their lists must agree. Specs mixing HNC
-    shapes narrow the candidates to block-compact layouts. An explicit
-    ``VLLM_KV_CACHE_LAYOUT`` must be one of the candidates or resolution fails,
-    with the legacy ``NHD``/``HND`` names as aliases for ``LBNHC``/``LBHNC``; the
-    connector's preference is used when compatible and dropped with a warning
-    otherwise. A layout already present on ``cache_config`` wins outright, and
-    the result is recorded there (see ``CacheConfig.kv_cache_layout``); it
-    reaches workers through the ``set_kv_cache_layout`` RPC and
-    ``KVCacheConfig.kv_cache_layout``.
+    ranks run the same backends, so their lists must agree. The layout fixes
+    only the within-block axis order: the planner packs each group's layers
+    into large pages itself. An explicit ``VLLM_KV_CACHE_LAYOUT`` must be one
+    of the candidates or resolution fails, with the legacy ``NHD``/``HND``
+    names as aliases for ``LBNHC``/``LBHNC``; the connector's preference is
+    used when compatible and dropped with a warning otherwise. A layout
+    already present on ``cache_config`` wins outright, and the result is
+    recorded there (see ``CacheConfig.kv_cache_layout``); it reaches workers
+    through the ``set_kv_cache_layout`` RPC and ``KVCacheConfig``.
     """
     cache_config = vllm_config.cache_config
     if cache_config.kv_cache_layout is not None:
-        return cache_config.get_resolved_kv_cache_layout()
+        layout = _store_head_planes_in_block(
+            cache_config.get_resolved_kv_cache_layout()
+        )
+        cache_config.kv_cache_layout = layout.name
+        return layout
 
     assert supported_layouts and all(supported_layouts), (
         "No worker reported supported KV cache layouts."
@@ -287,44 +300,6 @@ def resolve_kv_cache_layout(
         f"Workers disagree on supported KV cache layouts: {supported_layouts}."
     )
     candidates = [_layout_from_name(name) for name in supported_layouts[0]]
-
-    # A block-compact layout means the block is densely packed in memory, so any mix of
-    # specs can re-interpret HNC with different sizes as long as the total number of
-    # bytes is the same. If not block-compact, each spec must agree on HNC to alias
-    # the same page (this aliasing is done by the Hybrid Memory Allocator, HMA).
-    # Specs without per-layer views lay out their own raw backing tensor.
-    kv_cache_specs = tuple(
-        spec for spec in kv_cache_specs or () if spec.has_layer_views
-    )
-    hnc_shapes = {
-        (spec.num_heads, spec.num_states, spec.page_size_bytes)
-        for spec in kv_cache_specs
-    }
-    if len(hnc_shapes) > 1:
-        candidates = [m for m in candidates if m.is_block_compact]
-        if not candidates:
-            raise ValueError(
-                "Specs with mixed HNC shapes need a block-compact layout, but "
-                f"none is in every supported set: {supported_layouts}."
-            )
-
-    # Self-addressed per-request rings (e.g. the kpool tail) are replicated
-    # state like Mamba and don't need a separate draft group.
-    dcp_sharding = {
-        spec.dcp_sharded
-        for spec in kv_cache_specs
-        if isinstance(spec, AttentionSpec) and spec.uses_slot_mapping
-    }
-    page_sizes = {spec.page_size_bytes for spec in kv_cache_specs}
-    if len(dcp_sharding) > 1 and len(page_sizes) > 1:
-        # Sharded target and replicated draft caches need independent groups.
-        # Block-outer layouts can pack those groups without equalizing pages.
-        candidates = [layout for layout in candidates if layout.is_block_outermost]
-        if not candidates:
-            raise ValueError(
-                "DCP with a replicated draft and mixed KV page sizes requires "
-                f"a block-outer KV cache layout; supported sets: {supported_layouts}."
-            )
 
     if (requested := envs.VLLM_KV_CACHE_LAYOUT) is not None:
         layout = _layout_from_name(requested)
@@ -346,7 +321,22 @@ def resolve_kv_cache_layout(
         layout = candidates[0]
 
     logger.info_once("Using %s KV cache layout.", layout.name)
+    layout = _store_head_planes_in_block(layout)
     cache_config.kv_cache_layout = layout.name
+    return layout
+
+
+def _store_head_planes_in_block(layout: KVCacheLayout) -> KVCacheLayout:
+    """The layout the large-page pool stores ``layout`` as.
+
+    A pool row holds one block of every layer of a group, so a head plane
+    cannot span all blocks: LHBNC is stored as LBHNC, which has the same
+    in-block order. Kernels that read a head plane with a dense block stride
+    address the row through scaled block ids instead.
+    """
+    if layout is KVCacheLayout.LHBNC:
+        logger.info_once("Storing the LHBNC KV cache layout as LBHNC.")
+        return KVCacheLayout.LBHNC
     return layout
 
 

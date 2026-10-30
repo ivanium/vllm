@@ -32,6 +32,10 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.utils import (
+    get_supported_kv_cache_layouts,
+    resolve_kv_cache_layout,
+)
 from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
 from vllm.v1.core.kv_cache_planning import (
     get_kv_cache_configs,
@@ -65,7 +69,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
     large_page_block_range,
 )
-from vllm.v1.worker.utils import customize_attention_spec
+from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.worker.utils import allocate_kv_cache, customize_attention_spec
 
 pytestmark = pytest.mark.cpu_test
 
@@ -1186,6 +1191,62 @@ def test_large_page_dsv41_pp2():
     assert len(swa0.layer_names) == 20
     # The SWA row is its 23-layer row on rank 1; six of them fill a page.
     assert swa0.blocks_per_page == 6
+
+
+@pytest.mark.parametrize("layout", [layout.name for layout in KVCacheLayout])
+def test_large_page_views_for_every_layout(layout):
+    """Every layout name yields per-layer views that never alias inside a
+    group, and BHLNC keeps a block's head range contiguous across layers, the
+    run a heterogeneous-TP transfer moves."""
+    vllm_config = _large_page_vllm_config(max_model_len=1024)
+    vllm_config.cache_config.kv_cache_layout = layout
+    resolved = resolve_kv_cache_layout(vllm_config, [[layout]])
+    attn = FullAttentionSpec(
+        block_size=16, num_kv_heads=4, head_size=8, dtype=torch.float16
+    )
+    mla = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
+    )
+    specs = {f"layers.{i}.attn": attn for i in range(3)}
+    specs |= {f"layers.{i}.attn": mla for i in range(3, 5)}
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [8 * 2**20])
+    views = allocate_kv_cache(config, torch.device("cpu"), resolved)
+
+    for group in config.kv_cache_groups:
+        layer_views = [views[name].view(torch.int16) for name in group.layer_names]
+        num_blocks = layer_views[0].shape[0]
+        for i, view in enumerate(layer_views):
+            tags = torch.arange(num_blocks, dtype=torch.int16) * len(layer_views) + i
+            view.copy_(tags.view(-1, 1, 1, 1).expand_as(view))
+        for i, view in enumerate(layer_views):
+            tags = torch.arange(num_blocks, dtype=torch.int16) * len(layer_views) + i
+            assert torch.equal(view, tags.view(-1, 1, 1, 1).expand_as(view))
+
+    if resolved is not KVCacheLayout.BHLNC:
+        return
+    attn_views = [views[f"layers.{i}.attn"] for i in range(3)]
+    head_bytes = attn_views[0][0, 0].numel() * attn_views[0].element_size()
+    starts = sorted(view[5, h].data_ptr() for view in attn_views for h in range(2))
+    assert starts == list(range(starts[0], starts[0] + 6 * head_bytes, head_bytes))
+
+
+@pytest.mark.parametrize(
+    "declared, supported",
+    [
+        ("BLHNC", ["BLHNC", "LBHNC", "LHBNC"]),
+        ("LBNHC", ["LBNHC", "BLNHC"]),
+        ("BHLNC", ["BHLNC"]),
+    ],
+)
+def test_declared_layout_admits_layouts_stored_the_same(declared, supported):
+    """A declared layout admits every name the large-page pool stores the same
+    way, after it and in enum order, and no other."""
+    backend = SimpleNamespace(
+        supported_kv_cache_layouts=lambda: (KVCacheLayout[declared],)
+    )
+    assert [layout.name for layout in get_supported_kv_cache_layouts([backend])] == (
+        supported
+    )
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sparse MLA allocation and warmup must agree on physical addressing."""
+"""Sparse MLA allocation and warmup must agree on physical addressing.
+
+Under the large-page allocator the MLA and indexer layers are planned as
+separate KV cache groups (their page sizes differ), each getting kernel-row
+views from ``allocate_kv_cache``.
+"""
 
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -21,7 +26,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
 from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.utils import allocate_kv_cache, customize_attention_spec
 
@@ -34,9 +39,7 @@ pytestmark = pytest.mark.skip_global_cleanup
         "cpu",
         pytest.param(
             "cuda",
-            marks=pytest.mark.skipif(
-                not current_platform.is_cuda(), reason="CUDA only"
-            ),
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only"),
         ),
     ],
 )
@@ -53,9 +56,7 @@ pytestmark = pytest.mark.skip_global_cleanup
             "auto",
             True,
             64 * 1152,
-            marks=pytest.mark.skipif(
-                not current_platform.is_cuda(), reason="CUDA only"
-            ),
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only"),
         ),
         (AttentionBackendEnum.FLASHMLA_SPARSE, "auto", True, 1152),
         (AttentionBackendEnum.FLASHMLA_SPARSE, "fp8_ds_mla", False, MultipleOf(64)),
@@ -102,10 +103,11 @@ def test_allocation_and_warmup_follow_addressing_mode(
         [backend, DeepseekV32IndexerBackend]  # type: ignore[type-abstract]
     )
     specs = {"mla": spec, "indexer": index_spec}
-    group = KVCacheGroupSpec(
-        list(specs), UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=specs)
-    )
-    cache = get_kv_cache_config_from_groups(config, [group], 2**20)
+    groups = [
+        KVCacheGroupSpec([name], layer_spec, layer_kv_cache_specs={name: layer_spec})
+        for name, layer_spec in specs.items()
+    ]
+    cache = get_kv_cache_config_from_groups(config, groups, min_blocks=4)
     views = allocate_kv_cache(cache, torch.device(device), layout)
     register = MagicMock()
     monkeypatch.setattr(
@@ -123,7 +125,3 @@ def test_allocation_and_warmup_follow_addressing_mode(
         register.assert_called_once_with(config, block_stride_rows=stride)
         layer.kv_cache[1, 0].fill_(3)
         torch.testing.assert_close(rows[stride], layer.kv_cache[1, 0])
-    if alignment == 1:
-        assert cache.kv_cache_tensors[0].size == cache.num_blocks * sum(
-            item.page_size_bytes for item in specs.values()
-        )

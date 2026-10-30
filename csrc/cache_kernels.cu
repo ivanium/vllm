@@ -271,8 +271,10 @@ __global__ void reshape_and_cache_kernel(
     cache_t* __restrict__ value_cache,   // [num_blocks, num_heads, head_size,
                                          // block_size]
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
-    const int key_stride, const int value_stride, const int num_heads,
-    const int head_size, const int block_size, const int x,
+    const int key_stride, const int value_stride,
+    const int64_t key_block_stride, const int64_t key_head_stride,
+    const int64_t value_block_stride, const int64_t value_head_stride,
+    const int num_heads, const int head_size, const int block_size, const int x,
     const float* k_scale, const float* v_scale, const bool interleaved_v) {
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
@@ -297,14 +299,15 @@ __global__ void reshape_and_cache_kernel(
   const int64_t src_value_start =
       token_idx * value_stride + head_idx * head_size + h_block * x;
 
-  cache_t* __restrict__ key_dst =
-      key_cache + block_idx * num_heads * h_block_count * block_size * x +
-      head_idx * h_block_count * block_size * x + h_block * block_size * x +
-      block_offset * x;
+  // Blocks and heads sit at the caches' own strides (a block may be one row
+  // of several layers); each head's [head_size/x, block_size, x] is dense.
+  cache_t* __restrict__ key_dst = key_cache + block_idx * key_block_stride +
+                                  head_idx * key_head_stride +
+                                  h_block * block_size * x + block_offset * x;
   // V cache target: standard [.., head_size, block_size], or the interleaved
   // [.., block_size/x, head_size, x] the fused AITER writer/reader use.
-  const int64_t v_head_base = block_idx * num_heads * head_size * block_size +
-                              head_idx * head_size * block_size;
+  const int64_t v_head_base =
+      block_idx * value_block_stride + head_idx * value_head_stride;
   int64_t tgt_value_start;
   int v_dim_stride;
   if (interleaved_v) {
@@ -783,7 +786,8 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
           reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                 \
           reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),               \
           slot_mapping.const_data_ptr<int64_t>(), key_stride, value_stride, \
-          num_heads, head_size, block_size, x,                              \
+          key_cache.stride(0), key_cache.stride(1), value_cache.stride(0),  \
+          value_cache.stride(1), num_heads, head_size, block_size, x,       \
           reinterpret_cast<const float*>(k_scale.data_ptr()),               \
           reinterpret_cast<const float*>(v_scale.data_ptr()), interleaved_v);
 

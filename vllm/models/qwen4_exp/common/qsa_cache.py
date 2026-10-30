@@ -774,16 +774,6 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
             raise ValueError("QSA cache head size must be positive")
         if compress_ratio <= 0:
             raise ValueError("QSA compression ratio must be positive")
-        # The block size is final at spec-build time only under uniform_page;
-        # under large_page the engine's block-size selection enforces this
-        # against the resolved block size.
-        if (
-            cache_config.kv_cache_allocator == "uniform_page"
-            and cache_config.block_size % compress_ratio
-        ):
-            raise ValueError(
-                "QSA cache block size must be divisible by the compression ratio"
-            )
         self.head_size = head_size
         self.dtype = dtype
         self.cache_config = cache_config
@@ -849,17 +839,10 @@ class QSAKeyStateCache(_QSAStateCache):
         # Hold the open group's committed keys plus every row a speculative
         # step stores before acceptance is known, rounded up to whole groups.
         # Anything narrower lets a rejected draft row overwrite a committed
-        # key the next step needs to close the group. The ring must divide the
-        # attention block size: checked below under uniform_page (the block
-        # size is final at spec-build time there); under large_page the
-        # engine's block-size selection enforces it.
+        # key the next step needs to close the group. The engine's block-size
+        # selection makes the ring divide the attention block size.
         span = self.compress_ratio + vllm_config.num_speculative_tokens
         capacity = round_up(span, self.compress_ratio)
-        if self.cache_config.kv_cache_allocator == "uniform_page":
-            assert self.cache_config.block_size % capacity == 0, (
-                f"QSA ring capacity {capacity} must divide the attention block "
-                f"size {self.cache_config.block_size}"
-            )
         return CircularBufferSpec(
             block_size=capacity,
             num_kv_heads=1,

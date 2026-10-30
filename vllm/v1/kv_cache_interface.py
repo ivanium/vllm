@@ -1370,6 +1370,15 @@ class KVCacheGroupSpec:
         assert block_size % self.kernel_rows_per_block == 0
         return block_size // self.kernel_rows_per_block
 
+    def is_head_major(self, kv_cache_layout: str | None) -> bool:
+        """Whether this group's rows are head-major (BHLNC): head ``h`` of
+        every layer is one run, ``[head][layer][N, C]``."""
+        return (
+            kv_cache_layout == KVCacheLayout.BHLNC.name
+            and not self.host_resident
+            and self.kv_cache_spec.has_layer_views
+        )
+
 
 def large_page_block_range(page: int, page_bytes: int, block_bytes: int) -> range:
     """Block ids of a group that lie wholly in large page ``page``.

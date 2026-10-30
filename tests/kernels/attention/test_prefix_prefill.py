@@ -1165,3 +1165,32 @@ def test_qwen3_nonstandard_block_size(
         op=op,
         interleave_v=interleave_v,
     )
+
+
+def _strided_cache(block_stride, head_stride, offset=0):
+    buf = torch.zeros(8 * 1024)
+    return buf.as_strided((4, 2, 4, 8), (block_stride, head_stride, 8, 1), offset)
+
+
+@pytest.mark.parametrize(
+    "key_cache, value_cache, native",
+    [
+        # Dense blocks, and blocks one large-page row apart (the row holds
+        # other layers' pages): the native kernels take the block stride.
+        (_strided_cache(64, 32), _strided_cache(64, 32), True),
+        (_strided_cache(192, 32), _strided_cache(192, 32), True),
+        # A padded head interior, K/V with different strides, or a view that
+        # is not 16-byte aligned must take the Triton path.
+        (_strided_cache(192, 48), _strided_cache(192, 48), False),
+        (_strided_cache(192, 32), _strided_cache(64, 32), False),
+        (_strided_cache(192, 32, offset=2), _strided_cache(192, 32, offset=2), False),
+    ],
+)
+def test_has_native_kv_cache_layout(key_cache, value_cache, native):
+    """The native ROCm pairing addresses blocks and heads by the caches'
+    strides but needs a dense, 16-byte aligned head interior."""
+    from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
+        has_native_kv_cache_layout,
+    )
+
+    assert has_native_kv_cache_layout(key_cache, value_cache) is native

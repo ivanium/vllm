@@ -97,8 +97,7 @@ def _create_mamba2_builder(
         vllm_config=vllm_config,
         device=DEVICE,
     )
-    vllm_config.cache_config.hash_block_size = MAMBA_BLOCK_SIZE
-    vllm_config.cache_config.cache_hit_alignment_tokens = MAMBA_BLOCK_SIZE
+    vllm_config.cache_config.block_size = MAMBA_BLOCK_SIZE
     return builder
 
 

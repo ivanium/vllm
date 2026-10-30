@@ -122,7 +122,7 @@ def test_decode_attention_cpu_matches_reference(seq_lens):
 
     kv_cache = _random_paged_cache(num_blocks * block_size, HEAD_SIZE)
     block_table = torch.randperm(num_blocks).view(num_seqs, max_blocks).to(torch.int64)
-    req_to_token = _expand_block_table(block_table, block_size)
+    req_to_token = _expand_block_table(block_table, block_size, block_size)
     req_pool_indices = torch.arange(num_seqs, dtype=torch.int64)
     seq_lens_t = torch.tensor(seq_lens, dtype=torch.int64)
     scale = HEAD_SIZE**-0.5
@@ -183,7 +183,7 @@ def test_extend_attention_cpu_matches_reference(prefix_lens, extend_lens):
 
     kv_cache = _random_paged_cache(num_blocks * block_size, HEAD_SIZE)
     block_table = torch.randperm(num_blocks).view(num_seqs, max_blocks).to(torch.int64)
-    req_to_token = _expand_block_table(block_table, block_size)
+    req_to_token = _expand_block_table(block_table, block_size, block_size)
     req_pool_indices = torch.arange(num_seqs, dtype=torch.int64)
     seq_lens_t = torch.tensor(seq_lens, dtype=torch.int64)
     extend_seq_lens_t = torch.tensor(extend_lens, dtype=torch.int64)
@@ -337,7 +337,7 @@ def test_amx_mla_impl_forward_mqa_matches_reference(default_vllm_config):
 
     kv_cache = torch.randn(num_blocks, block_size, head_size, dtype=DTYPE)
     block_table = torch.randperm(num_blocks).view(num_seqs, max_blocks).to(torch.int64)
-    req_to_token = _expand_block_table(block_table, block_size)
+    req_to_token = _expand_block_table(block_table, block_size, block_size)
 
     q_nope = torch.randn(num_seqs, num_heads, qk_nope_head_dim, dtype=DTYPE)
     q_pe = torch.randn(num_seqs, num_heads, QK_ROPE_HEAD_DIM, dtype=DTYPE)
@@ -405,7 +405,7 @@ def test_amx_mla_impl_forward_mha_matches_reference(default_vllm_config):
 
     kv_cache = torch.randn(num_blocks, block_size, head_size, dtype=DTYPE)
     block_table = torch.randperm(num_blocks).view(num_seqs, max_blocks).to(torch.int64)
-    req_to_token = _expand_block_table(block_table, block_size)
+    req_to_token = _expand_block_table(block_table, block_size, block_size)
     flat_cache = _flatten_cache(kv_cache)
 
     total_new_tokens = sum(extend_lens)

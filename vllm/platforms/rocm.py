@@ -557,7 +557,9 @@ def _shares_layout_with_turboquant(backend_class: type["AttentionBackend"]) -> b
     )
     if layouts is None or turboquant_layouts is None:
         return True
-    return not set(layouts).isdisjoint(turboquant_layouts)
+    return not {layout.row_layout for layout in layouts}.isdisjoint(
+        layout.row_layout for layout in turboquant_layouts
+    )
 
 
 def _shares_layout_with_ultraquant(backend_class: type["AttentionBackend"]) -> bool:
@@ -573,7 +575,9 @@ def _shares_layout_with_ultraquant(backend_class: type["AttentionBackend"]) -> b
     )
     if layouts is None or ultraquant_layouts is None:
         return True
-    return not set(layouts).isdisjoint(ultraquant_layouts)
+    return not {layout.row_layout for layout in layouts}.isdisjoint(
+        layout.row_layout for layout in ultraquant_layouts
+    )
 
 
 def _get_invalid_reasons(
@@ -1342,6 +1346,14 @@ class RocmPlatform(Platform):
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
+        return True
+
+    @classmethod
+    def support_large_page_kv_cache(cls) -> bool:
+        # The GPU runner binds the strided views; in-tree ROCm kernels address
+        # them with int64, stride-aware math (Triton paths, AITER MLA row
+        # views, FlyDSL runtime strides). Kernels that need dense pages fall
+        # back to Triton or fail loudly.
         return True
 
     @classmethod

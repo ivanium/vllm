@@ -30,6 +30,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.rocm_aiter_mla import (
     AiterMLAHelper,
+    check_asm_mla_decode_reach,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     align_blocks_to_rows,
@@ -779,6 +780,7 @@ def reference_mla_sparse_prefill(
 class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
     supports_dcp = False
     use_aiter_sparse_mla = False
+    _asm_reach_checked = False
 
     def __init__(
         self,
@@ -1223,6 +1225,9 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                 layer, q, kv_c_and_k_pe_cache, attn_metadata
             )
             return output, None
+        if not self._asm_reach_checked:
+            check_asm_mla_decode_reach(kv_c_and_k_pe_cache)
+            self._asm_reach_checked = True
         mla_padded_q = AiterMLAHelper.get_mla_padded_q(self.num_heads, q)
         return self._forward_mla(
             layer, mla_padded_q, kv_c_and_k_pe_cache.unsqueeze(1), attn_metadata

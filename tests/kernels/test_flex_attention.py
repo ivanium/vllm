@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Integration tests for FlexAttention backend vs default backend."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from packaging import version
+from torch.nn.attention.flex_attention import flex_attention
 
 from tests.utils import set_random_seed
 from tests.v1.attention.utils import (
@@ -15,8 +18,10 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import AttentionConfig
 from vllm.model_executor.layers.attention import Attention
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flex_attention import (
     BlockSparsityHint,
+    FlexAttentionImpl,
     FlexAttentionMetadataBuilder,
     physical_to_logical_mapping,
 )
@@ -26,6 +31,15 @@ from ..models.utils import check_embeddings_close, check_logprobs_close
 TORCH_VERSION = version.parse(torch.__version__)
 MINIMUM_TORCH_VERSION = version.parse("2.7.0")
 DIRECT_BUILD_VERSION = version.parse("2.9.dev0")
+
+
+def bind_layer_kv_cache(vllm_config, kv_cache: torch.Tensor) -> list[str]:
+    """Bind ``kv_cache`` as a layer's view; return the layer names to build."""
+    layer_name = "model.layers.0.self_attn.attn"
+    vllm_config.compilation_config.static_forward_context[layer_name] = SimpleNamespace(
+        kv_cache=kv_cache
+    )
+    return [layer_name]
 
 
 @pytest.mark.parametrize(
@@ -62,6 +76,121 @@ def test_flex_attention_explicit_block_sizes_override_encoder_defaults():
         uses_paged_kv=False,
     )
     assert block_sizes == (64, 32)
+
+
+@torch.inference_mode()
+def test_flex_attention_large_page_strided_cache_matches_dense(monkeypatch):
+    """Decoder path reads a large-page strided layer view correctly.
+
+    Under the large-page allocator, one backing buffer holds all layers of a
+    KV cache group and each layer's view has stride(0) spanning the whole
+    group row. FlexAttention must read token (block k, offset i) from physical
+    row k * stride(0) + i and never leak the other layers' rows in between.
+    The block table holds kernel rows, which outnumber the large pages.
+    The layer under test is not the first in its row, so its view starts at
+    a storage offset.
+    """
+    # This host may have no GPU; pinned staging would fail although no copy
+    # leaves the CPU.
+    monkeypatch.setattr("vllm.utils.torch_utils.is_pin_memory_available", lambda: False)
+    # The Inductor CPU kernel requires AVX2; run flex_attention eagerly (the
+    # cache-reading path under test runs the same either way).
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.flex_attention.flex_attention_compiled",
+        flex_attention,
+    )
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    num_blocks, block_size, num_kv_heads, head_size = 8, 16, 2, 32
+    num_layers = 2
+    num_large_pages = num_blocks // 2
+
+    # Layer-1 logical content in [B, N, H, C]; the other "layer" holds large
+    # values so that any leaked gap row changes the output.
+    blocks = torch.randn(num_blocks, block_size, num_kv_heads, 2 * head_size)
+    block_elems = block_size * num_kv_heads * 2 * head_size
+    backing = torch.full((num_layers * num_blocks * block_elems,), 100.0)
+    backing.view(num_blocks, num_layers, block_elems)[:, 1] = blocks.flatten(1)
+
+    # The layer view as handed to the backend: [B, H, N, C] with stride(0)
+    # covering the whole group row.
+    strided_cache = backing.as_strided(
+        (num_blocks, num_kv_heads, block_size, 2 * head_size),
+        (
+            num_layers * block_elems,
+            2 * head_size,
+            num_kv_heads * 2 * head_size,
+            1,
+        ),
+        block_elems,
+    )
+    dense_cache = blocks.transpose(1, 2)
+
+    vllm_config = create_vllm_config(
+        model_name="Qwen/Qwen3-0.6B",
+        block_size=block_size,
+        max_model_len=128,
+        num_gpu_blocks=num_large_pages,
+        max_num_seqs=8,
+        max_num_batched_tokens=128,
+    )
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+    batch_spec = BatchSpec(seq_lens=[20, 33], query_lens=[20, 3])
+
+    def build(kv_cache):
+        layer_names = bind_layer_kv_cache(vllm_config, kv_cache)
+        builder = FlexAttentionMetadataBuilder(
+            kv_cache_spec, layer_names, vllm_config, device
+        )
+        common = create_common_attn_metadata(batch_spec, block_size, device)
+        common.block_table_tensor.copy_(
+            torch.tensor([[1, 2, 0], [3, 4, 5]], dtype=torch.int32)
+        )
+        return builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    strided_metadata = build(strided_cache)
+    dense_metadata = build(dense_cache)
+    # Contract between builder and impl: the impl reads the row-packed view
+    # in place only if the builder scales block ids by the layers in a row.
+    assert strided_metadata.kv_block_scale == num_layers
+
+    impl = FlexAttentionImpl(
+        num_heads=num_kv_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        attn_type=AttentionType.DECODER,
+    )
+
+    num_tokens = batch_spec.compute_num_tokens()
+    query = torch.randn(num_tokens, num_kv_heads, head_size)
+    key = torch.randn(num_tokens, num_kv_heads, head_size)
+    value = torch.randn(num_tokens, num_kv_heads, head_size)
+    layer = torch.nn.Module()
+
+    out_strided = impl.forward(
+        layer,
+        query,
+        key,
+        value,
+        strided_cache,
+        strided_metadata,
+        torch.empty(num_tokens, num_kv_heads, head_size),
+    )
+    out_dense = impl.forward(
+        layer,
+        query,
+        key,
+        value,
+        dense_cache,
+        dense_metadata,
+        torch.empty(num_tokens, num_kv_heads, head_size),
+    )
+
+    torch.testing.assert_close(out_strided, out_dense)
 
 
 @pytest.mark.skipif(
@@ -316,7 +445,13 @@ def test_block_mask_direct_vs_slow_path():
         batch_spec, vllm_config.cache_config.block_size, device
     )
 
-    builder = FlexAttentionMetadataBuilder(kv_cache_spec, [], vllm_config, device)
+    layer_names = bind_layer_kv_cache(
+        vllm_config,
+        torch.empty(vllm_config.cache_config.num_gpu_blocks, 1, 16, 1, device=device),
+    )
+    builder = FlexAttentionMetadataBuilder(
+        kv_cache_spec, layer_names, vllm_config, device
+    )
 
     metadata_direct = builder.build(
         common_prefix_len=0, common_attn_metadata=common_attn_metadata
@@ -379,8 +514,9 @@ def test_flex_attention_request_count_changes_reuse_compiled_graph(direct_build)
         max_num_seqs=8,
         max_num_batched_tokens=128,
     )
+    layer_names = bind_layer_kv_cache(config, torch.empty(40, 1, 16, 1, device=device))
     builder = FlexAttentionMetadataBuilder(
-        create_standard_kv_cache_spec(config), [], config, device
+        create_standard_kv_cache_spec(config), layer_names, config, device
     )
     builder.direct_build = direct_build
     query = torch.randn(1, 2, 32, 64, device=device)
@@ -499,7 +635,13 @@ def test_block_sparsity_hint_prunes_blocks():
         batch_spec, vllm_config.cache_config.block_size, device
     )
 
-    builder = FlexAttentionMetadataBuilder(kv_cache_spec, [], vllm_config, device)
+    layer_names = bind_layer_kv_cache(
+        vllm_config,
+        torch.empty(vllm_config.cache_config.num_gpu_blocks, 1, 16, 1, device=device),
+    )
+    builder = FlexAttentionMetadataBuilder(
+        kv_cache_spec, layer_names, vllm_config, device
+    )
 
     metadata_no_hint = builder.build(
         common_prefix_len=0, common_attn_metadata=common_attn_metadata

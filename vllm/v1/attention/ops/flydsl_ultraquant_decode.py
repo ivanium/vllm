@@ -385,6 +385,7 @@ def _get_kernel(
         cents,
         bt,
         sl,
+        scb: fx.Int64,  # type: ignore[name-defined]
         gx: fx.Int32,  # type: ignore[name-defined]
         gy: fx.Int32,  # type: ignore[name-defined]
         gz: fx.Int32,  # type: ignore[name-defined]
@@ -399,7 +400,7 @@ def _get_kernel(
         grid_x = arith.index_cast(T.index, gx.ir_value())
         grid_y = arith.index_cast(T.index, gy.ir_value())
         grid_z = arith.index_cast(T.index, gz.ir_value())
-        kfn(out, es, ml, q, kvc, cents, bt, sl).launch(
+        kfn(out, es, ml, q, kvc, cents, bt, sl, scb).launch(
             grid=(grid_x, grid_y, grid_z),
             block=(kmod.BLOCK_THREADS, 1, 1),
             stream=stream,
@@ -609,6 +610,16 @@ def flydsl_ultraquant_decode_attention(
         f"{', '.join(map(str, _ULTRAQUANT_FLYDSL_GQA))}, got {QG}"
     )
 
+    # The kernel bakes only the block-local layout; the block-to-block byte
+    # stride comes from the tensor itself: the layer view's stride(0) spans
+    # the whole layer group.
+    stride_cache_block = kv_cache.stride(0) * kv_cache.element_size()
+    block_extent_bytes = block_size * Hk * padded_slot * kv_cache.element_size()
+    assert stride_cache_block >= block_extent_bytes, (
+        f"kv_cache block stride {stride_cache_block}B cannot hold one "
+        f"{block_extent_bytes}B cache block"
+    )
+
     device = query.device
 
     # ---- PiT (Hadamard) — cache the contiguous fp32 form on the layer -----
@@ -808,6 +819,7 @@ def flydsl_ultraquant_decode_attention(
         centroids_c,
         block_table,
         seq_lens,
+        stride_cache_block,
         B,
         Hk,
         num_partitions,

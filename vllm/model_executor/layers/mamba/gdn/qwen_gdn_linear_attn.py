@@ -106,11 +106,6 @@ MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
-def xpu_gdn_kernel_available() -> bool:
-    """Whether vllm-xpu-kernels was built with the fused SYCL GDN op."""
-    return hasattr(torch.ops._xpu_C, "gdn_attention")
-
-
 def _aiter_flydsl_unsupported_reasons(
     vllm_config: VllmConfig, head_k_dim: int | None, head_v_dim: int | None
 ) -> list[str]:
@@ -133,10 +128,9 @@ def _resolve_gdn_prefill_backend(
 ) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "aiter_flydsl", "sycl"]]:
     """Resolve GDN prefill backend.
 
-    The SYCL kernel is chosen when ``requested in ["sycl", "auto"]``, the
-    platform is XPU and ``_xpu_C::gdn_attention`` is built. Unlike the other
-    backends it is a fused whole-layer op, so selecting it also replaces the
-    conv1d and decode kernels, not just prefill.
+    XPU always uses Triton: the fused SYCL ``_xpu_C::gdn_attention`` op
+    addresses conv states with int32 offsets, which overflow on the
+    large-page KV cache.
 
     FlashInfer's GDN prefill kernel is chosen when:
     * ``requested in ["flashinfer", "auto"]``;
@@ -167,13 +161,12 @@ def _resolve_gdn_prefill_backend(
         raise ValueError("GDN prefill backend 'sycl' is only supported on XPU.")
 
     if current_platform.is_xpu():
-        if backend in ("auto", "sycl") and xpu_gdn_kernel_available():
-            return backend, "sycl"
         if backend == "sycl":
             raise ValueError(
-                "GDN prefill backend 'sycl' was requested but "
-                "torch.ops._xpu_C.gdn_attention is not available. Rebuild "
-                "vllm-xpu-kernels with VLLM_GDN_ENABLED."
+                "GDN prefill backend 'sycl' is not supported with the "
+                "large-page KV cache: in vllm-xpu-kernels 0.1.15.4, "
+                "gdn_attention computes states_id * conv_states_stride_0 in "
+                "int32 (vllm-project/vllm-xpu-kernels#657). Use 'triton'."
             )
         return backend, "triton"
 

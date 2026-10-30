@@ -19,6 +19,12 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.mla.amx_mla import (
+    AMXMLAImpl,
+    _expand_block_table,
+)
+from vllm.v1.attention.backends.mla.cpu_mla import CPUMLAImpl
 from vllm.v1.attention.backends.mla.prefill.cpu_sdpa import (
     CPUSDPAMLAPrefillBackend,
 )
@@ -316,3 +322,222 @@ def test_zen_cpu_mla_prefill_new_tokens() -> None:
     gen_out, gen_lse = generic.run_prefill_new_tokens(q, k, v, return_softmax_lse=True)
     assert torch.equal(zen_out, gen_out)
     assert torch.equal(zen_lse, gen_lse)
+
+
+def _make_grouped_kv_cache(
+    num_blocks: int,
+    block_size: int,
+    head_dim: int,
+    num_layers: int = 2,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """One backing buffer shared by a KV cache group, plus layer 0's view.
+
+    Mimics the large_page layout: the view's stride(0) spans one kernel block
+    across ALL layers of the group, so the other layers' blocks sit in the
+    gaps between this layer's blocks. Returns (flat row view of the buffer,
+    layer view, block_stride_rows).
+    """
+    buffer = torch.zeros(num_layers * num_blocks, block_size, head_dim, dtype=dtype)
+    layer_view = buffer.as_strided(
+        (num_blocks, block_size, head_dim),
+        (num_layers * block_size * head_dim, head_dim, 1),
+    )
+    return buffer.view(-1, head_dim), layer_view, num_layers * block_size
+
+
+def _make_cpu_mla_impl(kv_lora_rank: int, pe_dim: int) -> CPUMLAImpl:
+    return CPUMLAImpl(
+        num_heads=4,
+        head_size=kv_lora_rank + pe_dim,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+        attn_type=AttentionType.DECODER,
+        kv_sharing_target_layer_name=None,
+        q_lora_rank=None,
+        kv_lora_rank=kv_lora_rank,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=pe_dim,
+        qk_head_dim=192,
+        v_head_dim=128,
+        kv_b_proj=None,
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="CPU only")
+def test_kv_cache_cpu_write_grouped_cache() -> None:
+    # On a large_page cache each layer's KV view is strided: the physical row
+    # of (block k, token i) is k * block_stride_rows + i. do_kv_cache_update
+    # must hit those rows and leave the gap rows (other layers) untouched.
+    kv_lora_rank = 512
+    pe_dim = 64
+    head_dim = kv_lora_rank + pe_dim
+    block_size = 16
+    num_blocks = 4
+
+    flat_buf, kv_cache, block_stride_rows = _make_grouped_kv_cache(
+        num_blocks, block_size, head_dim
+    )
+    impl = _make_cpu_mla_impl(kv_lora_rank, pe_dim)
+
+    slots_list = [0, 3, 16, 17, 47, 33]
+    kv_c = torch.randn(len(slots_list) + 1, kv_lora_rank)
+    k_pe = torch.randn(len(slots_list) + 1, 1, pe_dim)
+    slot_mapping = torch.tensor(slots_list + [-1], dtype=torch.long)
+
+    impl.do_kv_cache_update(kv_c, k_pe, kv_cache, slot_mapping, "auto", None)
+
+    written_rows = set()
+    for src_row, slot in enumerate(slots_list):
+        k, i = divmod(slot, block_size)
+        phys = k * block_stride_rows + i
+        written_rows.add(phys)
+        assert torch.equal(flat_buf[phys, :kv_lora_rank], kv_c[src_row])
+        assert torch.equal(flat_buf[phys, kv_lora_rank:], k_pe[src_row, 0])
+    gap_rows = [r for r in range(flat_buf.shape[0]) if r not in written_rows]
+    assert torch.all(flat_buf[gap_rows] == 0)
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="CPU only")
+def test_amx_expand_block_table_grouped_cache() -> None:
+    # The AMX kernels address the cache by flat physical row, so the expanded
+    # block table must use the group-row stride, not the dense block size.
+    block_table = torch.tensor([[3, 0, 7], [1, 2, 0]], dtype=torch.int32)
+    block_size = 4
+    block_stride_rows = 9
+    rows = _expand_block_table(block_table, block_size, block_stride_rows)
+    assert rows.dtype == torch.int64
+    expected = torch.tensor(
+        [
+            [27, 28, 29, 30, 0, 1, 2, 3, 63, 64, 65, 66],
+            [9, 10, 11, 12, 18, 19, 20, 21, 0, 1, 2, 3],
+        ],
+        dtype=torch.int64,
+    )
+    assert torch.equal(rows, expected)
+
+
+def _cpu_mla_ops_available() -> bool:
+    try:
+        import vllm._C  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch.ops._C, "mla_decode_kvcache") and hasattr(
+        torch.ops._C, "concat_and_cache_mla_cpu"
+    )
+
+
+requires_cpu_mla_ops = pytest.mark.skipif(
+    not _cpu_mla_ops_available(), reason="requires the built _C CPU ops"
+)
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="CPU only")
+@requires_cpu_mla_ops
+def test_amx_kv_cache_update_grouped_cache(default_vllm_config) -> None:
+    # Same layout contract as the CPU write test, through the AMX impl's
+    # concat-and-cache path.
+    kv_lora_rank = 512
+    pe_dim = 64
+    head_dim = kv_lora_rank + pe_dim
+    block_size = 32
+    num_blocks = 4
+
+    flat_buf, kv_cache, block_stride_rows = _make_grouped_kv_cache(
+        num_blocks, block_size, head_dim, dtype=torch.bfloat16
+    )
+    impl = AMXMLAImpl(
+        num_heads=4,
+        head_size=head_dim,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+        attn_type=AttentionType.DECODER,
+        kv_sharing_target_layer_name=None,
+        q_lora_rank=None,
+        kv_lora_rank=kv_lora_rank,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=pe_dim,
+        qk_head_dim=192,
+        v_head_dim=128,
+        kv_b_proj=None,
+    )
+
+    slots_list = [0, 3, 32, 33, 95, 65]
+    kv_c = torch.randn(len(slots_list) + 1, kv_lora_rank, dtype=torch.bfloat16)
+    k_pe = torch.randn(len(slots_list) + 1, 1, pe_dim, dtype=torch.bfloat16)
+    slot_mapping = torch.tensor(slots_list + [-1], dtype=torch.long)
+
+    impl.do_kv_cache_update(kv_c, k_pe, kv_cache, slot_mapping, "auto", None)
+
+    written_rows = set()
+    for src_row, slot in enumerate(slots_list):
+        k, i = divmod(slot, block_size)
+        phys = k * block_stride_rows + i
+        written_rows.add(phys)
+        assert torch.equal(flat_buf[phys, :kv_lora_rank], kv_c[src_row])
+        assert torch.equal(flat_buf[phys, kv_lora_rank:], k_pe[src_row, 0])
+    gap_rows = [r for r in range(flat_buf.shape[0]) if r not in written_rows]
+    assert torch.all(flat_buf[gap_rows] == 0)
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="CPU only")
+@requires_cpu_mla_ops
+def test_cpu_mla_decode_grouped_cache() -> None:
+    # Decode must read each token from its physical row
+    # (kernel_block * block_stride_rows + offset) of the strided layer view.
+    from vllm import _custom_ops as ops
+
+    kv_lora_rank = 512
+    pe_dim = 64
+    head_dim = kv_lora_rank + pe_dim
+    block_size = 16
+    num_blocks = 8
+    num_heads = 4
+    scale = 0.25
+
+    torch.manual_seed(0)
+    flat_buf, kv_cache, block_stride_rows = _make_grouped_kv_cache(
+        num_blocks, block_size, head_dim
+    )
+    impl = _make_cpu_mla_impl(kv_lora_rank, pe_dim)
+
+    block_table = torch.tensor([[5, 3], [1, 0]], dtype=torch.int32)
+    seq_lens = torch.tensor([20, 9], dtype=torch.int32)
+
+    # Fill the used blocks through the public write path.
+    total = int(seq_lens.sum())
+    slot_mapping = torch.tensor(
+        [
+            int(block_table[s, pos // block_size]) * block_size + pos % block_size
+            for s in range(2)
+            for pos in range(int(seq_lens[s]))
+        ],
+        dtype=torch.long,
+    )
+    kv_c = torch.randn(total, kv_lora_rank)
+    k_pe = torch.randn(total, 1, pe_dim)
+    impl.do_kv_cache_update(kv_c, k_pe, kv_cache, slot_mapping, "auto", None)
+
+    q = torch.randn(2, num_heads, head_dim)
+    out = torch.zeros(2, num_heads, kv_lora_rank)
+    ops.mla_decode_kvcache_cpu(out, q, kv_cache, scale, block_table, seq_lens)
+
+    for s in range(2):
+        rows = [
+            int(block_table[s, pos // block_size]) * block_stride_rows
+            + pos % block_size
+            for pos in range(int(seq_lens[s]))
+        ]
+        k = flat_buf[rows]
+        v = k[:, :kv_lora_rank]
+        scores = q[s] @ k.T * scale
+        ref = torch.softmax(scores, dim=-1) @ v
+        assert torch.allclose(out[s], ref, atol=1e-4)

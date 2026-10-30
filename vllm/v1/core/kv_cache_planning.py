@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    compute_layer_kv_cache_shape_bytes,
     large_pages_needed,
     min_blocks_per_large_page,
     replace_as,
@@ -565,6 +566,8 @@ class _LargePageGroupPlan:
     geometry: GroupGeometry
     # Per rank; empty where the group holds no layers.
     layer_offsets: list[dict[str, int]]
+    # One head of one layer in a head-major (BHLNC) row; None if layer-major.
+    head_slot_bytes: int | None = None
 
     def blocks_per_page(self, large_page_bytes: int) -> int:
         """Fewest blocks of this group one large page holds (n_g)."""
@@ -619,30 +622,48 @@ def _group_kernel_block_size(group: KVCacheGroupSpec) -> int:
 
 
 def _group_row_layout(
-    layer_specs: dict[str, KVCacheSpec], kernel_block_size: int
-) -> tuple[int, int, dict[str, int]]:
+    layer_specs: dict[str, KVCacheSpec], kernel_block_size: int, head_major: bool
+) -> tuple[int, int, dict[str, int], int | None]:
     """Bytes of one kernel block across all layers, the unit a row must be a
-    multiple of, and per-layer offsets.
+    multiple of, per-layer offsets, and the head slot of a head-major row.
 
     Each layer offset is aligned to its block-stride alignment; a row that
     is a multiple of the LCM of those units keeps every row start, and so
     every layer's block, aligned.
+
+    A head-major layout (BHLNC) lays a row out as
+    ``[head][layer][N, C]``: head ``h`` of layer ``l`` is at
+    ``(h * L + l) * slot``, so a head range is one run across all layers.
+    Offsets are then the head-0 positions and ``slot`` (one head of one layer,
+    rounded to the alignment) is returned; it is None for a layer-major row.
     """
-    offsets: dict[str, int] = {}
-    units: list[int] = []
+    kernel_specs = {
+        name: replace(spec, block_size=kernel_block_size, page_size_padded=None)
+        if isinstance(spec, (AttentionSpec, MambaSpec))
+        else spec
+        for name, spec in layer_specs.items()
+    }
+    unit = math.lcm(
+        *(spec.get_block_stride_alignment() for spec in kernel_specs.values())
+    )
+    if head_major:
+        shapes = {
+            compute_layer_kv_cache_shape_bytes(spec, 1)[1:]
+            for spec in kernel_specs.values()
+        }
+        assert len(shapes) == 1, f"Head-major layers differ in shape: {shapes}"
+        heads, states, content = shapes.pop()
+        slot = round_up(states * content, unit)
+        offsets = {name: i * slot for i, name in enumerate(kernel_specs)}
+        return heads * len(kernel_specs) * slot, unit, offsets, slot
+
+    offsets = {}
     offset = 0
-    for layer_name, spec in layer_specs.items():
-        unit = spec.get_block_stride_alignment()
-        offset = round_up(offset, unit) if offset else 0
+    for layer_name, spec in kernel_specs.items():
+        offset = round_up(offset, spec.get_block_stride_alignment())
         offsets[layer_name] = offset
-        if isinstance(spec, (AttentionSpec, MambaSpec)):
-            offset += replace(
-                spec, block_size=kernel_block_size, page_size_padded=None
-            ).page_size_bytes
-        else:
-            offset += spec.page_size_bytes
-        units.append(unit)
-    return offset, math.lcm(*units), offsets
+        offset += spec.page_size_bytes
+    return offset, unit, offsets, None
 
 
 def _large_page_waste(
@@ -681,6 +702,7 @@ def _plan_large_page_placement(
     a group's row is its largest over ranks. ``available_memory`` (per rank)
     rules out pages its budget cannot serve one max-model-len request with.
     """
+    kv_cache_layout = vllm_config.cache_config.kv_cache_layout
     plans: list[_LargePageGroupPlan] = []
     for group in groups:
         if group.host_resident:
@@ -688,6 +710,7 @@ def _plan_large_page_placement(
         kernel_block_size = _group_kernel_block_size(group)
         row = unit = 1
         offsets: list[dict[str, int]] = []
+        head_slots: set[int | None] = set()
         for worker_spec in worker_specs:
             layer_specs = {
                 name: group.layer_kv_cache_specs[name]  # type: ignore[index]
@@ -696,16 +719,20 @@ def _plan_large_page_placement(
             }
             layer_offsets: dict[str, int] = {}
             if layer_specs:
-                rank_row, rank_unit, layer_offsets = _group_row_layout(
-                    layer_specs, kernel_block_size
+                rank_row, rank_unit, layer_offsets, head_slot = _group_row_layout(
+                    layer_specs, kernel_block_size, group.is_head_major(kv_cache_layout)
                 )
                 row = max(row, rank_row)
                 unit = math.lcm(unit, rank_unit)
+                head_slots.add(head_slot)
             offsets.append(layer_offsets)
+        assert len(head_slots) <= 1, f"Ranks disagree on the head slot: {head_slots}"
         geometry = GroupGeometry(
             group.kv_cache_spec.block_size // kernel_block_size, round_up(row, unit)
         )
-        plans.append(_LargePageGroupPlan(group, geometry, offsets))
+        plans.append(
+            _LargePageGroupPlan(group, geometry, offsets, next(iter(head_slots), None))
+        )
 
     group_block_bytes = [plan.geometry.block_bytes for plan in plans]
     max_block = max(group_block_bytes)
@@ -888,6 +915,20 @@ def _build_large_page_kv_cache_config(
                 },
             )
         )
+        if plan.head_slot_bytes is not None:
+            # Head-major row: one tensor whose layer stride is the head slot,
+            # so the views' head stride spans this rank's layers.
+            if not layer_names:
+                continue
+            tensors.append(
+                KVCacheTensor(
+                    size=size,
+                    layers=layer_names,
+                    layer_stride=plan.head_slot_bytes,
+                    block_stride=geometry.row_bytes,
+                )
+            )
+            continue
         for layer_name in layer_names:
             tensors.append(
                 KVCacheTensor(

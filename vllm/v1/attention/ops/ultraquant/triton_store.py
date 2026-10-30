@@ -41,9 +41,10 @@ def _kv_cache_flat(kv_cache: torch.Tensor) -> torch.Tensor:
     """1-D uint8 view of the raw KV allocation (handles padded layouts)."""
     if kv_cache.is_contiguous():
         return kv_cache.reshape(-1)
-    n = kv_cache.untyped_storage().nbytes() // kv_cache.element_size()
+    offset = kv_cache.storage_offset()
+    n = kv_cache.untyped_storage().nbytes() // kv_cache.element_size() - offset
     return torch.empty(0, dtype=kv_cache.dtype, device=kv_cache.device).set_(
-        kv_cache.untyped_storage(), 0, (n,)
+        kv_cache.untyped_storage(), offset, (n,)
     )
 
 
