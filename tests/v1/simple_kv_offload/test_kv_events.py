@@ -51,14 +51,12 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheTensor,
     MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
 from vllm.v1.simple_kv_offload.manager import (
     SimpleCPUOffloadScheduler,
-    StoreRequestState,
     TransferMeta,
 )
 
@@ -73,29 +71,25 @@ def _make_mixed_kv_cache_config(
     SlidingWindow and Mamba groups for per-group metadata tests."""
     register_all_kvcache_specs(vllm_config=None)
     groups = []
-    tensors = []
 
-    # Group 0 is always FullAttention (the scheduler requires one FA group).
-    fa_layers = ["layer_fa"]
+    # Group 0 is always FullAttention; optional SlidingWindow/Mamba follow.
     fa_spec = FullAttentionSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=NUM_KV_HEADS,
         head_size=HEAD_SIZE,
         dtype=DTYPE,
     )
-    groups.append(KVCacheGroupSpec(fa_layers, fa_spec))
-    fa_bytes = _BYTES_PER_BLOCK * num_blocks
-    tensors.append(
-        KVCacheTensor(
-            size=fa_bytes,
-            layers=fa_layers,
-            layer_stride=fa_bytes,
-            block_stride=_BYTES_PER_BLOCK,
+    groups.append(
+        KVCacheGroupSpec(
+            ["layer_fa"],
+            fa_spec,
+            num_blocks=num_blocks,
+            kernel_rows_per_block=1,
+            row_bytes=fa_spec.page_size_bytes,
         )
     )
 
     if sliding_window is not None:
-        sw_layers = ["layer_sw"]
         sw_spec = SlidingWindowSpec(
             block_size=BLOCK_SIZE,
             num_kv_heads=NUM_KV_HEADS,
@@ -103,40 +97,39 @@ def _make_mixed_kv_cache_config(
             dtype=DTYPE,
             sliding_window=sliding_window,
         )
-        groups.append(KVCacheGroupSpec(sw_layers, sw_spec))
-        sw_bytes = _BYTES_PER_BLOCK * num_blocks
-        tensors.append(
-            KVCacheTensor(
-                size=sw_bytes,
-                layers=sw_layers,
-                layer_stride=sw_bytes,
-                block_stride=_BYTES_PER_BLOCK,
+        groups.append(
+            KVCacheGroupSpec(
+                ["layer_sw"],
+                sw_spec,
+                num_blocks=num_blocks,
+                kernel_rows_per_block=1,
+                row_bytes=sw_spec.page_size_bytes,
             )
         )
 
     if with_mamba:
-        m_layers = ["layer_m"]
         m_spec = MambaSpec(
             block_size=mamba_block_size,
             shapes=((NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE),),
             dtypes=(DTYPE,),
             mamba_cache_mode="align",
         )
-        groups.append(KVCacheGroupSpec(m_layers, m_spec))
-        m_bytes = _BYTES_PER_BLOCK * num_blocks
-        tensors.append(
-            KVCacheTensor(
-                size=m_bytes,
-                layers=m_layers,
-                layer_stride=m_bytes,
-                block_stride=_BYTES_PER_BLOCK,
+        groups.append(
+            KVCacheGroupSpec(
+                ["layer_m"],
+                m_spec,
+                num_blocks=num_blocks,
+                kernel_rows_per_block=1,
+                row_bytes=m_spec.page_size_bytes,
             )
         )
 
     return KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=tensors,
+        num_pages=num_blocks,
+        kv_cache_tensors=[],
         kv_cache_groups=groups,
+        large_page_bytes=max(g.row_bytes for g in groups),
+        block_size=BLOCK_SIZE,
     )
 
 
@@ -159,22 +152,22 @@ def make_events_scheduler(
     vllm_config.parallel_config.decode_context_parallel_size = dcp_world_size
 
     virtual_block_size = BLOCK_SIZE * dcp_world_size
-    cpu_capacity_bytes = _BYTES_PER_BLOCK * num_cpu_blocks * num_groups
+    cpu_capacity_bytes = kv_cache_config.large_page_bytes * num_cpu_blocks
 
     sched = SimpleCPUOffloadScheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         cpu_capacity_bytes=cpu_capacity_bytes,
         scheduler_block_size=virtual_block_size,
-        hash_block_size=virtual_block_size,
+        block_size=virtual_block_size,
         lazy_offload=lazy,
         disk_capacity_bytes=disk_capacity_bytes,
     )
 
     gpu_block_pool = BlockPool(
-        num_gpu_blocks=num_gpu_blocks,
+        num_pages=num_gpu_blocks,
         enable_caching=True,
-        hash_block_size=virtual_block_size,
+        block_size=virtual_block_size,
     )
     sched.bind_gpu_block_pool(gpu_block_pool)
     return SchedulerFixture(
@@ -325,8 +318,9 @@ def test_disk_mode_medium_storage_on_block_stored() -> None:
 
 def test_finished_eager_store_emits_all_storage_events() -> None:
     """Finished stores preserve and announce every registered hash."""
+    # 8 pages: O_DIRECT pads the 1024 B slot to a 4096 B page.
     fix = make_events_scheduler(
-        disk_capacity_bytes=_BYTES_PER_BLOCK * 8,
+        disk_capacity_bytes=_BYTES_PER_BLOCK * 32,
         enable_events=True,
     )
     sched = fix.scheduler
@@ -389,7 +383,7 @@ def test_finished_eager_store_emits_all_storage_events() -> None:
     assert secondary_event.token_ids == []
     assert secondary_event.parent_block_hash is None
 
-    sched.cpu_block_pool.evict_blocks({primary_cpu_block.block_id})
+    sched.cpu_block_pool.evict_blocks([(0, primary_cpu_block.block_id)])
     removed = [
         event for event in sched.take_events() if isinstance(event, BlockRemoved)
     ]
@@ -400,73 +394,48 @@ def test_finished_eager_store_emits_all_storage_events() -> None:
     assert all(event.medium == MEDIUM_STORAGE for event in removed)
 
 
-def test_secondary_hash_block_stored_metadata() -> None:
-    """Secondary hashes carry their own token range and block size."""
-    fix = make_events_scheduler(
-        disk_capacity_bytes=_BYTES_PER_BLOCK * 8,
-        enable_events=True,
-    )
+def test_secondary_block_stored_carries_payload() -> None:
+    """A partial re-key hash owned by the storing request emits its payload.
+
+    Mamba-align checkpoints register extra hashes on a block via
+    cache_partial_block. Their BlockStored events must carry token_ids, the
+    parent hash, and the hash block size like any other stored block.
+    """
+    fix = make_events_scheduler()
     sched = fix.scheduler
-    sched.hash_block_size = BLOCK_SIZE // 2
-    req = Request(
-        request_id="req-secondary-hash",
-        prompt_token_ids=list(range(BLOCK_SIZE + 1)),
-        sampling_params=SamplingParams(max_tokens=1),
-        pooling_params=None,
-        mm_features=None,
-        block_hasher=get_request_block_hasher(BLOCK_SIZE // 2, sha256),
-    )
-    req.num_computed_tokens = BLOCK_SIZE
-    gpu_block = fix.gpu_block_pool.get_new_blocks(1)[0]
-    primary_hash = make_block_hash_with_group_id(req.block_hashes[1], 0)
-    secondary_hash = make_block_hash_with_group_id(req.block_hashes[0], 0)
-    fix.gpu_block_pool._insert_block_hash(
-        primary_hash, gpu_block, num_tokens=BLOCK_SIZE
-    )
-    fix.gpu_block_pool._insert_block_hash(
-        secondary_hash, gpu_block, num_tokens=BLOCK_SIZE // 2
-    )
-    state = StoreRequestState(
-        request=req,
-        block_ids=([gpu_block.block_id],),
-        num_stored_blocks=[0],
-    )
+    req = make_request(num_blocks=3)
+    kv_blocks = _alloc_and_register(fix, req, num_blocks=3)
+    # Only two blocks are confirmed, so block_hashes[2] is never a stored
+    # block's primary hash and its event can only come from the re-key.
+    req.num_computed_tokens = 2 * BLOCK_SIZE
+    gpu_block = kv_blocks.blocks[0][0]
+    # Re-key block 0 at the third block boundary too, as a mamba-align
+    # checkpoint would via cache_partial_block.
+    secondary_hash = make_block_hash_with_group_id(req.block_hashes[2], 0)
+    fix.gpu_block_pool._insert_block_hash(secondary_hash, gpu_block, num_tokens=None)
 
-    gpu_block_ids, group_ids, advanced_per_group, block_meta = (
-        sched._select_eager_blocks_to_store(state, ([gpu_block.block_id],))
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: 2 * BLOCK_SIZE},
+            new_reqs={req.request_id: kv_blocks.get_block_ids()},
+        )
     )
-    assert gpu_block_ids == [gpu_block.block_id]
-    assert advanced_per_group == [1]
-    assert block_meta is not None
-    assert set(block_meta[0]) == {primary_hash, secondary_hash}
+    simulate_store_completion(sched, meta.store_event)
 
-    cpu_block = sched.cpu_block_pool.get_new_blocks(1)[0]
-    sched._process_store_completion(
-        TransferMeta(gpu_block_ids, [cpu_block.block_id], group_ids, block_meta)
-    )
-
-    primary_event_hash = maybe_convert_block_hash(get_block_hash(primary_hash))
-    secondary_event_hash = maybe_convert_block_hash(get_block_hash(secondary_hash))
-    stored = [event for event in sched.take_events() if isinstance(event, BlockStored)]
-    by_hash = {event.block_hashes[0]: event for event in stored}
-    assert set(by_hash) == {primary_event_hash, secondary_event_hash}
-    assert by_hash[primary_event_hash].block_size == BLOCK_SIZE
+    stored = [e for e in sched.take_events() if isinstance(e, BlockStored)]
+    by_hash = {e.block_hashes[0]: e for e in stored}
+    secondary_event = by_hash[maybe_convert_block_hash(get_block_hash(secondary_hash))]
+    assert secondary_event.medium == MEDIUM_CPU
+    assert secondary_event.block_size == BLOCK_SIZE
     assert req.prompt_token_ids is not None
-    assert by_hash[primary_event_hash].token_ids == req.prompt_token_ids[:BLOCK_SIZE]
-    assert by_hash[secondary_event_hash].block_size == BLOCK_SIZE // 2
     assert (
-        by_hash[secondary_event_hash].token_ids
-        == req.prompt_token_ids[: BLOCK_SIZE // 2]
+        secondary_event.token_ids
+        == (req.prompt_token_ids[2 * BLOCK_SIZE : 3 * BLOCK_SIZE])
     )
-
-    primary_cpu_block = sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(
-        primary_hash
+    assert secondary_event.parent_block_hash == maybe_convert_block_hash(
+        get_block_hash(make_block_hash_with_group_id(req.block_hashes[1], 0))
     )
-    secondary_cpu_block = sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(
-        secondary_hash
-    )
-    assert primary_cpu_block is not None
-    assert secondary_cpu_block is primary_cpu_block
 
 
 # ---------------------------------------------------------------------------
@@ -518,21 +487,20 @@ def test_lazy_store_emits_block_stored() -> None:
     # Allocate, hash, free -> hashed blocks in free queue.
     req = make_request(num_blocks=2)
     gpu_blocks = []
-    for blk in gpu_pool.get_new_blocks(2):
+    for blk in gpu_pool.get_new_blocks(2, 0):
         gpu_blocks.append(blk)
     gpu_pool.cache_full_blocks(
         request=req,
         blocks=gpu_blocks,
         num_cached_blocks=0,
         num_full_blocks=2,
-        block_size=BLOCK_SIZE,
         kv_cache_group_id=0,
     )
     gpu_pool.free_blocks(gpu_blocks)
 
     # Push hashed blocks to LRU head (8 total - 1 null = 7 usable; 2 freed
     # hashed + 5 other free -> consume 5 fillers).
-    fillers = gpu_pool.get_new_blocks(5)
+    fillers = gpu_pool.get_new_blocks(5, 0)
 
     meta = sched.build_connector_meta(make_scheduler_output({}))
     assert meta.store_event >= 0
@@ -589,9 +557,9 @@ def test_cp_world_size_scales_block_size() -> None:
 def test_mamba_block_size_not_scaled() -> None:
     """Mamba group: block_size = spec.block_size (no cp scaling).
 
-    With cp_world_size=2, scheduler_block_size=hash_block_size=32. The
-    coordinator constraints force Mamba spec.block_size=32 (must divide
-    scheduler_block_size and be a multiple of hash_block_size). The event
+    With cp_world_size=2, scheduler_block_size=32. The
+    coordinator constraints force Mamba spec.block_size=32 (it must divide
+    scheduler_block_size). The event
     block_size for Mamba must be 32 (spec.block_size * 1), NOT 64
     (spec.block_size * cp_world_size) -- that is the bug this guards.
     """
@@ -610,8 +578,8 @@ def test_mamba_block_size_not_scaled() -> None:
     cpu_pool = sched.cpu_block_pool
     gpu_pool = fix.gpu_block_pool
 
-    cpu_blk = cpu_pool.get_new_blocks(1)[0]
-    gpu_blk = gpu_pool.get_new_blocks(1)[0]
+    cpu_blk = cpu_pool.get_new_blocks(1, 0)[0]
+    gpu_blk = gpu_pool.get_new_blocks(1, 0)[0]
 
     raw_hash = make_request(num_blocks=1).block_hashes[0]
     mamba_hash = make_block_hash_with_group_id(raw_hash, group_id=1)
@@ -656,8 +624,8 @@ def test_multi_group_fa_block_stored_group_idx() -> None:
 
     # Store one block for each group via direct _process_store_completion.
     for gidx in (0, 1):
-        cpu_blk = cpu_pool.get_new_blocks(1)[0]
-        gpu_blk = gpu_pool.get_new_blocks(1)[0]
+        cpu_blk = cpu_pool.get_new_blocks(1, 0)[0]
+        gpu_blk = gpu_pool.get_new_blocks(1, 0)[0]
         gpu_blk._block_hash = make_block_hash_with_group_id(  # type: ignore
             raw_hash, group_id=gidx
         )
@@ -680,10 +648,11 @@ def test_multi_group_fa_block_stored_group_idx() -> None:
 
 def test_disk_mode_block_removed_relabeled_storage() -> None:
     """Disk mode: evicted BlockRemoved relabeled to MEDIUM_STORAGE."""
+    # 5 pages: O_DIRECT pads the 1024 B slot to a 4096 B page.
     fix = make_events_scheduler(
         num_cpu_blocks=5,
         num_gpu_blocks=16,
-        disk_capacity_bytes=_BYTES_PER_BLOCK * 5,
+        disk_capacity_bytes=_BYTES_PER_BLOCK * 20,
     )
     sched = fix.scheduler
     assert sched.kv_event_medium == MEDIUM_STORAGE
@@ -776,7 +745,7 @@ def test_scratch_group_store_emits_events_for_cacheable_groups_only() -> None:
 
     req = make_request(num_blocks=num_blocks)
     fa_blocks = _allocate_gpu_blocks(gpu_pool, req, num_blocks, group_id=0)
-    scratch_block = gpu_pool.get_new_blocks(1)
+    scratch_block = gpu_pool.get_new_blocks(1, 0)
     kv_blocks = KVCacheBlocks(blocks=(fa_blocks, scratch_block))
     req.num_computed_tokens = num_blocks * BLOCK_SIZE
     sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)

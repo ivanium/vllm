@@ -4,15 +4,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 import torch.distributed as dist
 
 from vllm.logger import init_logger
-
-if TYPE_CHECKING:
-    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
 
@@ -40,10 +35,3 @@ def sync_num_offload_blocks_across_workers(num_offload_blocks: int) -> int:
             world_group.world_size,
         )
     return synced
-
-
-def gpu_total_bytes(gpu_config: KVCacheConfig) -> int:
-    assert len(gpu_config.kv_cache_tensors) > 0
-    # Every KVCacheTensor describes placement within the same backing allocation,
-    # so its size is the total GPU KV cache size.
-    return gpu_config.kv_cache_tensors[0].size

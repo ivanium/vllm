@@ -25,8 +25,7 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     load_event: int = INVALID_JOB_ID
     load_gpu_blocks: list[int] = field(default_factory=list)
     load_cpu_blocks: list[int] = field(default_factory=list)
-    # KV cache group of each block: block ids are unique only within a group
-    # under the large-page allocator.
+    # KV cache group of each block; block ids are unique only within a group.
     load_group_ids: list[int] = field(default_factory=list)
     # Reverse map: load_event->req_ids, for tracking requests with finished load events
     load_event_to_reqs: dict[int, list[str]] = field(default_factory=dict)

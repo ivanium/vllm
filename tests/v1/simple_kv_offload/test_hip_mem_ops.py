@@ -15,15 +15,13 @@ import pytest
 
 from vllm.v1.simple_kv_offload import cuda_mem_ops
 from vllm.v1.simple_kv_offload.cuda_mem_ops import (
-    BatchMemcpyParams,
+    CopyGeometry,
     DriverMemcpyParams,
-    LargePageCopyGeometry,
-    LargePageMemcpyParams,
+    MemcpyParams,
     _CUmemcpyAttributes,
     _load_hip_runtime,
     _num_attrs_for_hip_version,
     copy_blocks,
-    copy_blocks_large_page,
 )
 
 
@@ -96,18 +94,20 @@ def _fake_driver_params() -> DriverMemcpyParams:
     )
 
 
-def _fake_params(num_layers: int, bytes_per_block: int = 512) -> BatchMemcpyParams:
+def _fake_params() -> MemcpyParams:
     """Minimal params for driving copy_blocks() without a real device.
 
     Bases are 0 and the batch-memcpy function is monkeypatched, so no memory is
     ever dereferenced; only the descriptor bookkeeping (count/chunking) matters.
     """
-    return BatchMemcpyParams(
-        src_bases=np.zeros(num_layers, dtype=np.uint64),
-        dst_bases=np.zeros(num_layers, dtype=np.uint64),
-        bpb=np.full(num_layers, bytes_per_block, dtype=np.uint64),
-        num_layers=num_layers,
-        driver=_fake_driver_params(),
+    geometry = CopyGeometry(
+        gpu_bases=np.zeros(1, dtype=np.int64),
+        has_region=np.ones(1, dtype=bool),
+        cpu_base=0,
+        block_bytes=np.full(1, 512, dtype=np.int64),
+    )
+    return MemcpyParams(
+        geometry=geometry, src_is_gpu=True, driver=_fake_driver_params()
     )
 
 
@@ -123,61 +123,63 @@ def _record_counts(monkeypatch) -> list[int]:
     return counts
 
 
-# ROCm chunks the descriptor batch at the cap (hipMemcpyBatchAsync faults above
+# One descriptor per block (a block's content is one contiguous range). ROCm
+# chunks the descriptor batch at the cap (hipMemcpyBatchAsync faults above
 # 8192/call); CUDA leaves the cap at 0 and issues a single call.
 @pytest.mark.parametrize(
-    ("max_desc", "num_layers", "num_blocks", "expected_counts"),
+    ("max_desc", "num_blocks", "expected_counts"),
     [
-        (8192, 3, 5000, [8192, 6808]),  # 15000 desc -> 8192 + 6808
-        (8192, 1, 8192, [8192]),  # exactly at the cap -> single call
-        (8192, 1, 8193, [8192, 1]),  # one over -> spills into a second call
-        (4096, 61, 135, [4096, 4096, 43]),  # bs=1 Kimi shape (8235 desc)
-        (0, 61, 135, [8235]),  # CUDA uncapped -> single call
+        (8192, 5000, [5000]),  # below the cap -> single call
+        (8192, 8192, [8192]),  # exactly at the cap -> single call
+        (8192, 8193, [8192, 1]),  # one over -> spills into a second call
+        (4096, 8235, [4096, 4096, 43]),  # bs=1 Kimi-scale block count
+        (0, 8235, [8235]),  # CUDA uncapped -> single call
     ],
 )
 def test_copy_blocks_chunks_at_descriptor_cap(
-    monkeypatch, max_desc, num_layers, num_blocks, expected_counts
+    monkeypatch, max_desc, num_blocks, expected_counts
 ):
     counts = _record_counts(monkeypatch)
     monkeypatch.setattr(cuda_mem_ops, "_max_batch_descriptors", max_desc)
 
     ids = list(range(num_blocks))
-    copy_blocks(ids, ids, _fake_params(num_layers))
+    copy_blocks(ids, ids, [0] * num_blocks, _fake_params())
 
     assert counts == expected_counts
-    assert sum(counts) == num_layers * num_blocks
+    assert sum(counts) == num_blocks
 
 
 def test_copy_blocks_noop_on_empty(monkeypatch):
     counts = _record_counts(monkeypatch)
     monkeypatch.setattr(cuda_mem_ops, "_max_batch_descriptors", 8192)
-    copy_blocks([], [], _fake_params(num_layers=4))
+    copy_blocks([], [], [], _fake_params())
     assert counts == []
 
 
 # ---------------------------------------------------------------------------
-# Large-page allocator: per-block address vectors
+# Block addresses
 # ---------------------------------------------------------------------------
 
 
-def _large_page_params(src_is_gpu: bool, has_region=(True, True)) -> tuple:
-    """Two groups; group 1's block does not divide the page."""
-    from tests.v1.kv_connector.unit.test_simple_cpu_offload_connector import (
-        _make_large_page_kv_cache_config,
-    )
+def _two_group_params(src_is_gpu: bool, has_region=(True, True)) -> tuple:
+    """Two groups with different block bytes over one planner-built pool."""
+    from tests.v1.kv_connector.unit.utils import make_two_group_large_page_config
 
-    config = _make_large_page_kv_cache_config()
-    groups = config.kv_cache_groups
-    geometry = LargePageCopyGeometry(
+    config = make_two_group_large_page_config()
+    geometry = CopyGeometry(
         # Both groups are strided views of one backing allocation.
         gpu_bases=np.array([1 << 40, 1 << 40], dtype=np.int64),
         has_region=np.array(has_region),
         cpu_base=1 << 42,
         block_bytes=np.array(
-            [g.kernel_rows_per_block * g.row_bytes for g in groups], dtype=np.int64
+            [
+                config.group_geometry(g).block_bytes
+                for g in range(len(config.kv_cache_groups))
+            ],
+            dtype=np.int64,
         ),
     )
-    params = LargePageMemcpyParams(
+    params = MemcpyParams(
         geometry=geometry, src_is_gpu=src_is_gpu, driver=_fake_driver_params()
     )
     return config, params
@@ -190,41 +192,51 @@ def _record_launches(monkeypatch) -> list[tuple[np.ndarray, np.ndarray, np.ndarr
     def fake_launch(dst_all, src_all, sz_all, params):
         launched.append((dst_all.copy(), src_all.copy(), sz_all.copy()))
 
-    monkeypatch.setattr(cuda_mem_ops, "_launch_batch", fake_launch)
+    monkeypatch.setattr(cuda_mem_ops, "launch_batch", fake_launch)
     return launched
 
 
-def test_copy_blocks_large_page_addresses(monkeypatch):
+def test_copy_blocks_addresses(monkeypatch):
     """Block b of a group is at b * block_bytes on both sides, and a copy
-    moves one block."""
-    _, store_params = _large_page_params(src_is_gpu=True)
-    _, load_params = _large_page_params(src_is_gpu=False)
+    moves one block's content."""
+    _, store_params = _two_group_params(src_is_gpu=True)
+    _, load_params = _two_group_params(src_is_gpu=False)
     launched = _record_launches(monkeypatch)
-    # Group 1 ids 2 and 5 cross a page end and are never allocated.
-    gpu_ids, cpu_ids, group_ids = [1, 5, 0, 3], [0, 2, 4, 1], [0, 0, 1, 1]
+    gpu_ids, cpu_ids, group_ids = [1, 5, 0, 3], [0, 2, 5, 1], [0, 0, 1, 1]
 
-    copy_blocks_large_page(gpu_ids, cpu_ids, group_ids, store_params)
-    copy_blocks_large_page(cpu_ids, gpu_ids, group_ids, load_params)
+    copy_blocks(gpu_ids, cpu_ids, group_ids, store_params)
+    copy_blocks(cpu_ids, gpu_ids, group_ids, load_params)
 
     (store_dst, store_src, store_sizes), (load_dst, load_src, _) = launched
-    # Group 0 blocks are 2 x 1024-byte rows, group 1 blocks one 768-byte row.
-    gpu_addr = [(1 << 40) + 2048, (1 << 40) + 5 * 2048, 1 << 40, (1 << 40) + 3 * 768]
-    cpu_addr = [1 << 42, (1 << 42) + 2 * 2048, (1 << 42) + 4 * 768, (1 << 42) + 768]
+    # Group 0 has 8704-byte blocks, group 1 has 4096-byte blocks (4 rows of
+    # 1024 bytes).
+    gpu_addr = [
+        (1 << 40) + 8704,
+        (1 << 40) + 5 * 8704,
+        1 << 40,
+        (1 << 40) + 3 * 4096,
+    ]
+    cpu_addr = [
+        1 << 42,
+        (1 << 42) + 2 * 8704,
+        (1 << 42) + 5 * 4096,
+        (1 << 42) + 4096,
+    ]
     np.testing.assert_array_equal(store_src, gpu_addr)
     np.testing.assert_array_equal(store_dst, cpu_addr)
-    np.testing.assert_array_equal(store_sizes, [2048, 2048, 768, 768])
+    np.testing.assert_array_equal(store_sizes, [8704, 8704, 4096, 4096])
     np.testing.assert_array_equal(load_src, cpu_addr)
     np.testing.assert_array_equal(load_dst, gpu_addr)
 
 
-def test_copy_blocks_large_page_skips_groups_without_local_layers(monkeypatch):
+def test_copy_blocks_skips_groups_without_local_layers(monkeypatch):
     """Under PP a rank holds no layer of some groups; their blocks are not
     copied there."""
-    _, params = _large_page_params(src_is_gpu=True, has_region=(False, True))
+    _, params = _two_group_params(src_is_gpu=True, has_region=(False, True))
     launched = _record_launches(monkeypatch)
 
-    copy_blocks_large_page([1], [0], [0], params)
+    copy_blocks([1], [0], [0], params)
     assert launched == []
-    copy_blocks_large_page([1, 3], [0, 1], [0, 1], params)
+    copy_blocks([1, 3], [0, 1], [0, 1], params)
     [(_, _, sizes)] = launched
-    np.testing.assert_array_equal(sizes, [768])
+    np.testing.assert_array_equal(sizes, [4096])
