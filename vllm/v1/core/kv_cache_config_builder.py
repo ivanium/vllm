@@ -66,6 +66,12 @@ class KVCacheConfigBuilder(ABC):
         overrides ``_get_pool_bytes_per_block``. Host-resident tensors, such as
         HiSparse source storage, are excluded from the device byte accounting
         and sized independently.
+
+        Under the large-page allocator (``CacheConfig.kv_cache_allocator``),
+        this hook is the worker-local profiling path: ``num_blocks`` is the
+        minimum block count each group must hold, and the placement (slots per
+        large page, page bytes) is computed locally from the given groups —
+        the engine re-plans with cross-rank memory after profiling.
         """
         raise NotImplementedError
 

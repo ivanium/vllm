@@ -25,6 +25,7 @@ from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -170,6 +171,9 @@ class KVCacheBlock:
     pool: "BlockPool | None" = field(
         default=None, repr=False, compare=False, kw_only=True
     )
+    # KV cache group that owns the block id; block ids are unique only within
+    # a group under the large-page allocator.
+    group_id: int = field(default=0, compare=False, kw_only=True)
     # The hash key (block hash + group id) of the block, only available
     # when the block is full and cached.
     _block_hash: BlockHashWithGroupId | None = None
@@ -184,6 +188,9 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # When the pool last released the block (or, for a page of slots, the
+    # page) into a free queue it is reused from last; orders eviction.
+    free_seq: int = 0
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -253,6 +260,9 @@ def trim_null_head(blocks: _BlockSeq) -> _BlockSeq:
 class KVCacheBlockCopy(NamedTuple):
     src_block_id: int
     dst_block_id: int
+    # KV cache group both blocks belong to; block ids are unique only within
+    # a group under the large-page allocator.
+    group_id: int = 0
 
 
 class FreeKVCacheBlockQueue:
@@ -832,10 +842,22 @@ def resolve_kv_cache_block_sizes(
       group block sizes; every group's block size must be divisible by it.
       Returns the scheduler block size (i.e. disables finer hashing) if block
       hashing is inactive or a mamba group is not using cache mode "align".
+    - Under the large-page allocator the planner fixed ``hash_block_size`` at
+      the global block size B; the scheduler block size is the LCM of B and
+      every group's block size (none-mode Mamba groups keep a private one).
     """
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
+
+    if kv_cache_config.allocator == "large_page":
+        hash_block_size = kv_cache_config.hash_block_size
+        assert hash_block_size is not None
+        scheduler_block_size = math.lcm(
+            hash_block_size,
+            *(resolve_dcp_kv_block_size(g.kv_cache_spec, dcp) for g in groups),
+        )
+        return scheduler_block_size, hash_block_size
 
     if len(groups) <= 1:
         if groups and not groups[0].kv_cache_spec.dcp_sharded:
@@ -1012,6 +1034,20 @@ def get_request_block_hasher(
     return request_block_hasher
 
 
+def large_page_blocks_per_request(spec: KVCacheSpec, vllm_config: VllmConfig) -> int:
+    """Blocks of one group that one max-model-len request holds.
+
+    Large-page allocator sizer/capacity accounting: the max-model-len block
+    count (window and state groups: their admission cap) plus the speculative
+    lookahead and a copy-on-write reserve. Mamba and ring groups already carry
+    their speculative blocks in ``max_memory_usage_bytes``.
+    """
+    blocks = cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+    if not isinstance(spec, (MambaSpec, CircularBufferSpec)):
+        blocks += cdiv(vllm_config.num_speculative_tokens, spec.block_size)
+    return blocks + 1
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
@@ -1023,16 +1059,20 @@ def get_max_concurrency_for_kv_cache_config(
     total is the sum over groups. The memory/page ratio is identical whether
     a group carries an aggregated UniformTypeKVCacheSpecs (worker config) or
     a representative per-layer spec (scheduler config), so both capacity
-    call sites agree.
+    call sites agree. Under the large-page allocator the pool is pages, and a
+    page holds ``slots_per_large_page`` blocks of one group.
 
     Host groups use a separate pool; the smaller concurrency limit applies.
     """
-    num_blocks_per_request = 0
-    host_blocks_per_request = 0
+    num_blocks_per_request = 0.0
+    host_blocks_per_request = 0.0
     for group in kv_cache_config.kv_cache_groups:
-        required = cdiv(
-            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-            group.kv_cache_spec.page_size_bytes,
+        required = (
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            / group.slots_per_large_page
         )
         if group.host_resident:
             host_blocks_per_request += required
@@ -1058,6 +1098,19 @@ def generate_scheduler_kv_cache_config(
         cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks
         for cfg in kv_cache_configs
     )
+
+    # One scheduler pool hands the same block ids to every worker, so a block
+    # id must name the same bytes on all of them.
+    def pool_geometry(cfg: KVCacheConfig) -> tuple:
+        return cfg.large_page_bytes, [
+            (g.kernel_rows_per_block, g.row_bytes, g.num_blocks)
+            for g in cfg.kv_cache_groups
+        ]
+
+    assert all(
+        pool_geometry(cfg) == pool_geometry(kv_cache_configs[0])
+        for cfg in kv_cache_configs
+    ), "KV cache pool geometry differs across workers"
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])

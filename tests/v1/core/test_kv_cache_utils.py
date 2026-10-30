@@ -83,6 +83,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
     is_full_attention_spec,
     iter_layer_specs,
+    large_page_block_range,
+    min_blocks_per_large_page,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
@@ -2190,3 +2192,27 @@ def test_null_head_len():
         assert null_head_len(table) == expected
     blocks = KVCacheBlocks(([null] * 4 + real, [null] + real[:1] + [null]))
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 2, 3], [1]]
+
+
+@pytest.mark.parametrize(
+    "page_bytes, block_bytes, expected",
+    [
+        # Blocks tile the page: every page holds the same three.
+        (900, 300, [[0, 1, 2], [3, 4, 5], [6, 7, 8]]),
+        # Block 3 spans bytes 900-1200 and crosses the end of page 0, so no
+        # page holds it; page 1 starts with block 4.
+        (1000, 300, [[0, 1, 2], [4, 5], [7, 8, 9]]),
+    ],
+)
+def test_large_page_holds_the_blocks_that_lie_wholly_in_it(
+    page_bytes, block_bytes, expected
+):
+    pages = [
+        list(large_page_block_range(page, page_bytes, block_bytes))
+        for page in range(len(expected))
+    ]
+
+    assert pages == expected
+    assert min_blocks_per_large_page(page_bytes, block_bytes) == min(
+        len(page) for page in expected
+    )

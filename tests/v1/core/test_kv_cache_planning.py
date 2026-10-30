@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -22,22 +23,28 @@ from tests.v1.core.utils import (
 from vllm.config import (
     CacheConfig,
     ModelConfig,
+    ParallelConfig,
     SchedulerConfig,
     VllmConfig,
 )
 from vllm.config.attention import HiSparseConfig
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.attention.backend import MultipleOf
+from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
 from vllm.v1.core.kv_cache_planning import (
     check_enough_kv_cache_memory,
     estimate_max_model_len,
     get_kv_cache_configs,
     get_kv_cache_groups,
+    get_kv_cache_groups_from_builder,
     is_kv_cache_spec_uniform,
     kv_cache_groups_tp_replicas,
+    select_global_block_size,
 )
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
 )
+from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.hisparse.layout import (
     get_hisparse_kv_cache_groups,
 )
@@ -58,6 +65,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     SparseCacheRole,
     UniformTypeKVCacheSpecs,
+    get_kv_quant_mode,
+    large_page_block_range,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
@@ -1644,6 +1653,31 @@ def test_auto_fit_max_model_len_respects_num_gpu_blocks_override():
     assert 0 < vllm_config.model_config.max_model_len <= 32 * 16
 
 
+def test_large_page_placement_pp_skewed_groups():
+    """PP-skewed hybrid: the globally largest group (FA, 57 layers on rank 1)
+    holds only 3 layers on rank 0, where another group (SWA, 20 layers) is
+    bigger. Each group's row is its largest over ranks, so both ranks share
+    one page that holds whole blocks of every group."""
+    vllm_config = _large_page_vllm_config(max_model_len=1024)
+    fa_spec = new_kv_cache_spec()
+    swa_spec = new_sliding_window_spec(sliding_window=128)
+    worker0 = {f"fa.{i}": fa_spec for i in range(3)}
+    worker0.update({f"swa.{i}": swa_spec for i in range(20)})
+    worker1 = {f"fa.{i}": fa_spec for i in range(3, 60)}
+
+    configs = get_kv_cache_configs(
+        vllm_config, [worker0, worker1], [GiB_bytes, GiB_bytes]
+    )
+
+    for config in configs:
+        for group in config.kv_cache_groups:
+            assert group.slots_per_large_page >= 1
+    assert configs[0].large_page_bytes == configs[1].large_page_bytes
+    assert configs[0].num_blocks == configs[1].num_blocks
+    for group0, group1 in zip(configs[0].kv_cache_groups, configs[1].kv_cache_groups):
+        assert group0.row_bytes == group1.row_bytes
+
+
 def test_check_enough_kv_cache_memory_respects_num_gpu_blocks_override():
     """Admission check must use the override-clamped pool size, not raw
     `available_memory`. Without this, startup could accept a max_model_len
@@ -2136,3 +2170,851 @@ def test_kv_cache_groups_tp_replicas(specs, tp_size, dcp_size, expected):
     """Replicas are the gcd of each layer's tp_size // max_tp_shards."""
     groups = [KVCacheGroupSpec([f"l.{i}"], spec) for i, spec in enumerate(specs)]
     assert kv_cache_groups_tp_replicas(groups, tp_size, dcp_size) == expected
+
+
+# ---------------------------------------------------------------------------
+# Large-page allocator (kv_cache_allocator="large_page")
+#
+# Golden grouping / block-size / placement checks for the five target models.
+# Spec maps are minimal reconstructions of the models' real worker-side specs
+# (classes and numbers from the model builders); expected values come from the
+# design table and the validated placement prototype (60 GiB KV budget/rank).
+# ---------------------------------------------------------------------------
+
+_LARGE_PAGE_KIMI = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
+_LARGE_PAGE_BUDGET = 60 * GiB_bytes
+
+
+def _large_page_vllm_config(
+    model="facebook/opt-125m", max_model_len=131072, mamba_align=False
+):
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model=model,
+            max_model_len=max_model_len,
+            # opt-125m derives max_model_len=2048; let the test override it.
+            hf_overrides={"max_position_embeddings": max_model_len},
+            skip_tokenizer_init=True,
+        ),
+        cache_config=CacheConfig(
+            kv_cache_allocator="large_page",
+            mamba_cache_mode="align" if mamba_align else "none",
+        ),
+        parallel_config=ParallelConfig(),
+        scheduler_config=SchedulerConfig(
+            max_model_len=max_model_len, is_encoder_decoder=False
+        ),
+    )
+    register_all_kvcache_specs(vllm_config)
+    return vllm_config
+
+
+def _dsv41_specs() -> dict[str, KVCacheSpec]:
+    """DeepSeek-V4.1-Flash, dspark k=5: 43 SWA (bounded replay, private 32),
+    4 compressed MLA + 4 indexer (tokens/state 2/2/2/1), 3 compressor rings."""
+    specs: dict[str, KVCacheSpec] = {}
+    swa = dict(
+        bounded_replay=True,
+        block_size=32,
+        num_kv_heads=1,
+        max_tp_shards=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=128,
+        cache_dtype_str="fp8_ds_mla",
+        state_content_bytes=528,
+        alignment=512,
+        block_stride_alignment=528,
+        model_version="deepseek_v4",
+        kv_quant_mode=get_kv_quant_mode("fp8_ds_mla"),
+        kernel_block_sizes=(MultipleOf(32),),
+    )
+    for i in range(40):
+        specs[f"model.layers.{i}.attn.swa_cache"] = SlidingWindowMLASpec(**swa)
+    for j in range(3):
+        specs[f"draft_model.layers.{40 + j}.attn.swa_cache"] = SlidingWindowMLASpec(
+            **swa, is_draft=True
+        )
+    for i in (2, 8, 14, 20):
+        ratio = 1 if i == 20 else 2
+        specs[f"model.layers.{i}.attn"] = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            tokens_per_state=ratio,
+            cache_dtype_str="fp8_ds_mla",
+            alignment=512,
+            model_version="deepseek_v4",
+            kv_quant_mode=get_kv_quant_mode("fp8_ds_mla"),
+            state_content_bytes=528,
+            kernel_block_sizes=(128,),
+        )
+        specs[f"model.layers.{i}.attn.indexer.k_cache"] = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+            tokens_per_state=ratio,
+            alignment=512,
+            kernel_block_sizes=(128,),
+        )
+        if ratio > 1:
+            specs[f"model.layers.{i}.attn.compressor.state_cache"] = CircularBufferSpec(
+                block_size=8,
+                num_kv_heads=1,
+                head_size=1024,
+                head_size_v=0,
+                dtype=torch.float32,
+            )
+    return specs
+
+
+def _glm53_specs(tp: int) -> dict[str, KVCacheSpec]:
+    """GLM-5.3-Flash, MTP k=1: 34 KDA (mamba align), 12 sparse MLA + 12 indexer
+    (11 target + 1 draft each), 12 tail rings."""
+    specs: dict[str, KVCacheSpec] = {}
+    kda_layers = [
+        0,
+        1,
+        2,
+        4,
+        5,
+        6,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26,
+        28,
+        29,
+        30,
+        32,
+        33,
+        34,
+        36,
+        37,
+        38,
+        40,
+        41,
+        42,
+        44,
+    ]
+    for i in kda_layers:
+        specs[f"model.language_model.layers.{i}.self_attn"] = MambaSpec(
+            block_size=16,
+            shapes=((24576 // tp, 4), (64 // tp, 128, 128)),
+            dtypes=(torch.bfloat16, torch.float32),
+            mamba_cache_mode="align",
+            num_speculative_blocks=1,
+            num_prefill_checkpoint_blocks=1,
+            prefill_checkpoint_alignment=16,
+        )
+    prefixes = [
+        f"model.language_model.layers.{i}.self_attn"
+        for i in (3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43)
+    ] + ["draft.model.layers.45.mtp_block.self_attn"]
+    for prefix in prefixes:
+        is_draft = prefix.startswith("draft.")
+        specs[f"{prefix}.attn"] = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            max_tp_shards=1,
+            head_size=512,
+            dtype=torch.uint8,
+            cache_dtype_str="fp8",
+            kv_quant_mode=get_kv_quant_mode("fp8"),
+            topk_buffer_width=2176,
+            is_index_group_leader=True,
+            block_stride_alignment=16384,
+            kernel_block_sizes=(MultipleOf(32),),
+            is_draft=is_draft,
+        )
+        specs[f"{prefix}.indexer.k_cache"] = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            max_tp_shards=1,
+            head_size=132,
+            dtype=torch.uint8,
+            cache_role=SparseCacheRole.INDEXER,
+            tokens_per_state=4,
+            block_stride_alignment=MultipleOf(256),
+            kernel_block_sizes=(128, 256),
+            is_draft=is_draft,
+        )
+        specs[f"{prefix}.indexer.tail_cache"] = CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=2,
+            head_size=128,
+            head_size_v=0,
+            dtype=torch.bfloat16,
+            dcp_sharded=False,
+            is_draft=is_draft,
+        )
+    return specs
+
+
+def _kimilinear_specs(tp: int) -> dict[str, KVCacheSpec]:
+    """Kimi-Linear-48B, ngram k=3: 20 KDA (mamba align), 7 MLA."""
+    specs: dict[str, KVCacheSpec] = {}
+    kda = [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 25]
+    for i in range(27):
+        name = f"model.layers.{i}.self_attn"
+        if i in kda:
+            specs[name] = MambaSpec(
+                block_size=16,
+                shapes=((6, 12288 // tp), (32 // tp, 128, 128)),
+                dtypes=(torch.bfloat16, torch.float32),
+                mamba_cache_mode="align",
+                num_speculative_blocks=3,
+            )
+        else:
+            specs[name] = MLAAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                max_tp_shards=1,
+                head_size=576,
+                dtype=torch.bfloat16,
+                block_stride_alignment=MultipleOf(64),
+                kernel_block_sizes=(32, 64),
+            )
+    return specs
+
+
+def _qwen38_specs(tp: int) -> dict[str, KVCacheSpec]:
+    """Qwen3.8-Flash-Next, MTP k=1: 36 GDN + 1 PLE (mamba align), 13 QSA sets
+    (full attention + raw ring + compressed, tokens/state 4)."""
+    specs: dict[str, KVCacheSpec] = {}
+    for i in range(48):
+        if (i + 1) % 4 == 0:
+            continue
+        if i == 1:
+            specs[f"model.layers.{i}.ple"] = MambaSpec(
+                block_size=16,
+                shapes=((10, 10240),),
+                dtypes=(torch.bfloat16,),
+                mamba_cache_mode="align",
+                num_speculative_blocks=1,
+                prefill_checkpoint_alignment=1,
+                tp_replicated=True,
+            )
+        specs[f"model.layers.{i}.linear_attn"] = MambaSpec(
+            block_size=16,
+            shapes=((4, 10240 // tp), (48 // tp, 128, 128)),
+            dtypes=(torch.bfloat16, torch.float32),
+            mamba_cache_mode="align",
+            num_speculative_blocks=1,
+            prefill_checkpoint_alignment=64,
+        )
+    prefixes = [f"model.layers.{i}.self_attn" for i in range(3, 48, 4)] + [
+        "mtp.layers.48.self_attn"
+    ]
+    for prefix in prefixes:
+        is_draft = prefix.startswith("mtp.")
+        specs[f"{prefix}.attn"] = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=max(2 // tp, 1),
+            head_size=256,
+            head_size_v=256,
+            dtype=torch.bfloat16,
+            kernel_block_sizes=(MultipleOf(16),),
+            is_draft=is_draft,
+        )
+        specs[f"{prefix}.indexer.raw_key_cache"] = CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=140,
+            head_size_v=0,
+            dtype=torch.bfloat16,
+            is_draft=is_draft,
+        )
+        specs[f"{prefix}.indexer.compressed_key_cache"] = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            tokens_per_state=4,
+            kernel_block_sizes=(MultipleOf(1),),
+            is_draft=is_draft,
+        )
+    return specs
+
+
+def _minimax_specs(tp: int, draft: str = "mtp") -> dict[str, KVCacheSpec]:
+    """MiniMax-M3: 3 dense + 57 sparse full attention, 57 indexer; the MTP
+    draft merges into the target groups, the 64-head EAGLE3 draft does not."""
+    kv_heads = max(1, 4 // tp)
+    specs: dict[str, KVCacheSpec] = {}
+    for i in range(60):
+        name = f"language_model.model.layers.{i}.self_attn.attn"
+        if i < 3:
+            specs[name] = FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=kv_heads,
+                head_size=128,
+                head_size_v=128,
+                dtype=torch.bfloat16,
+                kernel_block_sizes=(MultipleOf(16),),
+            )
+        else:
+            specs[name] = FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=kv_heads,
+                head_size=128,
+                head_size_v=128,
+                dtype=torch.bfloat16,
+                block_stride_alignment=MultipleOf(128),
+                kernel_block_sizes=(128,),
+            )
+            specs[f"{name}.index_cache"] = MLAAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+                cache_role=SparseCacheRole.INDEXER,
+                block_stride_alignment=MultipleOf(128),
+                kernel_block_sizes=(128,),
+            )
+    if draft == "mtp":
+        specs["draft.model.layers.0.self_attn.attn"] = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=kv_heads,
+            head_size=128,
+            head_size_v=128,
+            dtype=torch.bfloat16,
+            block_stride_alignment=MultipleOf(128),
+            kernel_block_sizes=(128,),
+            is_draft=True,
+        )
+        specs["draft.model.layers.0.self_attn.attn.index_cache"] = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            cache_role=SparseCacheRole.INDEXER,
+            block_stride_alignment=MultipleOf(128),
+            kernel_block_sizes=(128,),
+            is_draft=True,
+        )
+    else:
+        specs["draft.model.layers.0.self_attn.attn"] = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=64 // tp,
+            head_size=128,
+            head_size_v=128,
+            dtype=torch.bfloat16,
+            kernel_block_sizes=(MultipleOf(16),),
+            is_draft=True,
+        )
+    return specs
+
+
+def _large_page_group_table(
+    config: KVCacheConfig,
+) -> dict[tuple, KVCacheGroupSpec]:
+    """(spec class, layers, block size, tokens/state, head size) -> group."""
+    table = {}
+    for group in config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        key = (
+            type(spec).__name__,
+            len(group.layer_names),
+            spec.block_size,
+            str(getattr(spec, "tokens_per_state", None)),
+            getattr(spec, "head_size", None),
+        )
+        assert key not in table, f"ambiguous group key {key}"
+        table[key] = group
+    return table
+
+
+def _check_large_page_config(
+    vllm_config: VllmConfig,
+    config: KVCacheConfig,
+    expected_block_size: int,
+    expected_num_pages: int,
+    expected_page_bytes: int,
+    # group key -> (slots per large page, kernel rows per block, row bytes)
+    expected_groups: dict[tuple, tuple[int, int, int]],
+) -> None:
+    block_size = vllm_config.cache_config.block_size
+    assert block_size == expected_block_size
+    assert config.allocator == "large_page"
+    assert config.hash_block_size == block_size
+    assert config.cache_hit_alignment_tokens == block_size
+    assert config.num_blocks == expected_num_pages
+    assert config.num_blocks == expected_num_pages
+    assert config.large_page_bytes == expected_page_bytes
+    assert len(config.kv_cache_groups) == len(expected_groups)
+    table = _large_page_group_table(config)
+    for key, (n_g, rows_per_block, row_bytes) in expected_groups.items():
+        group = table[key]
+        assert group.slots_per_large_page == n_g, key
+        assert group.kernel_rows_per_block == rows_per_block, key
+        assert group.row_bytes == row_bytes, key
+        assert group.num_blocks == (
+            expected_num_pages * expected_page_bytes // (rows_per_block * row_bytes)
+        ), key
+    # One tensor per layer, kernel-block (row) granularity, over the pool.
+    num_layers = sum(len(g.layer_names) for g in config.kv_cache_groups)
+    assert len(config.kv_cache_tensors) == num_layers
+    group_of = {
+        name: group for group in config.kv_cache_groups for name in group.layer_names
+    }
+    for tensor in config.kv_cache_tensors:
+        (layer,) = tensor.layers
+        group = group_of[layer]
+        assert group.layer_kv_cache_specs is not None
+        alignment = group.layer_kv_cache_specs[layer].get_block_stride_alignment()
+        assert tensor.size == expected_num_pages * expected_page_bytes
+        assert tensor.block_stride == group.row_bytes
+        assert tensor.offset % alignment == 0
+
+
+def test_large_page_dsv41():
+    """DSV4.1-Flash (dspark k=5): B=128, 6 groups, SWA keeps its private 32."""
+    vllm_config = _large_page_vllm_config()
+    specs = _dsv41_specs()
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+    _check_large_page_config(
+        vllm_config,
+        config,
+        expected_block_size=128,
+        expected_num_pages=29558,
+        expected_page_bytes=2179584,
+        expected_groups={
+            ("SlidingWindowMLASpec", 43, 32, "1", 512): (3, 1, 726528),
+            ("MLAAttentionSpec", 3, 128, "2", 512): (21, 1, 101376),
+            ("MLAAttentionSpec", 3, 128, "2", 132): (82, 1, 26112),
+            ("CircularBufferSpec", 3, 8, "1", 1024): (21, 1, 98304),
+            ("MLAAttentionSpec", 1, 128, "1", 512): (31, 1, 67584),
+            ("MLAAttentionSpec", 1, 128, "1", 132): (129, 1, 16896),
+        },
+    )
+
+
+def test_large_page_dsv41_pp2():
+    """PP2 (split at layer 20): groups are global; a stage may hold zero layers
+    of a group. Block ids must name the same page on both ranks, so the page
+    size and every group's row are identical across ranks."""
+    vllm_config = _large_page_vllm_config()
+    specs = _dsv41_specs()
+
+    def stage_of(name):
+        idx = int(name.split("layers.")[1].split(".")[0])
+        return 0 if idx < 20 else 1
+
+    stages = [{n: s for n, s in specs.items() if stage_of(n) == r} for r in range(2)]
+    configs = get_kv_cache_configs(vllm_config, stages, [_LARGE_PAGE_BUDGET] * 2)
+    assert len(configs) == 2
+    assert configs[0].num_blocks == configs[1].num_blocks == 27630
+    assert configs[0].large_page_bytes == configs[1].large_page_bytes
+    # Every layer is on exactly one rank.
+    assert sum(len(g.layer_names) for g in configs[0].kv_cache_groups) + sum(
+        len(g.layer_names) for g in configs[1].kv_cache_groups
+    ) == len(specs)
+    for group0, group1 in zip(configs[0].kv_cache_groups, configs[1].kv_cache_groups):
+        assert group0.slots_per_large_page == group1.slots_per_large_page
+        assert group0.kernel_rows_per_block == group1.kernel_rows_per_block
+        assert group0.num_blocks == group1.num_blocks
+        assert group0.row_bytes == group1.row_bytes > 0
+    swa0 = configs[0].kv_cache_groups[0]
+    assert len(swa0.layer_names) == 20
+    # The SWA row is its 23-layer row on rank 1; six of them fill a page.
+    assert swa0.slots_per_large_page == 6
+
+
+@pytest.mark.parametrize(
+    "tp, expected",
+    [
+        (1, (431, 149291008, 1, 149291008, 189, 2944, 3036)),
+        # TP4: a page of one KDA slot wastes >2% on the sparse-MLA row, so the
+        # page holds 2 KDA slots.
+        (4, (863, 74645504, 2, 37322752, 94, 1471, 1518)),
+    ],
+)
+def test_large_page_glm53(tp, expected):
+    """GLM-5.3-Flash (MTP k=1): B=128, 4 groups; the KDA mamba group rides at B
+    and mamba_block_size is written back."""
+    num_pages, page_bytes, n_kda, kda_row, n_mla, n_idx, n_ring = expected
+    vllm_config = _large_page_vllm_config(mamba_align=True)
+    specs = _glm53_specs(tp)
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+    assert vllm_config.cache_config.mamba_block_size == 128
+    _check_large_page_config(
+        vllm_config,
+        config,
+        expected_block_size=128,
+        expected_num_pages=num_pages,
+        expected_page_bytes=page_bytes,
+        expected_groups={
+            ("MambaSpec", 34, 128, "-1", None): (n_kda, 1, kda_row),
+            ("MLAAttentionSpec", 12, 128, "1", 512): (n_mla, 1, 786432),
+            ("MLAAttentionSpec", 12, 128, "4", 132): (n_idx, 1, 50688),
+            ("CircularBufferSpec", 12, 8, "1", 128): (n_ring, 1, 49152),
+        },
+    )
+    # KDA checkpoints (raw alignment 16) stay on the B-token prefix-cache grid.
+    (kda,) = [
+        g for g in config.kv_cache_groups if isinstance(g.kv_cache_spec, MambaSpec)
+    ]
+    assert kda.kv_cache_spec.prefill_checkpoint_alignment == 128
+
+
+@pytest.mark.parametrize(
+    "tp, expected",
+    [
+        (1, (1435, 44892160, 1, 44892160, 86)),
+        # TP4 quarters the KDA row; three KDA slots per page keep the
+        # demand-weighted page waste under 2%.
+        (4, (1913, 33669120, 3, 11223040, 64)),
+    ],
+)
+def test_large_page_kimilinear(tp, expected):
+    """Kimi-Linear-48B (ngram k=3): B=64, the default floor; the KDA checkpoint
+    alignment (16) and the MLA kernel blocks (32, 64) both divide it."""
+    num_pages, page_bytes, n_kda, kda_row, n_mla = expected
+    vllm_config = _large_page_vllm_config(model=_LARGE_PAGE_KIMI, mamba_align=True)
+    assert vllm_config.model_config.use_mla
+    specs = _kimilinear_specs(tp)
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+    _check_large_page_config(
+        vllm_config,
+        config,
+        expected_block_size=64,
+        expected_num_pages=num_pages,
+        expected_page_bytes=page_bytes,
+        expected_groups={
+            ("MambaSpec", 20, 64, "-1", None): (n_kda, 1, kda_row),
+            ("MLAAttentionSpec", 7, 64, "1", 576): (n_mla, 1, 516096),
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "tp, expected",
+    [
+        (1, (554, 116195328, (1, 116195328), 566, (67, 1703936), 3989, 2181)),
+        # TP4 quarters the GDN row; two GDN slots per page.
+        (4, (1108, 58097664, (2, 29048832), 282, (67, 851968), 1994, 1090)),
+    ],
+)
+def test_large_page_qwen38(tp, expected):
+    """Qwen3.8-Flash-Next (MTP k=1): B=64 from the raw GDN prefill-checkpoint
+    alignment; the TP-replicated PLE group gets its own placement."""
+    num_pages, page_bytes, (n_gdn, gdn_row), n_ple, main, n_ring, n_comp = expected
+    vllm_config = _large_page_vllm_config(mamba_align=True)
+    specs = _qwen38_specs(tp)
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+    _check_large_page_config(
+        vllm_config,
+        config,
+        expected_block_size=64,
+        expected_num_pages=num_pages,
+        expected_page_bytes=page_bytes,
+        expected_groups={
+            ("MambaSpec", 36, 64, "-1", None): (n_gdn, 1, gdn_row),
+            ("MambaSpec", 1, 64, "-1", None): (n_ple, 1, 204800),
+            ("FullAttentionSpec", 13, 64, "1", 256): (main[0], 1, main[1]),
+            ("CircularBufferSpec", 13, 8, "1", 140): (n_ring, 1, 29120),
+            ("MLAAttentionSpec", 13, 64, "4", 128): (n_comp, 1, 53248),
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "tp, draft, expected",
+    [
+        # MTP: the draft layers merge into the target groups (2 groups).
+        (1, "mtp", (2014, 31981568, (2, 61, 15990784), (15, 58))),
+        (4, "mtp", (1611, 39976960, (10, 61, 3997696), (20, 58))),
+        # EAGLE3: the 64-head draft layer is its own group; 4 main slots a page.
+        (1, "eagle3", (1024, 62914560, (4, 60, 15728640), (32, 57))),
+    ],
+)
+def test_large_page_minimax(tp, draft, expected):
+    """MiniMax-M3: B=128 forced by exact kernel block sizes ([128]); dense and
+    sparse full-attention layers merge into one group despite different
+    block-stride alignments."""
+    num_pages, page_bytes, (n_main, main_layers, main_row), (n_idx, idx_layers) = (
+        expected
+    )
+    vllm_config = _large_page_vllm_config()
+    specs = _minimax_specs(tp, draft)
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+    expected_groups = {
+        ("FullAttentionSpec", main_layers, 128, "1", 128): (n_main, 1, main_row),
+        ("MLAAttentionSpec", idx_layers, 128, "1", 128): (
+            n_idx,
+            1,
+            idx_layers * 32768,
+        ),
+    }
+    if draft == "eagle3":
+        expected_groups[("FullAttentionSpec", 1, 128, "1", 128)] = (15, 1, 4194304)
+    _check_large_page_config(
+        vllm_config,
+        config,
+        expected_block_size=128,
+        expected_num_pages=num_pages,
+        expected_page_bytes=page_bytes,
+        expected_groups=expected_groups,
+    )
+
+
+def test_large_page_splits_layers_with_different_kernel_blocks():
+    """Layers whose backends resolve to different kernel blocks at B get
+    separate groups, since a group has one row layout (MiniMax-M3: dense
+    layers support kernel blocks up to 64, sparse layers only 128)."""
+    vllm_config = _large_page_vllm_config()
+
+    def layer(kernel_block_sizes):
+        return FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=128,
+            dtype=torch.bfloat16,
+            kernel_block_sizes=kernel_block_sizes,
+        )
+
+    specs = {
+        **{f"dense.{i}": layer((16, 32, 64)) for i in range(3)},
+        **{f"sparse.{i}": layer((128,)) for i in range(5)},
+    }
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+    assert vllm_config.cache_config.block_size == 128
+    rows = {
+        tuple(group.layer_names): group.kernel_rows_per_block
+        for group in config.kv_cache_groups
+    }
+    assert rows == {
+        tuple(f"dense.{i}" for i in range(3)): 2,
+        tuple(f"sparse.{i}" for i in range(5)): 1,
+    }
+
+
+def test_large_page_addressing_invariants():
+    """Every block a page holds lies inside the page and is disjoint from the
+    blocks of other pages under arbitrary page ownership; every page holds at
+    least slots_per_large_page blocks."""
+    vllm_config = _large_page_vllm_config()
+    specs = _dsv41_specs()
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+    num_pages = config.num_blocks
+    page_bytes = config.large_page_bytes
+
+    def page_blocks(group_id: int, page: int) -> list[tuple[int, int]]:
+        group = config.kv_cache_groups[group_id]
+        block_bytes = group.kernel_rows_per_block * group.row_bytes
+        return [
+            (block_id * block_bytes, (block_id + 1) * block_bytes)
+            for block_id in large_page_block_range(page, page_bytes, block_bytes)
+        ]
+
+    rng = np.random.default_rng(20261022)
+    num_groups = len(config.kv_cache_groups)
+    for _ in range(30):
+        owners = rng.integers(0, num_groups, size=num_pages)
+        intervals: list[tuple[int, int]] = []
+        for page in rng.choice(np.arange(1, num_pages), size=64, replace=False):
+            group_id = int(owners[page])
+            blocks = page_blocks(group_id, int(page))
+            assert len(blocks) >= config.kv_cache_groups[group_id].slots_per_large_page
+            for start, end in blocks:
+                assert page * page_bytes <= start
+                assert end <= (page + 1) * page_bytes
+            intervals.extend(blocks)
+        ordered = sorted(intervals)
+        for (_, prev_end), (start, _) in zip(ordered, ordered[1:]):
+            assert prev_end <= start
+
+    # The per-layer views cover the group's highest block.
+    for group in config.kv_cache_groups:
+        num_kernel_blocks = num_pages * page_bytes // group.row_bytes
+        assert group.num_blocks * group.kernel_rows_per_block <= num_kernel_blocks
+
+
+@pytest.mark.parametrize("max_model_len", [1024, 131072])
+def test_large_page_placement_independent_of_max_model_len(max_model_len):
+    """n_g, S and N come from per-token/per-request rates only and must not
+    move with max_model_len (auto-fit mutates it during its search)."""
+    vllm_config = _large_page_vllm_config(
+        model=_LARGE_PAGE_KIMI, mamba_align=True, max_model_len=max_model_len
+    )
+    specs = _kimilinear_specs(1)
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+    assert config.num_blocks == 1435
+    assert config.large_page_bytes == 44892160
+    assert [g.slots_per_large_page for g in config.kv_cache_groups] == [1, 86]
+
+
+def test_large_page_user_block_size():
+    """A user-set --block-size must be feasible as-is, else a ValueError
+    naming the violated constraint."""
+    specs = _dsv41_specs()
+    vllm_config = _large_page_vllm_config()
+    vllm_config.cache_config = CacheConfig(
+        kv_cache_allocator="large_page", block_size=128
+    )
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+    assert config.hash_block_size == 128
+
+    vllm_config = _large_page_vllm_config()
+    vllm_config.cache_config = CacheConfig(
+        kv_cache_allocator="large_page", block_size=64
+    )
+    with pytest.raises(ValueError, match="Invalid block_size=64"):
+        get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+
+
+def test_large_page_block_size_fits_dcp_sharded_kernel_blocks():
+    """A DCP-sharded layer holds B / dcp tokens per rank, so its kernel block
+    sizes constrain B / dcp, not B."""
+    vllm_config = _large_page_vllm_config()
+    vllm_config.parallel_config.decode_context_parallel_size = 2
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+        kernel_block_sizes=(64,),
+    )
+    assert select_global_block_size(vllm_config, {"layer": spec}) == 128
+
+
+def test_large_page_prefix_match_unit_mismatch():
+    """prefix_match_unit must equal the resolved global block size B."""
+    vllm_config = _large_page_vllm_config()
+    vllm_config.cache_config = CacheConfig(
+        kv_cache_allocator="large_page", prefix_match_unit=16
+    )
+    with pytest.raises(ValueError, match="prefix_match_unit=16"):
+        get_kv_cache_configs(vllm_config, [_dsv41_specs()], [_LARGE_PAGE_BUDGET])
+
+    # A unit matching the resolved B is accepted even when it differs from
+    # the requested (default) block size.
+    vllm_config = _large_page_vllm_config()
+    vllm_config.cache_config = CacheConfig(
+        kv_cache_allocator="large_page", prefix_match_unit=128
+    )
+    (config,) = get_kv_cache_configs(
+        vllm_config, [_dsv41_specs()], [_LARGE_PAGE_BUDGET]
+    )
+    assert config.hash_block_size == 128
+
+
+def test_large_page_num_gpu_blocks_override():
+    """num_gpu_blocks_override overrides N (large pages) directly."""
+    vllm_config = _large_page_vllm_config(model=_LARGE_PAGE_KIMI, mamba_align=True)
+    vllm_config.cache_config = CacheConfig(
+        kv_cache_allocator="large_page",
+        mamba_cache_mode="align",
+        num_gpu_blocks_override=1000,
+    )
+    (config,) = get_kv_cache_configs(
+        vllm_config, [_kimilinear_specs(1)], [_LARGE_PAGE_BUDGET]
+    )
+    assert config.num_blocks == 1000
+    assert config.num_blocks == 1000
+    assert config.kv_cache_groups[0].num_blocks == 1000
+    group = config.kv_cache_groups[1]
+    assert group.num_blocks == (
+        1000
+        * config.large_page_bytes
+        // (group.kernel_rows_per_block * group.row_bytes)
+    )
+
+
+def test_large_page_sizer_rejects_tiny_pool():
+    """One max-model-len request must fit: sum_g ceil(demand_g / n_g) <= N-1."""
+    vllm_config = _large_page_vllm_config()
+    vllm_config.cache_config = CacheConfig(
+        kv_cache_allocator="large_page", num_gpu_blocks_override=4
+    )
+    with pytest.raises(ValueError, match="To serve at least one request"):
+        get_kv_cache_configs(vllm_config, [_dsv41_specs()], [_LARGE_PAGE_BUDGET])
+
+
+def test_large_page_attention_free():
+    vllm_config = _large_page_vllm_config()
+    (config,) = get_kv_cache_configs(vllm_config, [{}], [_LARGE_PAGE_BUDGET])
+    assert config.num_blocks == 1
+    assert config.kv_cache_groups == []
+    assert config.kv_cache_tensors == []
+    assert config.allocator == "large_page"
+
+
+def test_large_page_none_mode_mamba_scheduler_block_size():
+    """Without prefix caching a Mamba group keeps a private max_model_len
+    block; the scheduler block size must still cover every group (the
+    coordinator asserts it), while block hashes stay on the B grid."""
+    vllm_config = _large_page_vllm_config(model=_LARGE_PAGE_KIMI, max_model_len=8192)
+    vllm_config.cache_config.enable_prefix_caching = False
+    specs = {
+        name: replace(spec, block_size=8192, mamba_cache_mode="none")
+        if isinstance(spec, MambaSpec)
+        else spec
+        for name, spec in _kimilinear_specs(4).items()
+    }
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(config, vllm_config) == (
+        8192,
+        config.hash_block_size,
+    )
+
+
+def test_large_page_disable_hybrid_promotes_sliding_window():
+    """--disable-hybrid-kv-cache-manager keeps its uniform_page meaning:
+    sliding-window layers are allocated as full attention, in one group."""
+    vllm_config = _large_page_vllm_config()
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = True
+    attn = dict(num_kv_heads=8, head_size=128, dtype=torch.bfloat16, block_size=16)
+    specs = {
+        "full": FullAttentionSpec(**attn),
+        "swa": SlidingWindowSpec(**attn, sliding_window=1024),
+    }
+    (config,) = get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+
+    (group,) = config.kv_cache_groups
+    assert type(group.kv_cache_spec) is FullAttentionSpec
+    assert group.layer_names == ["full", "swa"]
+
+
+def test_large_page_disable_hybrid_rejects_multi_group_model():
+    """Promoted layers whose pages differ cannot share a large-page group, so
+    the flag is an error rather than a silently multi-group plan."""
+    vllm_config = _large_page_vllm_config()
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = True
+    attn = dict(num_kv_heads=8, dtype=torch.bfloat16, block_size=16)
+    specs = {
+        "full": FullAttentionSpec(**attn, head_size=128),
+        "swa": SlidingWindowSpec(**attn, head_size=64, sliding_window=1024),
+    }
+    with pytest.raises(ValueError, match="one KV cache group"):
+        get_kv_cache_configs(vllm_config, [specs], [_LARGE_PAGE_BUDGET])
+
+
+def test_large_page_profiling_placement():
+    """The worker-side profiling path plans a local placement through the
+    builder with enough blocks of every group for min_blocks sequences."""
+    vllm_config = _large_page_vllm_config()
+    specs = _kimilinear_specs(1)
+    builder = get_kv_cache_config_builder(vllm_config)
+    groups = get_kv_cache_groups_from_builder(builder, vllm_config, dict(specs))
+    config = builder.get_kv_cache_config_from_groups(vllm_config, groups, 64)
+    assert config.allocator == "large_page"
+    assert config.num_blocks >= 64
+    for group in config.kv_cache_groups:
+        assert group.num_blocks >= 64
+    assert len(config.kv_cache_tensors) == 27

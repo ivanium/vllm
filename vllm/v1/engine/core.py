@@ -324,40 +324,48 @@ class EngineCore:
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
+        large_page = scheduler_kv_cache_config.allocator == "large_page"
         if kv_cache_groups:
-            # Exclude groups that opt out of prefix caching (e.g. a circular
-            # buffer, a 1-block/req scratch buffer with a small ring block):
-            # their small block_size would otherwise drag the global block_size
-            # below the real allocator block size and desync it from mamba.
-            participating = [
-                g.kv_cache_spec.block_size
-                for g in kv_cache_groups
-                if g.kv_cache_spec.prefix_cacheable
-            ]
-            vllm_config.cache_config.block_size = min(
-                participating
-                if participating
-                else [g.kv_cache_spec.block_size for g in kv_cache_groups]
-            )
+            # Under the large-page allocator the planner already wrote back the
+            # global block size B.
+            if not large_page:
+                # Exclude groups that opt out of prefix caching (e.g. a circular
+                # buffer, a 1-block/req scratch buffer with a small ring block):
+                # their small block_size would otherwise drag the global block_size
+                # below the real allocator block size and desync it from mamba.
+                participating = [
+                    g.kv_cache_spec.block_size
+                    for g in kv_cache_groups
+                    if g.kv_cache_spec.prefix_cacheable
+                ]
+                vllm_config.cache_config.block_size = min(
+                    participating
+                    if participating
+                    else [g.kv_cache_spec.block_size for g in kv_cache_groups]
+                )
             update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
 
         vllm_config.validate_block_size()
 
-        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
-            scheduler_kv_cache_config, vllm_config
-        )
-        cache_hit_alignment_tokens = resolve_cache_hit_alignment_tokens(
-            scheduler_kv_cache_config,
-            vllm_config,
-            scheduler_block_size,
-            hash_block_size,
-        )
-        # The scheduler's config is a deep copy taken before these are resolved,
-        # so set them there too: the KV connector's scheduler side reads the same
-        # fields as its workers.
-        for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
-            kv_cache_config.hash_block_size = hash_block_size
-            kv_cache_config.cache_hit_alignment_tokens = cache_hit_alignment_tokens
+        # Under the large-page allocator the planner already set
+        # hash_block_size = cache_hit_alignment_tokens = B on every config
+        # (including the scheduler's deep copy).
+        if not large_page:
+            scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+                scheduler_kv_cache_config, vllm_config
+            )
+            cache_hit_alignment_tokens = resolve_cache_hit_alignment_tokens(
+                scheduler_kv_cache_config,
+                vllm_config,
+                scheduler_block_size,
+                hash_block_size,
+            )
+            # The scheduler's config is a deep copy taken before these are resolved,
+            # so set them there too: the KV connector's scheduler side reads the same
+            # fields as its workers.
+            for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
+                kv_cache_config.hash_block_size = hash_block_size
+                kv_cache_config.cache_hit_alignment_tokens = cache_hit_alignment_tokens
 
         self.model_executor.initialize_from_config(kv_cache_configs)
         kv_transfer_config = vllm_config.kv_transfer_config

@@ -868,6 +868,8 @@ class MPClient(EngineCoreClient):
 
         # Setup KV cache config with initialization state from
         # engine core process. Sum num_gpu_blocks from all engines in DP case.
+        # Under the large-page allocator num_gpu_blocks is the number of large
+        # pages N, so the sum is in pages (unchanged in meaning).
         num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks or 0
         num_gpu_blocks += response.num_gpu_blocks
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks

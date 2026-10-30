@@ -5,17 +5,21 @@
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial, reduce
-from typing import Any
+from typing import Any, NamedTuple
 
 from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.core.kv_cache_config_builder import KVCacheConfigBuilder
-from vllm.v1.core.kv_cache_utils import _kv_cache_device_name
+from vllm.v1.core.kv_cache_utils import (
+    _kv_cache_device_name,
+    large_page_blocks_per_request,
+)
 from vllm.v1.hisparse.layout import (
     get_hisparse_host_pool_bytes,
     get_hisparse_kv_cache_config,
@@ -40,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     compute_layout_strides,
     iter_layer_specs,
+    min_blocks_per_large_page,
     replace_as,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -167,6 +172,18 @@ def check_enough_kv_cache_memory(
     """
     # No need to check for available memory if the kv_cache_spec is empty
     if kv_cache_spec:
+        if vllm_config.cache_config.kv_cache_allocator == "large_page":
+            groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
+            plans, page_bytes = _plan_large_page_placement(
+                groups, [kv_cache_spec], vllm_config, [available_memory]
+            )
+            _large_page_check_memory(
+                vllm_config,
+                plans,
+                _usable_large_pages(available_memory // page_bytes),
+                page_bytes,
+            )
+            return
         # Reserve the null block BlockPool permanently holds back, so the check
         # plans against usable blocks, as in get_kv_cache_configs. Group a copy
         # of the specs since grouping may unify them in-place.
@@ -1110,6 +1127,736 @@ def _ensure_min_page_size(
     return scaled, common_page
 
 
+# ---------------------------------------------------------------------------
+# Large-page allocator planning (CacheConfig.kv_cache_allocator="large_page")
+#
+# One KV cache group per (normalized) spec; one global block size B for all
+# prefix-cacheable token-paged groups. The pool is N large pages of S bytes;
+# each page belongs to one group at a time. Block b of group g is kernel
+# blocks b * R_g .. b * R_g + R_g - 1 of every layer view, so a page holds the
+# blocks that lie wholly in it (large_page_block_range). S and row_g are the
+# same on every rank (a rank with fewer layers of a group pads its rows), so
+# block ids name the same page on every rank.
+
+# The page size is the smallest multiple of a group's slot, at least the
+# largest slot, whose demand-weighted waste is within this bound and that every
+# rank's budget can hold one max-model-len request with. Smaller pages strand
+# fewer bytes on pages that one group owns.
+_LARGE_PAGE_MAX_PAGE_WASTE = 0.02
+# Unless --block-size is set, B starts here: smaller blocks only add hashing
+# and block-table work.
+_DEFAULT_MIN_BLOCK_SIZE = 64
+
+
+def _kernel_block_size_feasible(
+    sizes: tuple[int | MultipleOf, ...], block_size: int
+) -> bool:
+    """Whether a block of ``block_size`` tokens splits into whole kernel
+    blocks: some listed exact size divides it, or it is a multiple of some
+    ``MultipleOf`` base."""
+    return any(
+        block_size % (size.base if isinstance(size, MultipleOf) else size) == 0
+        for size in sizes
+    )
+
+
+def _kernel_block_size_supported(
+    sizes: tuple[int | MultipleOf, ...], kernel_block_size: int
+) -> bool:
+    """Whether the listed sizes allow ``kernel_block_size`` as a kernel block:
+    an exact ``int`` must be listed; ``MultipleOf(m)`` accepts multiples of m."""
+    return any(
+        kernel_block_size == size
+        if isinstance(size, int)
+        else kernel_block_size % size.base == 0
+        for size in sizes
+    )
+
+
+def select_global_block_size(
+    vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
+) -> int:
+    """The one block size B for all token-grid (prefix-cacheable, token-paged)
+    groups under the large-page allocator.
+
+    B is the smallest multiple of L0 (the LCM of the pure divisibility
+    constraints: prefix-cacheable tokens_per_state, DCP for sharded groups,
+    align-mode Mamba prefill-checkpoint alignments, ring capacities) at or
+    above the requested block size (at least 64) at which every token-grid
+    layer has a feasible kernel block. A user-set ``--block-size`` must be
+    feasible as-is.
+    """
+    cache_config = vllm_config.cache_config
+    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+    constraints: dict[str, int] = {}
+    # Layer -> (kernel block sizes, tokens of B the layer holds per rank).
+    kernel_preds: dict[str, tuple[tuple[int | MultipleOf, ...], int]] = {}
+    for layer_name, spec in kv_cache_spec.items():
+        if isinstance(spec, CircularBufferSpec):
+            # Rings keep their private block size (the ring capacity), which
+            # must still divide the token grid.
+            constraints[f"ring capacity of {layer_name}"] = spec.block_size
+        elif isinstance(spec, MambaSpec):
+            if spec.mamba_cache_mode == "align" and spec.prefill_checkpoint_alignment:
+                constraints[f"prefill-checkpoint alignment of {layer_name}"] = (
+                    spec.prefill_checkpoint_alignment
+                )
+        elif isinstance(spec, AttentionSpec) and spec.prefix_cacheable:
+            if spec.kernel_block_sizes:
+                shard = dcp_size if spec.dcp_sharded and dcp_size > 1 else 1
+                kernel_preds[layer_name] = (spec.kernel_block_sizes, shard)
+            tokens_per_state = spec.tokens_per_state
+            if isinstance(tokens_per_state, int) and tokens_per_state > 1:
+                constraints[f"tokens-per-state of {layer_name}"] = tokens_per_state
+            if spec.dcp_sharded and dcp_size > 1:
+                constraints[f"decode context parallelism of {layer_name}"] = dcp_size
+
+    base_lcm = math.lcm(1, *constraints.values())
+    requested = cache_config.block_size
+    if cache_config.user_specified_block_size:
+        problems = []
+        if requested % base_lcm:
+            detail = dict(sorted(constraints.items()))
+            problems.append(f"it must be a multiple of {base_lcm} ({detail})")
+        for layer_name, (sizes, shard) in kernel_preds.items():
+            if not _kernel_block_size_feasible(sizes, requested // shard):
+                problems.append(
+                    f"layer {layer_name} supports kernel block sizes "
+                    f"{list(sizes)}, none of which divides {requested // shard}"
+                )
+        if problems:
+            raise ValueError(
+                f"Invalid block_size={requested} with "
+                "kv_cache_allocator='large_page': " + "; ".join(problems)
+            )
+        return requested
+    block_size = round_up(max(requested, _DEFAULT_MIN_BLOCK_SIZE), base_lcm)
+    for _ in range(1024):
+        if all(
+            _kernel_block_size_feasible(sizes, block_size // shard)
+            for sizes, shard in kernel_preds.values()
+        ):
+            return block_size
+        block_size += base_lcm
+    raise ValueError(
+        f"No feasible large-page block size: L0={base_lcm}, "
+        f"kernel constraints={kernel_preds}"
+    )
+
+
+class _Bucket(NamedTuple):
+    spec: KVCacheSpec
+    kernel_block_size: int
+    layer_names: list[str]
+
+
+def _large_page_group_block_size(spec: KVCacheSpec, B: int, dcp_size: int) -> int:
+    """The block size a spec is planned at under the large-page allocator.
+
+    Prefix-cacheable token-paged specs use the global block size B (DCP-sharded
+    specs hold B/dcp tokens per rank). Rings, none-mode Mamba, and
+    non-prefix-cacheable window specs keep their own (private) block size.
+    """
+    if isinstance(spec, CircularBufferSpec):
+        return spec.block_size
+    if isinstance(spec, MambaSpec):
+        return B if spec.mamba_cache_mode == "align" else spec.block_size
+    if isinstance(spec, AttentionSpec):
+        if not spec.prefix_cacheable:
+            return spec.block_size
+        if spec.dcp_sharded and dcp_size > 1:
+            return B // dcp_size
+        return B
+    return spec.block_size
+
+
+def _get_kv_cache_groups_large_page(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """Group layers by normalized spec under the large-page allocator.
+
+    Bucket keys are the specs at their final block size with planner-written
+    padding, per-layer backend alignment and kernel-block constraints stripped
+    (the layers' own padding, e.g. MLA ``alignment``, is recomputed by
+    ``__post_init__`` and kept). Buckets then combine when their specs merge,
+    keeping the uniform-page planner's merge tolerance (window size,
+    non-causal-multi-token-decode). Per-layer specs are kept on the group for
+    placement and never enter ``merge``.
+    """
+    cache_config = vllm_config.cache_config
+    disable_hybrid = vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+    if disable_hybrid:
+        unify_hybrid_kv_cache_specs(kv_cache_spec)
+    B = select_global_block_size(vllm_config, kv_cache_spec)
+    # Workers skip Platform.update_block_size_for_backend under this allocator;
+    # the resolved block sizes reach them through KVCacheConfig (see
+    # Worker.initialize_from_config).
+    cache_config.block_size = B
+    if cache_config.mamba_cache_mode == "align":
+        if cache_config.mamba_block_size not in (None, B):
+            logger.info(
+                "kv_cache_allocator='large_page' sets mamba_block_size to the "
+                "resolved block size %d, discarding %d",
+                B,
+                cache_config.mamba_block_size,
+            )
+        cache_config.mamba_block_size = B
+    if cache_config.prefix_match_unit not in (None, B):
+        raise ValueError(
+            f"Invalid prefix_match_unit={cache_config.prefix_match_unit}; "
+            "with kv_cache_allocator='large_page' prefix-cache hits land on "
+            f"the resolved block size ({B}). Unset it or set it to {B}."
+        )
+    if not kv_cache_spec:
+        return []
+
+    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+    # A group needs one row layout, so layers whose backends resolve to
+    # different kernel blocks at their block size never share a group (e.g.
+    # MiniMax-M3 dense layers at 64 vs sparse layers at 128).
+    buckets: dict[tuple[KVCacheSpec, int], list[str]] = {}
+    layer_specs: dict[str, KVCacheSpec] = {}
+    for layer_name, spec in kv_cache_spec.items():
+        key: KVCacheSpec
+        if isinstance(spec, (AttentionSpec, MambaSpec)):
+            block_size = _large_page_group_block_size(spec, B, dcp_size)
+            if (
+                isinstance(spec, MambaSpec)
+                and spec.mamba_cache_mode == "align"
+                and spec.prefill_checkpoint_alignment
+            ):
+                # Checkpoint offsets stay on the prefix-cache grid, the block
+                # size, which the raw layer alignment divides.
+                spec = replace(spec, prefill_checkpoint_alignment=block_size)
+            final_spec = replace(spec, block_size=block_size, page_size_padded=None)
+            layer_specs[layer_name] = final_spec
+            key = replace(
+                final_spec, block_stride_alignment=None, kernel_block_sizes=()
+            )
+            kernel_block_size = _largest_kernel_block_size(
+                block_size, [_kernel_block_constraint(final_spec)]
+            )
+        else:
+            # Non-attention, non-mamba spec types pass through unchanged.
+            layer_specs[layer_name] = spec
+            key = spec
+            kernel_block_size = spec.block_size
+        buckets.setdefault((key, kernel_block_size), []).append(layer_name)
+
+    merged_buckets: list[_Bucket] = []
+    for (key, kernel_block_size), layer_names in buckets.items():
+        for i, bucket in enumerate(merged_buckets):
+            # A subclass marker (e.g. HiddenStateCacheSpec) must not be
+            # absorbed into a field-identical parent-class bucket.
+            if (
+                type(key) is not type(bucket.spec)
+                or bucket.kernel_block_size != kernel_block_size
+            ):
+                continue
+            try:
+                merged = bucket.spec.merge([bucket.spec, key])
+            except (AssertionError, ValueError):
+                continue
+            merged_buckets[i] = bucket._replace(
+                spec=merged, layer_names=bucket.layer_names + layer_names
+            )
+            break
+        else:
+            merged_buckets.append(_Bucket(key, kernel_block_size, layer_names))
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            bucket.layer_names,
+            bucket.spec,
+            layer_kv_cache_specs={
+                name: layer_specs[name] for name in bucket.layer_names
+            },
+        )
+        for bucket in merged_buckets
+    ]
+    for group in kv_cache_groups:
+        assert group.layer_kv_cache_specs is not None
+        page_sizes = {
+            spec.page_size_bytes for spec in group.layer_kv_cache_specs.values()
+        }
+        assert len(page_sizes) == 1, (
+            f"KV cache group has layers with different page sizes: {sorted(page_sizes)}"
+        )
+    if disable_hybrid and len(kv_cache_groups) > 1:
+        raise ValueError(
+            "--disable-hybrid-kv-cache-manager needs every layer in one KV cache "
+            "group, but kv_cache_allocator='large_page' formed "
+            f"{len(kv_cache_groups)} groups for this model."
+        )
+    return kv_cache_groups
+
+
+@dataclass(frozen=True)
+class _LargePageGroupPlan:
+    """Placement of one KV cache group in the large-page pool."""
+
+    group: KVCacheGroupSpec
+    kernel_block_size: int
+    # The largest row over ranks; every rank lays its rows out at this size.
+    row_bytes: int
+    # Per rank; empty where the group holds no layers.
+    layer_offsets: list[dict[str, int]]
+
+    @property
+    def rows_per_block(self) -> int:
+        """Kernel blocks (rows) per manager block of this group (R_g)."""
+        return self.group.kv_cache_spec.block_size // self.kernel_block_size
+
+    @property
+    def slot_bytes(self) -> int:
+        """Bytes of one manager block of this group."""
+        return self.rows_per_block * self.row_bytes
+
+    def slots_per_page(self, large_page_bytes: int) -> int:
+        """Fewest blocks of this group one large page holds (n_g)."""
+        return min_blocks_per_large_page(large_page_bytes, self.slot_bytes)
+
+
+def _kernel_block_constraint(spec: KVCacheSpec) -> tuple[int | MultipleOf, ...]:
+    """Kernel block sizes a layer's backend supports; empty for state and ring
+    layers, which have no kernel constraint (one row is one block)."""
+    if isinstance(spec, AttentionSpec) and not isinstance(spec, CircularBufferSpec):
+        return spec.kernel_block_sizes
+    return ()
+
+
+def _largest_kernel_block_size(
+    block_size: int, layer_sizes: list[tuple[int | MultipleOf, ...]]
+) -> int:
+    """The largest divisor of ``block_size`` that every listed layer supports."""
+    layer_sizes = [sizes for sizes in layer_sizes if sizes]
+    if not layer_sizes:
+        return block_size
+    divisors = sorted(
+        {
+            d
+            for i in range(1, math.isqrt(block_size) + 1)
+            if block_size % i == 0
+            for d in (i, block_size // i)
+        },
+        reverse=True,
+    )
+    for kernel_block_size in divisors:
+        if all(
+            _kernel_block_size_supported(sizes, kernel_block_size)
+            for sizes in layer_sizes
+        ):
+            return kernel_block_size
+    raise ValueError(
+        f"No common kernel block size for block size {block_size} "
+        f"and kernel constraints {layer_sizes}."
+    )
+
+
+def _large_page_kernel_block_size(group: KVCacheGroupSpec) -> int:
+    """Tokens per kernel block (one row) of a group."""
+    return _largest_kernel_block_size(
+        group.kv_cache_spec.block_size,
+        [
+            _kernel_block_constraint(spec)
+            for spec in (group.layer_kv_cache_specs or {}).values()
+        ],
+    )
+
+
+def _large_page_row_layout(
+    layer_specs: dict[str, KVCacheSpec], kernel_block_size: int
+) -> tuple[int, int, dict[str, int]]:
+    """Bytes of one kernel block across all layers, the unit a row must be a
+    multiple of, and per-layer offsets.
+
+    Each layer offset is aligned to its block-stride alignment; a row that
+    is a multiple of the LCM of those units keeps every row start, and so
+    every layer's block, aligned.
+    """
+    offsets: dict[str, int] = {}
+    units: list[int] = []
+    offset = 0
+    for layer_name, spec in layer_specs.items():
+        unit = spec.get_block_stride_alignment()
+        offset = round_up(offset, unit) if offset else 0
+        offsets[layer_name] = offset
+        if isinstance(spec, (AttentionSpec, MambaSpec)):
+            offset += replace(
+                spec, block_size=kernel_block_size, page_size_padded=None
+            ).page_size_bytes
+        else:
+            offset += spec.page_size_bytes
+        units.append(unit)
+    return offset, math.lcm(*units), offsets
+
+
+def _large_page_waste(
+    plans: list[_LargePageGroupPlan],
+    large_page_bytes: int,
+    vllm_config: VllmConfig,
+) -> float:
+    """Share of the page bytes a max-model-len request takes that its blocks
+    do not use. Requests share pages, so a request takes a 1 / slots_per_page
+    share of a page per block."""
+    used, taken = 0, 0.0
+    for plan in plans:
+        blocks = large_page_blocks_per_request(plan.group.kv_cache_spec, vllm_config)
+        used += blocks * plan.slot_bytes
+        taken += blocks * large_page_bytes / plan.slots_per_page(large_page_bytes)
+    return 1 - used / taken
+
+
+def _usable_large_pages(num_pages: int) -> int:
+    """Pages of a pool of ``num_pages`` that requests can take: page 0 is the
+    reserved null page."""
+    return num_pages - 1
+
+
+def _plan_large_page_placement(
+    groups: list[KVCacheGroupSpec],
+    worker_specs: list[dict[str, KVCacheSpec]],
+    vllm_config: VllmConfig,
+    available_memory: list[int] | None = None,
+) -> tuple[list[_LargePageGroupPlan], int]:
+    """Per-group plans and the large-page size S.
+
+    Block ids address the same pages on every rank only if S and each
+    group's row are the same on every rank, so a group's row is its largest
+    over ranks. ``available_memory`` (per rank) rules out pages its budget
+    cannot serve one max-model-len request with.
+    """
+    plans: list[_LargePageGroupPlan] = []
+    for group in groups:
+        kernel_block_size = _large_page_kernel_block_size(group)
+        row = unit = 1
+        offsets: list[dict[str, int]] = []
+        for worker_spec in worker_specs:
+            layer_specs = {
+                name: group.layer_kv_cache_specs[name]  # type: ignore[index]
+                for name in group.layer_names
+                if name in worker_spec
+            }
+            layer_offsets: dict[str, int] = {}
+            if layer_specs:
+                rank_row, rank_unit, layer_offsets = _large_page_row_layout(
+                    layer_specs, kernel_block_size
+                )
+                row = max(row, rank_row)
+                unit = math.lcm(unit, rank_unit)
+            offsets.append(layer_offsets)
+        plans.append(
+            _LargePageGroupPlan(group, kernel_block_size, round_up(row, unit), offsets)
+        )
+
+    max_slot = max(plan.slot_bytes for plan in plans)
+
+    def fits_budget(large_page_bytes: int) -> bool:
+        needed = _large_page_needed_pages(plans, vllm_config, large_page_bytes)
+        return available_memory is None or all(
+            needed <= _usable_large_pages(memory // large_page_bytes)
+            for memory in available_memory
+        )
+
+    # A page loses at most two blocks of a group to its ends, so past this
+    # size every page is within the waste bound.
+    max_page = math.ceil(2 * max_slot / _LARGE_PAGE_MAX_PAGE_WASTE)
+    candidates = sorted(
+        {
+            k * plan.slot_bytes
+            for plan in plans
+            for k in range(
+                cdiv(max_slot, plan.slot_bytes), max_page // plan.slot_bytes + 1
+            )
+        }
+    )
+    choice: tuple[bool, float, int] | None = None
+    for large_page_bytes in candidates:
+        if any(plan.slots_per_page(large_page_bytes) < 1 for plan in plans):
+            continue
+        score = (
+            not fits_budget(large_page_bytes),
+            _large_page_waste(plans, large_page_bytes, vllm_config),
+            large_page_bytes,
+        )
+        if not score[0] and score[1] <= _LARGE_PAGE_MAX_PAGE_WASTE:
+            choice = score
+            break
+        if choice is None or score[:2] < choice[:2]:
+            choice = score
+    assert choice is not None, "a KV cache group does not fit into any large page"
+    return plans, choice[2]
+
+
+def _large_page_needed_pages(
+    plans: list[_LargePageGroupPlan], vllm_config: VllmConfig, large_page_bytes: int
+) -> int:
+    """Usable pages one max-model-len request needs.
+
+    Every group draws from the one page pool the scheduler manages, so a
+    group counts even on PP ranks that hold none of its layers.
+    """
+    return sum(
+        cdiv(
+            large_page_blocks_per_request(plan.group.kv_cache_spec, vllm_config),
+            plan.slots_per_page(large_page_bytes),
+        )
+        for plan in plans
+    )
+
+
+def _large_page_max_fitting_len(
+    plans: list[_LargePageGroupPlan],
+    vllm_config: VllmConfig,
+    large_page_bytes: int,
+    usable_pages: int,
+) -> int:
+    """Largest max_model_len whose request fits in ``usable_pages`` pages (0
+    if even one token does not fit). Restores max_model_len before
+    returning."""
+    model_config = vllm_config.model_config
+    original_max = model_config.max_model_len
+
+    def fits() -> bool:
+        needed = _large_page_needed_pages(plans, vllm_config, large_page_bytes)
+        return needed <= usable_pages
+
+    try:
+        best = 0
+        lo, hi = 1, original_max
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            model_config.max_model_len = mid
+            if fits():
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+    finally:
+        model_config.max_model_len = original_max
+
+
+def _large_page_check_and_fit_max_model_len(
+    vllm_config: VllmConfig,
+    plans: list[_LargePageGroupPlan],
+    usable_pages: int,
+    page_bytes: int,
+) -> None:
+    """Auto-fit max_model_len if requested, then check that one full
+    max-model-len request fits in ``usable_pages`` pages."""
+    model_config = vllm_config.model_config
+
+    if model_config.original_max_model_len == -1:
+        auto_fit_max = _large_page_max_fitting_len(
+            plans, vllm_config, page_bytes, usable_pages
+        )
+        if auto_fit_max <= 0:
+            raise ValueError(
+                "Cannot auto-fit max_model_len: not enough KV cache memory "
+                "to serve even a single token. Try increasing "
+                "`gpu_memory_utilization`."
+            )
+        if auto_fit_max >= model_config.max_model_len:
+            logger.info_once(
+                "Auto-fit max_model_len: full model context length %d fits in "
+                "available KV cache memory (%d large pages)",
+                model_config.max_model_len,
+                usable_pages,
+            )
+        else:
+            logger.info_once(
+                "Auto-fit max_model_len: reduced from %d to %d to fit in "
+                "available KV cache memory (%d large pages)",
+                model_config.max_model_len,
+                auto_fit_max,
+                usable_pages,
+            )
+            model_config.max_model_len = auto_fit_max
+
+    _large_page_check_memory(vllm_config, plans, usable_pages, page_bytes)
+
+
+def _large_page_check_memory(
+    vllm_config: VllmConfig,
+    plans: list[_LargePageGroupPlan],
+    usable_pages: int,
+    page_bytes: int,
+) -> None:
+    """Check that one max-model-len request fits in ``usable_pages`` pages."""
+    _check_enough_kv_cache_memory(
+        usable_pages * page_bytes,
+        lambda: _large_page_needed_pages(plans, vllm_config, page_bytes) * page_bytes,
+        vllm_config.model_config.max_model_len,
+        lambda available: _large_page_max_fitting_len(
+            plans, vllm_config, page_bytes, available // page_bytes
+        ),
+    )
+
+
+def _build_large_page_kv_cache_config(
+    vllm_config: VllmConfig,
+    plans: list[_LargePageGroupPlan],
+    rank: int,
+    large_page_bytes: int,
+    num_pages: int,
+) -> KVCacheConfig:
+    """One rank's KVCacheConfig: per-layer tensors at kernel-block (row)
+    granularity over the shared pool of num_pages pages of large_page_bytes."""
+    cache_config = vllm_config.cache_config
+    groups: list[KVCacheGroupSpec] = []
+    tensors: list[KVCacheTensor] = []
+    size = num_pages * large_page_bytes
+    for plan in plans:
+        group = plan.group
+        assert group.layer_kv_cache_specs is not None
+        layer_names = [
+            name for name in group.layer_names if name in plan.layer_offsets[rank]
+        ]
+        groups.append(
+            KVCacheGroupSpec(
+                layer_names,
+                group.kv_cache_spec,
+                is_eagle_group=group.is_eagle_group,
+                host_resident=group.host_resident,
+                enable_kv_transfer=group.enable_kv_transfer,
+                role=group.role,
+                num_blocks=size // plan.slot_bytes,
+                slots_per_large_page=plan.slots_per_page(large_page_bytes),
+                kernel_rows_per_block=plan.rows_per_block,
+                row_bytes=plan.row_bytes,
+                layer_kv_cache_specs={
+                    name: group.layer_kv_cache_specs[name] for name in layer_names
+                },
+            )
+        )
+        for layer_name in layer_names:
+            tensors.append(
+                KVCacheTensor(
+                    size=size,
+                    layers=[layer_name],
+                    layer_stride=plan.row_bytes,
+                    block_stride=plan.row_bytes,
+                    offset=plan.layer_offsets[rank][layer_name],
+                )
+            )
+    return KVCacheConfig(
+        num_blocks=num_pages,
+        kv_cache_tensors=tensors,
+        kv_cache_groups=groups,
+        prefix_cache_retention_interval=cache_config.prefix_cache_retention_interval,
+        allocator="large_page",
+        large_page_bytes=large_page_bytes,
+        hash_block_size=cache_config.block_size,
+        cache_hit_alignment_tokens=cache_config.block_size,
+    )
+
+
+def get_large_page_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    min_blocks: int,
+) -> KVCacheConfig:
+    """Local large-page placement for worker-side profiling caches.
+
+    The engine computes the real (cross-rank) placement after profiling; here
+    one worker plans its own groups alone, with enough pages to give every
+    group ``min_blocks`` blocks. Over-estimating is safe: the minimal cache is
+    torn down after profiling.
+    """
+    worker_specs = [
+        {
+            name: spec
+            for group in kv_cache_groups
+            for name, spec in (group.layer_kv_cache_specs or {}).items()
+        }
+    ]
+    plans, large_page_bytes = _plan_large_page_placement(
+        kv_cache_groups, worker_specs, vllm_config
+    )
+    num_pages = max(
+        cdiv(min_blocks, plan.slots_per_page(large_page_bytes)) for plan in plans
+    )
+    return _build_large_page_kv_cache_config(
+        vllm_config, plans, 0, large_page_bytes, num_pages
+    )
+
+
+def _get_kv_cache_configs_large_page(
+    vllm_config: VllmConfig,
+    builder: KVCacheConfigBuilder,
+    merged_kv_cache_specs: dict[str, KVCacheSpec],
+    kv_cache_specs: list[dict[str, KVCacheSpec]],
+    available_memory: list[int],
+) -> list[KVCacheConfig]:
+    """Large-page allocator variant of the cross-worker KV cache planning."""
+    cache_config = vllm_config.cache_config
+    global_kv_cache_groups = get_kv_cache_groups_from_builder(
+        builder, vllm_config, merged_kv_cache_specs
+    )
+    # The global block size B, resolved by the grouping call.
+    B = cache_config.block_size
+
+    spec_config = vllm_config.speculative_config
+    if spec_config is not None and spec_config.use_eagle_block_drop():
+        draft_layer_names = {
+            name for name, spec in merged_kv_cache_specs.items() if spec.is_draft
+        }
+        for group in global_kv_cache_groups:
+            group.is_eagle_group = not draft_layer_names.isdisjoint(group.layer_names)
+        _warn_if_unannotated_eagle_mamba(spec_config, global_kv_cache_groups)
+
+    if not global_kv_cache_groups:
+        # Attention-free models do not have KV cache. Return num_blocks=1 as
+        # BlockPool always needs a null_block.
+        return [
+            KVCacheConfig(
+                num_blocks=1,
+                kv_cache_tensors=[],
+                kv_cache_groups=[],
+                prefix_cache_retention_interval=(
+                    cache_config.prefix_cache_retention_interval
+                ),
+                allocator="large_page",
+                hash_block_size=B,
+                cache_hit_alignment_tokens=B,
+            )
+            for _ in kv_cache_specs
+        ]
+
+    plans, large_page_bytes = _plan_large_page_placement(
+        global_kv_cache_groups, kv_cache_specs, vllm_config, available_memory
+    )
+    num_pages = min(available_memory) // large_page_bytes
+    override = cache_config.num_gpu_blocks_override
+    if override is not None:
+        logger.info(
+            "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
+            num_pages,
+            override,
+        )
+        num_pages = override
+
+    _large_page_check_and_fit_max_model_len(
+        vllm_config, plans, _usable_large_pages(num_pages), large_page_bytes
+    )
+
+    kv_cache_configs = [
+        _build_large_page_kv_cache_config(
+            vllm_config, plans, rank, large_page_bytes, num_pages
+        )
+        for rank in range(len(kv_cache_specs))
+    ]
+    for kv_cache_config in kv_cache_configs:
+        kv_cache_config.kv_tp_replicas = kv_cache_groups_tp_replicas(
+            kv_cache_config.kv_cache_groups,
+            vllm_config.parallel_config.tensor_parallel_size,
+            vllm_config.parallel_config.decode_context_parallel_size,
+        )
+    return kv_cache_configs
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -1124,6 +1871,9 @@ def get_kv_cache_groups(
         The generated KVCacheGroups
 
     """
+    if vllm_config.cache_config.kv_cache_allocator == "large_page":
+        return _get_kv_cache_groups_large_page(vllm_config, kv_cache_spec)
+
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
@@ -1526,6 +2276,14 @@ def get_kv_cache_configs(
     # Get global KV cache groups. This also handles spec unification for
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
+    if vllm_config.cache_config.kv_cache_allocator == "large_page":
+        return _get_kv_cache_configs_large_page(
+            vllm_config,
+            builder,
+            merged_kv_cache_specs,
+            kv_cache_specs,
+            available_memory,
+        )
     global_kv_cache_groups = get_kv_cache_groups_from_builder(
         builder, vllm_config, merged_kv_cache_specs
     )
@@ -1668,6 +2426,12 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
         """
         if not vllm_config.model_config.supports_kv_cache_grouping:
             return get_kv_cache_groups(vllm_config, kv_cache_spec)
+        if vllm_config.cache_config.kv_cache_allocator == "large_page":
+            raise ValueError(
+                "A model-declared get_kv_cache_groups cannot be combined "
+                "with kv_cache_allocator='large_page', which owns grouping "
+                "and placement. Remove one of them."
+            )
         if vllm_config.attention_config.hisparse_config is not None:
             raise ValueError(
                 "A model-declared get_kv_cache_groups cannot be combined "
@@ -1697,6 +2461,11 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
                 prefix_cache_retention_interval=(
                     vllm_config.cache_config.prefix_cache_retention_interval
                 ),
+            )
+        if vllm_config.cache_config.kv_cache_allocator == "large_page":
+            # Profiling path: a worker plans its own groups locally.
+            return get_large_page_kv_cache_config_from_groups(
+                vllm_config, kv_cache_groups, min_blocks=num_blocks
             )
         bytes_per_block = _pool_bytes_per_block(vllm_config, kv_cache_groups)
         return get_kv_cache_config_from_groups(
