@@ -103,7 +103,9 @@ class KVOutputAggregator:
         aggregated_kv_connector_stats = None
         aggregated_kv_connector_worker_meta = None
         combined_kv_cache_events = None
-        invalid_block_ids = set[int]()
+        # Any: uniform_page workers report bare ids, large_page workers report
+        # (group_id, block_id) pairs; the aggregator only unions and forwards.
+        invalid_block_ids: set[Any] = set()
         for model_runner_output in outputs:
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output

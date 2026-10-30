@@ -51,8 +51,11 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
 #  14: Add Qwen3.8-Flash-Next PLE page length - #59997
 #  15: Add remote_registration_generation to kv_transfer_params
+#  16: large_page allocator (opt-in): kernel-row transfer regions, per-group
+#      region_num_blocks authoritative, allocator in the compatibility hash;
+#      block b of a group is kernel blocks b * R to b * R + R - 1
 #
-NIXL_CONNECTOR_VERSION: int = 15
+NIXL_CONNECTOR_VERSION: int = 16
 
 
 @dataclass
@@ -81,6 +84,13 @@ class NixlAgentMetadata:
     region_members: list[list[str]] = field(default_factory=list)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Large-page allocator only (empty under uniform_page). Per transfer group,
+    # positional: kernel rows per block (R_g), which peers need to expand this
+    # engine's block ids to kernel-block descriptor ids (block b is rows
+    # b*R .. b*R+R-1), and the group's layer names on this
+    # worker.
+    group_kernel_rows_per_block: list[int] = field(default_factory=list)
+    group_layer_names: list[list[str]] = field(default_factory=list)
 
 
 @dataclass
@@ -200,6 +210,9 @@ def compute_nixl_compatibility_hash(
         "speculative_config": _get_speculative_compatibility_factors(vllm_config),
         # push (WRITE) and pull (READ) connectors are protocol-incompatible
         "transfer_mode": transfer_mode,
+        # uniform_page and large_page KV pools lay blocks out differently;
+        # they can never be paired.
+        "kv_cache_allocator": cache_config.kv_cache_allocator,
     }
 
     compat_hash = hash_factors(factors)

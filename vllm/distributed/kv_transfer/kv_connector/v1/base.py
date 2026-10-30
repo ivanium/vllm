@@ -423,12 +423,14 @@ class KVConnectorBase_V1(ABC):
             finished_recving=set(finished_recving or ()),
         )
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
+    def get_block_ids_with_load_errors(self) -> set[int] | set[tuple[int, int]]:
         """Get the set of block IDs that failed to load.
 
         Returns:
             Set of block IDs that encountered load errors.
             Empty set if no load errors occurred.
+            Under the large-page allocator block ids are unique only within a
+            KV cache group, so each entry is a ``(group_id, block_id)`` pair.
 
         Notes:
             - Applies to both sync- and async-loading requests.

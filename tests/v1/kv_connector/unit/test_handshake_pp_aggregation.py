@@ -67,7 +67,9 @@ def _run_engine_core_handshake(
     monkeypatch.setattr(
         engine_core_module.EngineCore,
         "_initialize_kv_caches",
-        lambda self, vllm_config: SimpleNamespace(kv_cache_groups=[object()]),
+        lambda self, vllm_config: SimpleNamespace(
+            kv_cache_groups=[object()], allocator="uniform_page"
+        ),
     )
     monkeypatch.setattr(
         engine_core_module,
