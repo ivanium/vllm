@@ -356,6 +356,11 @@ def run_attention_backend(
 
             assert isinstance(builder, FlexAttentionMetadataBuilder)
             builder.direct_build = use_direct_block_mask
+            # The builder sizes its block tables by the bound layer view.
+            for layer_name in layer_names:
+                vllm_config.compilation_config.static_forward_context[layer_name] = (
+                    SimpleNamespace(kv_cache=kv_cache)
+                )
         attn_metadata = builder.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
@@ -679,9 +684,8 @@ def _test_backend_correctness(
 
         backend_supported = backend_cls.supported_kv_cache_layouts()
         if backend_supported is not None and backend_layout not in backend_supported:
-            # Production resolution never pairs this backend with the shared layout
-            # (e.g. flex is LBNHC-only next to FlashInfer's LBHNC); give it a copy
-            # of the cache in a layout it supports.
+            # Production resolution never pairs this backend with the shared
+            # layout; give it a copy of the cache in a layout it supports.
             backend_layout = backend_supported[0]
             kv_cache_for_backend = _clone_kv_cache_in_layout(kv_cache, backend_layout)
 

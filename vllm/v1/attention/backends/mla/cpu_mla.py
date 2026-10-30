@@ -43,6 +43,10 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    flat_kv_row_view,
+    slots_to_flat_rows,
+)
 
 logger = init_logger(__name__)
 
@@ -206,7 +210,8 @@ class CPUMLAImpl(MLACommonImpl[MLACommonMetadata]):
         k_pe_sq = k_pe.squeeze(1)
         kv_lora_rank = kv_c_normed.shape[-1]
         pe_dim = k_pe_sq.shape[-1]
-        flat = kv_cache.view(-1, kv_lora_rank + pe_dim)
+        block_size = kv_cache.shape[1]
+        flat, block_stride_rows = flat_kv_row_view(kv_cache, block_size)
         slots = slot_mapping.flatten().to(torch.long)
         # Only write valid slots. Padding slots are set to -1 by the
         # scheduler and must be skipped.
@@ -215,6 +220,9 @@ class CPUMLAImpl(MLACommonImpl[MLACommonMetadata]):
             slots = slots[valid_mask]
             kv_c_normed = kv_c_normed[valid_mask]
             k_pe_sq = k_pe_sq[valid_mask]
+        # Dense slot ids -> physical flat rows; gap rows belong to other
+        # layers of the KV cache group and must stay untouched.
+        rows = slots_to_flat_rows(slots, block_size, block_stride_rows)
         target_dtype = flat.dtype
-        flat[slots, :kv_lora_rank] = kv_c_normed.to(target_dtype)
-        flat[slots, kv_lora_rank:] = k_pe_sq.view(-1, pe_dim).to(target_dtype)
+        flat[rows, :kv_lora_rank] = kv_c_normed.to(target_dtype)
+        flat[rows, kv_lora_rank:] = k_pe_sq.view(-1, pe_dim).to(target_dtype)

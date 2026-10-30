@@ -529,30 +529,6 @@ class CpuPlatform(Platform):
             )
 
     @classmethod
-    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
-        model_config = vllm_config.model_config
-        if model_config is None:
-            return
-        backend_classes = cls._find_non_ssm_backends(vllm_config)
-        if not backend_classes:
-            return
-
-        # Not in check_and_update_config(), which reruns with every
-        # VllmConfig.__post_init__ and would undo the hybrid alignment below.
-        cache_config = vllm_config.cache_config
-        if not cache_config.user_specified_block_size:
-            cache_config.block_size = cls._preferred_block_size_for_backends(
-                backend_classes, 128, vllm_config
-            )
-        if not model_config.is_hybrid:
-            return
-
-        # reconcile attention and mamba page sizes
-        pre_block_size = cache_config.block_size
-        cls._align_hybrid_block_size(vllm_config, backend_classes[0])
-        cls._check_aligned_block_size(vllm_config, backend_classes, pre_block_size)
-
-    @classmethod
     def discover_numa_topology(cls) -> list[list[int]]:
         """Discover NUMA topology and keep the last physical core of each numa
         into one core group list for nixl start_kv_load()

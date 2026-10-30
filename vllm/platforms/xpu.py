@@ -473,66 +473,14 @@ class XPUPlatform(Platform):
             )
 
     @classmethod
-    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
-        super().update_block_size_for_backend(vllm_config)
-        from vllm.config.vllm import get_layers_from_vllm_config
-        from vllm.model_executor.layers.attention_layer_base import (
-            AttentionLayerBase,
-        )
-        from vllm.utils.math_utils import cdiv
-
-        cache_config = vllm_config.cache_config
-        # special fix for GDN since kernel only supports block size dividable by 64
-        attn_layers = get_layers_from_vllm_config(
-            vllm_config,
-            AttentionLayerBase,  # type: ignore[type-abstract]
-        )
-
-        kernel_block_size = None
-        for layer in attn_layers.values():
-            b = layer.get_attn_backend()
-            if b.get_name() == "GDN_ATTN":
-                kernel_block_size = 64
-                break
-
-        if kernel_block_size is None:
-            return
-        new_block_size = (
-            cdiv(cache_config.block_size, kernel_block_size) * kernel_block_size
-        )
-        if new_block_size == cache_config.block_size:
-            return
-
-        pre_block_size = cache_config.block_size
-        if cache_config.mamba_cache_mode == "align":
-            cache_config.mamba_block_size = new_block_size
-        original_mamba_page_size_padded = cache_config.mamba_page_size_padded
-        if cache_config.mamba_page_size_padded is not None:
-            attn_page_size_1_token = (
-                cache_config.mamba_page_size_padded // cache_config.block_size
-            )
-            cache_config.mamba_page_size_padded = (
-                new_block_size * attn_page_size_1_token
-            )
-        cache_config.block_size = new_block_size
-        logger.info(
-            "[XPU]Setting attention block size to %d tokens to ensure multiple of %d.",
-            new_block_size,
-            kernel_block_size,
-        )
-        if original_mamba_page_size_padded is not None:
-            logger.info(
-                "[XPU]Scaled mamba_page_size_padded from %d to %d bytes accordingly.",
-                original_mamba_page_size_padded,
-                cache_config.mamba_page_size_padded,
-            )
-        # This rounding runs after super()'s check, so check its result too.
-        cls._check_aligned_block_size(
-            vllm_config, cls._find_non_ssm_backends(vllm_config), pre_block_size
-        )
+    def support_hybrid_kv_cache(cls) -> bool:
+        return True
 
     @classmethod
-    def support_hybrid_kv_cache(cls) -> bool:
+    def support_large_page_kv_cache(cls) -> bool:
+        # The GPU runner binds the strided views; the in-tree XPU kernel
+        # (XPU_MLA_SPARSE) addresses them with int64 row math and the Triton
+        # backends are stride-aware.
         return True
 
     @classmethod

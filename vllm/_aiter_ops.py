@@ -15,6 +15,7 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_aiter_sparse_attn_indexer,
     rocm_aiter_sparse_attn_indexer_fake,
@@ -714,6 +715,32 @@ def _rocm_aiter_gather_kv_b_proj_fake(
     pass
 
 
+def flat_kv_buffer_rows(kv_buffer: torch.Tensor) -> torch.Tensor:
+    """Flat ``[rows, 1, 1, head_dim]`` row view of a paged MLA KV buffer.
+
+    The AITER MLA decode kernels address the cache as flat rows (page_size=1).
+    A strided (large-page) layer view keeps other layers' rows between its
+    blocks, so the flat view must skip to each block with the physical block
+    stride; the gap rows are never indexed. A ``[rows, head_dim]`` input is
+    already a flat row view (the sparse backends pass one).
+    """
+    head_dim = kv_buffer.shape[-1]
+    if kv_buffer.dim() == 2:
+        assert kv_buffer.stride(0) == head_dim and kv_buffer.stride(1) == 1
+        rows = kv_buffer
+    else:
+        num_blocks, block_size = kv_buffer.shape[:2]
+        assert (
+            kv_buffer.stride(-1) == 1
+            and kv_buffer.stride(1) == head_dim
+            and kv_buffer.stride(0) % head_dim == 0
+        ), "MLA KV buffer blocks must be row-contiguous"
+        rows, _ = flat_kv_row_view(
+            kv_buffer.view(num_blocks, block_size, head_dim), block_size
+        )
+    return rows.view(-1, 1, 1, head_dim)
+
+
 def _rocm_aiter_mla_decode_fwd_impl(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
@@ -774,7 +801,7 @@ def _rocm_aiter_mla_decode_fwd_impl(
 
     mla_decode_fwd(
         q,
-        kv_buffer.view(-1, 1, 1, q.shape[-1]),
+        flat_kv_buffer_rows(kv_buffer),
         o,
         qo_indptr,
         kv_indptr,
@@ -858,7 +885,7 @@ def _rocm_aiter_mla_decode_fwd_lse_impl(
 
     _, final_lse = mla_decode_fwd(
         q,
-        kv_buffer.view(-1, 1, 1, q.shape[-1]),
+        flat_kv_buffer_rows(kv_buffer),
         o,
         qo_indptr,
         kv_indptr,
@@ -3793,7 +3820,7 @@ class rocm_aiter_ops:
     ):
         torch.ops.vllm.rocm_aiter_mla_decode_fwd(
             q,
-            kv_buffer.view(-1, 1, 1, q.shape[-1]),
+            flat_kv_buffer_rows(kv_buffer),
             o,
             qo_indptr,
             max_seqlen_qo,
@@ -3831,7 +3858,7 @@ class rocm_aiter_ops:
         """Run MLA decode without persistent metadata and return its LSE."""
         return torch.ops.vllm.rocm_aiter_mla_decode_fwd_lse(
             q,
-            kv_buffer.view(-1, 1, 1, q.shape[-1]),
+            flat_kv_buffer_rows(kv_buffer),
             o,
             qo_indptr,
             max_seqlen_qo,

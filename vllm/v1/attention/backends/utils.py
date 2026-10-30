@@ -23,7 +23,6 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d, np_to_pinned_tensor
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
@@ -260,21 +259,20 @@ def record_kv_cache_layout(cache_config: CacheConfig, layout_name: str) -> None:
 def resolve_kv_cache_layout(
     vllm_config: VllmConfig,
     supported_layouts: list[list[str]],
-    kv_cache_specs: Iterable[KVCacheSpec] | None = None,
 ) -> KVCacheLayout:
     """Resolve one KV cache layout for the whole model.
 
     Runs once in the engine core. Every worker reports the layouts its backends
     support, most preferred first (``get_supported_kv_cache_layouts``); all
-    ranks run the same backends, so their lists must agree. Specs mixing HNC
-    shapes narrow the candidates to block-compact layouts. An explicit
-    ``VLLM_KV_CACHE_LAYOUT`` must be one of the candidates or resolution fails,
-    with the legacy ``NHD``/``HND`` names as aliases for ``LBNHC``/``LBHNC``; the
-    connector's preference is used when compatible and dropped with a warning
-    otherwise. A layout already present on ``cache_config`` wins outright, and
-    the result is recorded there (see ``CacheConfig.kv_cache_layout``); it
-    reaches workers through the ``set_kv_cache_layout`` RPC and
-    ``KVCacheConfig.kv_cache_layout``.
+    ranks run the same backends, so their lists must agree. The layout fixes
+    only the within-block axis order: the planner packs each group's layers
+    into large pages itself. An explicit ``VLLM_KV_CACHE_LAYOUT`` must be one
+    of the candidates or resolution fails, with the legacy ``NHD``/``HND``
+    names as aliases for ``LBNHC``/``LBHNC``; the connector's preference is
+    used when compatible and dropped with a warning otherwise. A layout
+    already present on ``cache_config`` wins outright, and the result is
+    recorded there (see ``CacheConfig.kv_cache_layout``); it reaches workers
+    through the ``set_kv_cache_layout`` RPC and ``KVCacheConfig``.
     """
     cache_config = vllm_config.cache_config
     if cache_config.kv_cache_layout is not None:
@@ -287,44 +285,6 @@ def resolve_kv_cache_layout(
         f"Workers disagree on supported KV cache layouts: {supported_layouts}."
     )
     candidates = [_layout_from_name(name) for name in supported_layouts[0]]
-
-    # A block-compact layout means the block is densely packed in memory, so any mix of
-    # specs can re-interpret HNC with different sizes as long as the total number of
-    # bytes is the same. If not block-compact, each spec must agree on HNC to alias
-    # the same page (this aliasing is done by the Hybrid Memory Allocator, HMA).
-    # Specs without per-layer views lay out their own raw backing tensor.
-    kv_cache_specs = tuple(
-        spec for spec in kv_cache_specs or () if spec.has_layer_views
-    )
-    hnc_shapes = {
-        (spec.num_heads, spec.num_states, spec.page_size_bytes)
-        for spec in kv_cache_specs
-    }
-    if len(hnc_shapes) > 1:
-        candidates = [m for m in candidates if m.is_block_compact]
-        if not candidates:
-            raise ValueError(
-                "Specs with mixed HNC shapes need a block-compact layout, but "
-                f"none is in every supported set: {supported_layouts}."
-            )
-
-    # Self-addressed per-request rings (e.g. the kpool tail) are replicated
-    # state like Mamba and don't need a separate draft group.
-    dcp_sharding = {
-        spec.dcp_sharded
-        for spec in kv_cache_specs
-        if isinstance(spec, AttentionSpec) and spec.uses_slot_mapping
-    }
-    page_sizes = {spec.page_size_bytes for spec in kv_cache_specs}
-    if len(dcp_sharding) > 1 and len(page_sizes) > 1:
-        # Sharded target and replicated draft caches need independent groups.
-        # Block-outer layouts can pack those groups without equalizing pages.
-        candidates = [layout for layout in candidates if layout.is_block_outermost]
-        if not candidates:
-            raise ValueError(
-                "DCP with a replicated draft and mixed KV page sizes requires "
-                f"a block-outer KV cache layout; supported sets: {supported_layouts}."
-            )
 
     if (requested := envs.VLLM_KV_CACHE_LAYOUT) is not None:
         layout = _layout_from_name(requested)

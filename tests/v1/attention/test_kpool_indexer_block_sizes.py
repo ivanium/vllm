@@ -3,18 +3,16 @@
 """CPU tests for the kpool indexer's kernel block selection."""
 
 from types import SimpleNamespace
-from typing import Protocol
 
 import pytest
 import torch
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.models.glm5next.common.attention import Glm5NextIndexerCache
-from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla import indexer as indexer_mod
 from vllm.v1.attention.backends.mla.indexer import Glm5NextIndexerBackend
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
-from vllm.v1.worker.utils import prepare_kernel_block_sizes, select_common_block_size
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.worker.utils import select_common_block_size
 
 pytestmark = pytest.mark.cpu_test
 
@@ -50,31 +48,6 @@ def _kpool_storage_spec(manager_block: int) -> MLAAttentionSpec:
     return spec
 
 
-class _KernelBlockSizeBackend(Protocol):
-    """The backend hooks ``prepare_kernel_block_sizes`` reads off each group."""
-
-    @staticmethod
-    def get_supported_kernel_block_sizes(
-        kv_cache_spec: KVCacheSpec | None = None,
-    ) -> list[int | MultipleOf]: ...
-
-    @staticmethod
-    def get_name() -> str: ...
-
-
-def _prepare(
-    spec: MLAAttentionSpec, backends: list[type[_KernelBlockSizeBackend]]
-) -> list[int]:
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec, layer_names=[])],
-        kv_cache_tensors=[],
-    )
-    attn_groups = [
-        [SimpleNamespace(backend=backend, kv_cache_spec=spec) for backend in backends]
-    ]
-    return prepare_kernel_block_sizes(kv_cache_config, attn_groups)
-
-
 @pytest.mark.parametrize("manager_block", TP_FLOOR_MANAGER_BLOCKS)
 def test_kpool_group_maps_pool_pages(
     monkeypatch: pytest.MonkeyPatch, manager_block: int
@@ -99,37 +72,3 @@ def test_kpool_group_maps_pool_pages(
     assert selected != [manager_block]
     # The hybrid block-table split stays integral.
     assert manager_block % selected[0] == 0
-
-
-def test_prepare_uses_the_backend_vote():
-    """Unpacked groups take `select_common_block_size`'s answer."""
-
-    class Fixed64Backend:
-        @staticmethod
-        def get_supported_kernel_block_sizes(kv_cache_spec=None):
-            return [64]
-
-        @staticmethod
-        def get_name() -> str:
-            return "FIXED64"
-
-    plain_spec = MLAAttentionSpec(
-        block_size=640,
-        num_kv_heads=1,
-        head_size=128,
-        dtype=torch.bfloat16,
-    )
-    assert _prepare(plain_spec, [Fixed64Backend]) == [64]
-
-    # ...and with backends that accept the manager block, the manager wins,
-    # exactly as on main.
-    class AcceptAllBackend:
-        @staticmethod
-        def get_supported_kernel_block_sizes(kv_cache_spec=None):
-            return [MultipleOf(1)]
-
-        @staticmethod
-        def get_name() -> str:
-            return "ACCEPTALL"
-
-    assert _prepare(plain_spec, [AcceptAllBackend]) == [640]

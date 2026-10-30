@@ -1345,6 +1345,14 @@ class RocmPlatform(Platform):
         return True
 
     @classmethod
+    def support_large_page_kv_cache(cls) -> bool:
+        # The GPU runner binds the strided views; in-tree ROCm kernels address
+        # them with int64, stride-aware math (Triton paths, AITER MLA row
+        # views, FlyDSL runtime strides). Kernels that need dense pages fall
+        # back to Triton or fail loudly.
+        return True
+
+    @classmethod
     def support_static_graph_mode(cls) -> bool:
         return True
 

@@ -96,6 +96,7 @@ class MiniMaxM3SparseAiterPAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
         )
         page16 = minimax_m3_rebase_block_table_to_page16(
             block_table,
+            pages_per_block=self._aiter_sparse_pa_pages_per_block16(),
             out=self.page16_block_table_buffer[:num_reqs, :cols],
         )
 
@@ -130,11 +131,8 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
         decode_sparse_table: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         from vllm.models.minimax_m3.amd.ops.sparse_pa import (
-            PAGE16_SIDES_PER_BLOCK,
-            PAGES_PER_SPARSE_BLOCK,
             minimax_m3_sparse_attn_decode_aiter,
             minimax_m3_sparse_attn_prefill_aiter,
-            minimax_m3_sparse_block_page_stride,
         )
 
         attn_metadata = get_forward_context().attn_metadata
@@ -163,23 +161,12 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
         k_cache, v_cache = layer.get_aiter_sparse_pa_kv_cache()  # type: ignore[attr-defined]
+        # Physical page-16 pages per block row; the same value scales the
+        # emitted table's page ids (via the metadata builder's rebase), the
+        # writer's slot rebase, and the fallback table builders below.
+        block_page_stride = layer.get_aiter_sparse_pa_block_page_stride()  # type: ignore[attr-defined]
         k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
         v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
-
-        if sparse_bt_buf is not None:
-            # An emitted table was scaled by the metadata builder, which reads
-            # the packing off the layout rather than off these tensors. The two
-            # only disagree if the resolved layout gives each side its own
-            # plane, and a silent disagreement reads unrelated pages.
-            stride = minimax_m3_sparse_block_page_stride(k_cache, v_cache)
-            expected = PAGES_PER_SPARSE_BLOCK * PAGE16_SIDES_PER_BLOCK
-            if stride != expected:
-                raise RuntimeError(
-                    "MiniMax-M3 AITER sparse PA: the indexer emitted a page "
-                    f"table for a block spanning {expected} pages, but this "
-                    f"KV cache lays a block out over {stride}. The page-16 "
-                    "rebase assumes both K/V sides share a block."
-                )
 
         if main_md.num_decodes > 0:
             d = main_md.decode
@@ -201,6 +188,7 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
                 self.num_kv_heads,
                 self.scale,
                 out[:nd],
+                block_page_stride,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 decode_query_len=d.decode_query_len,
@@ -231,6 +219,7 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
                 self.num_kv_heads,
                 self.scale,
                 out[nd:],
+                block_page_stride,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 sparse_bt=(

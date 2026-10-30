@@ -503,10 +503,10 @@ class RocmAttentionImpl(AttentionImpl):
                 interleaved_v,
             )
         else:
-            # Non-standard blocks and hybrid attention/Mamba layouts need the
-            # stride-aware Triton writer. The native reshape_and_cache kernel
-            # assumes contiguous block storage and writes to the wrong hybrid
-            # cache blocks.
+            # Non-standard blocks and stride-padded (hybrid or large-page)
+            # layouts need the stride-aware Triton writer. The native
+            # reshape_and_cache kernel assumes contiguous block storage and
+            # writes to the wrong blocks on a strided view.
             triton_reshape_and_cache_flash(
                 key,
                 value,

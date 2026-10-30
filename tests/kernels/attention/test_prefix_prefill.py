@@ -1165,3 +1165,26 @@ def test_qwen3_nonstandard_block_size(
         op=op,
         interleave_v=interleave_v,
     )
+
+
+def test_has_native_kv_cache_layout():
+    """The native ROCm pairing requires packed, int32-addressable blocks.
+
+    A large-page layer view strides blocks by the whole group's row, and a
+    packed cache larger than int32 element offsets overflows the custom
+    kernels' 32-bit block math; both must route to the Triton path.
+    """
+    from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
+        has_native_kv_cache_layout,
+    )
+
+    packed = torch.zeros(4, 2, 3, 5)
+    assert has_native_kv_cache_layout(packed, packed)
+
+    buf = torch.zeros(4 * 240)
+    strided = buf.as_strided((4, 2, 3, 5), (240, 3, 5, 1))
+    assert has_native_kv_cache_layout(strided, packed) is False
+
+    big = torch.zeros(2**31, 1, device="meta")
+    small = torch.zeros(4, 2, 3, 5)
+    assert has_native_kv_cache_layout(big, small) is False

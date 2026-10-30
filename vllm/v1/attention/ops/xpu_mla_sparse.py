@@ -22,9 +22,9 @@ def _bf16_mla_sparse_kernel(
     dim_v,
     stride_q_token,
     stride_q_head,
-    stride_k_token,
+    stride_k_token: tl.int64,
     stride_k_head,
-    stride_v_token,
+    stride_v_token: tl.int64,
     stride_v_head,
     stride_out_token,
     stride_out_head,
@@ -95,9 +95,12 @@ def _bf16_mla_sparse_kernel(
         )
 
         mask_kv = (indices >= 0) & (indices < seq_kv)
+        # Paged caches hand this kernel a flat row view whose row ids multiply
+        # into element offsets past 2**31, so the row math is int64.
+        indices_64 = indices.to(tl.int64)
         mask_kv_d = mask_dmodel
         offs_k = (
-            indices[None, :] * stride_k_token
+            indices_64[None, :] * stride_k_token
             + cur_kv_head_id * stride_k_head
             + offs_d[:, None]
         )
@@ -111,7 +114,7 @@ def _bf16_mla_sparse_kernel(
         if BLOCK_DPE > 0:
             # q_rope @ k_rope
             offs_kpe = (
-                indices[None, :] * stride_k_token
+                indices_64[None, :] * stride_k_token
                 + cur_kv_head_id * stride_k_head
                 + offs_dpe[:, None]
             )
@@ -130,7 +133,7 @@ def _bf16_mla_sparse_kernel(
         # load v
         mask_v_d = offs_dv < dim_v
         offs_v = (
-            indices[:, None] * stride_v_token
+            indices_64[:, None] * stride_v_token
             + cur_kv_head_id * stride_v_head
             + offs_dv[None, :]
         )

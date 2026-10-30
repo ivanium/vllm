@@ -15,16 +15,28 @@ Both block-table strides are passed by the caller, so a non-contiguous view is
 covered explicitly rather than assumed away.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm.v1.attention.backends.mla.rocm_aiter_mla import (
+    AiterMLAMetadataBuilder,
     _expand_page_indices_kernel,
 )
 
 
-def _reference(block_table, cu_num_tokens, kernel_block_size, out_len, device):
+def _reference(
+    block_table,
+    cu_num_tokens,
+    kernel_block_size,
+    out_len,
+    device,
+    block_stride_rows=None,
+):
     """Per-token flat index, written the obvious way."""
+    if block_stride_rows is None:
+        block_stride_rows = kernel_block_size
     out = torch.full((out_len,), -1, dtype=torch.int64, device=device)
     num_reqs = cu_num_tokens.numel() - 1
     for r in range(num_reqs):
@@ -36,11 +48,20 @@ def _reference(block_table, cu_num_tokens, kernel_block_size, out_len, device):
         tok = torch.arange(n, device=device)
         blk = tok // kernel_block_size
         off = tok % kernel_block_size
-        out[start:end] = block_table[r, blk].to(torch.int64) * kernel_block_size + off
+        out[start:end] = block_table[r, blk].to(torch.int64) * block_stride_rows + off
     return out
 
 
-def _run(block_table, cu_num_tokens, kernel_block_size, out_len, device):
+def _run(
+    block_table,
+    cu_num_tokens,
+    kernel_block_size,
+    out_len,
+    device,
+    block_stride_rows=None,
+):
+    if block_stride_rows is None:
+        block_stride_rows = kernel_block_size
     out = torch.full((out_len,), -1, dtype=torch.int64, device=device)
     num_reqs = cu_num_tokens.numel() - 1
     max_tokens_per_req = block_table.shape[1] * kernel_block_size
@@ -52,6 +73,7 @@ def _run(block_table, cu_num_tokens, kernel_block_size, out_len, device):
         block_table.stride(1),
         cu_num_tokens,
         cu_num_tokens[1:] - cu_num_tokens[:-1],
+        block_stride_rows,
         KERNEL_BLOCK_SIZE=kernel_block_size,
         BLOCK_SIZE=1024,
     )
@@ -111,6 +133,7 @@ def test_ragged_batch_leaves_other_rows_untouched():
         bt.stride(1),
         cu,
         cu[1:] - cu[:-1],
+        kbs,
         KERNEL_BLOCK_SIZE=kbs,
         BLOCK_SIZE=1024,
     )
@@ -156,7 +179,97 @@ def test_over_provisioned_chunks_do_not_change_result():
             bt.stride(1),
             cu,
             cu[1:] - cu[:-1],
+            kbs,
             KERNEL_BLOCK_SIZE=kbs,
             BLOCK_SIZE=1024,
         )
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("kernel_block_size", [1, 16, 64])
+def test_strided_block_rows(kernel_block_size):
+    """Large-page views space a layer's blocks by the whole group's row.
+
+    The flat index of (block b, token i) must be b * block_stride_rows + i,
+    not b * kernel_block_size + i, so other layers' rows in the gaps are
+    never referenced.
+    """
+    block_stride_rows = kernel_block_size * 3 + 1
+    bt, cu, total = _make([1, 128, 4096, 7], kernel_block_size, "cuda")
+    got = _run(bt, cu, kernel_block_size, total, "cuda", block_stride_rows)
+    want = _reference(bt, cu, kernel_block_size, total, "cuda", block_stride_rows)
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+def test_flat_kv_buffer_rows_strided():
+    """The flat row view of a strided (large-page) cache hits physical rows.
+
+    The aiter MLA decode kernels address rows as index * head_dim; row
+    b * block_stride_rows + i must hold block b's token i even when other
+    layers' rows sit between the blocks. Runs on CPU: the view math is the
+    part that broke.
+    """
+    from vllm._aiter_ops import flat_kv_buffer_rows
+
+    num_blocks, block_size, head_dim = 5, 4, 8
+    block_stride_rows = 2 * block_size  # one gap row-block per block
+    buf = torch.arange(num_blocks * block_stride_rows * head_dim)
+    layer = buf.as_strided(
+        (num_blocks, block_size, head_dim),
+        (block_stride_rows * head_dim, head_dim, 1),
+    )
+
+    rows = flat_kv_buffer_rows(layer.unsqueeze(2))
+    assert rows.shape == (
+        (num_blocks - 1) * block_stride_rows + block_size,
+        1,
+        1,
+        head_dim,
+    )
+    for b in range(num_blocks):
+        for i in range(block_size):
+            torch.testing.assert_close(
+                rows[b * block_stride_rows + i, 0, 0], layer[b, i]
+            )
+
+    # A dense view flattens exactly like the old .view(-1, 1, 1, H).
+    dense = torch.arange(num_blocks * block_size * head_dim).view(
+        num_blocks, block_size, 1, head_dim
+    )
+    torch.testing.assert_close(
+        flat_kv_buffer_rows(dense), dense.view(-1, 1, 1, head_dim)
+    )
+
+
+def test_gluon_kv_cache_bound_spans_interleaved_layers():
+    """The Gluon 2 GiB bound measures the flat view the decode kernel reads.
+
+    That view of a large-page layer view runs over the other layers' rows
+    between its blocks, so it spans about num_layers times the layer's own
+    pages. Runs on CPU: only the size computation is under test.
+    """
+    num_blocks, block_size, head_dim, num_layers = 4, 16, 8, 32
+    group_row = num_layers * block_size * head_dim
+    backing = torch.empty(num_blocks * group_row, dtype=torch.bfloat16)
+    layer_view = backing.as_strided(
+        (num_blocks, block_size, head_dim), (group_row, head_dim, 1)
+    )
+    builder = SimpleNamespace(
+        _kv_cache_bytes=None,
+        layer_names=["model.layers.0.self_attn.attn"],
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                static_forward_context={
+                    "model.layers.0.self_attn.attn": SimpleNamespace(
+                        kv_cache=layer_view
+                    )
+                }
+            )
+        ),
+    )
+
+    flat_rows = (num_blocks - 1) * num_layers * block_size + block_size
+    assert AiterMLAMetadataBuilder._flat_kv_cache_bytes(builder) == (
+        flat_rows * head_dim * backing.element_size()
+    )

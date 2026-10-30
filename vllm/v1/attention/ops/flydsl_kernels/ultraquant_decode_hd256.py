@@ -209,9 +209,11 @@ def build_ultraquant_decode_hd256_module(
     _stride_bt_seq = max_blocks_per_seq
 
     # ultraquant AoS cache: [num_blocks, block_size, num_kv_heads, padded_slot].
+    # Only the block-local strides bake in; the block-to-block byte stride is a
+    # runtime kernel arg because each layer's view has stride(0) spanning
+    # the whole layer group.
     _stride_cache_head = _PADDED_SLOT
     _stride_cache_pos = num_kv_heads * _PADDED_SLOT
-    _stride_cache_block = _BS * _stride_cache_pos
 
     _stride_out_part = QG * HEAD_SIZE
     _stride_out_head = num_partitions * QG * HEAD_SIZE
@@ -257,6 +259,7 @@ def build_ultraquant_decode_hd256_module(
         centroids_ptr: fx.Tensor,
         block_tables_ptr: fx.Tensor,
         seq_lens_ptr: fx.Tensor,
+        stride_cache_block: fx.Int64,
     ):
         # ---- IDs ---------------------------------------------------------
         tid = gpu.thread_idx.x
@@ -635,11 +638,11 @@ def build_ultraquant_decode_hd256_module(
                     dtype=T.i32,
                 )
                 # A buffer descriptor addresses with a 32-bit voffset, so
-                # ``phys_block * c_block`` wraps once the cache view exceeds
-                # 4 GiB. Fold the block base into the descriptor's 64-bit
-                # base pointer and keep only in-block offsets below.
+                # ``phys_block * stride_cache_block`` wraps once the cache view
+                # exceeds 4 GiB. Fold the block base into the descriptor's
+                # 64-bit base pointer and keep only in-block offsets below.
                 blk_off_i64 = arith.extui(T.i64, phys_block) * fx.Int64(
-                    _stride_cache_block
+                    stride_cache_block
                 )
                 blk_rsrc = buffer_ops.create_buffer_resource(
                     kv_cache_ptr,

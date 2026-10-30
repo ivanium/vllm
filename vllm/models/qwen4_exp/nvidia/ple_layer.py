@@ -16,7 +16,6 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.mamba.abstract import (
     MambaBase,
     get_mamba_prefill_checkpoint_alignment,
-    get_mamba_prefill_checkpoint_grid,
 )
 from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointExporter,
@@ -212,20 +211,13 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             or not isinstance(spec, MambaSpec)
         ):
             return spec
-        if self.cache_config.kv_cache_allocator == "large_page":
-            # Checkpoint offsets are at least one block (the planner only
-            # rounds the block size up), so the window holds only inputs.
-            assert vllm_config.cache_config.block_size >= self.conv_state_len
-            return replace(
-                spec,
-                num_prefill_checkpoint_blocks=1,
-                prefill_checkpoint_alignment=self.get_prefill_checkpoint_alignment(),
-            )
-        grid = get_mamba_prefill_checkpoint_grid(vllm_config)
-        # Offsets are multiples of the grid, so the window holds only inputs.
-        assert grid >= self.conv_state_len
+        # Checkpoint offsets are at least one block (the planner only rounds
+        # the block size up), so the window holds only inputs.
+        assert vllm_config.cache_config.block_size >= self.conv_state_len
         return replace(
-            spec, num_prefill_checkpoint_blocks=1, prefill_checkpoint_alignment=grid
+            spec,
+            num_prefill_checkpoint_blocks=1,
+            prefill_checkpoint_alignment=self.get_prefill_checkpoint_alignment(),
         )
 
     def _short_conv_dilated_dispatch(
