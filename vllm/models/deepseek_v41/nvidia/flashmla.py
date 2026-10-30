@@ -9,6 +9,7 @@ from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.models.deepseek_v41.common.ops import (
+    check_flashmla_flattened_row_ceiling,
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
@@ -230,6 +231,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         # Reshape KV cache to (num_blocks, block_size, 1, head_bytes)
         if kv_cache is not None:
             kv_cache = kv_cache.unsqueeze(-2)
+        check_flashmla_flattened_row_ceiling(swa_cache)
+        if kv_cache is not None:
+            check_flashmla_flattened_row_ceiling(kv_cache)
 
         # One FlashMLASchedMeta per layer type, shared across all same-type
         # layers within this decode step. The first forward call per type

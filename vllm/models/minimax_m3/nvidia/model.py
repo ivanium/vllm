@@ -83,6 +83,7 @@ from vllm.models.minimax_m3.common.mm_preprocess import (
 from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseBackend,
     MiniMaxM3SparseImpl,
+    minimax_m3_dense_equivalent_index_slots,
     select_main_backend_and_impl_cls,
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
@@ -612,6 +613,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
+        index_slot_mapping = minimax_m3_dense_equivalent_index_slots(
+            index_slot_mapping, self.indexer.index_cache.kv_cache
+        )
         q = qkv.new_empty((num_tokens, self.q_size))
         # With query_fp8, q is emitted only in fp8; the attend dequantizes it
         # into ``q`` for the tokens that run on Triton decode.

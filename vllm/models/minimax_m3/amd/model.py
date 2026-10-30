@@ -124,6 +124,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseBackend,
     MiniMaxM3SparseImpl,
     MiniMaxM3SparseMetadata,
+    minimax_m3_dense_equivalent_index_slots,
     minimax_m3_rebase_slots_to_page16,
     minimax_m3_use_aiter_sparse_pa,
     select_main_backend_and_impl_cls,
@@ -1182,7 +1183,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                     self.index_k_norm.weight,
                     self.num_idx_heads,
                     main_slot_mapping,
-                    index_slot_mapping,
+                    minimax_m3_dense_equivalent_index_slots(
+                        index_slot_mapping, self.indexer.index_cache.kv_cache
+                    ),
                     self.kv_cache,
                     self.indexer.index_cache.kv_cache,
                     self.kv_cache.size(2),  # paged-cache block size

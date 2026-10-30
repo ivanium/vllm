@@ -2362,6 +2362,18 @@ class FlashInferImpl(AttentionImpl):
                         prefill_wrapper, BatchAttentionWithAttentionSinkWrapper
                     ):
                         assert self.sinks is not None
+                        # This (FA3 persistent) kernel multiplies the page index
+                        # by the page stride in 32 bits.
+                        num_kv_elements = kv_cache_permute.shape[
+                            0
+                        ] * kv_cache_permute.stride(0)
+                        if num_kv_elements > 2**32:
+                            raise ValueError(
+                                "FlashInfer's attention-sink prefill kernel "
+                                "addresses at most 2**32 KV cache elements per "
+                                f"layer view, got {num_kv_elements}; reduce the "
+                                "KV cache size."
+                            )
                         prefill_wrapper.run(
                             prefill_query,
                             kv_cache_for_fi,

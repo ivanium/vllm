@@ -27,6 +27,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.models.deepseek_v41.common.ops import (
+    check_flashmla_flattened_row_ceiling,
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
@@ -371,9 +372,13 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
             flashmla_metadata, swa_metadata
         )
         assert swa_metadata.decode_swa_indices is not None
+        swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
+        check_flashmla_flattened_row_ceiling(swa_cache)
+        if extra_cache is not None:
+            check_flashmla_flattened_row_ceiling(extra_cache)
         torch.ops._flashmla_C.fused_norm_rope_attn_rope_cast_decode(
             q,
-            self.swa_cache_layer.kv_cache.unsqueeze(-2),
+            swa_cache,
             swa_metadata.decode_swa_indices.view(q.shape[0], -1),
             self.scale,
             _HEAD_DIM_V,

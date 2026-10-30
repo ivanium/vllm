@@ -779,6 +779,9 @@ def fp8_fp4_paged_mqa_logits(
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()
+    # DeepGEMM's dense-paged host stores the block stride in a 32-bit int
+    # without checking it (its % 16 B rule is asserted host-side).
+    assert kv_cache.stride(0) <= 2**31 - 1
     # DeepGEMM asserts block_tables.stride(-1)==1. A trailing size-1 dim
     # (e.g. block_table shape [B,1] for short seqs under a large block_size)
     # can be a transposed view where .contiguous() is a no-op (torch treats the

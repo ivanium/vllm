@@ -3102,6 +3102,9 @@ def cp_gather_and_upconvert_fp8_kv_cache(
         device_row_ids: Device source row, or -1, for each remapped cache row
 
     """
+    # The kernel flattens (block, token) into an int32 slot
+    # (physical_block * block_size + page_token).
+    assert src_cache.shape[0] * src_cache.shape[1] < 2**31
     torch.ops._C_cache_ops.cp_gather_and_upconvert_fp8_kv_cache(
         src_cache,
         dst,
