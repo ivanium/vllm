@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections import defaultdict
-from dataclasses import replace
 
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.utils import group_pool_storage
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
     derive_canonical_mappings,
 )
@@ -18,13 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     get_offloading_group_ids,
 )
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    KVCacheConfig,
-    MambaSpec,
-    UniformTypeKVCacheSpecs,
-    group_kernel_blocks,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
@@ -69,152 +62,51 @@ class OffloadingConnectorWorker:
         self.worker = self.spec.get_worker(kv_caches)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """Register the GPU KV cache regions, one per offloaded group.
+
+        Every layer view of a group strides over one shared backing
+        allocation with stride(0) = the group's row_bytes, so manager block
+        ``b`` of the group is one contiguous byte range at
+        ``b * block_bytes`` holding all of the group's layers. The transfer
+        unit is the whole manager block: one tensor and one data ref per
+        group.
+        """
         kv_cache_config = self.kv_cache_config
         selected_group_ids = get_offloading_group_ids(kv_cache_config)
-        selected_groups = tuple(
-            kv_cache_config.kv_cache_groups[group_id] for group_id in selected_group_ids
-        )
         mappings = derive_canonical_mappings(
-            self.vllm_config, kv_cache_config, kv_caches
+            self.vllm_config, kv_cache_config, selected_group_ids
         )
 
-        # layer_name -> (num_blocks, page_size_bytes) tensor
-        tensors_per_block: dict[str, tuple[torch.Tensor, ...]] = {}
-        # layer_name -> size of (un-padded) page in bytes
-        unpadded_page_size_bytes: dict[str, int] = {}
-        # layer_name -> size of page in bytes
-        page_size_bytes: dict[str, int] = {}
-        for kv_cache_group in selected_groups:
-            assert not kv_cache_group.host_resident
-            num_blocks = kv_cache_config.num_blocks
-            group_layer_names = kv_cache_group.layer_names
-            group_kv_cache_spec = kv_cache_group.kv_cache_spec
-            if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):
-                per_layer_specs = group_kv_cache_spec.kv_cache_specs
-            else:
-                per_layer_specs = {}
-            for layer_name in group_layer_names:
-                layer_kv_cache_spec = per_layer_specs.get(
-                    layer_name, group_kv_cache_spec
-                )
-                ref = group_kernel_blocks(kv_caches[layer_name], num_blocks)
-                page = layer_kv_cache_spec.page_size_bytes
-                elem_size = ref.element_size()
-                byte_offset = ref.storage_offset() * elem_size
-                # Packed layouts (e.g. DSv4) interleave layers per block, so the
-                # attention tensor's stride(0) (the manager-block stride) exceeds
-                # page_size_bytes; other layouts have stride(0) == page_size_bytes.
-                block_stride_bytes = (
-                    ref.stride(0) * elem_size
-                    if isinstance(layer_kv_cache_spec, AttentionSpec)
-                    else page
-                )
-                tensors_per_block[layer_name] = (
-                    torch.tensor([], dtype=torch.int8, device=ref.device).set_(
-                        ref.untyped_storage(),
-                        byte_offset,
-                        (num_blocks, page),
-                        (block_stride_bytes, 1),
-                    ),
-                )
-                page_size_bytes[layer_name] = page
-
-                if isinstance(layer_kv_cache_spec, AttentionSpec):
-                    unpadded_page_size_bytes[layer_name] = (
-                        layer_kv_cache_spec.unpadded_page_size_bytes
-                    )
-                elif isinstance(layer_kv_cache_spec, MambaSpec):
-                    unpadded_page_size_bytes[layer_name] = replace(
-                        layer_kv_cache_spec, page_size_padded=None
-                    ).page_size_bytes
-                else:
-                    raise NotImplementedError
-
-        # Packed layouts (e.g. DSv4) interleave all layers within each manager
-        # block: a layer view's block stride exceeds its page size. Offload the
-        # whole packed block as a single transfer region.
-        packed_layer_name = next(
-            (
-                layer_name
-                for layer_name, (tensor,) in tensors_per_block.items()
-                if tensor.stride(0) != tensor.shape[1]
-            ),
-            None,
-        )
-        if (
-            packed_layer_name is not None
-            and kv_cache_config.hisparse_host_num_blocks is None
-        ):
-            (tensor,) = tensors_per_block[packed_layer_name]
-            num_blocks = tensor.shape[0]
-            block_stride = tensor.stride(0)
-            packed_tensor = tensor.as_strided(
-                (num_blocks, block_stride),
-                (block_stride, 1),
-                storage_offset=0,
-            )
-            self._init_worker(
-                CanonicalKVCaches(
-                    [CanonicalKVCacheTensor(packed_tensor, block_stride)],
-                    [[CanonicalKVCacheRef(0, block_stride)] for _ in selected_groups],
-                )
-            )
-            return
-
-        block_tensors: list[CanonicalKVCacheTensor] = []
-        block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
-        # Layers that alias the same bytes (cache groups overlay each other) share
-        # one transfer region: exactly the views with equal address and strides.
-        aliased_layers: dict[tuple[int, tuple[int, ...]], list[str]] = defaultdict(list)
-        for layer_name, layer_tensors in tensors_per_block.items():
-            view = layer_tensors[0]
-            aliased_layers[(view.data_ptr(), view.stride())].append(layer_name)
-
-        for tensor_layer_names in aliased_layers.values():
-            assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
-
-            first_layer_name = tensor_layer_names[0]
-            for tensor in tensors_per_block[first_layer_name]:
-                block_tensors.append(
-                    CanonicalKVCacheTensor(
-                        tensor=tensor,
-                        page_size_bytes=page_size_bytes[first_layer_name],
-                    )
-                )
-
-                curr_tensor_idx = len(block_tensors) - 1
-                for layer_name in tensor_layer_names:
-                    mapping = (
-                        mappings.get(layer_name)
-                        if len(tensors_per_block[first_layer_name]) == 1
-                        else None
-                    )
-                    assert (
-                        mapping is None
-                        or mapping.local_page_size_bytes
-                        == unpadded_page_size_bytes[layer_name]
-                    )
-                    block_data_refs[layer_name].append(
-                        CanonicalKVCacheRef(
-                            tensor_idx=curr_tensor_idx,
-                            page_size_bytes=(unpadded_page_size_bytes[layer_name]),
-                            mapping=mapping,
-                        )
-                    )
-
+        tensors: list[CanonicalKVCacheTensor] = []
         group_data_refs: list[list[CanonicalKVCacheRef]] = []
-        for kv_cache_group in selected_groups:
-            group_refs: list[CanonicalKVCacheRef] = []
-            for layer_name in kv_cache_group.layer_names:
-                group_refs += block_data_refs[layer_name]
-            group_data_refs.append(group_refs)
+        for group_id in selected_group_ids:
+            group = kv_cache_config.kv_cache_groups[group_id]
+            assert not group.host_resident
+            storage = group_pool_storage(kv_caches, kv_cache_config, group_id)
+            if storage is None:
+                # This rank holds no layer of the group (pipeline parallelism).
+                group_data_refs.append([])
+                continue
+            block_bytes = kv_cache_config.group_geometry(group_id).block_bytes
+            tensor = torch.empty(0, dtype=torch.int8, device=storage.device).set_(
+                storage, 0, (group.num_blocks, block_bytes)
+            )
+            tensors.append(
+                CanonicalKVCacheTensor(tensor=tensor, page_size_bytes=block_bytes)
+            )
+            group_data_refs.append(
+                [
+                    CanonicalKVCacheRef(
+                        tensor_idx=len(tensors) - 1,
+                        page_size_bytes=block_bytes,
+                        mapping=mappings.get(group_id),
+                    )
+                ]
+            )
 
-        canonical_kv_caches = CanonicalKVCaches(
-            tensors=block_tensors,
-            group_data_refs=group_data_refs,
+        self._init_worker(
+            CanonicalKVCaches(tensors=tensors, group_data_refs=group_data_refs)
         )
-
-        self._init_worker(canonical_kv_caches)
 
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
