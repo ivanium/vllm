@@ -513,27 +513,6 @@ def test_consumer_saves_only_full_decode_blocks(token_len, saved_tokens):
         assert req_meta.token_ids == list(range(32, 48))
 
 
-def test_preemption_resets_tracker():
-    scheduler = _make_bare_scheduler()
-    _add_unfinished_request(
-        scheduler,
-        token_ids=list(range(44)),
-        block_hashes=[b"h0", b"h1"],
-        prefill_end_tokens=48,
-    )
-    scheduler._request_trackers["req-0"].has_pending_offload = True
-
-    scheduler.build_connector_meta(_make_preemption_scheduler_output())
-
-    tracker = scheduler._request_trackers["req-0"]
-    assert tracker.token_len == 0
-    assert tracker.allocated_block_ids == ()
-    assert tracker.num_saved_tokens == 0
-    assert tracker.token_ids is None
-    assert tracker.has_pending_offload is False
-    assert tracker.prefill_end_tokens == 0
-
-
 def test_preemption_clears_stale_load_state():
     scheduler = _make_bare_scheduler()
     _make_pending_load_unfinished_request(
@@ -617,9 +596,6 @@ def test_pending_load_does_not_co_queue_save():
     # Load is still issued as planned.
     assert req_meta.load_spec is not None
     assert req_meta.load_spec.can_load is True
-    # And the save watermark does not advance for a save that was never queued.
-    tracker = scheduler._request_trackers["req-0"]
-    assert tracker.num_saved_tokens == 0
 
 
 def _make_resumed_unfinished_request(

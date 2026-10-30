@@ -58,7 +58,7 @@ from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
-from .utils import create_scheduler, create_vllm_config
+from .utils import create_model_runner_output, create_scheduler, create_vllm_config
 
 
 def _make_vllm_config():
@@ -1493,3 +1493,93 @@ def test_lookahead_hashed_prefix_is_retried_without_new_blocks():
     (meta,) = second.kv_connector_metadata.requests
     assert meta.num_hash_lookahead_tokens == 1
     assert meta.token_ids[-1] == 32
+
+
+@pytest.fixture(params=[False, True], ids=["new", "preempted"])
+def pending_lookahead_load(request):
+    config = _make_role_vllm_config(
+        "kv_both", enable_lookup=True, save_decode_cache=True
+    )
+    config.scheduler_config.async_scheduling = False
+    spec = SpeculativeConfig(model="ngram", num_speculative_tokens=1)
+    spec.method = "mtp"
+    spec.draft_model_config = config.model_config
+    config.speculative_config = spec
+    config.num_hash_lookahead_tokens = config._resolve_num_hash_lookahead_tokens()
+    with patch.object(scheduler, "LookupKeyClient") as lookup:
+        client = lookup.return_value
+        engine_scheduler = create_scheduler(config, num_blocks=16)
+    init_none_hash(sha256)
+    req = Request(
+        "load",
+        list(range(64)),
+        SamplingParams(max_tokens=2),
+        None,
+        block_hasher=get_request_block_hasher(16, sha256, 1),
+    )
+    engine_scheduler.add_request(req)
+    if request.param:
+        client.lookup.return_value = MooncakeLookupResult(0)
+        prefill = engine_scheduler.schedule()
+        engine_scheduler.update_from_output(
+            prefill,
+            create_model_runner_output(
+                [req],
+                token_id=64,
+                kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                    completed_saves={
+                        m.store_job_id: 1
+                        for m in prefill.kv_connector_metadata.requests
+                    }
+                ),
+            ),
+        )
+        engine_scheduler.reset_prefix_cache(reset_running_requests=True)
+        client.lookup.return_value = None
+        assert not engine_scheduler.schedule().num_scheduled_tokens
+    client.lookup.return_value = MooncakeLookupResult(48)
+    pending = engine_scheduler.schedule()
+    assert req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    (load,) = pending.kv_connector_metadata.requests
+    assert load.load_spec is not None and load.load_spec.can_load
+    assert not load.can_save
+    return engine_scheduler, req, pending
+
+
+@pytest.mark.cpu_test
+def test_failed_load_does_not_publish_unfilled_kv(pending_lookahead_load):
+    engine_scheduler, req, pending = pending_lookahead_load
+    engine_scheduler.update_from_output(
+        pending,
+        create_model_runner_output(
+            [], finished_recving={req.request_id}, failed_recving={req.request_id}
+        ),
+    )
+    assert req.status == RequestStatus.FINISHED_ERROR
+    assert engine_scheduler.schedule().kv_connector_metadata.requests == []
+
+
+@pytest.mark.cpu_test
+def test_aborted_load_does_not_publish_unfilled_kv(pending_lookahead_load):
+    engine_scheduler, req, pending = pending_lookahead_load
+    engine_scheduler.finish_requests(req.request_id, RequestStatus.FINISHED_ABORTED)
+    engine_scheduler.update_from_output(
+        pending, create_model_runner_output([], finished_recving={req.request_id})
+    )
+    assert engine_scheduler.schedule().kv_connector_metadata.requests == []
+
+
+@pytest.mark.cpu_test
+def test_loaded_request_saves_newly_hashed_kv(pending_lookahead_load):
+    engine_scheduler, req, pending = pending_lookahead_load
+    engine_scheduler.update_from_output(
+        pending, create_model_runner_output([], finished_recving={req.request_id})
+    )
+    compute = engine_scheduler.schedule()
+    assert compute.num_scheduled_tokens[req.request_id] > 0
+    engine_scheduler.update_from_output(
+        compute, create_model_runner_output([req], token_id=65)
+    )
+    (save,) = engine_scheduler.schedule().kv_connector_metadata.requests
+    assert save.can_save
+    assert save.token_len_chunk == 64
