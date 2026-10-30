@@ -44,8 +44,8 @@ class AuxRequestOutput:
 class AuxOutputSchedulerConnector:
     """Build worker metadata without owning auxiliary output payloads or stores."""
 
-    def __init__(self, hash_block_size: int) -> None:
-        self._hash_block_size = hash_block_size
+    def __init__(self, block_size: int) -> None:
+        self._block_size = block_size
         # Number of hashes already sent to the worker for each active request.
         self._sent_hash_counts: dict[str, int] = {}
         # Terminal events are delivered with the next connector metadata.
@@ -149,7 +149,7 @@ class AuxOutputSchedulerConnector:
         block_hashes = request.block_hashes
         num_sent = self._sent_hash_counts[request.request_id]
         assert num_sent <= len(block_hashes), "KV block-hash history shrank"
-        num_keyed = min(len(block_hashes), num_computed_tokens // self._hash_block_size)
+        num_keyed = min(len(block_hashes), num_computed_tokens // self._block_size)
         if num_keyed <= num_sent:
             return None
         self._sent_hash_counts[request.request_id] = num_keyed

@@ -1063,8 +1063,7 @@ def test_handshake_listener_appends_perf_counter_frame():
         NixlBaseConnectorScheduler,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import GET_META_MSG
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
-    from vllm.utils.network_utils import get_open_port, make_zmq_path
+    from vllm.utils.network_utils import get_open_port, make_zmq_path, zmq_socket_ctx
 
     encoded_data = {(0, 0): b"payload-rank-0"}
     ready_event = threading.Event()
@@ -1080,7 +1079,7 @@ def test_handshake_listener_appends_perf_counter_frame():
     try:
         assert ready_event.wait(timeout=5)
         path = make_zmq_path("tcp", host, port)
-        with zmq_ctx(zmq.REQ, path) as sock:
+        with zmq_socket_ctx(path, zmq.REQ, bind=False) as sock:
             sock.setsockopt(zmq.RCVTIMEO, 5000)
             t0 = time.perf_counter()
             sock.send(msgspec.msgpack.encode((GET_META_MSG, 0, 0)))

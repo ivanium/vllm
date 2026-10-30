@@ -14,7 +14,6 @@ from .utils import (
     create_request,
     create_scheduler,
     create_vllm_config,
-    make_kv_cache_config,
 )
 
 
@@ -121,7 +120,7 @@ def test_async_load_failure(
 
     # Simulate a failure in loading some of request2 blocks.
     (req2_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request2.request_id)
-    invalid_block_ids = {req2_block_ids[i] for i in invalid_block_idxs}
+    invalid_block_ids = {(0, req2_block_ids[i]) for i in invalid_block_idxs}
     model_runner_output = create_model_runner_output(
         reqs=[],
         finished_recving={request1.request_id, request3.request_id},
@@ -205,7 +204,7 @@ def test_sync_load_failure(
 
     # Simulate a failure in loading some of request2 blocks.
     req2_block_ids = scheduler_output.scheduled_new_reqs[1].block_ids[0]
-    invalid_block_ids = {req2_block_ids[i] for i in invalid_block_idxs}
+    invalid_block_ids = {(0, req2_block_ids[i]) for i in invalid_block_idxs}
     model_runner_output = create_model_runner_output(
         [request1, request2, request3],
         invalid_block_ids=invalid_block_ids,
@@ -284,7 +283,7 @@ def test_sync_load_failure_with_shared_blocks(
 
     # Simulate a failure in loading some of the shared blocks.
     req1_block_ids = scheduler_output.scheduled_new_reqs[0].block_ids[0]
-    invalid_block_ids = {req1_block_ids[i] for i in invalid_block_idxs}
+    invalid_block_ids = {(0, req1_block_ids[i]) for i in invalid_block_idxs}
     model_runner_output = create_model_runner_output(
         [request1, request2], invalid_block_ids=invalid_block_ids, use_eos=True
     )
@@ -354,7 +353,7 @@ def test_async_progressive_load_failure(
     # Simulate failures when progressively loading request blocks.
     for invalid_block_idx in invalid_block_idxs:
         (req_block_ids,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
-        invalid_block_ids = {req_block_ids[invalid_block_idx]}
+        invalid_block_ids = {(0, req_block_ids[invalid_block_idx])}
         model_runner_output = create_model_runner_output(
             reqs=[],
             finished_recving=set(),
@@ -376,21 +375,3 @@ def test_async_progressive_load_failure(
         assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         assert scheduler.failed_recving_kv_req_ids == {request.request_id}
         assert scheduler.connector.get_num_new_matched_tokens.call_count == 1
-
-
-@pytest.mark.cpu_test
-def test_block_level_load_failure_fails_closed_with_multiple_groups():
-    """Block-level invalid-block reporting is rejected on multi-group layouts.
-
-    Block IDs are only unique within a group, so the scheduler cannot map
-    them back to requests; connectors must report failed_recving instead.
-    """
-    vllm_config = create_vllm_config()
-    scheduler = create_scheduler(
-        vllm_config,
-        kv_cache_config=make_kv_cache_config(block_size=16, swa_enabled=True),
-    )
-    assert len(scheduler.kv_cache_config.kv_cache_groups) == 2
-
-    with pytest.raises(RuntimeError, match="failed_recving"):
-        scheduler._handle_invalid_blocks({1}, {})

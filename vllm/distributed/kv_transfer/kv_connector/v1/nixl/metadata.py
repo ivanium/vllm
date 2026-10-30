@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import GroupGeometry
 
 logger = init_logger(__name__)
 
@@ -54,8 +55,11 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  16: large_page allocator (opt-in): kernel-row transfer regions, per-group
 #      region_num_blocks authoritative, allocator in the compatibility hash;
 #      block b of a group is kernel blocks b * R to b * R + R - 1
+#  17: large_page is the only allocator: per-group geometry (group_geometries)
+#      always advertised; num_blocks and physical_blocks_per_logical_kv_block
+#      dropped
 #
-NIXL_CONNECTOR_VERSION: int = 16
+NIXL_CONNECTOR_VERSION: int = 17
 
 
 @dataclass
@@ -64,14 +68,12 @@ class NixlAgentMetadata:
     agent_metadata: bytes
     kv_caches_base_addr: list[int]
     device_id: int
-    num_blocks: int
     block_lens: list[int]
     block_strides: list[int]
     kv_cache_layout: str
     block_size: int
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
-    physical_blocks_per_logical_kv_block: int
     region_num_blocks: list[int] | None = None
     region_group_ids: list[int] | None = None
     region_names: list[str] | None = None
@@ -84,12 +86,10 @@ class NixlAgentMetadata:
     region_members: list[list[str]] = field(default_factory=list)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
-    # Large-page allocator only (empty under uniform_page). Per transfer group,
-    # positional: kernel rows per block (R_g), which peers need to expand this
-    # engine's block ids to kernel-block descriptor ids (block b is rows
-    # b*R .. b*R+R-1), and the group's layer names on this
-    # worker.
-    group_kernel_rows_per_block: list[int] = field(default_factory=list)
+    # Per transfer group, positional: the pool geometry, which peers use to
+    # expand this engine's block ids to kernel-block descriptor ids, and the
+    # group's layer names on this worker.
+    group_geometries: list[GroupGeometry] = field(default_factory=list)
     group_layer_names: list[list[str]] = field(default_factory=list)
 
 
@@ -210,9 +210,6 @@ def compute_nixl_compatibility_hash(
         "speculative_config": _get_speculative_compatibility_factors(vllm_config),
         # push (WRITE) and pull (READ) connectors are protocol-incompatible
         "transfer_mode": transfer_mode,
-        # uniform_page and large_page KV pools lay blocks out differently;
-        # they can never be paired.
-        "kv_cache_allocator": cache_config.kv_cache_allocator,
     }
 
     compat_hash = hash_factors(factors)
@@ -257,7 +254,8 @@ class RemoteMeta:
 @dataclass
 class ReqMeta:
     local_block_ids: BlockIds
-    # To be used when logical block size does not match the kernel block size
+    # Kernel block ids: local_block_ids expanded per group (block b is rows
+    # b*R .. b*R+R-1).
     local_physical_block_ids: BlockIds
     tp_size: int
     dcp_size: int = 1

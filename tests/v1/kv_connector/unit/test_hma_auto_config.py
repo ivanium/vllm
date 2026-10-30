@@ -8,10 +8,24 @@ import pytest
 from vllm.config import DeviceConfig, KVTransferConfig, SchedulerConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 pytestmark = pytest.mark.cpu_test
+
+
+class NonHMAConnector(KVConnectorBase_V1):
+    """A registered connector that does not implement SupportsHMA.
+
+    Never instantiated: the factory rejects non-HMA connectors before
+    construction, and the auto-disable path only queries the class.
+    """
+
+
+KVConnectorFactory.register_connector(
+    "NonHMAConnector", __name__, NonHMAConnector.__name__
+)
 
 
 @pytest.fixture(autouse=True)
@@ -31,7 +45,7 @@ def mock_hybrid_kv_cache_supported(monkeypatch):
             False,
         ),
         (  # Non-HMA connector → HMA is auto-disabled
-            KVTransferConfig(kv_connector="ExampleConnector", kv_role="kv_both"),
+            KVTransferConfig(kv_connector="NonHMAConnector", kv_role="kv_both"),
             True,
         ),
         (  # MultiConnector: all HMA children → HMA stays enabled
@@ -66,7 +80,7 @@ def mock_hybrid_kv_cache_supported(monkeypatch):
                             "kv_role": "kv_both",
                             "kv_connector_extra_config": {"cpu_bytes_to_use": 1 << 30},
                         },
-                        {"kv_connector": "ExampleConnector", "kv_role": "kv_both"},
+                        {"kv_connector": "NonHMAConnector", "kv_role": "kv_both"},
                     ]
                 },
             ),
@@ -94,12 +108,12 @@ def test_explicit_hma_with_non_hma_connector_errors_at_factory():
             disable_hybrid_kv_cache_manager=False,
         ),
         kv_transfer_config=KVTransferConfig(
-            kv_connector="ExampleConnector",
+            kv_connector="NonHMAConnector",
             kv_role="kv_both",
         ),
     )
     kv_cache_config = KVCacheConfig(
-        num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]
+        num_pages=0, kv_cache_tensors=[], kv_cache_groups=[], block_size=16
     )
     with pytest.raises(ValueError, match="does not support HMA but HMA is enabled"):
         KVConnectorFactory.create_connector(
