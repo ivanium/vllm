@@ -14,14 +14,12 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, trim_null_head
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
-    MambaSpec,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
@@ -134,7 +132,6 @@ class KVCacheManager:
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
         scheduler_block_size: int,
-        hash_block_size: int,
         max_in_flight_tokens: int | None = None,
         enable_caching: bool = True,
         use_eagle: bool = False,
@@ -145,7 +142,6 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
-        enable_mamba_shared_prefix_checkpoint: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -174,25 +170,9 @@ class KVCacheManager:
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
-            hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )
-        # One predicate, read by both sides of the feature, so the scheduler
-        # cannot end a chunk at a junction the manager would refuse -- a refused
-        # junction costs a forward pass and displaces the block-boundary stop.
-        # Multi-module MTP is excluded because ``cache_blocks`` then hands the
-        # manager ``num_computed - num_reprefillable`` rather than the chunk end.
-        self.mamba_shared_prefix_checkpoint = (
-            enable_mamba_shared_prefix_checkpoint
-            and bool(self.coordinator.eagle_group_ids)
-            and self.coordinator.enable_partial_hash_hits
-            and self.coordinator.num_reprefillable_tokens == 0
-        )
-        if self.mamba_shared_prefix_checkpoint:
-            for manager in self.coordinator.single_type_managers:
-                if isinstance(manager, MambaManager):
-                    manager.shared_prefix_checkpoint = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.retained_hit_group_ids = tuple(
@@ -202,16 +182,12 @@ class KVCacheManager:
         )
         self.kv_cache_config = kv_cache_config
 
-        # Under the large-page allocator block ids are unique only within a
-        # group, so block ids leave the manager as (group_id, block_id) pairs.
-        self._large_page = kv_cache_config.allocator == "large_page"
-
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
         # It counts pages, which are blocks unless a group has more blocks per
         # page.
         assert watermark >= 0.0, "watermark must be non-negative"
-        self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        self.watermark_blocks = int(watermark * kv_cache_config.num_pages)
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -317,8 +293,7 @@ class KVCacheManager:
 
         # The junction to pin is where the lagging sparse-retention group stops
         # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.
-        # the longest single-group hit. Sub-block gaps are left to the mask,
-        # which floors to the alignment boundary (a no-op there).
+        # the longest single-group hit.
         shared_prefix_boundary = (
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
@@ -392,7 +367,7 @@ class KVCacheManager:
                 managers[group_id].get_num_skipped_tokens(total_computed_tokens)
                 // managers[group_id].block_size :
             ]
-            for group_id in self.block_pool.slots_per_page
+            for group_id in self.block_pool.page_group_ids
         }
         return self.block_pool.can_allocate(demand, hit_blocks, num_reserved_pages)
 
@@ -702,20 +677,19 @@ class KVCacheManager:
         """
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
-    def evict_blocks(self, block_ids: set[int] | set[tuple[int, int]]) -> None:
+    def evict_blocks(self, block_ids: set[tuple[int, int]]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
 
+        Block ids are unique only within a group, so each entry is a
+        ``(group_id, block_id)`` pair. Only evicts blocks that are currently
+        cached (have a hash). blocks with ref_cnt > 0 are not freed from the
+        block pool, only evicted from the prefix cache hash table.
+
         Args:
-            block_ids: Set of block IDs to evict from cache. Under
-                ``large_page`` block ids are unique only within a group, so
-                each entry is a ``(group_id, block_id)`` pair.
+            block_ids: Set of (group_id, block_id) pairs to evict from cache.
 
         """
-        if self._large_page:
-            for group_id, block_id in block_ids:  # type: ignore[misc]
-                self.block_pool.evict_blocks({block_id}, group_id)
-            return
-        self.block_pool.evict_blocks(block_ids)  # type: ignore[arg-type]
+        self.block_pool.evict_blocks(block_ids)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -845,55 +819,12 @@ class KVCacheManager:
         # Only create new KVCacheBlocks for non-empty blocks
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
 
-    def truncate_computed_blocks(
-        self, blocks: KVCacheBlocks, num_computed_tokens: int
-    ) -> KVCacheBlocks:
-        """Return a lookup-result view truncated at an aligned token endpoint.
-
-        An external hit can supply the final Mamba state even when the local
-        Mamba group ends before this endpoint. Other groups must cover it.
-        Pure slicing: refcounts are untouched and ``blocks`` is not mutated.
-        """
-        truncated: list[list[KVCacheBlock]] = []
-        for group_blocks, manager, group in zip(
-            blocks.blocks,
-            self.coordinator.single_type_managers,
-            self.kv_cache_config.kv_cache_groups,
-            strict=True,
-        ):
-            if not group.kv_cache_spec.prefix_cacheable:
-                # Scratch groups (e.g. the CSA compressor ring) hold a fixed
-                # block covering no token range, so a lookup result never
-                # carries computed blocks for them and their block size does
-                # not divide the endpoint.
-                assert not group_blocks
-                truncated.append([])
-                continue
-            assert num_computed_tokens % manager.block_size == 0
-            num_blocks = num_computed_tokens // manager.block_size
-            if isinstance(group.kv_cache_spec, MambaSpec):
-                num_blocks = min(num_blocks, len(group_blocks))
-            else:
-                assert num_blocks <= len(group_blocks)
-            truncated.append(list(group_blocks[:num_blocks]))
-        return self.create_kv_cache_blocks(tuple(truncated))
-
-    def take_new_block_ids(self) -> list[int] | list[tuple[int, int]]:
-        """Drain and return new attention block IDs for zeroing.
-
-        Under ``large_page`` block ids are unique only within a group, so each
-        entry is a ``(group_id, block_id)`` pair.
-        """
-        if self._large_page:
-            return [
-                (mgr.kv_cache_group_id, block_id)
-                for mgr in self.coordinator.single_type_managers
-                for block_id in mgr.take_new_block_ids()
-            ]
-        ids: list[int] = []
-        for mgr in self.coordinator.single_type_managers:
-            ids.extend(mgr.take_new_block_ids())
-        return ids
+    def take_new_block_ids(self) -> list[list[int]]:
+        """Drain and return new attention block IDs for zeroing, per KV cache
+        group (block ids are unique only within a group)."""
+        return [
+            mgr.take_new_block_ids() for mgr in self.coordinator.single_type_managers
+        ]
 
     def record_blocks_for_zeroing(self, request_id: str, start_token: int) -> None:
         """Re-record the request's blocks from start_token onwards for
@@ -909,39 +840,13 @@ class KVCacheManager:
                 blocks = mgr.req_to_blocks[request_id]
                 mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
 
-    def take_kv_cache_block_copies(
-        self,
-    ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
-        """Drain pending copies and return their retained endpoints.
-
-        Each copy carries its ``group_id``: under ``large_page`` block ids
-        are unique only within a group.
-        """
-        pending_copies: list[tuple[int, tuple[KVCacheBlock, KVCacheBlock]]] = []
-        for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(
-                (mgr.kv_cache_group_id, copy) for copy in mgr.take_pending_cow_copies()
-            )
-        copies = [
-            KVCacheBlockCopy(
-                src_block_id=source_block.block_id,
-                dst_block_id=cow_block.block_id,
-                group_id=group_id,
-            )
-            for group_id, (source_block, cow_block) in pending_copies
-        ]
-        retained_blocks = [block for _, pair in pending_copies for block in pair]
-        return copies, retained_blocks
-
     def take_boundary_state_offloads(
         self,
     ) -> dict[str, list[tuple[int, int, int]]]:
         """Drain this step's boundary-state hand-offs for a KV connector.
 
         Returns ``{request_id: [(group_id, block_id, boundary_tokens), ...]}``
-        for mamba "align" boundary states: the
-        request's committed boundary-state snapshots and, on a sub-block partial
-        hit, the CoW copy of its last-prompt-boundary state. Only mamba "align"
+        of the request's committed boundary-state snapshots. Only mamba "align"
         groups contribute; empty otherwise. A connector reads the referenced
         blocks — never resolving them positionally — and offloads them so a
         later request can hit that prefix.
@@ -957,29 +862,6 @@ class KVCacheManager:
                 offloads.setdefault(req_id, []).append(
                     (group_id, block.block_id, boundary_tokens)
                 )
-        return offloads
-
-    def finalize_partial_tail_offloads(
-        self, request: Request
-    ) -> list[tuple[int, int, int]]:
-        """Consume safe producer partial tails when a request finishes.
-
-        A mamba align table block is a valid boundary source only if no later
-        token was forwarded. The connector pins and queues the exact table
-        block before request cleanup, then releases the pin when every worker
-        reports the store job complete.
-        """
-        offloads: list[tuple[int, int, int]] = []
-        for mgr in self.coordinator.single_type_managers:
-            finalized = mgr.finalize_partial_tail_offload(
-                request.request_id,
-                request.num_computed_tokens,
-                request.num_in_flight_tokens,
-            )
-            if finalized is None:
-                continue
-            group_id, block, boundary_tokens = finalized
-            offloads.append((group_id, block.block_id, boundary_tokens))
         return offloads
 
     def new_step_starts(self) -> None:

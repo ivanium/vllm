@@ -197,26 +197,6 @@ class CacheConfig:
     set the value is final and read with ``get_resolved_kv_cache_layout``,
     which raises on ``None``. Tests and standalone tools may pre-set a value,
     which resolution then honors as-is."""
-    prefix_match_unit: int | None = Field(default=None, gt=0)
-    """The finest token boundary (in tokens) a prefix-cache hit can land on.
-
-    Prefix-cache keys are computed every `prefix_match_unit` tokens. It can
-    be set finer than the physical KV cache block sizes (e.g. 32 vs a
-    1024-token hybrid-model block) as long as every KV cache group's
-    `block_size` is divisible by it, enabling cache hits at boundaries
-    inside a physical block. It controls matching granularity only, not how
-    often states are stored.
-
-    This equals to the `hash_block_size` used throughout the KV cache code.
-    """
-    kv_cache_allocator: Literal["uniform_page", "large_page"] = "uniform_page"
-    """KV cache block allocator.
-
-    - "uniform_page": all KV cache groups share one pool of equal-size blocks,
-    so the planner equalizes page sizes across groups.
-    - "large_page": the pool is a set of large pages; each page belongs to one
-    group at a time and holds whole blocks of that group. Groups are formed
-    per KV cache spec and all token-paged groups use one block size."""
     gpu_memory_utilization: float = Field(default=0.92, gt=0, le=1)
     """The fraction of GPU memory to be used for the model executor, which can
     range from 0 to 1. For example, a value of 0.5 would imply 50% GPU memory
@@ -254,9 +234,9 @@ class CacheConfig:
     """Whether the model is attention-free. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
     num_gpu_blocks_override: int | None = None
-    """Number of GPU blocks (large pages under the large_page allocator) to
-    use. This overrides the profiled `num_gpu_blocks` if specified. Does
-    nothing if `None`. Used for testing preemption."""
+    """Number of GPU KV cache large pages to use. This overrides the profiled
+    `num_gpu_blocks` if specified. Does nothing if `None`. Used for testing
+    preemption."""
     sliding_window: int | None = None
     """Sliding window size for the KV cache. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
@@ -315,12 +295,6 @@ class CacheConfig:
       token of each scheduler step and when the token is at position
       i * block_size.
     """
-    enable_mamba_shared_prefix_checkpoint: bool = False
-    """Also register a Mamba "align" checkpoint at the shared-prefix junction --
-    where an EAGLE/MTP sibling was observed to resume -- instead of only at the
-    prompt tail. Off by default; only takes effect with prefix caching enabled,
-    EAGLE on the Mamba group, and a prefix match unit smaller than the Mamba
-    block size."""
     replayssm_buffer_len: int = Field(default=16, gt=0)
     """ReplaySSM logical history length B for Mamba2. Triton uses B physical
     rows and FlashInfer uses B+T, where T is the target verification length.
@@ -337,8 +311,8 @@ class CacheConfig:
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
-    """The number of blocks to allocate for GPU memory
-    (`KVCacheConfig.num_blocks`): large pages under the large_page allocator."""
+    """The number of KV cache large pages to allocate for GPU memory
+    (`KVCacheConfig.num_pages`), not a block or kernel-row count."""
     num_cpu_blocks: int | None = field(default=None, init=False)
     """The number of blocks to allocate for CPU memory."""
 
@@ -354,15 +328,6 @@ class CacheConfig:
     for hybrid models where requests occupy multiple KV cache groups."""
     kv_cache_max_concurrency: float | None = field(default=None, init=False)
     """Per-DP-engine maximum concurrency at max_model_len tokens."""
-    # The two differ when hashes are finer than the scheduler block but partial
-    # hash hits are off (e.g. a sliding-window group cannot look up sub-block
-    # hits), so hits only land on the scheduler block.
-    # TODO(zjy0516): Merge into one value
-    hash_block_size: int | None = field(default=None, init=False)
-    """Tokens per prefix-cache block hash."""
-    cache_hit_alignment_tokens: int | None = field(default=None, init=False)
-    """Token granularity at which prefix-cache hits land: `hash_block_size`
-    with partial hash hits, otherwise the scheduler block size."""
 
     kv_sharing_fast_prefill: bool = False
     """In some KV sharing setups, e.g. YOCO (https://arxiv.org/abs/2405.05254),
@@ -419,8 +384,6 @@ class CacheConfig:
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
-            "prefix_match_unit",
-            "enable_mamba_shared_prefix_checkpoint",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",
@@ -432,8 +395,6 @@ class CacheConfig:
             "effective_attention_block_size",
             "kv_cache_size_tokens",
             "kv_cache_max_concurrency",
-            "hash_block_size",
-            "cache_hit_alignment_tokens",
             # Feature toggles not impacting compiled graph shape
             "kv_sharing_fast_prefill",
             "swa_bounded_replay",
@@ -496,6 +457,20 @@ class CacheConfig:
                 str(cache_dtype),
             )
         return cache_dtype
+
+    def adopt_block_size(self, block_size: int) -> None:
+        """Adopt the planner's global block size B; align-mode Mamba caches
+        checkpoint at B too."""
+        self.block_size = block_size
+        if self.mamba_cache_mode == "align":
+            if self.mamba_block_size not in (None, block_size):
+                logger.info(
+                    "Setting mamba_block_size to the resolved block size %d, "
+                    "discarding %d",
+                    block_size,
+                    self.mamba_block_size,
+                )
+            self.mamba_block_size = block_size
 
     def get_resolved_kv_cache_layout(self) -> KVCacheLayout:
         if self.kv_cache_layout is None:

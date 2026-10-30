@@ -809,14 +809,7 @@ class EngineArgs:
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
-    prefix_match_unit: int | None = get_field(CacheConfig, "prefix_match_unit")
-    kv_cache_allocator: Literal["uniform_page", "large_page"] = (
-        CacheConfig.kv_cache_allocator
-    )
     mamba_cache_mode: MambaCacheMode | None = None
-    enable_mamba_shared_prefix_checkpoint: bool = (
-        CacheConfig.enable_mamba_shared_prefix_checkpoint
-    )
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
     use_replayssm: bool = CacheConfig.use_replayssm
 
@@ -1424,22 +1417,12 @@ class EngineArgs:
             "--mamba-block-size", **cache_kwargs["mamba_block_size"]
         )
         cache_group.add_argument(
-            "--prefix-match-unit", **cache_kwargs["prefix_match_unit"]
-        )
-        cache_group.add_argument(
-            "--kv-cache-allocator", **cache_kwargs["kv_cache_allocator"]
-        )
-        cache_group.add_argument(
             "--mamba-cache-mode",
             **{
                 **cache_kwargs["mamba_cache_mode"],
                 "default": None,
                 "help": _MAMBA_CACHE_MODE_DEPRECATION_MESSAGE,
             },
-        )
-        cache_group.add_argument(
-            "--enable-mamba-shared-prefix-checkpoint",
-            **cache_kwargs["enable_mamba_shared_prefix_checkpoint"],
         )
         cache_group.add_argument(
             "--replayssm-buffer-len", **cache_kwargs["replayssm_buffer_len"]
@@ -2316,11 +2299,6 @@ class EngineArgs:
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
-            prefix_match_unit=self.prefix_match_unit,
-            kv_cache_allocator=self.kv_cache_allocator,
-            enable_mamba_shared_prefix_checkpoint=(
-                self.enable_mamba_shared_prefix_checkpoint
-            ),
             replayssm_buffer_len=self.replayssm_buffer_len,
             use_replayssm=self.use_replayssm,
             kv_offloading_size=self.kv_offloading_size,

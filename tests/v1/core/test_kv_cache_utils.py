@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import copy
 import hashlib
 import importlib
 from collections.abc import Callable
@@ -8,17 +7,15 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
-import vllm.v1.core.kv_cache_planning as kv_cache_planning
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
 import vllm.v1.hisparse.runtime as hisparse_runtime_module
 from tests.v1.core.utils import (
     new_kv_cache_spec,
-    new_mamba_spec,
     new_mla_spec,
-    new_sliding_window_spec,
 )
 from vllm.config import (
     CacheConfig,
@@ -37,9 +34,6 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
-from vllm.v1.core.kv_cache_planning import (
-    get_kv_cache_groups,
-)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
@@ -64,29 +58,24 @@ from vllm.v1.hisparse.layout import (
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    GroupGeometry,
     HiSparseHotSpec,
     HiSparseResidentSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheSpec,
     KVCacheSpecKind,
     KVCacheTensor,
     KVQuantMode,
-    MambaSpec,
     MLAAttentionSpec,
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     SparseCacheRole,
-    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
-    is_full_attention_spec,
-    iter_layer_specs,
     large_page_block_range,
     min_blocks_per_large_page,
 )
-from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
 
@@ -107,7 +96,7 @@ def test_hisparse_steady_state_concurrency_excludes_spilled_resident_pages():
     )
     page_size = attn_spec.page_size_bytes
     kv_cache_config = KVCacheConfig(
-        num_blocks=64,
+        num_pages=64,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(["source"], attn_spec, host_resident=True),
@@ -123,6 +112,7 @@ def test_hisparse_steady_state_concurrency_excludes_spilled_resident_pages():
                 ),
             ),
         ],
+        block_size=block_size,
         hisparse_host_num_blocks=100,
     )
 
@@ -135,7 +125,7 @@ def test_hisparse_steady_state_concurrency_excludes_spilled_resident_pages():
     ) == pytest.approx(64 / 24)
 
 
-@pytest.mark.parametrize("extra_blocks,ok", [(1, False), (2, True)])
+@pytest.mark.parametrize("extra_blocks,ok", [(0, False), (1, True)])
 def test_hisparse_host_pool_must_fit_max_model_len(monkeypatch, extra_blocks, ok):
     """Every page needs a host block, so one max_model_len request must fit."""
     monkeypatch.setattr(
@@ -167,7 +157,7 @@ def test_hisparse_host_pool_must_fit_max_model_len(monkeypatch, extra_blocks, ok
     )
     host_page = specs["model.layers.0.self_attn"].page_size_bytes
     host_budget = (4 + extra_blocks) * host_page
-    groups = get_hisparse_kv_cache_groups(config, specs)
+    groups, _ = get_hisparse_kv_cache_groups(config, specs, block_size=64)
 
     if ok:
         layout = create_hisparse_layout(config, groups, host_budget=host_budget)
@@ -175,53 +165,6 @@ def test_hisparse_host_pool_must_fit_max_model_len(monkeypatch, extra_blocks, ok
     else:
         with pytest.raises(ValueError, match="increase host_pool_gib"):
             create_hisparse_layout(config, groups, host_budget=host_budget)
-
-
-def test_hisparse_derived_specs_do_not_affect_kv_cache_layout(monkeypatch):
-    """Workers report HiSparse's resident/hot caches, which lay out their own raw
-    backing; KV cache layout resolution must skip them."""
-    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
-
-    monkeypatch.setattr(
-        hisparse_runtime_module.current_platform, "is_cuda_alike", lambda: True
-    )
-    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
-    specs: dict[str, KVCacheSpec] = {
-        "model.layers.0.self_attn": MLAAttentionSpec(
-            block_size=64,
-            num_kv_heads=1,
-            head_size=576,
-            dtype=torch.bfloat16,
-            is_index_group_leader=True,
-        ),
-        "model.layers.0.self_attn.indexer": MLAAttentionSpec(
-            block_size=64,
-            num_kv_heads=1,
-            head_size=128,
-            dtype=torch.bfloat16,
-            cache_role=SparseCacheRole.INDEXER,
-        ),
-    }
-    config = VllmConfig(model_config=ModelConfig(max_model_len=1024))
-    config.attention_config.hisparse_config = HiSparseConfig()
-    config.model_config.hf_config.index_topk = 128
-    reported = specs | {
-        name: group.kv_cache_spec
-        for group in get_hisparse_kv_cache_groups(config, specs) or []
-        if isinstance(group.kv_cache_spec, (HiSparseResidentSpec, HiSparseHotSpec))
-        for name in group.layer_names
-    }
-    assert len(reported) > len(specs)
-
-    layouts = []
-    for worker_specs in (specs, reported):
-        config.cache_config.kv_cache_layout = None
-        layouts.append(
-            resolve_kv_cache_layout(
-                config, [["BLHNC", "LBNHC"]], list(worker_specs.values())
-            )
-        )
-    assert layouts[0] == layouts[1]
 
 
 def test_hisparse_rejects_deepseek_v4():
@@ -241,7 +184,7 @@ def test_hisparse_rejects_deepseek_v4():
     )
 
     with pytest.raises(ValueError, match="does not support DeepSeek V4"):
-        get_hisparse_kv_cache_groups(config, full_specs)
+        get_hisparse_kv_cache_groups(config, full_specs, block_size=256)
 
 
 @pytest.fixture(autouse=True)
@@ -298,17 +241,17 @@ def test_effective_attention_block_size_matches_events(dcp):
     from vllm.v1.engine.core import EngineCore
 
     config = KVCacheConfig(
-        num_blocks=32,
+        num_pages=32,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(["attention"], new_kv_cache_spec()),
         ],
+        block_size=16 * dcp,
     )
     manager = KVCacheManager(
         generate_scheduler_kv_cache_config([config]),
         max_model_len=256,
         scheduler_block_size=16 * dcp,
-        hash_block_size=16 * dcp,
         dcp_world_size=dcp,
         enable_kv_cache_events=True,
     )
@@ -338,9 +281,10 @@ def test_kv_cache_config_selects_only_transferable_groups():
         KVCacheGroupSpec(["layer.2"], new_kv_cache_spec()),
     ]
     config = KVCacheConfig(
-        num_blocks=1,
+        num_pages=1,
         kv_cache_tensors=[],
         kv_cache_groups=groups,
+        block_size=16,
     )
 
     assert config.transfer_group_ids == (0, 2)
@@ -371,9 +315,10 @@ def test_kv_cache_config_selects_prefix_cacheable_groups():
         ["disabled"], new_kv_cache_spec(), enable_kv_transfer=False
     )
     config = KVCacheConfig(
-        num_blocks=1,
+        num_pages=1,
         kv_cache_tensors=[],
         kv_cache_groups=[full_group, qsa_group, disabled_group],
+        block_size=16,
     )
     assert config.transfer_group_ids == (0, 1)
     assert config.select_transfer_block_ids(([1], [2], [3])) == ([1], [2])
@@ -1199,93 +1144,6 @@ def test_metrics_empty_stats():
     assert metrics.hit_rate == 0.75
 
 
-@pytest.mark.parametrize("sliding_window", [None, 256])
-@pytest.mark.parametrize("disable_hybrid", [False, True])
-@pytest.mark.parametrize("pcp_size", [1, 4])
-def test_dcp_target_allocates_replicated_draft_independently(
-    monkeypatch, sliding_window, disable_hybrid, pcp_size
-):
-    """A draft must retain all positions even when the target shards them."""
-    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
-
-    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
-    config = VllmConfig(model_config=ModelConfig(max_model_len=1024))
-    config.parallel_config.decode_context_parallel_size = 4
-    config.parallel_config.prefill_context_parallel_size = pcp_size
-    config.scheduler_config.disable_hybrid_kv_cache_manager = disable_hybrid
-    config.cache_config.block_size = 16
-    config.cache_config.kv_cache_layout = None
-    draft_args = dict(
-        block_size=16,
-        num_kv_heads=8,
-        head_size=64,
-        dtype=torch.bfloat16,
-        dcp_sharded=False,
-    )
-    draft = (
-        FullAttentionSpec(**draft_args)
-        if sliding_window is None
-        else SlidingWindowSpec(**draft_args, sliding_window=sliding_window)
-    )
-    specs = {"target": new_mla_spec(), "draft": draft}
-    layout = resolve_kv_cache_layout(config, [["LBHNC", "BLHNC"]], specs.values())
-    assert layout == KVCacheLayout.BLHNC
-    groups = get_kv_cache_groups(config, specs)
-    assert [group.layer_names for group in groups] == [["target"], ["draft"]]
-    widths = [g.kv_cache_spec.max_num_blocks_per_req(config, 1024) for g in groups]
-    assert widths == [16, 64]
-
-    cache_config = kv_cache_planning.get_kv_cache_config_from_groups(
-        config, groups, available_memory=16 * 1024 * 1024
-    )
-    scheduler_config = generate_scheduler_kv_cache_config([cache_config])
-    assert get_max_concurrency_for_kv_cache_config(config, cache_config) > 0
-    assert get_max_concurrency_for_kv_cache_config(config, cache_config) == (
-        get_max_concurrency_for_kv_cache_config(config, scheduler_config)
-    )
-    manager = KVCacheManager(
-        scheduler_config,
-        max_model_len=1024,
-        hash_block_size=16,
-        scheduler_block_size=64,
-        dcp_world_size=4,
-        pcp_world_size=pcp_size,
-        enable_caching=True,
-    )
-    assert manager.coordinator.group_block_sizes == (64, 16)
-    request = make_request("replicated-draft", [1] * 65, block_size=16, hash_fn=sha256)
-    blocks = manager.allocate_slots(request, 65)
-    assert blocks is not None
-    assert [len(group) for group in blocks.blocks] == [2, 5]
-    manager.cache_blocks(request, 64)
-    cached_request = make_request(
-        "cached-draft", [1] * 65, block_size=16, hash_fn=sha256
-    )
-    cached_blocks, num_cached, _ = manager.get_computed_blocks(cached_request)
-    assert num_cached == 64
-    assert [len(group) for group in cached_blocks.blocks] == [1, 4]
-
-
-def test_dcp_replicated_kpool_tail_keeps_block_interior_layout(monkeypatch):
-    """A replicated kpool tail ring is per-request state, not a draft group."""
-    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
-
-    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
-    config = VllmConfig(model_config=ModelConfig(max_model_len=1024))
-    config.parallel_config.decode_context_parallel_size = 4
-    config.cache_config.kv_cache_layout = None
-    tail = CircularBufferSpec(
-        block_size=4,
-        num_kv_heads=2,
-        head_size=128,
-        head_size_v=0,
-        dtype=torch.bfloat16,
-        dcp_sharded=False,
-    )
-    layout = resolve_kv_cache_layout(config, [["LBHNC"]], [new_mla_spec(), tail])
-    assert layout == KVCacheLayout.LBHNC
-
-
 @pytest.mark.parametrize("use_mla", [False, True])
 def test_full_attention_merge_preserves_replicated_cache_geometry(use_mla):
     config = VllmConfig(model_config=ModelConfig(max_model_len=1024))
@@ -1296,8 +1154,7 @@ def test_full_attention_merge_preserves_replicated_cache_geometry(use_mla):
         dcp_sharded=False,
     )
     merged = type(draft).merge([draft, draft])
-    wrapped = UniformTypeKVCacheSpecs.from_specs({"draft": merged})
-    assert wrapped is not None and not wrapped.dcp_sharded
+    assert not merged.dcp_sharded
     assert merged.max_num_blocks_per_req(config, 1024) == 64
     assert merged.max_memory_usage_bytes(config) == 64 * draft.page_size_bytes
     assert kv_cache_utils.resolve_dcp_kv_block_size(merged, 4) == 16
@@ -1319,34 +1176,6 @@ def test_draft_layer_tag_is_not_part_of_the_cache_format(target):
     draft = replace(target, is_draft=True)
     assert draft == target and hash(draft) == hash(target)
     assert type(target).merge([target, draft]) == target
-
-
-@pytest.mark.parametrize(
-    "layer_type,dcp_size,expected_width",
-    [
-        ("mla", 1, 64),
-        ("mla", 2, 32),
-        # Mamba state is replicated, not DCP-sharded, and its width is the
-        # resident state block count rather than cdiv(max_len, block_size).
-        ("mamba", 2, 3),
-    ],
-)
-def test_uniform_type_spec_block_table_width_matches_layer_spec(
-    layer_type, dcp_size, expected_width
-):
-    # The runner sizes the block table from the group spec while the metadata
-    # builders are constructed from the per-layer spec, so the aggregate must
-    # report the same width as the layers it wraps.
-    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=1024))
-    vllm_config.parallel_config.decode_context_parallel_size = dcp_size
-    layer_spec = new_mla_spec() if layer_type == "mla" else new_mamba_spec()
-    uniform_spec = UniformTypeKVCacheSpecs(
-        block_size=layer_spec.block_size,
-        kv_cache_specs={"layer1": layer_spec, "layer2": layer_spec},
-    )
-
-    assert layer_spec.max_num_blocks_per_req(vllm_config, 1024) == expected_width
-    assert uniform_spec.max_num_blocks_per_req(vllm_config, 1024) == expected_width
 
 
 def test_merge_kv_cache_spec():
@@ -1454,11 +1283,12 @@ def test_get_max_concurrency_for_kv_cache_config():
     )
 
     kv_cache_config_full_attention = KVCacheConfig(
-        num_blocks=int(1024 * 1.5),
+        num_pages=int(1024 * 1.5),
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec([f"layer_{i}" for i in range(32)], full_attention_spec),
         ],
+        block_size=16,
     )
     max_concurrency_full_attention = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config_full_attention
@@ -1466,11 +1296,12 @@ def test_get_max_concurrency_for_kv_cache_config():
     assert max_concurrency_full_attention == 1.5
 
     kv_cache_config_sliding_window = KVCacheConfig(
-        num_blocks=129 * 3,
+        num_pages=129 * 3,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec([f"layer_{i}" for i in range(32)], sliding_window_spec),
         ],
+        block_size=16,
     )
     max_concurrency_sliding_window = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config_sliding_window
@@ -1478,7 +1309,7 @@ def test_get_max_concurrency_for_kv_cache_config():
     assert max_concurrency_sliding_window == 3
 
     kv_cache_config_hybrid_model = KVCacheConfig(
-        num_blocks=(1024 + 129) * 3,
+        num_pages=(1024 + 129) * 3,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec([f"layer_{i}" for i in range(32)], full_attention_spec),
@@ -1486,6 +1317,7 @@ def test_get_max_concurrency_for_kv_cache_config():
                 [f"layer_{i}" for i in range(32, 64)], sliding_window_spec
             ),
         ],
+        block_size=16,
     )
     max_concurrency_hybrid_model = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config_hybrid_model
@@ -1502,12 +1334,13 @@ def test_get_max_concurrency_for_kv_cache_config():
     # same as the equal-hybrid case above, regardless of the second group
     # holding only 2 layers.
     kv_cache_config_unequal_groups = KVCacheConfig(
-        num_blocks=1153 * 3,
+        num_pages=1153 * 3,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec([f"layer_{i}" for i in range(32)], full_attention_spec),
             KVCacheGroupSpec(["layer_32", "layer_33"], sliding_window_spec),
         ],
+        block_size=16,
     )
     assert (
         get_max_concurrency_for_kv_cache_config(
@@ -1516,50 +1349,50 @@ def test_get_max_concurrency_for_kv_cache_config():
         == 3
     )
 
-    # UniformTypeKVCacheSpecs group (worker config shape): the aggregated
-    # spec's memory/page ratio equals a single layer's page count, so the
-    # group needs 1024 blocks and the request 1153 in total. The previous
-    # formula normalized both groups' memory by the first group's page size,
-    # reporting 3459/1057 = 3.27 here instead of 3 — and a different value
-    # again for the scheduler-config shape below.
-    uniform_full_spec = UniformTypeKVCacheSpecs(
-        block_size=full_attention_spec.block_size,
-        kv_cache_specs={f"layer_{i}": full_attention_spec for i in range(4)},
+
+def test_get_max_concurrency_scales_with_blocks_per_page():
+    """A page holds ``blocks_per_page`` blocks of a group, so packing
+    divides the group's per-request page cost by that factor."""
+    model_config = ModelConfig(
+        "Qwen/Qwen1.5-7B",
+        runner="generate",
+        dtype="float16",
+        max_model_len=16384,
     )
-    kv_cache_config_uniform_group = KVCacheConfig(
-        num_blocks=1153 * 3,
+    vllm_config = VllmConfig(model_config=model_config)
+    full_attention_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=32,
+        head_size=128,
+        dtype=torch.float16,
+    )
+    layers = [f"layer_{i}" for i in range(32)]
+
+    unpacked = KVCacheConfig(
+        num_pages=1536,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(layers, full_attention_spec)],
+        block_size=16,
+    )
+    assert get_max_concurrency_for_kv_cache_config(vllm_config, unpacked) == 1.5
+
+    packed = KVCacheConfig(
+        num_pages=1536,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec([f"layer_{i}" for i in range(4)], uniform_full_spec),
-            KVCacheGroupSpec(["layer_4", "layer_5"], sliding_window_spec),
+            KVCacheGroupSpec(layers, full_attention_spec, blocks_per_page=4)
         ],
+        block_size=16,
     )
-    assert (
-        get_max_concurrency_for_kv_cache_config(
-            vllm_config, kv_cache_config_uniform_group
-        )
-        == 3
-    )
-
-    # Scheduler-config shape: generate_scheduler_kv_cache_config replaces the
-    # uniform-type group's spec with a representative per-layer spec.
-    # Capacity must not change between the two shapes (the engine computes
-    # on the scheduler config, the worker loop on the worker config).
-    kv_cache_config_scheduler_shape = generate_scheduler_kv_cache_config(
-        [copy.deepcopy(kv_cache_config_uniform_group)]
-    )
-    assert get_max_concurrency_for_kv_cache_config(
-        vllm_config, kv_cache_config_scheduler_shape
-    ) == get_max_concurrency_for_kv_cache_config(
-        vllm_config, kv_cache_config_uniform_group
-    )
+    # 1024 blocks a request, 4 blocks a page: 256 pages, 6x the pool.
+    assert get_max_concurrency_for_kv_cache_config(vllm_config, packed) == 6.0
 
 
 def test_allocate_with_lookahead():
     """Verify that lookahead tokens correctly affect block allocation."""
     block_size = 4
     config = KVCacheConfig(
-        num_blocks=10,
+        num_pages=10,
         kv_cache_tensors=[
             KVCacheTensor(
                 size=100,
@@ -1571,6 +1404,7 @@ def test_allocate_with_lookahead():
         kv_cache_groups=[
             KVCacheGroupSpec(["layer1"], new_kv_cache_spec(block_size=block_size)),
         ],
+        block_size=block_size,
     )
 
     request = make_request(
@@ -1586,7 +1420,6 @@ def test_allocate_with_lookahead():
         kv_cache_config=config,
         max_model_len=100,
         scheduler_block_size=block_size,
-        hash_block_size=block_size,
     )
     blocks = kv_cache_manager.allocate_slots(
         request,
@@ -1600,7 +1433,6 @@ def test_allocate_with_lookahead():
         kv_cache_config=config,
         max_model_len=100,
         scheduler_block_size=block_size,
-        hash_block_size=block_size,
     )
     # required_blocks = ceil((3 + 2) /4) = 2
     blocks = kv_cache_manager.allocate_slots(
@@ -1616,7 +1448,6 @@ def test_allocate_with_lookahead():
         kv_cache_config=config,
         max_model_len=100,
         scheduler_block_size=block_size,
-        hash_block_size=block_size,
     )
     blocks = kv_cache_manager.allocate_slots(
         request,
@@ -1624,114 +1455,6 @@ def test_allocate_with_lookahead():
         num_lookahead_tokens=4,
     )
     assert len(blocks.get_block_ids()[0]) == 2
-
-
-def test_generate_uniform_type_kv_cache_specs():
-    # All layers are full attention, can be merged
-    kv_cache_specs = {
-        "layer_1": new_kv_cache_spec(),
-        "layer_2": new_kv_cache_spec(head_size=128),
-    }
-    uniform_spec = UniformTypeKVCacheSpecs.from_specs(kv_cache_specs)
-    assert uniform_spec == UniformTypeKVCacheSpecs(
-        block_size=16, kv_cache_specs=kv_cache_specs
-    )
-
-    # Full attention + sliding window, cannot be merged
-    kv_cache_specs = {
-        "layer_1": new_kv_cache_spec(),
-        "layer_2": new_sliding_window_spec(sliding_window=1),
-    }
-    uniform_spec = UniformTypeKVCacheSpecs.from_specs(kv_cache_specs)
-    assert uniform_spec is None
-
-    # different order of full attention + sliding window, cannot be merged
-    kv_cache_specs = {
-        "layer_1": new_sliding_window_spec(sliding_window=1),
-        "layer_2": new_kv_cache_spec(),
-    }
-    uniform_spec = UniformTypeKVCacheSpecs.from_specs(kv_cache_specs)
-    assert uniform_spec is None
-
-    # Same-size sliding window, can be merged
-    kv_cache_specs = {
-        "layer_1": new_sliding_window_spec(sliding_window=1),
-        "layer_2": new_sliding_window_spec(sliding_window=1, head_size=128),
-    }
-    uniform_spec = UniformTypeKVCacheSpecs.from_specs(kv_cache_specs)
-    assert uniform_spec == UniformTypeKVCacheSpecs(
-        block_size=16, kv_cache_specs=kv_cache_specs
-    )
-
-    # different block sizes, cannot be merged
-    kv_cache_specs = {
-        "layer_1": new_kv_cache_spec(block_size=16),
-        "layer_2": new_kv_cache_spec(block_size=32),
-    }
-    uniform_spec = UniformTypeKVCacheSpecs.from_specs(kv_cache_specs)
-    assert uniform_spec is None
-
-
-def test_generate_scheduler_kv_cache_config():
-    kv_cache_specs = {
-        "layer_1": new_kv_cache_spec(),
-        "layer_2": new_kv_cache_spec(head_size=128),
-    }
-    kv_cache_configs = [
-        KVCacheConfig(
-            num_blocks=10,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["layer_1", "layer_2"],
-                    UniformTypeKVCacheSpecs(
-                        block_size=16, kv_cache_specs=kv_cache_specs
-                    ),
-                ),
-            ],
-        )
-    ]
-    scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
-    assert scheduler_kv_cache_config == KVCacheConfig(
-        num_blocks=10,
-        kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["layer_1", "layer_2"], new_kv_cache_spec())],
-    )
-
-
-def test_resolve_dcp_kv_block_size_unwraps_uniform_type_specs():
-    attention = FullAttentionSpec(
-        block_size=16,
-        num_kv_heads=1,
-        head_size=64,
-        dtype=torch.float16,
-    )
-    mamba = MambaSpec(
-        block_size=16,
-        shapes=((1, 1),),
-        dtypes=(torch.float16,),
-    )
-    wrapped_attention = UniformTypeKVCacheSpecs(
-        block_size=16,
-        kv_cache_specs={"attention.0": attention, "attention.1": attention},
-    )
-    wrapped_mamba = UniformTypeKVCacheSpecs(
-        block_size=16,
-        kv_cache_specs={"mamba.0": mamba, "mamba.1": mamba},
-    )
-
-    assert kv_cache_utils.resolve_dcp_kv_block_size(attention, 4) == 64
-    assert kv_cache_utils.resolve_dcp_kv_block_size(wrapped_attention, 4) == 64
-    assert kv_cache_utils.resolve_dcp_kv_block_size(mamba, 4) == 16
-    assert kv_cache_utils.resolve_dcp_kv_block_size(wrapped_mamba, 4) == 16
-
-    scaled_attention = kv_cache_utils.resolve_dcp_kv_cache_spec(wrapped_attention, 4)
-    assert scaled_attention.block_size == 64
-    assert isinstance(scaled_attention, UniformTypeKVCacheSpecs)
-    assert all(
-        spec.block_size == 64 for spec in scaled_attention.kv_cache_specs.values()
-    )
-    assert kv_cache_utils.resolve_dcp_kv_cache_spec(wrapped_mamba, 4) is wrapped_mamba
 
 
 def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
@@ -1762,58 +1485,6 @@ def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
     )
 
 
-def test_get_kv_cache_spec_kind_unwraps_uniform_type_specs():
-    uniform_mla_spec = UniformTypeKVCacheSpecs(
-        block_size=16,
-        kv_cache_specs={
-            "layer_1": new_mla_spec(),
-            "layer_2": new_mla_spec(cache_dtype_str="fp8"),
-        },
-    )
-    assert get_kv_cache_spec_kind(uniform_mla_spec) == KVCacheSpecKind.MLA_ATTENTION
-
-    uniform_swa_mla_spec = UniformTypeKVCacheSpecs(
-        block_size=16,
-        kv_cache_specs={
-            "layer_1": SlidingWindowMLASpec(
-                block_size=16,
-                num_kv_heads=1,
-                head_size=576,
-                dtype=torch.float32,
-                sliding_window=128,
-            ),
-            "layer_2": SlidingWindowMLASpec(
-                block_size=16,
-                num_kv_heads=1,
-                head_size=1024,
-                dtype=torch.float32,
-                sliding_window=128,
-            ),
-        },
-    )
-    assert (
-        get_kv_cache_spec_kind(uniform_swa_mla_spec)
-        == KVCacheSpecKind.SLIDING_WINDOW_MLA
-    )
-
-
-def test_get_kv_cache_spec_kind_unknown_for_mixed_uniform_type_specs():
-    uniform_mixed_spec = UniformTypeKVCacheSpecs(
-        block_size=16,
-        kv_cache_specs={
-            "layer_1": new_mla_spec(),
-            "layer_2": SlidingWindowMLASpec(
-                block_size=16,
-                num_kv_heads=1,
-                head_size=576,
-                dtype=torch.float32,
-                sliding_window=128,
-            ),
-        },
-    )
-    assert get_kv_cache_spec_kind(uniform_mixed_spec) == KVCacheSpecKind.UNKNOWN
-
-
 def test_get_kv_cache_spec_sliding_window_reads_windowed_specs():
     full_attention_spec = FullAttentionSpec(
         block_size=16,
@@ -1831,50 +1502,6 @@ def test_get_kv_cache_spec_sliding_window_reads_windowed_specs():
 
     assert get_kv_cache_spec_sliding_window(full_attention_spec) is None
     assert get_kv_cache_spec_sliding_window(sliding_window_spec) == 128
-
-
-def test_get_kv_cache_spec_sliding_window_unwraps_uniform_type_specs():
-    uniform_window_spec = UniformTypeKVCacheSpecs(
-        block_size=16,
-        kv_cache_specs={
-            "layer_1": SlidingWindowSpec(
-                block_size=16,
-                num_kv_heads=1,
-                head_size=64,
-                dtype=torch.float32,
-                sliding_window=128,
-            ),
-            "layer_2": SlidingWindowSpec(
-                block_size=16,
-                num_kv_heads=2,
-                head_size=64,
-                dtype=torch.float32,
-                sliding_window=128,
-            ),
-        },
-    )
-    mixed_window_spec = UniformTypeKVCacheSpecs(
-        block_size=16,
-        kv_cache_specs={
-            "layer_1": SlidingWindowSpec(
-                block_size=16,
-                num_kv_heads=1,
-                head_size=64,
-                dtype=torch.float32,
-                sliding_window=128,
-            ),
-            "layer_2": SlidingWindowSpec(
-                block_size=16,
-                num_kv_heads=1,
-                head_size=64,
-                dtype=torch.float32,
-                sliding_window=256,
-            ),
-        },
-    )
-
-    assert get_kv_cache_spec_sliding_window(uniform_window_spec) == 128
-    assert get_kv_cache_spec_sliding_window(mixed_window_spec) is None
 
 
 def test_merge_mla_spec():
@@ -2064,119 +1691,6 @@ def test_hma_not_disabled_when_kv_events_enabled():
     )
 
 
-def test_resolve_block_hashes_gate():
-    # Resolve symbols through the module so they stay consistent with each other
-    # even after other tests reload ``kv_cache_utils``.
-    resolve_block_hashes = kv_cache_utils.resolve_block_hashes
-    BlockHashListWithBlockSize = kv_cache_utils.BlockHashListWithBlockSize
-    # Raw, hash_block_size-granularity hashes (contents are opaque here).
-    raw = [BlockHash(bytes([i])) for i in range(8)]
-
-    # block_size == hash_block_size: always reuse the raw hashes.
-    assert resolve_block_hashes(raw, 2, 2, alignment_tokens=2) is raw
-    assert (
-        resolve_block_hashes(
-            raw, 2, 2, supports_fine_grained_hash_lookup=True, alignment_tokens=2
-        )
-        is raw
-    )
-
-    # Fine-grained manager, partial hits ON (alignment_tokens == hash_block_size
-    # < block_size): keep raw hashes so the manager can scan at hash granularity.
-    assert (
-        resolve_block_hashes(
-            raw, 2, 4, supports_fine_grained_hash_lookup=True, alignment_tokens=2
-        )
-        is raw
-    )
-
-    # Fine-grained manager, partial hits OFF (alignment_tokens ==
-    # scheduler_block_size >= block_size): must fall back to a block-size view,
-    # exactly like the pre-refactor coordinator did.
-    off = resolve_block_hashes(
-        raw, 2, 4, supports_fine_grained_hash_lookup=True, alignment_tokens=4
-    )
-    assert isinstance(off, BlockHashListWithBlockSize)
-    assert off.scale_factor == 2
-
-    # Non-fine-grained manager (e.g. sliding window): always a block-size view
-    # when block_size != hash_block_size, regardless of alignment_tokens.
-    swa = resolve_block_hashes(
-        raw, 2, 4, supports_fine_grained_hash_lookup=False, alignment_tokens=2
-    )
-    assert isinstance(swa, BlockHashListWithBlockSize)
-    assert swa.scale_factor == 2
-
-
-def test_resolve_block_hashes_rejects_mismatched_view():
-    resolve_block_hashes = kv_cache_utils.resolve_block_hashes
-    BlockHashListWithBlockSize = kv_cache_utils.BlockHashListWithBlockSize
-    raw = [BlockHash(bytes([i])) for i in range(8)]
-
-    # A view built at this block_size is returned as-is (idempotent).
-    view = BlockHashListWithBlockSize(raw, 2, 4)
-    assert resolve_block_hashes(view, 2, 4) is view
-
-    # A view built at a different block_size must fail loudly rather than be
-    # silently reinterpreted at the wrong granularity.
-    mismatched = BlockHashListWithBlockSize(raw, 2, 8)
-    with pytest.raises(AssertionError):
-        resolve_block_hashes(mismatched, 2, 4)
-
-
-def test_is_full_attention_spec_unwraps_uniform_type_specs():
-    """``UniformTypeKVCacheSpecs`` is not a ``FullAttentionSpec``, so callers
-    scanning groups with a bare isinstance miss DeepSeek-V4-shaped configs."""
-    common = dict(num_kv_heads=1, head_size=1, dtype=torch.float32)
-    full = FullAttentionSpec(block_size=4, **common)
-    mla = MLAAttentionSpec(block_size=4, **common)
-    swa = SlidingWindowMLASpec(block_size=4, sliding_window=8, **common)
-
-    def wrap(**specs):
-        return UniformTypeKVCacheSpecs(block_size=4, kv_cache_specs=specs)
-
-    assert is_full_attention_spec(full)
-    assert is_full_attention_spec(mla)
-    assert not is_full_attention_spec(swa)
-
-    assert is_full_attention_spec(wrap(a=mla, b=mla))
-    assert not is_full_attention_spec(wrap(a=swa, b=swa))
-
-    # Every layer must qualify: a group holding a recycling sliding-window layer
-    # has no stable slot layout. Grouping forbids mixing today, but the wrapper
-    # is also built directly (e.g. projecting groups onto a PP worker).
-    assert not is_full_attention_spec(wrap(a=mla, b=swa))
-    assert not is_full_attention_spec(wrap())
-
-
-def test_iter_layer_specs_returns_group_members():
-    common = dict(num_kv_heads=1, head_size=1, dtype=torch.float32)
-    full = FullAttentionSpec(block_size=4, **common)
-    mla = MLAAttentionSpec(block_size=4, **common)
-
-    assert list(iter_layer_specs(full)) == [full]
-    wrapped = UniformTypeKVCacheSpecs(
-        block_size=4, kv_cache_specs={"a": full, "b": mla}
-    )
-    assert list(iter_layer_specs(wrapped)) == [full, mla]
-
-
-def test_wrapped_mamba_group_requires_block_zeroing():
-    mamba = MambaSpec(
-        block_size=4,
-        shapes=((4, 1),),
-        dtypes=(torch.float32,),
-    )
-    wrapped = UniformTypeKVCacheSpecs(block_size=4, kv_cache_specs={"mamba": mamba})
-    config = KVCacheConfig(
-        num_blocks=4,
-        kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["mamba"], wrapped)],
-    )
-
-    assert config.needs_kv_cache_zeroing
-
-
 def test_null_head_len():
     null = KVCacheBlock(0, is_null=True)
     real = [KVCacheBlock(i) for i in range(1, 4)]
@@ -2216,3 +1730,10 @@ def test_large_page_holds_the_blocks_that_lie_wholly_in_it(
     assert min_blocks_per_large_page(page_bytes, block_bytes) == min(
         len(page) for page in expected
     )
+
+
+def test_group_geometry_rows_are_affine_in_the_block_id():
+    geometry = GroupGeometry(kernel_rows_per_block=2, row_bytes=150)
+
+    assert geometry.block_bytes == 300
+    assert geometry.rows(np.array([0, 4])).tolist() == [0, 1, 8, 9]

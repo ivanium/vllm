@@ -35,18 +35,18 @@ def _make_engine_core_with_dcp_manager() -> EngineCore:
         mamba_cache_mode="align",
     )
     config = KVCacheConfig(
-        num_blocks=32,
+        num_pages=32,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(["mla"], mla_spec),
             KVCacheGroupSpec(["mamba"], mamba_spec),
         ],
+        block_size=BASE_BLOCK_SIZE,
     )
     manager = KVCacheManager(
         config,
         max_model_len=BASE_BLOCK_SIZE * DCP_WORLD_SIZE * 2,
         scheduler_block_size=BASE_BLOCK_SIZE * DCP_WORLD_SIZE,
-        hash_block_size=BASE_BLOCK_SIZE,
         dcp_world_size=DCP_WORLD_SIZE,
     )
     scheduler = SimpleNamespace(kv_cache_config=config, kv_cache_manager=manager)

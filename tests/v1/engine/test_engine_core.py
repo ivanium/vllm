@@ -585,13 +585,12 @@ def test_encoder_instance_zero_kv_cache(
     )
 
     if ec_role == "ec_producer":
-        # Check 1: num_blocks should be 0
-        # NOTE: num_blocks=1 as BlockPool always needs a null_block.
+        # Check 1: num_pages should be 0
+        # NOTE: num_pages=1 as BlockPool always needs a null_block.
         kv_cache_config = engine_core.scheduler.kv_cache_manager.kv_cache_config
         print(f"kv_cache_config: {kv_cache_config}")
-        assert kv_cache_config.num_blocks == 1, (
-            f"ec_producer should only have 1 KV blocks, "
-            f"got {kv_cache_config.num_blocks}"
+        assert kv_cache_config.num_pages == 1, (
+            f"ec_producer should only have 1 KV blocks, got {kv_cache_config.num_pages}"
         )
 
         # Check 2: kv_cache_groups should be empty
@@ -620,11 +619,11 @@ def test_encoder_instance_zero_kv_cache(
         )
 
     elif ec_role == "ec_consumer":
-        # Check 1: num_blocks should be > 1
+        # Check 1: num_pages should be > 1
         kv_cache_config = engine_core.scheduler.kv_cache_manager.kv_cache_config
         print(f"kv_cache_config: {kv_cache_config}")
-        assert kv_cache_config.num_blocks > 1, (
-            f"ec_consumer should have >1 KV blocks, got {kv_cache_config.num_blocks}"
+        assert kv_cache_config.num_pages > 1, (
+            f"ec_consumer should have >1 KV blocks, got {kv_cache_config.num_pages}"
         )
 
         # Check 2: kv_cache_groups should NOT be empty
