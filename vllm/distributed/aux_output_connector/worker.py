@@ -121,7 +121,14 @@ class AuxOutputWorkerConnector:
         block_nbytes = hash_block_size * int(np.prod(shape_per_token)) * dtype.itemsize
         max_bytes = vllm_config.aux_output_config.max_bytes
         if max_bytes is None:
-            max_bytes = kv_cache_config.num_blocks * hashes_per_kv_block * block_nbytes
+            # A large page holds several blocks of its group, so the KV cache
+            # holds up to the largest group's block count.
+            num_kv_blocks = (
+                max(group.num_blocks for group in kv_cache_config.kv_cache_groups)
+                if kv_cache_config.allocator == "large_page"
+                else kv_cache_config.num_blocks
+            )
+            max_bytes = num_kv_blocks * hashes_per_kv_block * block_nbytes
         self._store = BackgroundBlockObjectStore(
             BlockObjectStore(max_bytes=max_bytes, object_nbytes=block_nbytes),
             max_pending_batches=2 * vllm_config.scheduler_config.max_num_seqs,

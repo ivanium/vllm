@@ -3,6 +3,7 @@
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
+from itertools import count
 from typing import Any
 
 import numpy as np
@@ -21,9 +22,11 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     CrossAttentionSpec,
+    KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
+    large_page_block_range,
 )
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -84,6 +87,49 @@ def _warmup_block_counter(
     return block_count
 
 
+def _block_id_allocator(
+    kv_cache_config: KVCacheConfig,
+) -> Callable[[int, int], list[int]]:
+    """Sequential block-id hand-out for warmup `SchedulerOutput`s.
+
+    Under large_page each group takes whole pages from one page counter that
+    skips page 0 (every group's null block), so dummy blocks of different
+    groups never share bytes; otherwise one counter spans all groups.
+    """
+    if kv_cache_config.allocator != "large_page":
+        counter = count(1)
+        return lambda num_blocks, group_id: [next(counter) for _ in range(num_blocks)]
+
+    groups = kv_cache_config.kv_cache_groups
+    next_page = count(1)
+    free_ids: list[list[int]] = [[] for _ in groups]
+    page_bytes = kv_cache_config.large_page_bytes
+
+    def alloc(num_blocks: int, group_id: int) -> list[int]:
+        group = groups[group_id]
+        block_bytes = group.block_bytes or page_bytes
+        free = free_ids[group_id]
+        while len(free) < num_blocks:
+            page = next(next_page)
+            free.extend(large_page_block_range(page, page_bytes, block_bytes))
+        block_ids = free[:num_blocks]
+        del free[:num_blocks]
+        return block_ids
+
+    return alloc
+
+
+def _large_page_pages_needed(
+    kv_cache_config: KVCacheConfig, block_counts: list[int]
+) -> int:
+    """Upper bound on the large pages `_block_id_allocator` takes for these
+    per-group counts."""
+    return sum(
+        cdiv(n, group.slots_per_large_page)
+        for group, n in zip(kv_cache_config.kv_cache_groups, block_counts)
+    )
+
+
 def run_mixed_prefill_decode_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -121,22 +167,29 @@ def run_mixed_prefill_decode_warmup(
     ]
     prefill_block_counts = [block_count(prefill_len, s) for s in kv_cache_specs]
     required_blocks = sum(decode_block_counts) + sum(prefill_block_counts)
-    if model_runner.kv_cache_config.num_blocks <= required_blocks:
+    kv_cache_config = model_runner.kv_cache_config
+    if kv_cache_config.allocator == "large_page":
+        # Page 0 is reserved; each group takes whole pages.
+        required = _large_page_pages_needed(
+            kv_cache_config,
+            [d + p for d, p in zip(decode_block_counts, prefill_block_counts)],
+        )
+        available = kv_cache_config.num_blocks - 1
+        fits = required <= available
+    else:
+        fits = model_runner.kv_cache_config.num_blocks > required_blocks
+        available = model_runner.kv_cache_config.num_blocks
+        required = required_blocks
+    if not fits:
         logger.warning(
-            "Skipping V2 mixed prefill+decode warmup because only %d KV blocks "
-            "are available for %d required warmup blocks.",
-            model_runner.kv_cache_config.num_blocks,
-            required_blocks,
+            "Skipping V2 mixed prefill+decode warmup because only %s KV blocks "
+            "are available for %s required warmup blocks.",
+            available,
+            required,
         )
         return False
 
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        block_ids = list(range(next_block_id, next_block_id + num_blocks))
-        next_block_id += num_blocks
-        return block_ids
+    _alloc_blocks = _block_id_allocator(model_runner.kv_cache_config)
 
     sampling_params = SamplingParams(
         max_tokens=2,
@@ -155,7 +208,9 @@ def run_mixed_prefill_decode_warmup(
             mm_features=[],
             sampling_params=sampling_params,
             pooling_params=None,
-            block_ids=tuple(_alloc_blocks(n) for n in decode_prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(n, g) for g, n in enumerate(decode_prefill_block_counts)
+            ),
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=decode_token_ids,
@@ -166,7 +221,9 @@ def run_mixed_prefill_decode_warmup(
     }
     decode_prefill_output.total_num_scheduled_tokens = decode_prompt_len
 
-    decode_new_blocks = tuple(_alloc_blocks(n) for n in decode_block_deltas)
+    decode_new_blocks = tuple(
+        _alloc_blocks(n, g) for g, n in enumerate(decode_block_deltas)
+    )
     cached_decode_req = CachedRequestData.make_empty()
     cached_decode_req.req_ids = [decode_req_id]
     cached_decode_req.num_computed_tokens = [decode_prompt_len]
@@ -185,7 +242,9 @@ def run_mixed_prefill_decode_warmup(
             mm_features=[],
             sampling_params=sampling_params,
             pooling_params=None,
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(n, g) for g, n in enumerate(prefill_block_counts)
+            ),
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=prefill_token_ids,
@@ -313,10 +372,24 @@ def _warmup_kernels(
     if max_blocks_per_req > 0 and not null_blocks:
         # Reserve block 0 (null block) and ensure we have enough blocks.
         # Encoder-only models allocate no KV blocks, so this cap doesn't apply.
-        num_reqs = min(
-            num_reqs,
-            max(1, (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req),
-        )
+        kv_cache_config = model_runner.kv_cache_config
+        if kv_cache_config.allocator == "large_page":
+            # Conservative: each request rounds its blocks up to whole pages.
+            pages_per_req = _large_page_pages_needed(
+                kv_cache_config, decode_block_counts
+            )
+            num_reqs = min(
+                num_reqs,
+                max(1, (kv_cache_config.num_blocks - 1) // pages_per_req),
+            )
+        else:
+            num_reqs = min(
+                num_reqs,
+                max(
+                    1,
+                    (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req,
+                ),
+            )
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
 
@@ -337,15 +410,15 @@ def _warmup_kernels(
         pooling_params = None
 
     # Assign distinct block IDs per request per group. 0 null block, start from 1.
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+    _alloc_blocks = _block_id_allocator(model_runner.kv_cache_config)
 
     # The KV-block zeroing kernel is driven by the scheduler's
     # new_block_ids_to_zero, so none of the steps below reach it.
-    if model_runner.kv_block_zeroer is not None:
+    if model_runner.kv_cache_config.allocator == "large_page":
+        for zeroer in getattr(model_runner, "kv_block_zeroers", None) or []:
+            if zeroer is not None:
+                zeroer.warmup(1)
+    elif model_runner.kv_block_zeroer is not None:
         model_runner.kv_block_zeroer.warmup(model_runner.kv_cache_config.num_blocks)
 
     # Step 1: Prefill all requests with 1 + decode_query_len prompt tokens each.
@@ -358,7 +431,9 @@ def _warmup_kernels(
                 pooling_params,
                 mm_features=warmup_mm_features,
             ),
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(n, g) for g, n in enumerate(prefill_block_counts)
+            ),
             prefill_token_ids=prompt_token_ids,
         )
         for i in range(num_reqs)
@@ -416,7 +491,9 @@ def _warmup_kernels(
                     for spec, held in zip(kv_cache_specs, req_blocks[i])
                 ]
                 cached_req_data.new_block_ids.append(
-                    tuple(_alloc_blocks(n) for n in deltas) if any(deltas) else None
+                    tuple(_alloc_blocks(n, g) for g, n in enumerate(deltas))
+                    if any(deltas)
+                    else None
                 )
                 req_blocks[i] = [
                     held + delta for held, delta in zip(req_blocks[i], deltas)
@@ -472,6 +549,5 @@ def _warmup_kernels(
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
-    if model_runner.kv_block_zeroer is not None:
-        model_runner.kv_block_zeroer.zero_block_ids([0])
+    model_runner.zero_null_page()
     torch.accelerator.synchronize()

@@ -11,6 +11,8 @@ from tests.v1.attention.utils import dense_kv_cache_views
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheLayout,
     SlidingWindowSpec,
 )
@@ -20,6 +22,166 @@ from vllm.v1.worker.utils import (
     KVBlockZeroer,
     _zero_kv_blocks_kernel,
 )
+
+
+def _large_page_two_group_config() -> KVCacheConfig:
+    """Two KV cache groups under the large-page allocator.
+
+    Group 0 (attention): 2 kernel rows per manager block, row of 1536 bytes,
+    which does not divide the 4096-byte page. Group 1 (sliding window): 1 row
+    per block, row of 512 bytes.
+    """
+    return KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["a.0"],
+                kv_cache_spec=FullAttentionSpec(
+                    block_size=8, num_kv_heads=1, head_size=8, dtype=torch.float16
+                ),
+                num_blocks=5,
+                slots_per_large_page=1,
+                kernel_rows_per_block=2,
+                row_bytes=1536,
+            ),
+            KVCacheGroupSpec(
+                layer_names=["s.0"],
+                kv_cache_spec=SlidingWindowSpec(
+                    block_size=8,
+                    num_kv_heads=1,
+                    head_size=8,
+                    dtype=torch.float16,
+                    sliding_window=16,
+                ),
+                num_blocks=32,
+                slots_per_large_page=8,
+                kernel_rows_per_block=1,
+                row_bytes=512,
+            ),
+        ],
+        allocator="large_page",
+        large_page_bytes=4096,
+    )
+
+
+def _large_page_zeroers(
+    cfg: KVCacheConfig, device: torch.device
+) -> tuple[list[KVBlockZeroer], list[torch.Tensor]]:
+    """One zeroer per group on that group's kernel-row views (the runner's
+    large-page wiring), plus the per-group views for content assertions."""
+    kernel_block_sizes = [
+        g.kv_cache_spec.block_size // g.kernel_rows_per_block
+        for g in cfg.kv_cache_groups
+    ]
+    zeroers = []
+    views = []
+    for group_id, group in enumerate(cfg.kv_cache_groups):
+        num_rows = cfg.num_blocks * cfg.large_page_bytes // group.row_bytes
+        row_el = group.row_bytes // 4
+        view = torch.ones((num_rows, row_el), dtype=torch.int32, device=device)
+        views.append(view)
+        layer_name = group.layer_names[0]
+        zeroers.append(
+            KVBlockZeroer(
+                device,
+                attn_groups_iter=[
+                    AttentionGroup(None, [layer_name], group.kv_cache_spec, group_id)
+                ],
+                kernel_block_sizes=kernel_block_sizes,
+                static_forward_context={layer_name: SimpleNamespace(kv_cache=view)},
+                num_blocks=num_rows,
+                kernel_rows_per_block=group.kernel_rows_per_block,
+            )
+        )
+    return zeroers, views
+
+
+def test_large_page_zeroer_maps_manager_ids_to_kernel_rows(monkeypatch):
+    """Per-group zeroers map (group, manager block b) to the block's kernel
+    rows b * R_g .. b * R_g + R_g - 1."""
+    cfg = _large_page_two_group_config()
+    device = torch.device("cpu")
+    zeroers, _ = _large_page_zeroers(cfg, device)
+
+    # Segments step by one kernel row, not by a manager block.
+    for zeroer, group in zip(zeroers, cfg.kv_cache_groups):
+        assert zeroer._meta is not None
+        _, seg_block_strides, seg_page_sizes, *_ = zeroer._meta
+        assert seg_block_strides.tolist() == [group.row_bytes // 4]
+        assert seg_page_sizes.tolist() == [group.row_bytes // 4]
+
+    uploaded: list[torch.Tensor] = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(worker_utils, "_zero_kv_blocks_kernel", FakeKernel())
+    monkeypatch.setattr(
+        worker_utils,
+        "async_tensor_h2d",
+        lambda values, **kwargs: uploaded.append(
+            torch.as_tensor(values, dtype=torch.int64)
+        ),
+    )
+
+    zeroers[0].zero_block_ids([1, 4])
+    zeroers[1].zero_block_ids([3, 19])
+
+    assert uploaded[0].tolist() == [2, 3, 8, 9]
+    assert uploaded[1].tolist() == [3, 19]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_large_page_zeroing_covers_only_allocated_rows():
+    """Zeroing a block of one group zeroes exactly that group's kernel rows
+    for the block; other rows of the group and the other group are untouched,
+    and block 0 of each group maps to the head of its row grid (page 0)."""
+    cfg = _large_page_two_group_config()
+    device = torch.device("cuda")
+    zeroers, views = _large_page_zeroers(cfg, device)
+
+    zeroers[0].zero_block_ids([3])
+    zeroers[1].zero_block_ids([7])
+    torch.accelerator.synchronize()
+
+    for group_id, (view, block_id) in enumerate(zip(views, (3, 7))):
+        group = cfg.kv_cache_groups[group_id]
+        first_row = block_id * cfg.kv_cache_groups[group_id].kernel_rows_per_block
+        expected = torch.ones_like(view)
+        expected[first_row : first_row + group.kernel_rows_per_block] = 0
+        assert torch.equal(view, expected), f"group {group_id}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_large_page_zero_kernel_rows_covers_page_zero():
+    """zero_null_page re-zeroes the reserved page 0 after dummy writes, per
+    group on that group's kernel-row grid. Only rows fully inside page 0 are
+    zeroed (floor): a row crossing the page end would extend into page 1,
+    which another group may own with live data. Page 0 stays byte-complete
+    because a group whose row divides the page (group 1 here) tiles it."""
+    cfg = _large_page_two_group_config()
+    device = torch.device("cuda")
+    zeroers, views = _large_page_zeroers(cfg, device)
+    for view in views:
+        view.fill_(7)
+
+    worker_utils.zero_null_page(zeroers, cfg)
+    torch.accelerator.synchronize()
+
+    for group_id, (view, group) in enumerate(zip(views, cfg.kv_cache_groups)):
+        rows_in_page = cfg.large_page_bytes // group.row_bytes
+        # The null block's rows [0, R_g) stay covered.
+        assert rows_in_page >= group.kernel_rows_per_block
+        expected = torch.full_like(view, 7)
+        expected[:rows_in_page] = 0
+        assert torch.equal(view, expected), f"group {group_id}"
+    # Group 0's row size does not divide the page: the row at the floor
+    # boundary starts inside page 0 but extends past it, so it is untouched.
+    boundary = cfg.large_page_bytes // cfg.kv_cache_groups[0].row_bytes
+    assert cfg.large_page_bytes % cfg.kv_cache_groups[0].row_bytes != 0
+    assert (views[0][boundary] == 7).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -126,6 +288,7 @@ def test_block_ids_are_not_overwritten_while_copy_is_in_flight():
     # in-flight copy behavior without constructing model attention groups.
     zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
     zeroer.device = device
+    zeroer.kernel_rows_per_block = 1
     zeroer._meta = (
         torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
         torch.tensor([page_size_el], dtype=torch.int64, device=device),
@@ -164,6 +327,7 @@ def test_non_uniform_page_sizes():
 
     zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
     zeroer.device = device
+    zeroer.kernel_rows_per_block = 1
 
     seg_page_sizes = [page_size_a, page_size_b]
     max_ps = max(seg_page_sizes)
@@ -209,6 +373,7 @@ def test_packed_segment_zeros_only_its_last_block_page():
 
     zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
     zeroer.device = device
+    zeroer.kernel_rows_per_block = 1
     zeroer._meta = (
         torch.tensor(
             [backing.data_ptr() + page_offset_el * backing.element_size()],
@@ -301,6 +466,7 @@ def test_warmup_compiles_for_all_block_counts():
 
     zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
     zeroer.device = device
+    zeroer.kernel_rows_per_block = 1
     zeroer._meta = (
         torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
         torch.tensor([page_size_el], dtype=torch.int64, device=device),
@@ -338,6 +504,7 @@ def test_warmup_respects_available_block_count():
 
     zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
     zeroer.device = device
+    zeroer.kernel_rows_per_block = 1
     zeroer._meta = (
         torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
         torch.tensor([page_size_el], dtype=torch.int64, device=device),

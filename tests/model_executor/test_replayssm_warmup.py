@@ -32,7 +32,7 @@ def _autotune_runner(
     use_v2_model_runner: bool = False,
     query_len: int = 6,
     max_num_seqs: int = 32,
-    num_blocks: int = 17,
+    num_mamba_blocks: int = 17,
     max_num_tokens: int = 100,
     use_replayssm: bool = True,
     backend: MambaBackendEnum = MambaBackendEnum.FLASHINFER,
@@ -47,7 +47,7 @@ def _autotune_runner(
         decode_query_len=query_len,
         max_num_tokens=max_num_tokens,
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
-        kv_cache_config=SimpleNamespace(num_blocks=num_blocks),
+        kv_cache_config=SimpleNamespace(num_mamba_blocks=num_mamba_blocks),
     )
 
 
@@ -57,8 +57,11 @@ def _autotune_runner(
         # max_num_seqs (32) vs max_num_tokens // query_len (16) vs blocks-1 (16).
         (dict(query_len=6, use_v2_model_runner=False), 16),
         (dict(query_len=6, use_v2_model_runner=True), 16),
-        # num_blocks - 1 is the binding constraint.
-        (dict(query_len=1, max_num_tokens=128, max_num_seqs=64, num_blocks=5), 4),
+        # num_mamba_blocks - 1 is the binding constraint.
+        (
+            dict(query_len=1, max_num_tokens=128, max_num_seqs=64, num_mamba_blocks=5),
+            4,
+        ),
     ],
     ids=["v1", "v2", "clamped_to_state_capacity"],
 )
@@ -96,7 +99,7 @@ def test_replayssm_autotune_decode_kwargs(runner_kwargs, expected_num_reqs):
         (dict(use_replayssm=False), True),
         (dict(backend=MambaBackendEnum.TRITON), True),
         ({}, False),
-        (dict(num_blocks=1), True),
+        (dict(num_mamba_blocks=1), True),
     ],
     ids=[
         "replayssm_disabled",

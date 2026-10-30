@@ -869,6 +869,15 @@ class Worker(WorkerBase):
         self.cache_config.cache_hit_alignment_tokens = (
             kv_cache_config.cache_hit_alignment_tokens
         )
+        if kv_cache_config.allocator == "large_page":
+            # Workers skip Platform.update_block_size_for_backend under the
+            # large-page allocator, so their cache_config.block_size is still
+            # the provisional default. Adopt the planner's global block size;
+            # hash_block_size is always that block size in this mode.
+            assert kv_cache_config.hash_block_size is not None
+            self.cache_config.block_size = kv_cache_config.hash_block_size
+            if self.cache_config.mamba_cache_mode == "align":
+                self.cache_config.mamba_block_size = kv_cache_config.hash_block_size
 
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.

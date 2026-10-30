@@ -814,11 +814,14 @@ def set_dcp_capture_context(
     # attention is not baked into the graph.
     if block_tables.cp_size == 1:
         return
+    num_kv_blocks: int | list[int] = kv_cache_config.num_blocks
+    if kv_cache_config.allocator == "large_page":
+        num_kv_blocks = [g.num_blocks for g in kv_cache_config.kv_cache_groups]
     set_dummy_context(
         input_batch,
         block_tables,
         block_tables.cp_size * block_tables.cp_interleave,
-        kv_cache_config.num_blocks,
+        num_kv_blocks,
         model_state.max_model_len,
         input_block_tables=input_block_tables,
     )
@@ -1075,6 +1078,8 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         runner.model_state._mamba_spec = None
     if hasattr(runner, "kv_caches"):
         runner.kv_caches.clear()
+    if hasattr(runner, "kv_caches_by_layer"):
+        runner.kv_caches_by_layer.clear()
     if hasattr(runner, "attn_groups"):
         runner.attn_groups.clear()
     if hasattr(runner, "kv_cache_config"):

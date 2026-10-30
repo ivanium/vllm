@@ -42,6 +42,7 @@ def test_mixed_warmup_disables_watermarking():
                 SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
             ],
             num_blocks=128,
+            allocator="uniform_page",
         ),
         vllm_config=SimpleNamespace(num_lookahead_tokens=0),
         max_model_len=128,

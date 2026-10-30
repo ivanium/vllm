@@ -34,6 +34,7 @@ from vllm.v1.worker.utils import (
     bind_kv_cache,
     bind_kv_cache_to_layers,
     copy_kv_cache_blocks_inplace,
+    copy_kv_cache_blocks_large_page,
     request_memory,
 )
 
@@ -451,6 +452,51 @@ def test_copy_cpu_kv_cache_logical_blocks_ignores_storage_padding():
     torch.testing.assert_close(cache[4:6], torch.full_like(cache[4:6], 11))
     assert (backing[0] == -1).all()
     assert (backing[9] == -1).all()
+
+
+def test_copy_kv_cache_blocks_large_page():
+    """Under the large-page allocator a CoW copy moves kernel rows on the
+    group's views: manager block b occupies rows b * R_g + j, j < R_g."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+    )
+
+    cfg = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["a.0", "a.1"],
+                kv_cache_spec=FullAttentionSpec(
+                    block_size=8, num_kv_heads=1, head_size=8, dtype=torch.float16
+                ),
+                num_blocks=5,
+                slots_per_large_page=1,
+                kernel_rows_per_block=2,
+                # Does not divide the page, so some block ids straddle a page end.
+                row_bytes=1536,
+            )
+        ],
+        allocator="large_page",
+        large_page_bytes=4096,
+    )
+    num_rows = 4 * 4096 // 1536
+    base = torch.arange(num_rows * 4, dtype=torch.float32).reshape(num_rows, 4)
+    views = [base.clone(), base.clone() * 100]  # two layers of the group
+    copies = [KVCacheBlockCopy(2, 4, group_id=0), KVCacheBlockCopy(1, 3, group_id=0)]
+    copy_kv_cache_blocks_large_page(
+        views, cfg.kv_cache_groups[0].kernel_rows_per_block, copies
+    )
+
+    for layer, view in enumerate(views):
+        expected = base.clone() * (100 if layer else 1)
+        for src, dst in ((2, 4), (1, 3)):
+            expected[2 * dst : 2 * dst + 2] = base[2 * src : 2 * src + 2] * (
+                100 if layer else 1
+            )
+        assert torch.equal(view, expected), f"layer {layer}"
 
 
 def test_bind_kv_cache_keeps_scheduler_block_views_for_runner():

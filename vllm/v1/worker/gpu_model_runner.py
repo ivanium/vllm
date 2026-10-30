@@ -227,8 +227,11 @@ from .utils import (
     add_kv_sharing_layers_to_kv_cache_groups,
     allocate_kv_cache,
     bind_kv_cache,
+    build_large_page_zeroers,
     copy_kv_cache_blocks_inplace,
     customize_attention_spec,
+    dispatch_large_page_cow,
+    dispatch_large_page_zeroing,
     map_kv_caches_to_kernel_blocks,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
@@ -1123,6 +1126,19 @@ class GPUModelRunner(
 
         Called from gpu_worker.py outside the CuMem pool context.
         """
+        kv_cache_config = self.kv_cache_config
+        if kv_cache_config.allocator == "large_page":
+            self._kv_block_zeroers: list[KVBlockZeroer | None] = (
+                build_large_page_zeroers(
+                    kv_cache_config,
+                    self.attn_groups,
+                    self.device,
+                    self._kernel_block_sizes,
+                    self.compilation_config.static_forward_context,
+                    runner_only_attn_layers=self.runner_only_attn_layers,
+                )
+            )
+            return
         self._kv_block_zeroer = KVBlockZeroer(
             self.device,
             attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
@@ -1194,13 +1210,28 @@ class GPUModelRunner(
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            if self.kv_cache_config.allocator == "large_page":
+                dispatch_large_page_zeroing(
+                    self._kv_block_zeroers,
+                    cast(list[tuple[int, int]], scheduler_output.new_block_ids_to_zero),
+                )
+            else:
+                self._zero_block_ids(
+                    cast(list[int], scheduler_output.new_block_ids_to_zero)
+                )
         if scheduler_output.kv_cache_block_copies:
-            copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
-                scheduler_output.kv_cache_block_copies,
-            )
+            if self.kv_cache_config.allocator == "large_page":
+                dispatch_large_page_cow(
+                    self.kv_cache_config,
+                    self.kv_caches_by_layer,
+                    scheduler_output.kv_cache_block_copies,
+                )
+            else:
+                copy_kv_cache_blocks_inplace(
+                    self.kv_caches,
+                    self.kv_cache_config.num_blocks,
+                    scheduler_output.kv_cache_block_copies,
+                )
 
         # Free the cached encoder outputs.
         self._process_encoder_cache_scheduler_output(scheduler_output)
@@ -6229,6 +6260,9 @@ class GPUModelRunner(
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
             self.kv_caches.clear()
+        if hasattr(self, "kv_caches_by_layer"):
+            self.kv_caches_by_layer.clear()
+            del self.kv_caches_by_layer
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
@@ -7068,6 +7102,9 @@ class GPUModelRunner(
                 kernel_block_sizes,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
+        if kv_cache_config.allocator == "large_page":
+            # Per-group CoW copies address each group's own layer views.
+            self.kv_caches_by_layer = kv_caches
 
         if (
             self.speculative_config

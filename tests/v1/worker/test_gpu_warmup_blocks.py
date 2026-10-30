@@ -101,13 +101,16 @@ def _make_runner(
         model_state=SimpleNamespace(max_encoder_len=0),
         scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=2048),
         kv_cache_config=SimpleNamespace(
-            kv_cache_groups=kv_cache_groups, num_blocks=1024
+            kv_cache_groups=kv_cache_groups,
+            num_blocks=1024,
+            allocator="uniform_page",
         ),
         vllm_config=SimpleNamespace(
             num_lookahead_tokens=num_lookahead_tokens, is_mm_encoder_only=False
         ),
         kv_block_zeroer=None,
         kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
+        zero_null_page=lambda: None,
     )
 
 
@@ -381,3 +384,47 @@ def test_num_lookahead_tokens_without_speculation():
     config = _config_without_post_init(None)
 
     assert config.num_lookahead_tokens == 0
+
+
+def test_large_page_warmup_blocks_never_share_pages():
+    """Under large_page, warmup dummy blocks of different groups never share a
+    large page and never use page 0 (every group's null block lives there), so
+    one group's dummy writes cannot overwrite another group's dummy data; the
+    request count is capped by the page count."""
+    page_bytes = 4
+    groups = [
+        KVCacheGroupSpec(
+            [f"layer{g}"],
+            _attention_group().kv_cache_spec,
+            slots_per_large_page=n,
+            row_bytes=page_bytes // n,
+        )
+        for g, n in enumerate([1, 4])
+    ]
+    runner = _make_runner(groups, NUM_SPEC_STEPS)
+    runner.kv_cache_config.allocator = "large_page"
+    runner.kv_cache_config.num_blocks = 7
+    runner.kv_cache_config.large_page_bytes = page_bytes
+
+    outputs = []
+
+    def execute_model(scheduler_output) -> None:
+        outputs.append(scheduler_output)
+
+    warmup_kernels(runner, execute_model, lambda grammar_output=None: None)
+
+    prefill_outputs = [so for so in outputs if so.scheduled_new_reqs]
+    assert prefill_outputs
+    # Each request needs 2 blocks per group: 2 pages of group 0 (n=1) and
+    # 1 page of group 1 (n=4), so 6 usable pages fit 2 requests.
+    assert len(prefill_outputs[0].scheduled_new_reqs) == 2
+    pages_by_group: list[set[int]] = [set(), set()]
+    for scheduler_output in prefill_outputs:
+        for new_req in scheduler_output.scheduled_new_reqs:
+            for group_id, block_ids in enumerate(new_req.block_ids):
+                row_bytes = groups[group_id].row_bytes
+                pages_by_group[group_id].update(
+                    b * row_bytes // page_bytes for b in block_ids
+                )
+    assert 0 not in pages_by_group[0] | pages_by_group[1]
+    assert not pages_by_group[0] & pages_by_group[1]

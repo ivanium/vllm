@@ -45,7 +45,7 @@ def _replayssm_autotune_kwargs(
     max_num_reqs = min(
         runner.scheduler_config.max_num_seqs,
         runner.max_num_tokens // query_len,
-        runner.kv_cache_config.num_blocks - 1,
+        runner.kv_cache_config.num_mamba_blocks - 1,
     )
     if max_num_reqs <= 0:
         logger.warning_once(

@@ -72,7 +72,10 @@ class UniProcExecutor(Executor):
             self.driver_worker.elastic_ep_execute("load_model")
         else:
             self.driver_worker.load_model()
-        current_platform.update_block_size_for_backend(self.vllm_config)
+        # Under the large-page allocator the engine planner selects the global
+        # block size; workers adopt it from the KVCacheConfig instead.
+        if self.vllm_config.cache_config.kv_cache_allocator != "large_page":
+            current_platform.update_block_size_for_backend(self.vllm_config)
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
