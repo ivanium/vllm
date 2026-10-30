@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    SlidingWindowSpec,
 )
 
 
@@ -77,6 +78,77 @@ def _make_connector(
         kv_cache_config=kv_cache_config,
     )
     return connector
+
+
+# Two-group large_page geometry: group 0 packs 2 kernel rows of 1024 B per
+# block and gets 1 block per page; group 1 has one 768 B row, which does not
+# divide the 2048 B page, so some of its block ids cross a page end.
+LP_PAGE_BYTES = 2048
+LP_NUM_PAGES = 8
+LP_SLOTS_PER_PAGE = (1, 2)
+LP_ROWS_PER_BLOCK = (2, 1)
+LP_ROW_BYTES = (1024, 768)
+
+
+def _make_large_page_kv_cache_config() -> KVCacheConfig:
+    fa = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    swa = SlidingWindowSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+        sliding_window=BLOCK_SIZE * 4,
+    )
+    groups = [
+        KVCacheGroupSpec(
+            ["fa"],
+            fa,
+            num_blocks=8,  # 8 * 2048 B // 2048 B
+            slots_per_large_page=LP_SLOTS_PER_PAGE[0],
+            kernel_rows_per_block=LP_ROWS_PER_BLOCK[0],
+            row_bytes=LP_ROW_BYTES[0],
+        ),
+        KVCacheGroupSpec(
+            ["swa"],
+            swa,
+            num_blocks=21,  # 8 * 2048 B // 768 B
+            slots_per_large_page=LP_SLOTS_PER_PAGE[1],
+            kernel_rows_per_block=LP_ROWS_PER_BLOCK[1],
+            row_bytes=LP_ROW_BYTES[1],
+        ),
+    ]
+    return KVCacheConfig(
+        num_blocks=LP_NUM_PAGES,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        allocator="large_page",
+        large_page_bytes=LP_PAGE_BYTES,
+        hash_block_size=BLOCK_SIZE,
+    )
+
+
+def _make_large_page_connector(
+    extra_config: dict | None = None,
+    cpu_bytes: int = LP_PAGE_BYTES * 6,
+) -> SimpleCPUOffloadConnector:
+    config_dict = {"cpu_bytes_to_use": cpu_bytes}
+    if extra_config:
+        config_dict.update(extra_config)
+    vllm_config = create_vllm_config(
+        kv_connector="SimpleCPUOffloadConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config=config_dict,
+    )
+    return SimpleCPUOffloadConnector(
+        vllm_config=vllm_config,
+        role=KVConnectorRole.SCHEDULER,
+        kv_cache_config=_make_large_page_kv_cache_config(),
+    )
 
 
 def test_disk_mode_rejects_non_positive_capacity() -> None:
@@ -199,3 +271,58 @@ def test_engine_queries_offload_blocks_only_when_enabled(
         expected_blocks is not None
     )
     assert config.cache_config.simple_cpu_offload_num_blocks == expected_blocks
+
+
+def test_large_page_cpu_pool_geometry() -> None:
+    """The CPU side of a large_page config mirrors the GPU pool geometry.
+
+    N_cpu = cpu_bytes / S pages of the GPU page size S, and group g gets the
+    N_cpu * S // block_bytes_g block ids of those pages.
+    """
+    connector = _make_large_page_connector(cpu_bytes=LP_PAGE_BYTES * 6)
+    scheduler = connector.scheduler_manager
+    assert scheduler is not None
+    cpu_config = scheduler.cpu_kv_cache_config
+    assert cpu_config.allocator == "large_page"
+    assert cpu_config.large_page_bytes == LP_PAGE_BYTES
+    assert cpu_config.num_blocks == 6
+    assert cpu_config.num_blocks == 6
+    assert scheduler.num_cpu_blocks == 6
+    groups = cpu_config.kv_cache_groups
+    # 6 pages of 2048 B hold 6 blocks of 2048 B or 16 of 768 B.
+    assert [g.num_blocks for g in groups] == [6, 16]
+    assert [g.slots_per_large_page for g in groups] == list(LP_SLOTS_PER_PAGE)
+    assert [g.kernel_rows_per_block for g in groups] == list(LP_ROWS_PER_BLOCK)
+    assert [g.row_bytes for g in groups] == list(LP_ROW_BYTES)
+
+
+def test_large_page_num_cpu_blocks_override_counts_pages() -> None:
+    """Under large_page the num_cpu_blocks override means CPU large pages."""
+    connector = _make_large_page_connector(extra_config={"num_cpu_blocks": 3})
+    scheduler = connector.scheduler_manager
+    assert scheduler is not None
+    assert scheduler.num_cpu_blocks == 3
+    groups = scheduler.cpu_kv_cache_config.kv_cache_groups
+    assert [g.num_blocks for g in groups] == [3, 8]
+
+    # 7 pages exceed the local capacity of 6 pages.
+    with pytest.raises(ValueError, match="num_cpu_blocks"):
+        _make_large_page_connector(extra_config={"num_cpu_blocks": 7})
+
+
+@pytest.mark.parametrize(
+    ("extra_config", "match"),
+    [
+        (
+            {"kv_offload_backend": "disk", "disk_path": "/tmp/fake"},
+            "disk.*not supported",
+        ),
+        ({"lazy_offload": True}, "lazy_offload.*not supported"),
+    ],
+)
+def test_large_page_rejects_disk_backend_and_lazy_offload(
+    extra_config: dict, match: str
+) -> None:
+    """v1 gaps under large_page fail at config time, not mid-transfer."""
+    with pytest.raises(ValueError, match=match):
+        _make_large_page_connector(extra_config=extra_config)

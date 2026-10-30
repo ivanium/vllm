@@ -215,6 +215,7 @@ def _drive_store(
         backend.launch_copy(
             block_ids,
             block_ids,
+            [0] * len(block_ids),
             is_store=True,
             event_idx=it,
             events_list=store_events,
@@ -270,6 +271,7 @@ class _RecordingBackend:
         self,
         src_blocks,
         dst_blocks,
+        group_ids,
         is_store,
         event_idx,
         events_list,
@@ -313,12 +315,12 @@ def test_build_params_src_access_order():
     stream = torch.cuda.Stream()
 
     default = build_params(gpu, cpu, stream)
-    assert default.attrs.srcAccessOrder == CU_MEMCPY_SRC_ACCESS_ORDER_ANY
+    assert default.driver.attrs.srcAccessOrder == CU_MEMCPY_SRC_ACCESS_ORDER_ANY
 
     ordered = build_params(
         gpu, cpu, stream, src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
     )
-    assert ordered.attrs.srcAccessOrder == CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
+    assert ordered.driver.attrs.srcAccessOrder == CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
 
 
 @pytest.mark.parametrize("layout", list(KVCacheLayout))

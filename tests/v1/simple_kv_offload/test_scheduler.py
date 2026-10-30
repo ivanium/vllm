@@ -327,6 +327,11 @@ def make_scheduler(
         num_gpu_blocks=num_gpu_blocks,
         enable_caching=True,
         hash_block_size=BLOCK_SIZE,
+        large_page_bytes=kv_cache_config.large_page_bytes,
+        block_bytes=[
+            g.kernel_rows_per_block * g.row_bytes
+            for g in kv_cache_config.kv_cache_groups
+        ],
     )
     sched.bind_gpu_block_pool(gpu_block_pool)
 
@@ -472,7 +477,7 @@ def _allocate_gpu_blocks(
     register them in the prefix cache via cache_full_blocks so that
     re-allocation properly evicts stale hashes.
     """
-    blocks = gpu_block_pool.get_new_blocks(num_blocks)
+    blocks = gpu_block_pool.get_new_blocks(num_blocks, group_id)
     num_full = min(num_blocks, len(request.block_hashes))
     if num_full > 0:
         gpu_block_pool.cache_full_blocks(
@@ -645,7 +650,9 @@ def test_eager_store_preserves_secondary_block_hashes() -> None:
     )
     assert (
         secondary_hash
-        in fix.gpu_block_pool.cached_block_hashes_by_block[gpu_block.block_id]
+        in fix.gpu_block_pool.cached_block_hashes_by_block[
+            (gpu_block.group_id, gpu_block.block_id)
+        ]
     )
 
     sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
@@ -666,7 +673,9 @@ def test_eager_store_preserves_secondary_block_hashes() -> None:
     assert cpu_block.block_hash_num_tokens == primary_num_tokens
     assert (
         secondary_hash
-        in sched.cpu_block_pool.cached_block_hashes_by_block[cpu_block.block_id]
+        in sched.cpu_block_pool.cached_block_hashes_by_block[
+            (cpu_block.group_id, cpu_block.block_id)
+        ]
     )
 
 
@@ -1045,7 +1054,9 @@ def test_eager_in_flight_store_dedup_across_steps() -> None:
     assert meta1.store_event >= 0
     assert len(meta1.store_cpu_blocks) == num_blocks
     # In-flight set tracks the scheduled GPU blocks until completion.
-    assert sched._in_flight_store_gpu_blocks == set(meta1.store_gpu_blocks)
+    assert sched._in_flight_store_gpu_blocks == set(
+        zip(meta1.store_group_ids, meta1.store_gpu_blocks)
+    )
     cpu_free_after_first = get_cpu_free_blocks(sched)
 
     # Second request shares the prefix and reuses the same GPU block IDs
@@ -3064,7 +3075,12 @@ def test_boundary_handoff_keeps_block_meta_index_parallel() -> None:
         },
     )
 
-    gpu_ids, cpu_ids, req_ids, block_meta = sched.prepare_store_specs(output)
+    transfer, req_ids = sched.prepare_store_specs(output)
+    gpu_ids, cpu_ids, block_meta = (
+        transfer.gpu_block_ids,
+        transfer.cpu_block_ids,
+        transfer.block_meta,
+    )
     assert mamba_blocks[1].block_id in gpu_ids
     assert set(gpu_ids) == {
         *(block.block_id for block in attn_blocks),
@@ -3417,3 +3433,134 @@ def test_eager_store_matches_gpu_cacheable_prefix(
         scheduler.cpu_block_pool.blocks[bid].block_hash
         for bid in load_meta.load_cpu_blocks
     ] == target_hashes + draft_hashes
+
+
+def _make_large_page_scheduler(num_pages: int = 8) -> SchedulerFixture:
+    """FA + SWA groups under the large-page allocator. Each group has its own
+    block id space over the shared pages, so only the group tags keep block
+    ids apart."""
+    register_all_kvcache_specs(vllm_config=None)
+    fa = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    swa = SlidingWindowSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+        sliding_window=BLOCK_SIZE * 4,
+    )
+    config = KVCacheConfig(
+        num_blocks=num_pages,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["fa"],
+                fa,
+                num_blocks=num_pages,
+                slots_per_large_page=1,
+                kernel_rows_per_block=2,
+                row_bytes=1024,
+            ),
+            KVCacheGroupSpec(
+                ["swa"],
+                swa,
+                num_blocks=num_pages * 2048 // 768,
+                slots_per_large_page=2,
+                kernel_rows_per_block=1,
+                row_bytes=768,
+            ),
+        ],
+        allocator="large_page",
+        large_page_bytes=2048,
+    )
+    return make_scheduler(
+        num_cpu_blocks=12, num_gpu_blocks=num_pages, kv_cache_config=config
+    )
+
+
+def test_large_page_transfers_keep_each_block_group() -> None:
+    """Under large_page the store, a boundary hand-off and the load of the
+    stored prefix tag every block with its own group."""
+    fix = _make_large_page_scheduler()
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    req = make_request(num_blocks=2)
+    swa_blocks = _allocate_gpu_blocks(gpu_pool, req, 2, group_id=1)
+    fa_blocks = _allocate_gpu_blocks(gpu_pool, req, 2, group_id=0)
+    kv_blocks = KVCacheBlocks(blocks=(fa_blocks, swa_blocks))
+    req.num_computed_tokens = 2 * BLOCK_SIZE
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: 2 * BLOCK_SIZE},
+            new_reqs={req.request_id: kv_blocks.get_block_ids()},
+        )
+    )
+    fa_ids = [b.block_id for b in fa_blocks]
+    swa_ids = [b.block_id for b in swa_blocks]
+    assert meta.store_gpu_blocks == fa_ids + swa_ids
+    assert meta.store_group_ids == [0, 0, 1, 1]
+
+    simulate_store_completion(sched, meta.store_event)
+    req2 = Request(
+        request_id="req-lp-load",
+        prompt_token_ids=req.prompt_token_ids,
+        sampling_params=req.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req._block_hasher,
+    )
+    hit_tokens, _ = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
+    assert hit_tokens == 2 * BLOCK_SIZE
+    fa_blocks2 = gpu_pool.get_new_blocks(2, 0)
+    swa_blocks2 = gpu_pool.get_new_blocks(2, 1)
+    kv_blocks2 = KVCacheBlocks(blocks=(fa_blocks2, swa_blocks2))
+    sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=hit_tokens)
+    meta2 = sched.build_connector_meta(make_scheduler_output({req2.request_id: 1}))
+
+    assert meta2.load_gpu_blocks == [b.block_id for b in fa_blocks2 + swa_blocks2]
+    assert meta2.load_group_ids == [0, 0, 1, 1]
+    assert meta2.load_cpu_blocks == meta.store_cpu_blocks
+
+
+def test_large_page_boundary_offload_keeps_group_id() -> None:
+    """A boundary hand-off is stored under its own group, not group 0."""
+    fix = _make_large_page_scheduler()
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    req = make_request(num_blocks=2)
+    fa_blocks = _allocate_gpu_blocks(gpu_pool, req, 2, group_id=0)
+    swa_blocks = _allocate_gpu_blocks(gpu_pool, req, 2, group_id=1)
+    kv_blocks = KVCacheBlocks(blocks=(fa_blocks, swa_blocks))
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+
+    # Nothing is confirmed yet, so the blocks arrive only as hand-offs.
+    sched_out = make_scheduler_output(
+        {req.request_id: 1},
+        new_reqs={req.request_id: kv_blocks.get_block_ids()},
+    )
+    sched_out.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids=lambda _: (),
+        boundary_state_offloads={
+            req.request_id: [
+                (0, fa_blocks[0].block_id, BLOCK_SIZE),
+                (1, swa_blocks[1].block_id, BLOCK_SIZE),
+            ]
+        },
+    )
+    meta = sched.build_connector_meta(sched_out)
+
+    assert meta.store_gpu_blocks == [fa_blocks[0].block_id, swa_blocks[1].block_id]
+    assert meta.store_group_ids == [0, 1]
+    simulate_store_completion(sched, meta.store_event)
+    for block in (fa_blocks[0], swa_blocks[1]):
+        assert sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(
+            block.block_hash
+        )

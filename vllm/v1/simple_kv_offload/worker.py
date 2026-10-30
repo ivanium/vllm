@@ -4,13 +4,14 @@
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
-from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+from vllm.v1.simple_kv_offload.cuda_mem_ops import LargePageCopyGeometry, pin_tensor
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -81,6 +82,9 @@ class SimpleCPUOffloadWorker:
         # Completed store events to report via build_connector_worker_meta
         self._completed_store_events: dict[int, int] = {}
 
+        # The CPU arena under the large-page allocator.
+        self._cpu_arena: torch.Tensor | None = None
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -102,6 +106,9 @@ class SimpleCPUOffloadWorker:
         self.device = next(iter(kv_caches.values())).device
 
         assert self.kv_cache_config is not None
+        if self.kv_cache_config.allocator == "large_page":
+            self._register_kv_caches_large_page(kv_caches)
+            return
         num_blocks = self.kv_cache_config.num_blocks
         assert self.kv_cache_config.kv_cache_tensors
 
@@ -178,6 +185,70 @@ class SimpleCPUOffloadWorker:
             self._init_disk_mode(unique_gpu_caches, total_bytes_per_block, self.device)
         else:
             self._init_cpu_mode(unique_gpu_caches, total_bytes_per_block, self.device)
+
+    def _register_kv_caches_large_page(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> None:
+        """Register per-group regions under the large-page allocator.
+
+        Every layer view is a stride into one backing allocation. A manager
+        block of group g is one contiguous byte range of ``block_bytes_g`` at
+        ``base_g + b * block_bytes_g``. CPU blocks live at the same offsets in
+        one arena of GPU-sized large pages.
+        """
+        config = self.kv_cache_config
+        assert config is not None
+        assert not self.disk_mode, "disk backend is rejected under large_page"
+        groups = config.kv_cache_groups
+
+        gpu_bases = np.zeros(len(groups), dtype=np.int64)
+        has_region = np.zeros(len(groups), dtype=bool)
+        for group_id, group in enumerate(groups):
+            name = next((n for n in group.layer_names if n in kv_caches), None)
+            if name is None:
+                continue  # PP: this rank holds no layer of the group.
+            view = kv_caches[name]
+            assert view.stride(0) * view.element_size() == group.row_bytes
+            gpu_bases[group_id] = view.untyped_storage().data_ptr()
+            has_region[group_id] = True
+
+        page_bytes = config.large_page_bytes
+        self.num_cpu_blocks = self._resolve_num_cpu_blocks(
+            self.cpu_capacity_bytes, page_bytes
+        )
+
+        # Use lowest priority so KV cache I/O yields to compute streams.
+        low_pri, _ = torch.cuda.Stream.priority_range()
+        self.load_stream = torch.cuda.Stream(priority=low_pri)
+        self.store_stream = torch.cuda.Stream(priority=low_pri)
+
+        logger.info(
+            "SimpleCPUOffloadWorker [CPU]: %d groups, %d CPU pages (%.2f GB)",
+            int(has_region.sum()),
+            self.num_cpu_blocks,
+            (self.num_cpu_blocks * page_bytes) / (1024**3),
+        )
+
+        self._cpu_arena = torch.zeros(
+            self.num_cpu_blocks * page_bytes, dtype=torch.uint8, device="cpu"
+        )
+        if PIN_MEMORY:
+            pin_tensor(self._cpu_arena)
+
+        geometry = LargePageCopyGeometry(
+            gpu_bases=gpu_bases,
+            has_region=has_region,
+            cpu_base=self._cpu_arena.data_ptr(),
+            block_bytes=np.array(
+                [g.block_bytes for g in groups],
+                dtype=np.int64,
+            ),
+        )
+        self._backend = DmaCopyBackend()
+        self._backend.init_large_page(
+            geometry, self.device, self.load_stream, self.store_stream
+        )
 
     def _resolve_num_cpu_blocks(self, capacity_bytes: int, bytes_per_block: int) -> int:
         local_capacity = capacity_bytes // bytes_per_block
@@ -280,6 +351,7 @@ class SimpleCPUOffloadWorker:
             backend.launch_copy(
                 metadata.load_cpu_blocks,
                 metadata.load_gpu_blocks,
+                metadata.load_group_ids,
                 is_store=False,
                 event_idx=metadata.load_event,
                 events_list=self._load_events,
@@ -303,6 +375,7 @@ class SimpleCPUOffloadWorker:
             backend.launch_copy(
                 metadata.store_gpu_blocks,
                 metadata.store_cpu_blocks,
+                metadata.store_group_ids,
                 is_store=True,
                 event_idx=metadata.store_event,
                 events_list=self._store_events,

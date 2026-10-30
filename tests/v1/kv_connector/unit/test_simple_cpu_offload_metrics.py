@@ -365,9 +365,9 @@ def test_manager_get_stats_gauges_and_info_labels() -> None:
     fixture = make_scheduler(num_cpu_blocks=8)
     sched = fixture.scheduler
 
-    sched._store_event_to_blocks[0] = TransferMeta([10], [11])
-    sched._pending_finished_stores.append(TransferMeta([12], [13]))
-    sched._abandoned_store_event_to_blocks[1] = TransferMeta([14], [15])
+    sched._store_event_to_blocks[0] = TransferMeta([10], [11], [0])
+    sched._pending_finished_stores.append(TransferMeta([12], [13], [0]))
+    sched._abandoned_store_event_to_blocks[1] = TransferMeta([14], [15], [0])
 
     stats = sched.get_stats()
     assert _values(stats, PENDING_STORE_BLOCKS) == {(): 3}
@@ -419,7 +419,9 @@ def test_manager_counts_load_blocks_completed() -> None:
     sched._reqs_to_load[request.request_id] = LoadRequestState(
         request=request,
         transfer_meta=TransferMeta(
-            [b.block_id for b in gpu_blocks], [b.block_id for b in cpu_blocks]
+            [b.block_id for b in gpu_blocks],
+            [b.block_id for b in cpu_blocks],
+            [0] * len(gpu_blocks),
         ),
     )
 
@@ -447,7 +449,9 @@ def test_manager_abandoned_load_counts_as_completed_after_reset() -> None:
     sched._reqs_to_load[request.request_id] = LoadRequestState(
         request=request,
         transfer_meta=TransferMeta(
-            [b.block_id for b in gpu_blocks], [b.block_id for b in cpu_blocks]
+            [b.block_id for b in gpu_blocks],
+            [b.block_id for b in cpu_blocks],
+            [0] * len(gpu_blocks),
         ),
     )
 

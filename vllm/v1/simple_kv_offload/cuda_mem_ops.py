@@ -169,11 +169,9 @@ def _num_attrs_for_hip_version(version: int) -> int:
     return 1 if (major, minor) >= (7, 13) else 0
 
 
-class BatchMemcpyParams(NamedTuple):
-    src_bases: np.ndarray  # [num_layers] uint64 — data_ptr per layer
-    dst_bases: np.ndarray  # [num_layers] uint64
-    bpb: np.ndarray  # [num_layers] uint64 — bytes per block
-    num_layers: int
+class DriverMemcpyParams(NamedTuple):
+    """Driver-API plumbing shared by both batch-memcpy param sets."""
+
     # One attributes entry carrying srcAccessOrder. Ignored when num_attrs is
     # 0, which is what ROCm runtimes older than 7.13 require (see
     # _num_attrs_for_hip_version).
@@ -186,17 +184,38 @@ class BatchMemcpyParams(NamedTuple):
     stream_handle: int  # raw cudaStream_t / CUstream
 
 
+def _driver_memcpy_params(
+    stream: torch.cuda.Stream,
+    src_access_order: int,
+) -> DriverMemcpyParams:
+    global _batch_memcpy
+    if _batch_memcpy is None:
+        _batch_memcpy = _resolve_batch_memcpy()
+    _, num_attrs = _batch_memcpy
+
+    return DriverMemcpyParams(
+        attrs=_CUmemcpyAttributes(srcAccessOrder=src_access_order),
+        attrs_idx=ctypes.c_size_t(0),
+        num_attrs=num_attrs,
+        fail_idx=ctypes.c_size_t(0),
+        stream_handle=stream.cuda_stream,
+    )
+
+
+class BatchMemcpyParams(NamedTuple):
+    src_bases: np.ndarray  # [num_layers] uint64 — data_ptr per layer
+    dst_bases: np.ndarray  # [num_layers] uint64
+    bpb: np.ndarray  # [num_layers] uint64 — bytes per block
+    num_layers: int
+    driver: DriverMemcpyParams
+
+
 def build_params(
     src_caches: dict[str, torch.Tensor],
     dst_caches: dict[str, torch.Tensor],
     stream: torch.cuda.Stream,
     src_access_order: int = CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
 ) -> BatchMemcpyParams:
-    global _batch_memcpy
-    if _batch_memcpy is None:
-        _batch_memcpy = _resolve_batch_memcpy()
-    _, num_attrs = _batch_memcpy
-
     assert list(src_caches.keys()) == list(dst_caches.keys())
     src_tensors = list(src_caches.values())
     dst_tensors = list(dst_caches.values())
@@ -209,18 +228,12 @@ def build_params(
         dst_bases.append(d.data_ptr())
         bpb.append(s_bpb)
 
-    attrs = _CUmemcpyAttributes(srcAccessOrder=src_access_order)
-
     return BatchMemcpyParams(
         src_bases=np.array(src_bases, dtype=np.uint64),
         dst_bases=np.array(dst_bases, dtype=np.uint64),
         bpb=np.array(bpb, dtype=np.uint64),
         num_layers=len(src_tensors),
-        attrs=attrs,
-        attrs_idx=ctypes.c_size_t(0),
-        num_attrs=num_attrs,
-        fail_idx=ctypes.c_size_t(0),
-        stream_handle=stream.cuda_stream,
+        driver=_driver_memcpy_params(stream, src_access_order),
     )
 
 
@@ -234,9 +247,6 @@ def copy_blocks(
     if n == 0:
         return
 
-    assert _batch_memcpy is not None, "build_params() must run before copy_blocks()"
-    fn, _ = _batch_memcpy
-
     src_ids = np.array(src_block_ids, dtype=np.uint64)
     dst_ids = np.array(dst_block_ids, dtype=np.uint64)
 
@@ -247,7 +257,20 @@ def copy_blocks(
         params.dst_bases[:, None] + dst_ids[None, :] * params.bpb[:, None]
     ).ravel()
     sz_all = np.repeat(params.bpb, n)
-    total = n * params.num_layers
+
+    _launch_batch(dst_all, src_all, sz_all, params.driver)
+
+
+def _launch_batch(
+    dst_all: np.ndarray,
+    src_all: np.ndarray,
+    sz_all: np.ndarray,
+    driver: DriverMemcpyParams,
+) -> None:
+    """Issue the descriptor arrays in chunks the platform batch call accepts."""
+    assert _batch_memcpy is not None, "build_params() must run before copies"
+    fn, _ = _batch_memcpy
+    total = len(sz_all)
 
     # Chunk on ROCm: hipMemcpyBatchAsync faults above 8192 descriptors/call.
     # CUDA is uncapped (max_desc == 0) and issues a single call.
@@ -260,13 +283,85 @@ def copy_blocks(
             src_all[off : off + cnt].ctypes.data,
             sz_all[off : off + cnt].ctypes.data,
             cnt,
-            ctypes.addressof(params.attrs),
-            ctypes.byref(params.attrs_idx),
-            params.num_attrs,
-            ctypes.byref(params.fail_idx),
-            params.stream_handle,
+            ctypes.addressof(driver.attrs),
+            ctypes.byref(driver.attrs_idx),
+            driver.num_attrs,
+            ctypes.byref(driver.fail_idx),
+            driver.stream_handle,
         )
         if err != 0:
             raise RuntimeError(
-                f"batch memcpy failed: err={err} failIdx={params.fail_idx.value}"
+                f"batch memcpy failed: err={err} failIdx={driver.fail_idx.value}"
             )
+
+
+class LargePageCopyGeometry(NamedTuple):
+    """Per-group copy geometry under the large-page allocator.
+
+    Block ``b`` of group ``g`` is one contiguous byte range of
+    ``block_bytes[g]`` at ``gpu_bases[g] + b * block_bytes[g]`` in the GPU pool
+    and at ``cpu_base + b * block_bytes[g]`` in the CPU arena, which mirrors
+    the GPU pool page for page.
+
+    Per-group arrays are int64 so that address arithmetic stays integral.
+    """
+
+    gpu_bases: np.ndarray  # [G] — pool backing base per group
+    has_region: np.ndarray  # [G] bool — False if this rank holds no layer (PP)
+    cpu_base: int  # CPU arena base
+    block_bytes: np.ndarray  # [G] — bytes of one block of the group
+
+
+class LargePageMemcpyParams(NamedTuple):
+    geometry: LargePageCopyGeometry
+    src_is_gpu: bool  # store: GPU->CPU; load: CPU->GPU
+    driver: DriverMemcpyParams
+
+
+def build_large_page_params(
+    geometry: LargePageCopyGeometry,
+    src_is_gpu: bool,
+    stream: torch.cuda.Stream,
+    src_access_order: int = CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+) -> LargePageMemcpyParams:
+    return LargePageMemcpyParams(
+        geometry=geometry,
+        src_is_gpu=src_is_gpu,
+        driver=_driver_memcpy_params(stream, src_access_order),
+    )
+
+
+def copy_blocks_large_page(
+    src_block_ids: list[int],
+    dst_block_ids: list[int],
+    group_ids: list[int],
+    params: LargePageMemcpyParams,
+) -> None:
+    """Copy blocks under the large-page allocator.
+
+    Each block is one byte range on both sides (see ``LargePageCopyGeometry``);
+    blocks of groups without a region on this rank are skipped. One batched
+    call covers all blocks.
+    """
+    geometry = params.geometry
+    groups = np.array(group_ids, dtype=np.int64)
+    local = geometry.has_region[groups]
+    groups = groups[local]
+    if len(groups) == 0:
+        return
+    src_ids = np.array(src_block_ids, dtype=np.int64)[local]
+    dst_ids = np.array(dst_block_ids, dtype=np.int64)[local]
+    gpu_ids, cpu_ids = (src_ids, dst_ids) if params.src_is_gpu else (dst_ids, src_ids)
+
+    block_bytes = geometry.block_bytes[groups]
+    gpu_addr = geometry.gpu_bases[groups] + gpu_ids * block_bytes
+    cpu_addr = geometry.cpu_base + cpu_ids * block_bytes
+    src_addr, dst_addr = (
+        (gpu_addr, cpu_addr) if params.src_is_gpu else (cpu_addr, gpu_addr)
+    )
+    _launch_batch(
+        dst_addr.astype(np.uint64),
+        src_addr.astype(np.uint64),
+        block_bytes.astype(np.uint64),
+        params.driver,
+    )

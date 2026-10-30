@@ -167,6 +167,21 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
         self.worker_handler: SimpleCPUOffloadWorker | None = None
 
+        if kv_cache_config is not None and kv_cache_config.allocator == "large_page":
+            # v1 gaps under the large-page allocator: the disk backend needs
+            # per-group slot geometry, and lazy mode walks a single shared
+            # free queue, which the large-page pool splits per group.
+            if disk_mode:
+                raise ValueError(
+                    'kv_offload_backend="disk" is not supported with '
+                    'kv_cache_allocator="large_page".'
+                )
+            if lazy_offload:
+                raise ValueError(
+                    "lazy_offload is not supported with "
+                    'kv_cache_allocator="large_page".'
+                )
+
         if not enable_prefix_caching:
             logger.warning(
                 "Detected prefix caching disabled, disabling CPU offload "

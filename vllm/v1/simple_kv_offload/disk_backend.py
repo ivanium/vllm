@@ -190,11 +190,14 @@ class DiskBackend:
         self,
         src_blocks: list[int],
         dst_blocks: list[int],
+        group_ids: list[int],
         is_store: bool,
         event_idx: int,
         events_list: list[tuple[int, torch.Event]],
         wait_event: torch.Event | None = None,
     ) -> None:
+        # Block ids are unique across groups: the large-page allocator rejects
+        # the disk backend.
         q = self._store_queue if is_store else self._load_queue
         q.put((src_blocks, dst_blocks, event_idx, events_list, wait_event))
 
