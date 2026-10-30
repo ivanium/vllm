@@ -23,9 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     worker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
-    MooncakeLookupResult,
     MooncakeStoreConnectorMetadata,
-    TailKeyBoundary,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
@@ -35,9 +33,11 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
+    KVCacheGroupRole,
     KVCacheGroupSpec,
     KVCacheTensor,
     MambaSpec,
+    MLAAttentionSpec,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
@@ -78,20 +78,34 @@ def test_store_tp_does_not_override_backend_kv_cache_layout(extra_config):
 
 
 def _make_kv_cache_config() -> KVCacheConfig:
-    """Single-group full-attention KVCacheConfig — enough for the connector
-    constructor's validate() pass."""
+    """Single-group full-attention large-page KVCacheConfig, as the planner
+    emits it — enough for the connector constructor's validate() pass."""
     spec = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+    # One 16-token kernel row per block: 1 layer x 8 heads x 16 x 64 x fp16.
+    num_pages = 4
+    row_bytes = 8 * 16 * 64 * 2
     return KVCacheConfig(
-        num_blocks=4,
+        num_pages=num_pages,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=8192,
+                size=num_pages * row_bytes,
                 layers=["layer0"],
-                layer_stride=8192,
-                block_stride=2048,
+                layer_stride=row_bytes,
+                block_stride=row_bytes,
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer0"],
+                spec,
+                num_blocks=num_pages,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=row_bytes,
+            )
+        ],
+        large_page_bytes=row_bytes,
+        block_size=16,
     )
 
 
@@ -112,20 +126,48 @@ def _make_qsa_hybrid_kv_cache_config(mamba_mode: str):
         dtypes=(torch.float32,),
         mamba_cache_mode=mamba_mode,
     )
+    # The validation tests only read the specs; the large-page geometry is
+    # plumbing, one block of one kernel row per page, with row bytes derived
+    # from each spec's shape.
+    num_pages = 4
+    page_bytes = 800 * 8 * 64 * 2
+    groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            full_spec,
+            num_blocks=num_pages,
+            blocks_per_page=1,
+            kernel_rows_per_block=1,
+            row_bytes=page_bytes,
+        ),
+        KVCacheGroupSpec(
+            ["qsa"],
+            qsa_spec,
+            num_blocks=num_pages,
+            blocks_per_page=1,
+            kernel_rows_per_block=1,
+            row_bytes=8 * 1 * 64 * 2,
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            mamba_spec,
+            num_blocks=num_pages,
+            blocks_per_page=1,
+            kernel_rows_per_block=1,
+            row_bytes=4,
+        ),
+    ]
     return KVCacheConfig(
-        num_blocks=4,
+        num_pages=num_pages,
         kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(["full"], full_spec),
-            KVCacheGroupSpec(["qsa"], qsa_spec),
-            KVCacheGroupSpec(["mamba"], mamba_spec),
-        ],
+        kv_cache_groups=groups,
+        large_page_bytes=page_bytes,
+        block_size=800,
     )
 
 
-def test_validation_accepts_aligned_mamba_after_block_size_rewrite():
+def test_validation_accepts_aligned_mamba():
     vllm_config = _make_vllm_config()
-    vllm_config.cache_config.block_size = 8
 
     mooncake_store_connector.MooncakeStoreConnector._validate_kv_cache_config(
         vllm_config, _make_qsa_hybrid_kv_cache_config("align")
@@ -142,9 +184,57 @@ def test_validation_rejects_mamba_mode_directly():
         )
 
 
+def test_validation_rejects_hisparse_groups():
+    """HiSparse source/indexer groups are prefix-cacheable and would reach the
+    hit coordinator, but this connector has no HiSparse store semantics; fail
+    at validation with a clear error."""
+    vllm_config = _make_vllm_config()
+    num_pages = 4
+    page_bytes = 16 * 8 * 64 * 2
+    cfg = KVCacheConfig(
+        num_pages=num_pages,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=8, head_size=64, dtype=None
+                ),
+                num_blocks=num_pages,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=page_bytes,
+            ),
+            KVCacheGroupSpec(
+                ["src"],
+                MLAAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=576, dtype=None
+                ),
+                num_blocks=num_pages,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=16 * 576 * 2,
+                role=KVCacheGroupRole.HISPARSE_SOURCE,
+                host_resident=True,
+            ),
+        ],
+        large_page_bytes=page_bytes,
+        block_size=16,
+    )
+
+    with pytest.raises(ValueError, match="HiSparse"):
+        mooncake_store_connector.MooncakeStoreConnector._validate_kv_cache_config(
+            vllm_config, cfg
+        )
+
+
 def _make_mamba_none_kv_cache_config(
     attention_block_size: int | None, mamba_block_size: int
 ) -> KVCacheConfig:
+    # The scheduler tests only reach resolve_scheduler_block_size, which reads
+    # block size and the group block sizes; the per-group geometry is one
+    # block of one kernel row per page.
+    num_pages = 4
     groups = [
         KVCacheGroupSpec(
             ["mamba"],
@@ -154,11 +244,15 @@ def _make_mamba_none_kv_cache_config(
                 dtypes=(torch.float32,),
                 mamba_cache_mode="none",
             ),
+            num_blocks=num_pages,
+            blocks_per_page=1,
+            kernel_rows_per_block=1,
+            row_bytes=4,
         )
     ]
     if attention_block_size is not None:
-        # Kimi K3 layout without prefix caching: the LCM hash unit exceeds both
-        # group block sizes, so no lookup coordinator can be built.
+        # Kimi K3 layout without prefix caching: none-mode Mamba keeps its own
+        # block size, so no lookup coordinator can be built.
         groups.insert(
             0,
             KVCacheGroupSpec(
@@ -169,9 +263,19 @@ def _make_mamba_none_kv_cache_config(
                     head_size=64,
                     dtype=torch.float32,
                 ),
+                num_blocks=num_pages,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=attention_block_size * 8 * 64 * 4,
             ),
         )
-    return KVCacheConfig(num_blocks=4, kv_cache_tensors=[], kv_cache_groups=groups)
+    return KVCacheConfig(
+        num_pages=num_pages,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        large_page_bytes=max(g.row_bytes for g in groups),
+        block_size=mamba_block_size,
+    )
 
 
 def _make_role_vllm_config(kv_role: str, enable_lookup: bool, save_decode_cache: bool):
@@ -333,7 +437,7 @@ def test_worker_methods_delegate_to_store_worker():
 
     worker = mock_worker_cls.return_value
     worker.get_finished.return_value = ({"req-1"}, {"req-2"})
-    worker.get_block_ids_with_load_errors.return_value = {3, 4}
+    worker.get_block_ids_with_load_errors.return_value = {(0, 3), (0, 4)}
     connector.bind_connector_metadata(metadata)
 
     connector.register_kv_caches(kv_caches)
@@ -348,7 +452,7 @@ def test_worker_methods_delegate_to_store_worker():
     worker.get_finished.assert_called_once_with(finished_req_ids, metadata)
     assert result == ({"req-1"}, {"req-2"})
     worker.get_block_ids_with_load_errors.assert_called_once_with()
-    assert invalid_block_ids == {3, 4}
+    assert invalid_block_ids == {(0, 3), (0, 4)}
 
 
 def test_get_transfer_results_delegates_to_store_worker():
@@ -753,9 +857,7 @@ def test_lookup_key_client_lookup_prepends_typed_tag():
 
     # Blocking lookup (non_block defaults to False) runs on the executor and
     # returns the resolved hit length.
-    result = client.lookup("req0", num_tokens=128, block_hashes=[])
-    assert result is not None
-    assert result.hit_length == 5
+    assert client.lookup("req0", num_tokens=128, block_hashes=[]) == 5
 
     sent_frames = fake_socket.send_multipart.call_args[0][0]
     assert sent_frames[0] == protocol.LOOKUP_MSG
@@ -790,7 +892,7 @@ def _poll_lookup(client, req_id, num_tokens=128, block_hashes=(), timeout=5.0):
     while time.monotonic() < deadline:
         result = client.lookup(req_id, num_tokens, list(block_hashes), non_block=True)
         if result is not None:
-            return result.hit_length
+            return result
         time.sleep(0.005)
     return None
 
@@ -885,7 +987,7 @@ def test_get_num_new_matched_tokens_async_defers_then_reports():
     assert sched.lookup_async is True
     mock_client = mock_client_cls.return_value
 
-    block_size = sched._block_size
+    block_size = sched._scheduler_block_size
     request = MagicMock()
     request.request_id = "r1"
     request.num_tokens = 4 * block_size
@@ -898,13 +1000,11 @@ def test_get_num_new_matched_tokens_async_defers_then_reports():
 
     # Lookup ready with a hit -> report need_to_allocate + async-load flag.
     hit = 3 * block_size
-    boundary = TailKeyBoundary(group_id=0, num_tokens=4 * block_size)
-    mock_client.lookup.return_value = MooncakeLookupResult(hit, (boundary,))
+    mock_client.lookup.return_value = hit
     need, load_async = sched.get_num_new_matched_tokens(request, 0)
     assert need == hit
     assert load_async == sched.load_async
     assert sched.load_specs["r1"].kvpool_cached_tokens == hit
-    assert sched.load_specs["r1"].tail_key_boundaries == (boundary,)
 
 
 def test_protocol_tags_are_distinct_and_non_empty():
@@ -917,18 +1017,10 @@ def test_protocol_tags_are_distinct_and_non_empty():
     assert protocol.RESP_OK != protocol.RESP_ERR
 
 
-def test_lookup_response_round_trip_preserves_tail_keys():
-    result = MooncakeLookupResult(
-        hit_length=20,
-        tail_key_boundaries=(
-            TailKeyBoundary(group_id=0, num_tokens=24),
-            TailKeyBoundary(group_id=1, num_tokens=20),
-        ),
-    )
+def test_lookup_response_round_trip_preserves_hit_length():
+    payload = protocol.encode_lookup_response(20)
 
-    assert protocol.decode_lookup_response(protocol.encode_lookup_response(result)) == (
-        result
-    )
+    assert protocol.decode_lookup_response(payload) == 20
 
 
 def test_scheduler_reset_connector_cache_invokes_connector_reset():

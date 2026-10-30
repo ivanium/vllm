@@ -15,7 +15,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tests.v1.attention.utils import dense_kv_cache_views
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
     KVConnectorRole,
@@ -30,9 +29,9 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    GroupGeometry,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheLayout,
     MambaSpec,
 )
 
@@ -45,6 +44,17 @@ def noop_shutdown():
 
 
 def make_hybrid_gdn_kv_cache_config(block_size: int) -> KVCacheConfig:
+    """FA + GDN groups over a shared large-page pool (identity mapping).
+
+    The 704-byte page holds an integral number of each group's blocks, so
+    manager block ids double as kernel row ids.
+    """
+    fa_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float16,
+    )
     gdn_spec = MambaSpec(
         block_size=block_size,
         shapes=((6, 3), (1, 2, 2)),
@@ -52,24 +62,31 @@ def make_hybrid_gdn_kv_cache_config(block_size: int) -> KVCacheConfig:
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
     )
     assert gdn_spec.mamba_type == MambaAttentionBackendEnum.GDN_ATTN
+    fa_row = fa_spec.page_size_bytes
+    gdn_row = gdn_spec.page_size_bytes
     return KVCacheConfig(
-        num_blocks=16,
+        num_pages=16,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["model.layers.0.self_attn"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                ),
+                fa_spec,
+                num_blocks=16 * 11,
+                blocks_per_page=11,
+                kernel_rows_per_block=1,
+                row_bytes=fa_row,
             ),
             KVCacheGroupSpec(
                 ["model.layers.1.linear_attn"],
                 gdn_spec,
+                num_blocks=16 * 16,
+                blocks_per_page=16,
+                kernel_rows_per_block=1,
+                row_bytes=gdn_row,
             ),
         ],
+        large_page_bytes=704,
+        block_size=block_size,
     )
 
 
@@ -162,16 +179,25 @@ def test_register_kv_caches_emits_fa_and_gdn_regions(monkeypatch):
         )
         worker = connector.connector_worker
 
-        num_blocks = kv_cache_config.num_blocks
-        fa_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
-        gdn_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
-        fa_raw = torch.empty(num_blocks * fa_spec.page_size_bytes, dtype=torch.int8)
-        gdn_block_stride = gdn_spec.page_size_bytes + 64
-        gdn_raw = torch.empty(num_blocks, gdn_block_stride, dtype=torch.int8)
-        (fa_cache,) = dense_kv_cache_views(
-            fa_raw, fa_spec, num_blocks, 1, KVCacheLayout.LBHNC
+        fa_group, gdn_group = kv_cache_config.kv_cache_groups
+        pool = torch.empty(
+            kv_cache_config.num_pages * kv_cache_config.large_page_bytes,
+            dtype=torch.int8,
         )
-        gdn_cache = gdn_raw[:, : gdn_spec.page_size_bytes]
+        # Per-layer kernel-row views over the shared pool: each group's row
+        # grid starts at the pool base.
+        fa_cache = torch.as_strided(
+            pool,
+            (pool.nbytes // fa_group.row_bytes, fa_group.row_bytes),
+            (fa_group.row_bytes, 1),
+            0,
+        )
+        gdn_cache = torch.as_strided(
+            pool,
+            (pool.nbytes // gdn_group.row_bytes, gdn_group.row_bytes),
+            (gdn_group.row_bytes, 1),
+            0,
+        )
 
         worker.register_kv_caches(
             {
@@ -185,15 +211,17 @@ def test_register_kv_caches_emits_fa_and_gdn_regions(monkeypatch):
             "model.layers.0.self_attn",
             "model.layers.1.linear_attn",
         ]
+        fa_spec = fa_group.kv_cache_spec
+        gdn_spec = gdn_group.kv_cache_spec
+        assert worker.block_len_per_layer == [fa_group.row_bytes, gdn_group.row_bytes]
         assert worker.kv_block_len_per_layer == [
             fa_spec.page_size_bytes,
             gdn_spec.page_size_bytes,
         ]
         assert worker.registered_group_indices == [0, 1]
-        assert worker.kv_caches_base_addr == [
-            fa_cache.data_ptr(),
-            gdn_cache.data_ptr(),
-        ]
+        # Both groups' row grids start at the pool base; the regions must
+        # not merge.
+        assert worker.kv_caches_base_addr == [pool.data_ptr(), pool.data_ptr()]
 
         worker.shutdown()
         worker.shutdown = noop_shutdown
@@ -201,6 +229,7 @@ def test_register_kv_caches_emits_fa_and_gdn_regions(monkeypatch):
 
 
 def test_register_kv_caches_scales_attention_len_to_kernel_block(monkeypatch):
+    """A group with R>1 registers views whose payload is one kernel row."""
     monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector",
@@ -210,6 +239,9 @@ def test_register_kv_caches_scales_attention_len_to_kernel_block(monkeypatch):
     kv_cache_config = make_hybrid_gdn_kv_cache_config(
         vllm_config.cache_config.block_size
     )
+    fa_group = kv_cache_config.kv_cache_groups[0]
+    fa_group.kernel_rows_per_block = 4
+    fa_group.row_bytes = fa_group.kv_cache_spec.page_size_bytes // 4
 
     with set_current_vllm_config(vllm_config), patch_worker_dependencies():
         connector = MooncakeConnector(
@@ -218,21 +250,14 @@ def test_register_kv_caches_scales_attention_len_to_kernel_block(monkeypatch):
             kv_cache_config,
         )
         worker = connector.connector_worker
-        factor = 4
-        worker._physical_blocks_per_logical_kv_block = factor
 
-        fa_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
-        physical_page_bytes = fa_spec.page_size_bytes // factor
-        fa_cache = torch.empty(
-            kv_cache_config.num_blocks * factor,
-            physical_page_bytes,
-            dtype=torch.uint8,
-        )
-
+        # The worker binds views at kernel-block granularity, so one row of
+        # the view is one kernel block, not one manager block.
+        fa_cache = torch.empty(64, fa_group.row_bytes, dtype=torch.uint8)
         worker.register_kv_caches({"model.layers.0.self_attn": fa_cache})
 
-        assert worker.block_len_per_layer == [physical_page_bytes]
-        assert worker.kv_block_len_per_layer == [physical_page_bytes]
+        assert worker.block_len_per_layer == [fa_group.row_bytes]
+        assert worker.kv_block_len_per_layer == [fa_group.row_bytes]
 
         worker.shutdown()
         worker.shutdown = noop_shutdown
@@ -242,6 +267,9 @@ def test_register_kv_caches_scales_attention_len_to_kernel_block(monkeypatch):
 @pytest.mark.asyncio
 async def test_build_transfer_params_uses_non_overlapping_physical_pages():
     kv_cache_config = make_hybrid_gdn_kv_cache_config(block_size=16)
+    fa_group = kv_cache_config.kv_cache_groups[0]
+    fa_group.kernel_rows_per_block = 4
+    fa_group.row_bytes = fa_group.kv_cache_spec.page_size_bytes // 4
     worker = object.__new__(MooncakeConnectorWorker)
     worker.shutdown = noop_shutdown
     # __new__ skips __init__, where these caches are created.
@@ -260,18 +288,12 @@ async def test_build_transfer_params_uses_non_overlapping_physical_pages():
         for group in kv_cache_config.kv_cache_groups
         for layer_name in group.layer_names
     }
-    worker._layer_group_indices = {
-        layer_name: group_index
-        for group_index, group in enumerate(kv_cache_config.kv_cache_groups)
-        for layer_name in group.layer_names
-    }
 
     ratio = 4
-    worker._physical_blocks_per_logical_kv_block = ratio
     fa_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
     physical_page_bytes = fa_spec.page_size_bytes // ratio
     fa_cache = torch.empty(
-        kv_cache_config.num_blocks * ratio,
+        64,
         physical_page_bytes,
         dtype=torch.uint8,
     )
@@ -306,6 +328,8 @@ async def test_build_transfer_params_uses_non_overlapping_physical_pages():
         local_block_ids=[[local_logical_block], []],
         ready=asyncio.Event(),
     )
+    # The consumer advertises the same per-group geometry: one manager block
+    # expands to `ratio` kernel rows on both sides.
     xfer_meta = MooncakeXferMetadata(
         remote_hostname="consumer-host",
         remote_port=54321,
@@ -320,6 +344,10 @@ async def test_build_transfer_params_uses_non_overlapping_physical_pages():
         kv_caches_base_addr=[],
         block_lens=[],
         kv_block_lens=[],
+        group_geometries=[
+            GroupGeometry(ratio, physical_page_bytes),
+            GroupGeometry(1, 44),
+        ],
     )
 
     (
@@ -411,14 +439,18 @@ def test_register_kv_caches_deduplicates_shared_backing_memory(monkeypatch):
         )
         worker = connector.connector_worker
 
-        fa_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
-        fa_cache_width = (
-            fa_spec.page_size_bytes
-            // torch.tensor([], dtype=torch.float16).element_size()
+        # All groups share the one large-page pool backing.
+        fa_group, gdn_group = kv_cache_config.kv_cache_groups
+        pool = torch.empty(
+            kv_cache_config.num_pages * kv_cache_config.large_page_bytes,
+            dtype=torch.int8,
         )
-        backing = torch.empty((4, fa_cache_width), dtype=torch.float16)
-        fa_cache = backing[:2]
-        gdn_cache = backing[:3]
+        fa_cache = torch.as_strided(
+            pool, (11, fa_group.row_bytes), (fa_group.row_bytes, 1), 0
+        )
+        gdn_cache = torch.as_strided(
+            pool, (16, gdn_group.row_bytes), (gdn_group.row_bytes, 1), 0
+        )
 
         with patch.object(
             worker.engine, "batch_register_memory", return_value=0
@@ -436,8 +468,8 @@ def test_register_kv_caches_deduplicates_shared_backing_memory(monkeypatch):
         ]
         batch_register_memory.assert_called_once()
         registered_ptrs, registered_lens = batch_register_memory.call_args[0]
-        assert registered_ptrs == [backing.data_ptr()]
-        assert registered_lens == [backing.untyped_storage().nbytes()]
+        assert registered_ptrs == [pool.data_ptr()]
+        assert registered_lens == [pool.untyped_storage().nbytes()]
 
         worker.shutdown()
         worker.shutdown = noop_shutdown
@@ -500,6 +532,7 @@ def test_hybrid_gdn_transfer_params_preserve_group_identity(monkeypatch):
             kv_caches_base_addr=[],
             block_lens=[],
             kv_block_lens=[],
+            group_geometries=[GroupGeometry(1, 64), GroupGeometry(1, 44)],
         )
 
         local_regions = [
@@ -558,18 +591,6 @@ def test_hybrid_gdn_transfer_params_preserve_group_identity(monkeypatch):
         worker.shutdown()
         worker.shutdown = noop_shutdown
         connector.connector_worker = None
-
-
-def test_logical_to_kernel_block_ids_expands_fa_not_gdn():
-    worker = object.__new__(MooncakeConnectorWorker)
-    worker.shutdown = noop_shutdown
-    worker._physical_blocks_per_logical_kv_block = 17
-    worker.kv_cache_config = make_hybrid_gdn_kv_cache_config(block_size=544)
-
-    block_ids = [[2], [2]]
-    kernel_block_ids = worker._logical_to_kernel_block_ids(block_ids)
-
-    assert kernel_block_ids == [list(range(34, 51)), [2]]
 
 
 def test_hybrid_gdn_keeps_packed_fa_and_gdn_regions_whole(
