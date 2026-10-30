@@ -13,6 +13,7 @@ mid-decode (silent corruption of an unrelated request).
 
 import math
 from collections import defaultdict
+from contextlib import nullcontext
 from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1667,3 +1668,447 @@ def test_ring_scratch_without_mamba_registers_and_addresses_its_own_regions():
     )
     # Paged block 1 in both regions; ring block 0 only in its scratch region.
     assert sorted(desc_ids.tolist()) == sorted([0 * 2 + 1, 1 * 2 + 1, 1 * 2 + 0])
+
+
+# ---------------------------------------------------------------------------
+# large_page allocator: per-group kernel-row regions
+# ---------------------------------------------------------------------------
+
+# Shared geometry for the large-page fixtures: one pool of N pages of S
+# bytes. S is a multiple of neither group's block, so some block ids cross a
+# page end and are never allocated.
+_LP_PAGE_BYTES = 1792  # S_r
+_LP_NUM_PAGES = 4  # N
+
+
+def _large_page_pool_views(pool, views_spec):
+    """as_strided layer views over the pool: (rows, page) with row stride."""
+    return {
+        name: torch.as_strided(pool, (rows, page), (stride, 1), offset)
+        for name, (rows, page, stride, offset) in views_spec.items()
+    }
+
+
+def _make_large_page_worker(
+    worker_cls=NixlPullConnectorWorker,
+    *,
+    with_mamba: bool = False,
+):
+    """A worker over one shared large-page pool with two transfer groups.
+
+    Group 0 is a 2-layer head-sharded (GQA) attention group with R_g=2 and
+    registers one kernel-row region per layer; group 1 is a single-layer MLA
+    group with R_g=1 and registers one whole-row region. With ``with_mamba``
+    group 1 is instead a single-layer Mamba group (per-layer conv/ssm
+    sub-descriptors) and group 0 is the whole-row MLA group.
+    """
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+        MambaSpec,
+        MLAAttentionSpec,
+    )
+
+    block_size = 16
+    pool = torch.zeros(_LP_PAGE_BYTES * _LP_NUM_PAGES, dtype=torch.uint8)
+
+    if with_mamba:
+        from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+        attn_spec = MLAAttentionSpec(
+            block_size=block_size, num_kv_heads=1, head_size=24, dtype=torch.uint8
+        )
+        mamba_spec = MambaSpec(
+            block_size=block_size,
+            shapes=((8, 3), (1, 4, 4)),
+            dtypes=(torch.float16, torch.float32),
+            page_size_padded=128,
+            mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        )
+        attn_row = attn_spec.page_size_bytes  # R=1
+        mamba_row = mamba_spec.page_size_bytes
+        attn_rows = (_LP_PAGE_BYTES * _LP_NUM_PAGES) // attn_row
+        mamba_rows = (_LP_PAGE_BYTES * _LP_NUM_PAGES) // mamba_row
+        groups = [
+            KVCacheGroupSpec(
+                ["attn.0"],
+                attn_spec,
+                num_blocks=2 * _LP_NUM_PAGES,
+                slots_per_large_page=2,
+                kernel_rows_per_block=1,
+                row_bytes=attn_row,
+            ),
+            KVCacheGroupSpec(
+                ["ssm.0"],
+                mamba_spec,
+                num_blocks=2 * _LP_NUM_PAGES,
+                slots_per_large_page=2,
+                kernel_rows_per_block=1,
+                row_bytes=mamba_row,
+            ),
+        ]
+        views_spec = {
+            "attn.0": (attn_rows, attn_row, attn_row, 0),
+            "ssm.0": (mamba_rows, mamba_row, mamba_row, 0),
+        }
+    else:
+        g0_spec = FullAttentionSpec(
+            block_size=block_size, num_kv_heads=2, head_size=8, dtype=torch.uint8
+        )
+        g1_spec = MLAAttentionSpec(
+            block_size=block_size, num_kv_heads=1, head_size=24, dtype=torch.uint8
+        )
+        # Group 0: two layers, two kernel rows (R_g=2) per manager block.
+        g0_layer_row = g0_spec.page_size_bytes // 2
+        g0_row = 2 * g0_layer_row
+        g1_row = g1_spec.page_size_bytes
+        g0_rows = (_LP_PAGE_BYTES * _LP_NUM_PAGES) // g0_row
+        g1_rows = (_LP_PAGE_BYTES * _LP_NUM_PAGES) // g1_row
+        groups = [
+            KVCacheGroupSpec(
+                ["g0.l0", "g0.l1"],
+                g0_spec,
+                num_blocks=_LP_NUM_PAGES,
+                slots_per_large_page=1,
+                kernel_rows_per_block=2,
+                row_bytes=g0_row,
+            ),
+            KVCacheGroupSpec(
+                ["g1.l0"],
+                g1_spec,
+                num_blocks=2 * _LP_NUM_PAGES,
+                slots_per_large_page=2,
+                kernel_rows_per_block=1,
+                row_bytes=g1_row,
+            ),
+        ]
+        views_spec = {
+            "g0.l0": (g0_rows, g0_layer_row, g0_row, 0),
+            "g0.l1": (g0_rows, g0_layer_row, g0_row, g0_layer_row),
+            "g1.l0": (g1_rows, g1_row, g1_row, 0),
+        }
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=_LP_NUM_PAGES,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=pool.nbytes,
+                layers=list(views_spec),
+                layer_stride=pool.nbytes,
+                block_stride=0,
+            )
+        ],
+        kv_cache_groups=groups,
+        allocator="large_page",
+        large_page_bytes=_LP_PAGE_BYTES,
+    )
+
+    vllm_config = create_vllm_config(block_size=block_size)
+    vllm_config.cache_config.enable_prefix_caching = False
+
+    fake_backend = MagicMock()
+    fake_backend.get_supported_kernel_block_sizes.return_value = [block_size]
+    fake_backend.get_name.return_value = "TEST_ATTN"
+    fake_backend.full_cls_name.return_value = "test.AttentionBackend"
+
+    mamba_layout_patch = (
+        patch(
+            "vllm.model_executor.layers.mamba.mamba_utils.get_conv_state_layout",
+            return_value="DS",
+        )
+        if with_mamba
+        else nullcontext()
+    )
+    with (
+        patch.object(bw, "NixlWrapper", _RecordingNixl),
+        patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+        patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
+        patch("threading.Thread"),
+        set_current_vllm_config(vllm_config),
+        mamba_layout_patch,
+    ):
+        worker = worker_cls(vllm_config, "local-engine", kv_cache_config)
+        worker.register_kv_caches(_large_page_pool_views(pool, views_spec))
+    worker._test_pool = pool
+    return worker
+
+
+def _large_page_remote_meta(
+    worker, engine_id="remote-engine", addr_offset=0, **overrides
+):
+    """This worker's advertised metadata as a peer's, bases shifted."""
+    metadata = msgspec.msgpack.decode(
+        worker.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
+    )
+    metadata.engine_id = engine_id
+    metadata.kv_caches_base_addr = [
+        addr + addr_offset for addr in metadata.kv_caches_base_addr
+    ]
+    for field_name, value in overrides.items():
+        setattr(metadata, field_name, value)
+    return metadata
+
+
+def _large_page_owned_ranges(worker, group_manager_ids):
+    """Byte ranges owned by the given per-group manager blocks: every kernel
+    row of every block, b * R + j."""
+    config = worker.kv_cache_config
+    pool_addr = worker._test_pool.data_ptr()
+    owned = []
+    for group_id, ids in enumerate(group_manager_ids):
+        group = config.kv_cache_groups[group_id]
+        for block in ids:
+            for j in range(group.kernel_rows_per_block):
+                row = block * config.kv_cache_groups[group_id].kernel_rows_per_block + j
+                owned.append(
+                    (
+                        pool_addr + row * group.row_bytes,
+                        pool_addr + (row + 1) * group.row_bytes,
+                    )
+                )
+    return owned
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "worker_cls", [NixlPullConnectorWorker, NixlPushConnectorWorker]
+)
+def test_large_page_registration_per_group_row_regions(worker_cls):
+    worker = _make_large_page_worker(worker_cls)
+    pool_addr = worker._test_pool.data_ptr()
+    config = worker.kv_cache_config
+    g0, g1 = config.kv_cache_groups
+
+    # One region per layer of the head-sharded group, one whole-row region
+    # for the MLA group.
+    assert worker.region_names == ["g0.l0", "g0.l1", "g1.l0"]
+    assert worker.region_group_ids == [0, 0, 1]
+    assert bw._SHARED_REGION_GROUP_ID not in worker.region_group_ids
+    assert worker.block_stride_per_layer == [g0.row_bytes, g0.row_bytes, g1.row_bytes]
+    assert worker.block_len_per_layer == [
+        g0.kv_cache_spec.page_size_bytes // 2,
+        g0.kv_cache_spec.page_size_bytes // 2,
+        g1.row_bytes,
+    ]
+    assert worker.region_num_blocks == [
+        14,  # (1792 * 4) // 512
+        14,
+        18,  # (1792 * 4) // 384
+    ]
+    # Dedup regression: the group-0 layer-0 view and the group-1 row share
+    # the pool base address but have different strides; they must not merge.
+    bases = worker.kv_caches_base_addr[worker.engine_id][0]
+    assert bases == [pool_addr, pool_addr + 256, pool_addr]
+    # One memory registration over the whole pool.
+    assert worker._registered_descs == [[(pool_addr, worker._test_pool.nbytes, 0, "")]]
+    assert worker._packed_member_layouts == {"g1.l0": (0, g1.row_bytes)}
+
+    metadata = msgspec.msgpack.decode(
+        worker.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
+    )
+    assert metadata.group_kernel_rows_per_block == [2, 1]
+    assert metadata.group_layer_names == [["g0.l0", "g0.l1"], ["g1.l0"]]
+    assert metadata.region_num_blocks == worker.region_num_blocks
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "worker_cls", [NixlPullConnectorWorker, NixlPushConnectorWorker]
+)
+def test_large_page_desc_ids_match_affine_kernel_rows(worker_cls):
+    worker = _make_large_page_worker(worker_cls)
+    config = worker.kv_cache_config
+
+    # Allocatable ids only: group 0 blocks are 1024 bytes, so odd ids cross a
+    # 1792-byte page end; group 1 block 4 (384 bytes) crosses the first.
+    manager_ids = ([0, 2, 4, 6], [0, 1, 5])
+    kernel_ids = worker._logical_to_kernel_block_ids(manager_ids, 1)
+    # Block b of a group with R kernel rows per block is rows b * R .. b * R
+    # + R - 1: group 0 has R=2, group 1 has R=1.
+    assert kernel_ids == [[0, 1, 4, 5, 8, 9, 12, 13], [0, 1, 5]]
+
+    # Descriptor ids index the region-major kernel-row space; every kernel
+    # row of a manager block maps to that block's rows of the group's views.
+    desc_ids = worker._compute_desc_ids(
+        kernel_ids,
+        dst_num_blocks=config.num_blocks,
+        block_size_ratio=None,
+        physical_blocks_per_logical=1,
+        region_num_blocks=worker.dst_region_num_blocks[worker.engine_id],
+        region_group_ids=worker.region_group_ids,
+    )
+    descs = expand_strided_descs(worker.src_blocks_data)
+    pool_addr = worker._test_pool.data_ptr()
+    g0_row, g1_row = 512, 384
+    expected_addrs = []
+    for kid in kernel_ids[0]:  # group 0: both layer regions, row-major
+        expected_addrs.append(pool_addr + kid * g0_row)  # g0.l0
+    for kid in kernel_ids[0]:
+        expected_addrs.append(pool_addr + 256 + kid * g0_row)  # g0.l1
+    for kid in kernel_ids[1]:
+        expected_addrs.append(pool_addr + kid * g1_row)  # g1 row
+    assert descs[desc_ids, 0].tolist() == expected_addrs
+
+
+@pytest.mark.cpu_test
+def test_large_page_pull_writes_stay_within_request_blocks():
+    """A pulled request's local descriptors must all land in the kernel rows
+    of its own manager blocks."""
+    worker = _make_large_page_worker()
+    metadata = _large_page_remote_meta(worker, addr_offset=0x1000_0000)
+    _register_remote_agents(worker, metadata, tp_size=1)
+
+    local_ids = ([2, 6], [2])
+    remote_ids = ([0, 4], [5])
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+
+    connector_meta = NixlConnectorMetadata()
+    connector_meta.add_new_req_to_recv(
+        request_id="req-lp",
+        local_block_ids=local_ids,
+        kv_transfer_params={
+            "remote_block_ids": remote_ids,
+            "remote_engine_id": "remote-engine",
+            "remote_request_id": "prefill-req-lp",
+            "remote_host": "remote-host",
+            "remote_port": 1234,
+            "tp_size": 1,
+        },
+    )
+    meta = connector_meta.reqs_to_recv["req-lp"]
+    meta.local_physical_block_ids = worker._logical_to_kernel_block_ids(
+        meta.local_block_ids, 1
+    )
+    worker._recving_metadata["req-lp"] = meta
+
+    worker._read_blocks_for_req("req-lp", meta)
+
+    owned = _large_page_owned_ranges(worker, local_ids)
+    assert _assert_local_writes_within(worker, owned) > 0
+
+
+@pytest.mark.cpu_test
+def test_large_page_fewer_remote_groups_fails_with_clear_error():
+    """A peer advertising fewer transfer groups than local must hit the
+    descriptive group-count error, not a raw IndexError from indexing the
+    advertised per-group lists."""
+    worker = _make_large_page_worker()
+    metadata = _large_page_remote_meta(worker, addr_offset=0x1000_0000)
+    # Truncate the advertised per-group lists to one transfer group.
+    metadata.group_layer_names = metadata.group_layer_names[:1]
+    metadata.group_kernel_rows_per_block = metadata.group_kernel_rows_per_block[:1]
+
+    with pytest.raises(RuntimeError, match="different number of transfer groups"):
+        worker.add_remote_agent(metadata, remote_tp_rank=0, remote_tp_size=1)
+
+
+@pytest.mark.cpu_test
+def test_large_page_push_writes_stay_within_request_blocks():
+    """The push-mode equivalent: a pushed request's local (P) descriptors
+    must all land in the kernel rows of its own manager blocks."""
+    worker = _make_large_page_worker(NixlPushConnectorWorker)
+    metadata = _large_page_remote_meta(worker, addr_offset=0x1000_0000)
+    _register_remote_agents(worker, metadata, tp_size=1)
+
+    local_ids = ([2, 6], [2])
+    remote_ids = ([0, 4], [5])
+    worker._do_start_push_kv(
+        "req-lp",
+        local_ids,
+        {
+            "decode_engine_id": "remote-engine",
+            "local_block_ids": remote_ids,
+            "request_id": "decode-req-lp",
+            "decode_host": "remote-host",
+            "decode_port": 1234,
+            "decode_tp_size": 1,
+        },
+    )
+
+    owned = _large_page_owned_ranges(worker, local_ids)
+    assert _assert_local_writes_within(worker, owned) > 0
+
+
+@pytest.mark.cpu_test
+def test_large_page_mamba_per_layer_sub_descriptors():
+    """Mamba groups keep per-layer conv/ssm sub-descriptors under large_page,
+    with per-region kernel-row counts."""
+    worker = _make_large_page_worker(with_mamba=True)
+    config = worker.kv_cache_config
+    attn_group, mamba_group = config.kv_cache_groups
+    pool_addr = worker._test_pool.data_ptr()
+
+    # Region 0: whole-row MLA; region 1: the mamba layer. Same pool base,
+    # different strides -> distinct regions.
+    assert worker.region_group_ids == [0, 1]
+    assert worker._ssm_region_indices == [1]
+    assert worker.block_stride_per_layer == [
+        attn_group.row_bytes,
+        mamba_group.row_bytes,
+    ]
+    assert worker.kv_caches_base_addr[worker.engine_id][0] == [
+        pool_addr,
+        pool_addr,
+    ]
+
+    # Local descs: 18 FA rows, then 4 sub-descriptor runs of 56 rows each.
+    attn_rows = worker.region_num_blocks[0]
+    mamba_rows = worker.region_num_blocks[1]
+    assert (attn_rows, mamba_rows) == (18, 56)
+    assert worker.src_blocks_data.shape == (1 + 4, 5)
+    for run in worker.src_blocks_data[1:]:
+        assert run[4] == mamba_rows
+
+    kernel_ids = worker._logical_to_kernel_block_ids(([1], [2]), 1)
+    desc_ids = worker._compute_desc_ids(
+        kernel_ids,
+        dst_num_blocks=config.num_blocks,
+        block_size_ratio=None,
+        physical_blocks_per_logical=1,
+        region_num_blocks=worker.dst_region_num_blocks[worker.engine_id],
+        region_group_ids=worker.region_group_ids,
+    )
+    # FA desc for the attention kernel row; then the 4 mamba sub-runs, each
+    # mamba_rows long, at the mamba kernel row.
+    attn_row_id = kernel_ids[0][0]
+    ssm_row_id = kernel_ids[1][0]
+    assert desc_ids.tolist() == [attn_row_id] + [
+        attn_rows + sub * mamba_rows + ssm_row_id for sub in range(4)
+    ]
+
+    # A pull transfer resolves local descs into the request's own rows.
+    metadata = _large_page_remote_meta(worker, addr_offset=0x1000_0000)
+    _register_remote_agents(worker, metadata, tp_size=1)
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+
+    connector_meta = NixlConnectorMetadata()
+    connector_meta.add_new_req_to_recv(
+        request_id="req-lp-mamba",
+        local_block_ids=([1], [2]),
+        kv_transfer_params={
+            "remote_block_ids": ([0], [1]),
+            "remote_engine_id": "remote-engine",
+            "remote_request_id": "prefill-req-lp-mamba",
+            "remote_host": "remote-host",
+            "remote_port": 1234,
+            "tp_size": 1,
+        },
+    )
+    meta = connector_meta.reqs_to_recv["req-lp-mamba"]
+    meta.local_physical_block_ids = worker._logical_to_kernel_block_ids(
+        meta.local_block_ids, 1
+    )
+    worker._recving_metadata["req-lp-mamba"] = meta
+    worker._read_blocks_for_req("req-lp-mamba", meta)
+
+    owned = _large_page_owned_ranges(worker, ([1], [2]))
+    assert _assert_local_writes_within(worker, owned) > 0

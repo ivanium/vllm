@@ -204,9 +204,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 raise NotImplementedError(
                     "Region-mapped NIXL transfers require matching physical block sizes"
                 )
-            remote_physical_block_ids = self._logical_to_kernel_block_ids(
+            remote_physical_block_ids = self._remote_logical_to_kernel_block_ids(
                 meta.remote.block_ids,
                 remote_info.remote_physical_blocks_per_logical,
+                engine_id,
             )
             remote_by_region = self._block_ids_by_region(
                 remote_physical_block_ids, remote_region_groups
@@ -225,7 +226,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 transfer_groups = self.kv_cache_config.transfer_group_ids
                 num_computed_blocks = [
                     meta.local_num_computed_blocks[transfer_groups[group]]
-                    * self._physical_blocks_per_logical_kv_block
+                    * (
+                        self.kv_cache_config.kv_cache_groups[
+                            transfer_groups[group]
+                        ].kernel_rows_per_block
+                        if self._large_page
+                        else self._physical_blocks_per_logical_kv_block
+                    )
                     for group in local_region_groups
                 ]
                 num_remote_blocks = cdiv(
@@ -262,9 +269,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             ]
         else:
             remote_logical_block_ids = meta.remote.block_ids
-            meta.remote.block_ids = self._logical_to_kernel_block_ids(
+            meta.remote.block_ids = self._remote_logical_to_kernel_block_ids(
                 remote_logical_block_ids,
                 remote_info.remote_physical_blocks_per_logical,
+                engine_id,
             )
             num_groups = len(meta.local_block_ids)
 
@@ -298,9 +306,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     local_physical_ids = self._logical_to_kernel_block_ids(
                         local_ids, self._physical_blocks_per_logical_kv_block
                     )
-                    remote_physical_ids = self._logical_to_kernel_block_ids(
+                    remote_physical_ids = self._remote_logical_to_kernel_block_ids(
                         remote_ids,
                         remote_info.remote_physical_blocks_per_logical,
+                        engine_id,
                     )
                 else:
                     local_physical_ids = group_ids(meta.local_physical_block_ids, rank)

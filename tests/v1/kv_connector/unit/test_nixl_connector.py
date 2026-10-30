@@ -80,6 +80,10 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
+from .test_nixl_desc_geometry import (
+    _large_page_remote_meta,
+    _make_large_page_worker,
+)
 from .utils import (
     create_model_runner_output,
     create_request,
@@ -1875,6 +1879,57 @@ class TestNixlHandshake:
                 worker.add_remote_agent(meta, remote_tp_size=remote_tp)
         else:
             worker.add_remote_agent(meta, remote_tp_size=remote_tp)
+
+    def test_handshake_large_page_learns_peer_geometry(self):
+        """A matching large_page peer handshakes, and its advertised kernel
+        rows per block are what expand its manager block ids to kernel-block
+        desc ids."""
+        worker = _make_large_page_worker()
+        meta = _large_page_remote_meta(worker, group_kernel_rows_per_block=[4, 1])
+        worker.add_remote_agent(meta, remote_tp_size=1)
+
+        assert worker._dst_kernel_rows_per_block[meta.engine_id] == [4, 1]
+        # Group 0, block 3 with the peer's R=4: rows 12 to 15.
+        assert worker._remote_logical_to_kernel_block_ids(
+            ([3], []), 1, meta.engine_id
+        ) == [[12, 13, 14, 15], []]
+        # Group 1, block 5 with R=1: row 5.
+        assert worker._remote_logical_to_kernel_block_ids(
+            ([], [5]), 1, meta.engine_id
+        ) == [[], [5]]
+
+    def test_handshake_large_page_rejects_unequal_block_size(self):
+        """large_page pairing requires the same global block size B; the
+        block-size-ratio path is uniform_page-only."""
+        worker = _make_large_page_worker()
+        meta = _large_page_remote_meta(worker, block_size=32)
+        with pytest.raises(RuntimeError, match="equal P/D block sizes"):
+            worker.add_remote_agent(meta, remote_tp_size=1)
+        assert meta.engine_id not in worker.tp_mappings
+
+    def test_handshake_large_page_rejects_group_layer_set_mismatch(self):
+        """The peers must pack the same layers into each group; a within-group
+        subset mismatch is rejected. Whole-stage PP gaps (an empty group on
+        one side) pass."""
+        worker = _make_large_page_worker()
+        bad = _large_page_remote_meta(worker, group_layer_names=[["g0.l0"], ["g1.l0"]])
+        with pytest.raises(RuntimeError, match="layer-set mismatch"):
+            worker.add_remote_agent(bad, remote_tp_size=1)
+
+        pp_gap = _large_page_remote_meta(
+            worker, group_layer_names=[["g0.l0", "g0.l1"], []]
+        )
+        worker.add_remote_agent(pp_gap, remote_tp_size=1)
+
+    def test_compat_hash_includes_kv_cache_allocator(self):
+        """The allocator is a compatibility-hash factor: uniform_page and
+        large_page deployments can never complete a handshake."""
+        uniform_config = create_vllm_config(block_size=16)
+        large_config = create_vllm_config(block_size=16)
+        large_config.cache_config.kv_cache_allocator = "large_page"
+        assert compute_nixl_compatibility_hash(
+            uniform_config, "FLASH_ATTN"
+        ) != compute_nixl_compatibility_hash(large_config, "FLASH_ATTN")
 
 
 # NOTE: resource cleanup in mp backend is a bit finicky, so the order in which

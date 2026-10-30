@@ -119,7 +119,8 @@ def test_hidden_state_group_isolated_from_packed_mla_groups():
     }
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(
-            get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC
+            kv_cache_allocator="uniform_page",
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC,
         ),
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         speculative_config=None,
@@ -150,7 +151,8 @@ def test_hidden_state_group_isolated_from_packed_mixed_page_groups():
     }
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(
-            get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC
+            kv_cache_allocator="uniform_page",
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC,
         ),
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         speculative_config=None,

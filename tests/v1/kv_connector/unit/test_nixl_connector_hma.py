@@ -1161,6 +1161,7 @@ def _make_mock_worker_for_desc_ids(
 
     worker = MagicMock(spec=NixlConnectorWorker)
     worker.num_regions = num_regions
+    worker._large_page = False
     worker._uses_region_group_mapping = False
     worker._transfer_layer_group_ids = ()
     worker._has_mamba = has_mamba
@@ -1544,6 +1545,7 @@ def _make_fake_kv_cache_manager():
     from vllm.v1.core.kv_cache_manager import KVCacheManager
 
     manager = object.__new__(KVCacheManager)
+    manager._large_page = False
     manager.coordinator = MagicMock()
     manager.kv_cache_config = MagicMock()
     manager.kv_cache_config.kv_cache_groups = (

@@ -60,6 +60,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import KVConnectorOutput
 
+from .test_nixl_desc_geometry import (
+    _large_page_remote_meta,
+    _make_large_page_worker,
+)
 from .utils import create_request, expand_strided_descs, make_nixl_push_scheduler
 
 # ----------------------------------------------------------------- #
@@ -396,6 +400,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w.dst_region_group_ids = {}
         w.dst_uses_region_group_mapping = {}
         w.dst_region_mem_types = {}
+        w._dst_kernel_rows_per_block = {}
         # Single non-hybrid attention group, matching the stub block id lists.
         w._has_mamba = False
         w._is_csa_linear = False
@@ -2172,3 +2177,36 @@ def test_layer_handshake_rejects_unsupported_geometry(
     assert not worker.kv_caches_base_addr
     with pytest.raises(KeyError):
         worker.transfer_topo.get_engine_info(metadata.engine_id)
+
+
+# ---------------------------------------------------------------------------
+# large_page allocator: push-mode handshake checks
+# ---------------------------------------------------------------------------
+
+
+class TestPushLargePageHandshake:
+    """Push-mode equivalents of the large_page handshake checks (pull side:
+    TestNixlHandshake in test_nixl_connector.py)."""
+
+    def test_push_large_page_learns_peer_geometry(self):
+        worker = _make_large_page_worker(NixlPushConnectorWorker)
+        meta = _large_page_remote_meta(worker)
+        worker.add_remote_agent(meta, remote_tp_size=1)
+
+        # Per-group kernel-row regions, and the peer's kernel rows per block
+        # used to expand its manager block ids into kernel-block desc ids.
+        assert worker.region_group_ids == [0, 0, 1]
+        assert worker._dst_kernel_rows_per_block[meta.engine_id] == [2, 1]
+
+    def test_push_large_page_rejects_unequal_block_size(self):
+        worker = _make_large_page_worker(NixlPushConnectorWorker)
+        meta = _large_page_remote_meta(worker, block_size=32)
+        with pytest.raises(RuntimeError, match="equal P/D block sizes"):
+            worker.add_remote_agent(meta, remote_tp_size=1)
+        assert meta.engine_id not in worker.tp_mappings
+
+    def test_push_large_page_rejects_group_layer_set_mismatch(self):
+        worker = _make_large_page_worker(NixlPushConnectorWorker)
+        bad = _large_page_remote_meta(worker, group_layer_names=[["g0.l0"], ["g1.l0"]])
+        with pytest.raises(RuntimeError, match="layer-set mismatch"):
+            worker.add_remote_agent(bad, remote_tp_size=1)
