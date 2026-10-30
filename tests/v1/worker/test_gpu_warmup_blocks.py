@@ -8,17 +8,17 @@ writes KV past the token range the target model was scheduled for. The warmup
 hand-builds its `SchedulerOutput`s, so it has to reserve the same blocks.
 """
 
+from math import lcm
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from tests.v1.core.test_prefix_caching import make_kv_cache_manager
 from tests.v1.core.utils import create_requests
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.vllm import VllmConfig
-from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -38,8 +38,11 @@ NUM_SPEC_STEPS = 3
 
 # `warmup_kernels` ends on `torch.accelerator.synchronize()`.
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="warmup synchronizes on the accelerator"
+    not torch.cuda.is_available(), reason="warmup synchronizes on the accelerator"
 )
+
+
+PAGE_BYTES = 4
 
 
 def _attention_group() -> KVCacheGroupSpec:
@@ -51,6 +54,7 @@ def _attention_group() -> KVCacheGroupSpec:
             head_size=1,
             dtype=torch.float32,
         ),
+        blocks_per_page=1,
     )
 
 
@@ -63,6 +67,7 @@ def _circular_group() -> KVCacheGroupSpec:
             head_size=1,
             dtype=torch.float32,
         ),
+        blocks_per_page=1,
     )
 
 
@@ -77,6 +82,7 @@ def _mamba_group(mamba_cache_mode: str) -> KVCacheGroupSpec:
             mamba_cache_mode=mamba_cache_mode,
             num_speculative_blocks=NUM_SPEC_STEPS,
         ),
+        blocks_per_page=1,
     )
 
 
@@ -102,13 +108,14 @@ def _make_runner(
         scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=2048),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=kv_cache_groups,
-            num_blocks=1024,
-            allocator="uniform_page",
+            num_pages=1024,
+            # Groups without row_bytes take one block per page.
+            large_page_bytes=PAGE_BYTES,
         ),
         vllm_config=SimpleNamespace(
             num_lookahead_tokens=num_lookahead_tokens, is_mm_encoder_only=False
         ),
-        kv_block_zeroer=None,
+        kv_block_zeroers={},
         kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
         zero_null_page=lambda: None,
     )
@@ -240,7 +247,7 @@ def test_warmup_reserves_mamba_speculative_blocks(mamba_cache_mode):
 def _hybrid_kv_cache_config(num_blocks: int) -> KVCacheConfig:
     """Attention, circular, and Mamba groups exercise every reservation branch."""
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             _attention_group(),
@@ -248,7 +255,19 @@ def _hybrid_kv_cache_config(num_blocks: int) -> KVCacheConfig:
             _mamba_group("none"),
             _mamba_group("align"),
         ],
+        large_page_bytes=16,
+        block_size=BLOCK_SIZE,
     )
+
+
+def make_kv_cache_manager(kv_cache_config: KVCacheConfig, **kwargs) -> KVCacheManager:
+    """Build a ``KVCacheManager``, deriving ``scheduler_block_size`` from the
+    config (LCM of group block sizes) unless explicitly provided."""
+    kwargs.setdefault(
+        "scheduler_block_size",
+        lcm(*(g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups)),
+    )
+    return KVCacheManager(kv_cache_config, **kwargs)
 
 
 def test_reserved_block_count_matches_real_kv_cache_manager():
@@ -278,7 +297,6 @@ def test_reserved_block_count_matches_real_kv_cache_manager():
     manager = make_kv_cache_manager(
         kv_cache_config,
         max_model_len=MAX_MODEL_LEN,
-        hash_block_size=BLOCK_SIZE,
         enable_caching=False,
     )
     (request,) = create_requests(
@@ -387,24 +405,21 @@ def test_num_lookahead_tokens_without_speculation():
 
 
 def test_large_page_warmup_blocks_never_share_pages():
-    """Under large_page, warmup dummy blocks of different groups never share a
+    """Warmup dummy blocks of different groups never share a
     large page and never use page 0 (every group's null block lives there), so
     one group's dummy writes cannot overwrite another group's dummy data; the
     request count is capped by the page count."""
-    page_bytes = 4
     groups = [
         KVCacheGroupSpec(
             [f"layer{g}"],
             _attention_group().kv_cache_spec,
-            slots_per_large_page=n,
-            row_bytes=page_bytes // n,
+            blocks_per_page=n,
+            row_bytes=PAGE_BYTES // n,
         )
         for g, n in enumerate([1, 4])
     ]
     runner = _make_runner(groups, NUM_SPEC_STEPS)
-    runner.kv_cache_config.allocator = "large_page"
-    runner.kv_cache_config.num_blocks = 7
-    runner.kv_cache_config.large_page_bytes = page_bytes
+    runner.kv_cache_config.num_pages = 7
 
     outputs = []
 
@@ -424,7 +439,7 @@ def test_large_page_warmup_blocks_never_share_pages():
             for group_id, block_ids in enumerate(new_req.block_ids):
                 row_bytes = groups[group_id].row_bytes
                 pages_by_group[group_id].update(
-                    b * row_bytes // page_bytes for b in block_ids
+                    b * row_bytes // PAGE_BYTES for b in block_ids
                 )
     assert 0 not in pages_by_group[0] | pages_by_group[1]
     assert not pages_by_group[0] & pages_by_group[1]

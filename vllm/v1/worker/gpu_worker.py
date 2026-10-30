@@ -856,28 +856,18 @@ class Worker(WorkerBase):
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
-        # Update local config with adjusted num blocks after profiling,
+        # Update local config with adjusted num pages after profiling,
         # so that it's available to the warmup stage.
-        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        self.cache_config.num_gpu_blocks = kv_cache_config.num_pages
 
         # Adopt the engine core's layout and prefix-cache granularity; workers
         # spawned after resolution (e.g. elastic EP scale-up) only see them
         # through the config.
         if kv_cache_config.kv_cache_layout is not None:
             record_kv_cache_layout(self.cache_config, kv_cache_config.kv_cache_layout)
-        self.cache_config.hash_block_size = kv_cache_config.hash_block_size
-        self.cache_config.cache_hit_alignment_tokens = (
-            kv_cache_config.cache_hit_alignment_tokens
-        )
-        if kv_cache_config.allocator == "large_page":
-            # Workers skip Platform.update_block_size_for_backend under the
-            # large-page allocator, so their cache_config.block_size is still
-            # the provisional default. Adopt the planner's global block size;
-            # hash_block_size is always that block size in this mode.
-            assert kv_cache_config.hash_block_size is not None
-            self.cache_config.block_size = kv_cache_config.hash_block_size
-            if self.cache_config.mamba_cache_mode == "align":
-                self.cache_config.mamba_block_size = kv_cache_config.hash_block_size
+        # Workers do not plan the KV cache, so their cache_config.block_size is
+        # still the provisional default. Adopt the planner's global block size.
+        self.cache_config.adopt_block_size(kv_cache_config.block_size)
 
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.

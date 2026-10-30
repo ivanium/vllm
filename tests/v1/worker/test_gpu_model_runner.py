@@ -29,11 +29,9 @@ from vllm.distributed.parallel_state import (
 from vllm.lora.layers import LoRAMappingType
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
-from vllm.platforms.interface import Platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import update_environment_variables
@@ -45,19 +43,15 @@ from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
 )
 from vllm.v1.attention.backends.registry import (
     AttentionBackendEnum,
-    MambaAttentionBackendEnum,
 )
-from vllm.v1.core.kv_cache_planning import (
-    estimate_max_model_len,
-    get_kv_cache_configs,
-)
+from vllm.v1.core.kv_cache_planning import get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheSpec,
     KVCacheTensor,
+    MambaSpec,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -100,7 +94,7 @@ def initialize_kv_cache(runner: GPUModelRunner):
     )
     tensor_size = attn_spec.page_size_bytes * NUM_BLOCKS
     kv_cache_config = KVCacheConfig(
-        num_blocks=NUM_BLOCKS,
+        num_pages=NUM_BLOCKS,
         kv_cache_tensors=[
             KVCacheTensor(
                 size=tensor_size,
@@ -110,8 +104,17 @@ def initialize_kv_cache(runner: GPUModelRunner):
             ),
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=attn_spec)
+            KVCacheGroupSpec(
+                layer_names=["layer.0"],
+                kv_cache_spec=attn_spec,
+                num_blocks=NUM_BLOCKS,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=attn_spec.page_size_bytes,
+            )
         ],
+        large_page_bytes=attn_spec.page_size_bytes,
+        block_size=BLOCK_SIZE,
     )
     runner.kv_cache_config = kv_cache_config
     runner.input_batch = InputBatch(
@@ -435,172 +438,6 @@ def test_select_common_block_size_no_valid_option():
 
     with pytest.raises(ValueError):
         select_common_block_size(48, [backend_a, backend_b])
-
-
-def _mock_backend(supported: list, *, exact: bool = False):
-    """Backend accepting multiples of ``supported``, or only those exact sizes
-    when ``exact`` (as CPU_MLA does)."""
-    from vllm.v1.attention.backend import AttentionBackend
-
-    class _MockBackendCls(AttentionBackend):
-        @staticmethod
-        def get_name() -> str:
-            return "MOCK_EXACT" if exact else "MOCK"
-
-        @staticmethod
-        def get_supported_kernel_block_sizes(
-            kv_cache_spec: KVCacheSpec | None = None,
-        ) -> list[int | MultipleOf]:
-            return list(supported)
-
-        if exact:
-
-            @classmethod
-            def supports_block_size(cls, block_size: int | None) -> bool:
-                return block_size is None or block_size in supported
-
-    return _MockBackendCls
-
-
-@pytest.mark.parametrize(
-    "backends,expected",
-    [
-        # A lone backend keeps the default; MultipleOf(8) makes a
-        # minimum-based regression return 8 instead of 16.
-        ([[MultipleOf(8)]], 16),
-        # Sparse-MLA main backend (32 or 64) beside an indexer supporting only
-        # 64: the main backend alone picks 32, which the indexer rejects at
-        # select_common_block_size time.
-        ([[32, 64], [64]], 64),
-        ([[32, 64]], 32),
-        # Neither divides the other, so only the LCM satisfies both.
-        ([[32], [48]], 96),
-    ],
-)
-def test_preferred_block_size_satisfies_every_backend(backends, expected):
-    classes = [_mock_backend(s) for s in backends]
-    assert Platform._preferred_block_size_for_backends(classes, 16, None) == expected
-
-
-def test_preferred_block_size_searches_past_an_exact_size_backend():
-    # Extending greedily picks lcm(16, 32) = 32, which the exact backend
-    # rejects; 96 is accepted by both.
-    classes = [_mock_backend([16, 96], exact=True), _mock_backend([MultipleOf(32)])]
-    assert Platform._preferred_block_size_for_backends(classes, 16, None) == 96
-
-
-def test_preferred_block_size_rejects_backends_with_no_common_size():
-    classes = [_mock_backend([16], exact=True), _mock_backend([MultipleOf(64)])]
-    with pytest.raises(ValueError, match="share no supported KV cache block size"):
-        Platform._preferred_block_size_for_backends(classes, 16, None)
-
-
-@pytest.mark.parametrize("cpu", [False, True])
-def test_alignment_rejected_by_a_sibling_backend_raises(monkeypatch, cpu):
-    # Alignment that lands on a size an exact-size sibling rejects must fail
-    # here, not later in select_common_block_size().
-    backends = [_mock_backend([MultipleOf(16)]), _mock_backend([16], exact=True)]
-    monkeypatch.setattr(
-        Platform, "_find_non_ssm_backends", classmethod(lambda cls, c: backends)
-    )
-
-    def bump(cls, vllm_config, backend_cls):
-        vllm_config.cache_config.block_size = 32
-
-    monkeypatch.setattr(Platform, "_align_hybrid_block_size", classmethod(bump))
-    cache_config = SimpleNamespace(
-        block_size=16, user_specified_block_size=True, kv_cache_dtype_skip_layers=None
-    )
-    vllm_config = SimpleNamespace(
-        cache_config=cache_config, model_config=SimpleNamespace(is_hybrid=True)
-    )
-    from vllm.platforms.cpu import CpuPlatform  # overrides the method; must check too
-
-    platform = CpuPlatform if cpu else Platform
-    with pytest.raises(ValueError, match="MOCK_EXACT"):
-        platform.update_block_size_for_backend(vllm_config)
-
-
-class _CheckpointingMambaLayer(MambaBase):
-    mamba_type = MambaAttentionBackendEnum.GDN_ATTN
-
-    def __init__(self, prefill_checkpoint_alignment: int | None):
-        self._prefill_checkpoint_alignment = prefill_checkpoint_alignment
-
-    def get_prefill_checkpoint_alignment(self) -> int | None:
-        return self._prefill_checkpoint_alignment
-
-    def get_state_shape(self):
-        return ()
-
-    def get_state_dtype(self):
-        return ()
-
-
-def _align_qwen3_5_blocks(*prefill_checkpoint_alignments: int | None):
-    from tests.v1.attention.utils import create_vllm_config
-
-    vllm_config = create_vllm_config(model_name="Qwen/Qwen3.5-0.8B")
-    cache_config = vllm_config.cache_config
-    cache_config.mamba_cache_mode = "align"
-    forward_context = vllm_config.compilation_config.static_forward_context
-    for i, alignment in enumerate(prefill_checkpoint_alignments):
-        forward_context[f"mamba.{i}"] = _CheckpointingMambaLayer(alignment)
-    Platform._align_hybrid_block_size(vllm_config, _mock_backend([MultipleOf(16)]))
-    return cache_config
-
-
-@pytest.mark.parametrize(
-    ("prefill_checkpoint_alignments", "block_size"),
-    [((64,), 576), ((None,), 544), ((64, None), 544)],
-)
-def test_blocks_land_on_the_mamba_checkpoint_grid(
-    prefill_checkpoint_alignments, block_size
-):
-    """A layer that checkpoints every 64 tokens needs 64-aligned blocks.
-
-    Unaligned, Qwen3.5-0.8B's block (544) puts every other checkpoint off the
-    grid. A Mamba layer that cannot checkpoint (like Qwen4Exp's PLE short conv)
-    stops the scheduler from taking any, so the block stays.
-    """
-    cache_config = _align_qwen3_5_blocks(*prefill_checkpoint_alignments)
-
-    assert cache_config.block_size == block_size
-
-
-def test_xpu_gdn_rounding_rejected_by_a_sibling_backend_raises(monkeypatch):
-    # XPU's GDN rounding runs after super()'s check, so it must check again.
-    try:
-        from vllm.platforms.xpu import XPUPlatform
-    except ImportError:
-        pytest.skip("vllm_xpu_kernels not importable outside an XPU stack")
-
-    backends = [_mock_backend([MultipleOf(16)]), _mock_backend([16], exact=True)]
-    monkeypatch.setattr(
-        Platform, "update_block_size_for_backend", classmethod(lambda cls, c: None)
-    )
-    monkeypatch.setattr(
-        Platform, "_find_non_ssm_backends", classmethod(lambda cls, c: backends)
-    )
-    gdn_layer = SimpleNamespace(
-        get_attn_backend=lambda: SimpleNamespace(get_name=lambda: "GDN_ATTN")
-    )
-    monkeypatch.setattr(
-        "vllm.config.vllm.get_layers_from_vllm_config",
-        lambda vllm_config, layer_type: {"gdn": gdn_layer},
-    )
-    cache_config = SimpleNamespace(
-        block_size=16,
-        mamba_cache_mode="none",
-        mamba_page_size_padded=None,
-        user_specified_block_size=True,
-        kv_cache_dtype_skip_layers=None,
-    )
-    vllm_config = SimpleNamespace(
-        cache_config=cache_config, model_config=SimpleNamespace(is_hybrid=True)
-    )
-    with pytest.raises(ValueError, match="MOCK_EXACT"):
-        XPUPlatform.update_block_size_for_backend(vllm_config)
 
 
 def test_set_active_mm_loras_builds_tower_and_connector_mappings():
@@ -1368,7 +1205,6 @@ def test_init_kv_cache_without_kv_sharing(default_vllm_config):
         }
         # suppress var not used error
         assert fwd_context is not None
-    # Set high context length to test max context length estimation
     vllm_config.model_config.max_model_len = 3_000_000
     vllm_ctx = vllm_config.compilation_config.static_forward_context
     runner = GPUModelRunner(vllm_config, DEVICE_TYPE)
@@ -1382,23 +1218,20 @@ def test_init_kv_cache_without_kv_sharing(default_vllm_config):
     kv_cache_config = get_kv_cache_configs(
         vllm_config, [kv_cache_spec], [available_memory]
     )[0]
-    assert kv_cache_config.num_blocks == num_expected_blocks
-    assert len(kv_cache_config.kv_cache_tensors) == 1
+    assert kv_cache_config.num_pages == num_expected_blocks
+    # The large-page planner emits one tensor per layer, all views of the
+    # shared backing allocation.
+    assert len(kv_cache_config.kv_cache_tensors) == 2
     assert kv_cache_config.kv_cache_tensors[0].size == available_memory
 
-    max_context_len = estimate_max_model_len(vllm_config, kv_cache_spec, 5 * GiB_bytes)
-    # max context len with KV sharing should be 2x as large as without
-    assert max_context_len == 1310720
-
     # important: override tensor size to prevent large mem alloc during test
-    # this will only allocate 1 block worth of memory per layer (2 layers * 32kb)
-    kv_cache_config.num_blocks = 1
+    # this will only allocate one large page (2 layers * 32kb)
+    kv_cache_config.num_pages = 1
+    kv_cache_config.num_pages = 1
+    for group in kv_cache_config.kv_cache_groups:
+        group.num_blocks = group.blocks_per_page
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        page_size = kv_cache_spec[kv_cache_tensor.layers[0]].page_size_bytes
-        kv_cache_tensor.size = page_size * len(kv_cache_tensor.layers)
-        # One block per layer: a layer's region is exactly one page.
-        kv_cache_tensor.layer_stride = page_size
-        kv_cache_tensor.block_stride = page_size
+        kv_cache_tensor.size = kv_cache_config.large_page_bytes
 
     runner.initialize_kv_cache(kv_cache_config)
 
@@ -1437,7 +1270,6 @@ def test_init_kv_cache_with_kv_sharing_valid(default_vllm_config):
         }
         # suppress var not used error
         assert fwd_context is not None
-    # Set high context length to test max context length estimation
     vllm_config.model_config.max_model_len = 3_000_000
     vllm_ctx = vllm_config.compilation_config.static_forward_context
     runner = GPUModelRunner(vllm_config, DEVICE_TYPE)
@@ -1454,19 +1286,16 @@ def test_init_kv_cache_with_kv_sharing_valid(default_vllm_config):
     kv_cache_config = get_kv_cache_configs(
         vllm_config, [kv_cache_spec], [available_memory]
     )[0]
-    assert kv_cache_config.num_blocks == num_expected_blocks
+    assert kv_cache_config.num_pages == num_expected_blocks
     assert len(kv_cache_config.kv_cache_tensors) == 1
     # Each layer now has twice the available memory for KV cache
     # compared to no KV sharing
     assert kv_cache_config.kv_cache_tensors[0].size == available_memory
 
-    max_context_len = estimate_max_model_len(vllm_config, kv_cache_spec, 5 * GiB_bytes)
-    # max context len with KV sharing should be 2x as large as without
-    assert max_context_len == 2 * 1310720
-
     # important: override tensor size to prevent large mem alloc during test
     # this will only allocate 1 block worth of memory (32kb)
-    kv_cache_config.num_blocks = 1
+    kv_cache_config.num_pages = 1
+    kv_cache_config.num_pages = 1
     page_size = kv_cache_spec[layer_0].page_size_bytes
     kv_cache_config.kv_cache_tensors[0].size = page_size
     kv_cache_config.kv_cache_tensors[0].layer_stride = page_size
@@ -1547,7 +1376,6 @@ def test_hybrid_attention_mamba_tensor_shapes():
     layer_3 = "model.layers.3.mixer"
     layer_4 = "model.layers.4.mixer"
     layer_5 = "model.layers.5.mixer"
-
     with set_current_vllm_config(vllm_config):
         hf_config = vllm_config.model_config.hf_config
         fwd_context = {}
@@ -1581,7 +1409,6 @@ def test_hybrid_attention_mamba_tensor_shapes():
         vllm_ctx = vllm_config.compilation_config.static_forward_context
 
         runner = GPUModelRunner(vllm_config, DEVICE_TYPE)
-        current_platform.update_block_size_for_backend(vllm_config)
         kv_cache_spec = runner.get_kv_cache_spec()
 
         available_memory = 5 * GiB_bytes
@@ -1590,34 +1417,36 @@ def test_hybrid_attention_mamba_tensor_shapes():
         )[0]
         runner.initialize_kv_cache(kv_cache_config)
 
-    # random partition of blocks
-    # blocks0 will be assigned to attention layers
-    # blocks1 will be assigned to mamba layers
-    num_blocks = kv_cache_config.num_blocks
-    ind = np.arange(num_blocks)
-    np.random.shuffle(ind)
-    blocks0, blocks1 = ind[: (num_blocks // 2)], ind[(num_blocks // 2) :]
+    # Under the large-page allocator a page belongs to one group at a time,
+    # so attention and mamba blocks from disjoint page ranges can never share
+    # bytes. Take the first attention manager blocks and mamba manager blocks
+    # from the second half of the mamba group's id space.
+    attn_gid = next(
+        i
+        for i, g in enumerate(kv_cache_config.kv_cache_groups)
+        if isinstance(g.kv_cache_spec, FullAttentionSpec)
+    )
+    mamba_gid = next(
+        i
+        for i, g in enumerate(kv_cache_config.kv_cache_groups)
+        if isinstance(g.kv_cache_spec, MambaSpec)
+    )
+    mamba_mid = kv_cache_config.kv_cache_groups[mamba_gid].num_blocks // 2
 
     attn_shape = vllm_ctx[layer_0].kv_cache.shape
     conv_shape = vllm_ctx[layer_2].kv_cache[0].shape
     ssm_shape = vllm_ctx[layer_2].kv_cache[1].shape
 
-    # assert we are using FlashInfer
-    assert attn_shape[0] % num_blocks == 0
-    block_split_ratio = attn_shape[0] // num_blocks
-
-    # use small blocks for testing to avoid memory issues
-    test_block_size = min(2, len(blocks0), len(blocks1))
-
-    # use non-overlapping blocks to avoid data contamination
-    # Split kernel blocks: first half for attention, second half for mamba
-    mid_point = num_blocks // 2
-
-    # attention uses kernel blocks from first half (mapped to logical blocks)
-    kv_blocks_for_attention = np.array([0, 1])[:test_block_size]
-
-    # mamba uses kernel blocks from second half
-    kv_blocks_for_mamba = np.array([mid_point, mid_point + 1])[:test_block_size]
+    # The views are kernel-row granular: map each manager block to its first
+    # kernel row.
+    kernel_blocks_for_attention = [
+        b * kv_cache_config.kv_cache_groups[attn_gid].kernel_rows_per_block
+        for b in (0, 1)
+    ]
+    kernel_blocks_for_mamba = [
+        b * kv_cache_config.kv_cache_groups[mamba_gid].kernel_rows_per_block
+        for b in (mamba_mid, mamba_mid + 1)
+    ]
 
     # create small constant tensors for testing with corrected shapes
     # attention: [block_size, ...] starting from dimension 2
@@ -1626,17 +1455,14 @@ def test_hybrid_attention_mamba_tensor_shapes():
     ssm_constant_shape = ssm_shape[1:]
 
     attn_blocks_constant = torch.full(
-        (test_block_size, *attn_constant_shape), device=DEVICE_TYPE, fill_value=3.33
+        (2, *attn_constant_shape), device=DEVICE_TYPE, fill_value=3.33
     )
     conv_blocks_constant = torch.full(
-        (test_block_size, *conv_constant_shape), device=DEVICE_TYPE, fill_value=6.66
+        (2, *conv_constant_shape), device=DEVICE_TYPE, fill_value=6.66
     )
     ssm_blocks_constant = torch.full(
-        (test_block_size, *ssm_constant_shape), device=DEVICE_TYPE, fill_value=9.99
+        (2, *ssm_constant_shape), device=DEVICE_TYPE, fill_value=9.99
     )
-
-    # Fill attention blocks with constants using kv block indices
-    kernel_blocks_for_attention = kv_blocks_for_attention * block_split_ratio
 
     for layer in [layer_0, layer_1]:
         # attention: kv_cache[kernel_block_idx, kv_idx, ...]
@@ -1646,7 +1472,7 @@ def test_hybrid_attention_mamba_tensor_shapes():
     # fill mamba blocks with constants using kernel block indices
     for layer in [layer_2, layer_3, layer_4, layer_5]:
         # mamba: kv_cache[component][kernel_block_idx, ...]
-        for i, kv_block in enumerate(kv_blocks_for_mamba):
+        for i, kv_block in enumerate(kernel_blocks_for_mamba):
             vllm_ctx[layer].kv_cache[0][kv_block, :] = conv_blocks_constant[i]
             vllm_ctx[layer].kv_cache[1][kv_block, :] = ssm_blocks_constant[i]
 
@@ -1662,7 +1488,7 @@ def test_hybrid_attention_mamba_tensor_shapes():
                 assert torch.equal(actual_kv[head_idx], expected)
 
     for layer in [layer_2, layer_3, layer_4, layer_5]:
-        for i, kv_block in enumerate(kv_blocks_for_mamba):
+        for i, kv_block in enumerate(kernel_blocks_for_mamba):
             actual_conv = vllm_ctx[layer].kv_cache[0][kv_block, :]
             actual_ssm = vllm_ctx[layer].kv_cache[1][kv_block, :]
             expected_conv = conv_blocks_constant[i]
@@ -1672,7 +1498,7 @@ def test_hybrid_attention_mamba_tensor_shapes():
             assert torch.equal(actual_ssm, expected_ssm)
 
     for layer in [layer_2, layer_3, layer_4, layer_5]:
-        for i, kv_block in enumerate(kv_blocks_for_mamba):
+        for i, kv_block in enumerate(kernel_blocks_for_mamba):
             actual_conv = vllm_ctx[layer].kv_cache[0][kv_block, :]
             actual_ssm = vllm_ctx[layer].kv_cache[1][kv_block, :]
             expected_conv = conv_blocks_constant[i]
@@ -1713,7 +1539,7 @@ def test_input_batch_reinitialized_after_late_interleave_adjustment(monkeypatch)
         max_num_blocks_per_req=lambda *_: 4,
     )
     kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)],
     )
     input_batch_cls = Mock(return_value=SimpleNamespace())
     monkeypatch.setattr(gpu_model_runner_module, "InputBatch", input_batch_cls)
@@ -1787,46 +1613,12 @@ def test_hybrid_cache_integration(default_vllm_config, dist_init):
     runner = GPUModelRunner(vllm_config, DEVICE_TYPE)
 
     # Initialize KV cache with configuration
-    attn_spec = FullAttentionSpec(
-        block_size=16,  # Use kernel block size directly
-        num_kv_heads=runner.model_config.get_num_kv_heads(runner.parallel_config),
-        head_size=runner.model_config.get_head_size(),
-        dtype=runner.kv_cache_dtype,
-    )
-    tensor_size = attn_spec.page_size_bytes * NUM_BLOCKS
-    kv_cache_config = KVCacheConfig(
-        num_blocks=NUM_BLOCKS,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=tensor_size,
-                layers=["layer.0"],
-                layer_stride=tensor_size,
-                block_stride=attn_spec.page_size_bytes,
-            ),
-        ],
-        kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=attn_spec)
-        ],
-    )
-    runner.kv_cache_config = kv_cache_config
-
-    # Initialize input batch with kernel block sizes
-    runner.input_batch = InputBatch(
-        max_num_reqs=runner.max_num_reqs,
-        max_model_len=runner.max_model_len,
-        max_num_batched_tokens=runner.max_num_tokens,
-        device=runner.device,
-        vocab_size=runner.model_config.get_vocab_size(),
-        block_sizes=[kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size],
-        max_num_blocks_per_req=[NUM_BLOCKS],
-    )
-
-    runner.initialize_attn_backend(kv_cache_config)
+    initialize_kv_cache(runner)
 
     # Verify hybrid block table configuration
     block_table = runner.input_batch.block_table.block_tables[0]
     assert block_table.block_size == (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
     )
 
     # Test request processing with hybrid blocks
@@ -2013,14 +1805,13 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
         assert fwd_context is not None
 
         runner = GPUModelRunner(vllm_config, DEVICE_TYPE)
-        current_platform.update_block_size_for_backend(vllm_config)
         kv_cache_spec = runner.get_kv_cache_spec()
 
         available_memory = 5 * GiB_bytes
         kv_cache_config = get_kv_cache_configs(
             vllm_config, [kv_cache_spec], [available_memory]
         )[0]
-        num_blocks = kv_cache_config.num_blocks
+        num_blocks = kv_cache_config.num_pages
 
         # Force max_num_seqs to exceed num_blocks so the check triggers.
         runner.max_num_reqs = num_blocks + 100

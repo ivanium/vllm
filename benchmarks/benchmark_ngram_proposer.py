@@ -5,6 +5,7 @@ import time
 from unittest import mock
 
 import numpy as np
+import torch
 from benchmark_utils import TimeCollector
 from tabulate import tabulate
 
@@ -130,9 +131,14 @@ def benchmark_batched_propose(args):
             max_model_len=MAX_MODEL_LEN,
             max_num_batched_tokens=args.num_req * args.num_token,
             device=DEVICE,
-            pin_memory=False,
             vocab_size=256000,
             block_sizes=[16],
+            max_num_blocks_per_req=[MAX_MODEL_LEN // 16],
+            kernel_block_sizes=[16],
+            # Identity LUT: one kernel block per manager block.
+            k0_luts=[
+                torch.arange(MAX_MODEL_LEN // 16, dtype=torch.int32, device=DEVICE)
+            ],
         )
         dummy_input_batch._req_ids = list(str(id) for id in range(args.num_req))
         dummy_input_batch.num_tokens_no_spec = [args.num_token] * args.num_req

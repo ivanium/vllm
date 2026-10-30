@@ -170,14 +170,8 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if not worker.use_v2_model_runner:
         # The KV-block zeroing kernel is driven by the scheduler's
         # `new_block_ids_to_zero`, so no dummy run ever reaches it.
-        # large_page builds one zeroer per group; uniform_page builds one.
-        runner = worker.model_runner
-        zeroers = getattr(runner, "_kv_block_zeroers", None) or [
-            getattr(runner, "_kv_block_zeroer", None)
-        ]
-        for zeroer in zeroers:
-            if zeroer is not None:
-                zeroer.warmup(runner.kv_cache_config.num_blocks)
+        for zeroer in worker.model_runner.kv_block_zeroers.values():
+            zeroer.warmup(worker.model_runner.kv_cache_config.num_pages)
 
     enable_jit_warmup = worker.vllm_config.kernel_config.enable_jit_warmup
     if enable_jit_warmup:

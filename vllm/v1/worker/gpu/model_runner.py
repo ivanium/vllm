@@ -23,7 +23,7 @@ from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import replace
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -74,7 +74,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
     SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
     DraftTokenIds,
@@ -187,13 +186,9 @@ from vllm.v1.worker.gpu.ubatch_utils import (
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
-    build_large_page_zeroers,
+    build_kv_block_zeroers,
     clear_layer_kv_caches,
-    copy_kv_cache_blocks_inplace,
-    dispatch_large_page_cow,
-    dispatch_large_page_zeroing,
     get_uniform_decode_token_count,
-    zero_null_page,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
@@ -225,10 +220,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
                 self.cache_config.cache_dtype
             ]
-
-        # Lazily initialized in _init_kv_zero_meta() when the KV cache needs
-        # zeroing (e.g. hybrid models with fp8 KV cache).
-        self.kv_block_zeroer: KVBlockZeroer | None = None
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
@@ -360,6 +351,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # KV Connector if configured.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
+
+        # Built by _init_kv_zero_meta when the KV cache needs zeroing.
+        self.kv_block_zeroers: dict[int, KVBlockZeroer] = {}
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
@@ -652,9 +646,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
-            layer_spec = (
-                spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
-            )
+            layer_spec = spec
             slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
             dcp_sharded.append(spec.dcp_sharded)
             sliding_window_reach.append(
@@ -799,24 +791,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.compilation_config.static_forward_context,
                 self.kv_cache_config,
                 self.device,
-                self.kernel_block_sizes,
                 self.vllm_config,
                 kv_cache_allocation_context=kv_cache_allocation_context,
                 block_tables=self.block_tables,
-                # Draft groups build their own metadata, so they map the views too.
-                attn_groups=(
-                    g
-                    for groups in self.attn_groups
-                    + getattr(self.speculator, "attn_groups", [])
-                    for g in groups
-                ),
             )
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
-        if self.kv_cache_config.allocator == "large_page":
-            # Per-group CoW copies address each group's own layer views.
-            self.kv_caches_by_layer = kv_caches_dict
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
@@ -831,34 +812,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
-        kv_cache_config = self.kv_cache_config
-        if kv_cache_config.allocator == "large_page":
-            self.kv_block_zeroers: list[KVBlockZeroer | None] = (
-                build_large_page_zeroers(
-                    kv_cache_config,
-                    self.attn_groups,
-                    self.device,
-                    self.kernel_block_sizes,
-                    self.compilation_config.static_forward_context,
-                )
-            )
-            return
-        self.kv_block_zeroer = KVBlockZeroer(
+        self.kv_block_zeroers = build_kv_block_zeroers(
+            self.kv_cache_config,
+            self.attn_groups,
             self.device,
-            attn_groups_iter=(g for groups in self.attn_groups for g in groups),
-            kernel_block_sizes=self.kernel_block_sizes,
-            static_forward_context=self.compilation_config.static_forward_context,
-            num_blocks=kv_cache_config.num_blocks,
+            self.kernel_block_sizes,
+            self.compilation_config.static_forward_context,
         )
 
     def zero_null_page(self) -> None:
-        """Re-zero the reserved null block/page after dummy or EPLB writes."""
-        if self.kv_cache_config.allocator == "large_page":
-            zero_null_page(
-                getattr(self, "kv_block_zeroers", None), self.kv_cache_config
-            )
-        elif self.kv_block_zeroer is not None:
-            self.kv_block_zeroer.zero_block_ids([0])
+        """Re-zero the reserved null page (page 0) after dummy or EPLB writes."""
+        for zeroer in self.kv_block_zeroers.values():
+            zeroer.zero_null_page(self.kv_cache_config.large_page_bytes)
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
@@ -1306,32 +1271,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            if self.kv_cache_config.allocator == "large_page":
-                dispatch_large_page_zeroing(
-                    self.kv_block_zeroers,
-                    cast(list[tuple[int, int]], scheduler_output.new_block_ids_to_zero),
-                )
-            else:
-                assert self.kv_block_zeroer is not None
-                self.kv_block_zeroer.zero_block_ids(
-                    cast(list[int], scheduler_output.new_block_ids_to_zero)
-                )
-
-        # Apply copy-on-write block copies for partial prefix-cache hits, after
-        # zeroing new blocks and before the forward pass reads them.
-        if scheduler_output.kv_cache_block_copies:
-            if self.kv_cache_config.allocator == "large_page":
-                dispatch_large_page_cow(
-                    self.kv_cache_config,
-                    self.kv_caches_by_layer,
-                    scheduler_output.kv_cache_block_copies,
-                )
-            else:
-                copy_kv_cache_blocks_inplace(
-                    self.kv_caches,
-                    self.kv_cache_config.num_blocks,
-                    scheduler_output.kv_cache_block_copies,
-                )
+            for group_id, zeroer in self.kv_block_zeroers.items():
+                zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero[group_id])
 
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
@@ -1648,10 +1589,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             state_slots = torch.arange(
                 1, input_batch.num_reqs + 1, dtype=torch.int32, device=self.device
             )
-            if self.kv_cache_config.allocator == "large_page":
-                # The ids must be valid in each group's own id space.
-                for group in self.kv_cache_config.kv_cache_groups:
-                    assert input_batch.num_reqs + 1 <= group.num_blocks
+            # The ids must be valid in each group's own id space.
+            for group in self.kv_cache_config.kv_cache_groups:
+                assert input_batch.num_reqs + 1 <= group.num_blocks
             for block_table in block_tables:
                 block_table[:, 0].copy_(state_slots)
         slot_mappings = block_table_provider.get_dummy_slot_mappings(
@@ -1932,11 +1872,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch, valid_dummy_state_slots
                 )
                 if context_len:
-                    num_kv_blocks: int | list[int] = self.kv_cache_config.num_blocks
-                    if self.kv_cache_config.allocator == "large_page":
-                        num_kv_blocks = [
-                            g.num_blocks for g in self.kv_cache_config.kv_cache_groups
-                        ]
+                    num_kv_blocks = [
+                        g.num_blocks for g in self.kv_cache_config.kv_cache_groups
+                    ]
                     set_dummy_context(
                         input_batch,
                         self.block_tables,
@@ -2434,8 +2372,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
-        if hasattr(self, "kv_caches_by_layer"):
-            self.kv_caches_by_layer.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
