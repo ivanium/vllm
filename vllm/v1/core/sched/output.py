@@ -296,9 +296,13 @@ class SchedulerOutput:
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
-    new_block_ids_to_zero: list[int] | None = None
+    # Under the large-page allocator block ids are unique only within a group,
+    # so each entry is a (group_id, block_id) pair.
+    new_block_ids_to_zero: list[int] | list[tuple[int, int]] | None = None
 
     # CoW copies to apply after zeroing new blocks and before forward.
+    # Each copy's group_id names its KV cache group (block ids are unique
+    # only within a group under the large-page allocator).
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
     # Scheduler-local; always None by the time this reaches a worker.

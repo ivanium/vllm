@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -12,6 +13,7 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -26,6 +28,10 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
     resolve_block_hashes,
     to_event_extra_keys,
+)
+from vllm.v1.kv_cache_interface import (
+    large_page_block_range,
+    min_blocks_per_large_page,
 )
 from vllm.v1.request import Request
 
@@ -133,6 +139,23 @@ class BlockHashToBlockMap:
         raise AssertionError(f"Invalid KV cache block type {type(blocks)}")
 
 
+@dataclass(slots=True)
+class _Page:
+    """Bookkeeping of one page of the pool."""
+
+    # The group with more blocks per page whose blocks the page holds; -1 when
+    # the page is the one block of a group with one block per page.
+    owner: int = -1
+    # Blocks of the page with ref_cnt > 0.
+    num_in_use: int = 0
+    # Free blocks of the page that still carry a prefix-cache hash.
+    num_cached: int = 0
+    # While the page is in use, bit i is set if slot i is free and has no hash.
+    free_mask: int = 0
+    # The blocks of the page in slot order.
+    slots: list[KVCacheBlock] = field(default_factory=list)
+
+
 class BlockPool:
     """BlockPool that manages KVCacheBlocks.
     It provides methods to allocate, free and cache the kv cache blocks. The
@@ -141,8 +164,21 @@ class BlockPool:
     maps between block hash and cached block to support finding cached blocks
     by their block hash.
 
+    The pool is a set of pages of ``large_page_bytes``. A page holds the
+    blocks of the one group ``g`` that allocated it that lie wholly in it:
+    block ``b`` spans bytes ``[b * block_bytes[g], (b + 1) * block_bytes[g])``
+    (see ``large_page_block_range``). A group whose block fills a page (every
+    group under the ``uniform_page`` allocator) uses the page as its block,
+    so ``blocks`` and ``free_block_queue`` hold its blocks. A group with more
+    blocks per page allocates, in order: free blocks on its in-use pages
+    (fullest page first, so that pages empty and return to the pool), a
+    page without cached blocks, its cached free blocks on in-use pages (LRU),
+    then any page from the front of ``free_block_queue``, whose cached blocks
+    are evicted. Taking clean pages before evicting cached blocks keeps the
+    prefix cache while the pool has slack.
+
     Args:
-        num_gpu_blocks: The number of blocks in the pool.
+        num_gpu_blocks: The number of pages in the pool.
         enable_caching: Whether to enable prefix caching.
         hash_block_size: The block size of which the block hashes are computed.
             The actual block size usually equals hash_block_size, but in cases
@@ -151,6 +187,10 @@ class BlockPool:
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
         medium: Storage medium reported in KV cache events.
+        large_page_bytes: Bytes of one page.
+        block_bytes: Bytes of one block of each KV cache group. Groups past
+            the end of the sequence, or whose block fills a page, use the page
+            as their block.
 
     """
 
@@ -162,24 +202,58 @@ class BlockPool:
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
         medium: str = MEDIUM_GPU,
+        large_page_bytes: int = 0,
+        block_bytes: Sequence[int] = (),
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.medium = medium
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
-        # All kv-cache blocks.
+        self.large_page_bytes = large_page_bytes
+        # Bytes of one block of each group whose block is smaller than a page.
+        self._block_bytes = {
+            g: b for g, b in enumerate(block_bytes) if 0 < b < large_page_bytes
+        }
+        # Fewest blocks a page holds, per group with blocks smaller than a page.
+        self.slots_per_page = {
+            g: min_blocks_per_large_page(large_page_bytes, b)
+            for g, b in self._block_bytes.items()
+        }
+        # Size of the block id space of those groups.
+        self._num_group_blocks = {
+            g: num_gpu_blocks * large_page_bytes // b
+            for g, b in self._block_bytes.items()
+        }
+        # The first block of every page. For a group with more blocks per
+        # page, it only links the page into free_block_queue.
         self.blocks: list[KVCacheBlock] = [
-            KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
+            KVCacheBlock(idx, pool=self, group_id=-1) for idx in range(num_gpu_blocks)
         ]
+        self._pages = [_Page(slots=[block]) for block in self.blocks]
         # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
+        # list of pages with no block in use (including eviction candidates
+        # when caching is enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # Free blocks on in-use pages of groups with more blocks per page:
+        # the number without a hash, the in-use pages that hold them by
+        # their number of blocks in use, and the cached ones in LRU order.
+        self._num_free_slots = dict.fromkeys(self.slots_per_page, 0)
+        self._pages_by_use = {
+            g: [FreeKVCacheBlockQueue([]) for _ in range(large_page_bytes // b)]
+            for g, b in self._block_bytes.items()
+        }
+        self._cached_slots = {g: FreeKVCacheBlockQueue([]) for g in self._block_bytes}
+        # Release counter for free_seq.
+        self._free_seq = 0
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
-        self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
+        # Secondary (non-primary) hash entries per block. Block ids are unique
+        # only within a group, so the key is (group_id, block_id).
+        self.cached_block_hashes_by_block: dict[
+            tuple[int, int], set[BlockHashWithGroupId]
+        ] = {}
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -194,6 +268,28 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+
+    def get_block(self, group_id: int, block_id: int) -> KVCacheBlock:
+        """The allocated block ``block_id`` of a group."""
+        assert block_id < self._num_group_blocks.get(group_id, self.num_gpu_blocks), (
+            f"Invalid block_id {block_id} of group {group_id}. This indicates "
+            "a bug in the KV connector - workers should only report block IDs "
+            "that were allocated by the scheduler."
+        )
+        if group_id not in self._block_bytes or block_id == 0:
+            # Block 0 of every group is the null block.
+            return self.blocks[block_id]
+        page = self._pages[self._page_id(group_id, block_id)]
+        index = block_id - page.slots[0].block_id
+        assert page.owner == group_id and 0 <= index < len(page.slots), (
+            f"Block {block_id} of group {group_id} is not allocated"
+        )
+        return page.slots[index]
+
+    def _page_id(self, group_id: int, block_id: int) -> int:
+        """The page that holds a block of a group with blocks smaller than a
+        page."""
+        return block_id * self._block_bytes[group_id] // self.large_page_bytes
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -594,7 +690,9 @@ class BlockPool:
         block_hashes: list[BlockHashWithGroupId] = []
         if block.block_hash is not None:
             block_hashes.append(block.block_hash)
-        block_hashes.extend(self.cached_block_hashes_by_block.pop(block.block_id, ()))
+        block_hashes.extend(
+            self.cached_block_hashes_by_block.pop((block.group_id, block.block_id), ())
+        )
         if not block_hashes:
             return []
 
@@ -640,9 +738,9 @@ class BlockPool:
         if block.block_hash is None:
             block.set_block_hash(block_hash_with_group_id, num_tokens=num_tokens)
         else:
-            self.cached_block_hashes_by_block.setdefault(block.block_id, set()).add(
-                block_hash_with_group_id
-            )
+            self.cached_block_hashes_by_block.setdefault(
+                (block.group_id, block.block_id), set()
+            ).add(block_hash_with_group_id)
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
 
     def move_block_hashes(
@@ -657,47 +755,217 @@ class BlockPool:
         under the same hashes instead. Entries stay live; no events emitted.
         """
         assert dst_block.block_hash is None
-        assert dst_block.block_id not in self.cached_block_hashes_by_block
+        assert (
+            dst_block.group_id,
+            dst_block.block_id,
+        ) not in self.cached_block_hashes_by_block
         num_tokens = src_block.block_hash_num_tokens
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(self, num_blocks: int, group_id: int = 0) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
 
         Args:
             num_blocks: The number of blocks to allocate.
+            group_id: The KV cache group that allocates.
 
         Returns:
             A list of new block.
 
         """
-        if num_blocks > self.get_num_free_blocks():
+        if num_blocks > self.get_num_free_blocks(group_id):
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
-
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if group_id not in self._block_bytes:
+            ret = self.free_block_queue.popleft_n(num_blocks)
+            for block in ret:
+                if self.slots_per_page and self._pages[block.block_id].owner != -1:
+                    # The page holds blocks of a group with more blocks per page.
+                    self._take_page(block.block_id, group_id)
+                    continue
+                if self.enable_caching:
+                    self._maybe_evict_cached_block(block)
+                block.group_id = group_id
+        else:
+            ret = self._get_new_slots(num_blocks, group_id)
 
         if self._reuse_watchers:
             self._notify_reuse(ret)
 
-        # In order to only iterate the list once, we duplicated code a bit
-        if self.enable_caching:
-            for block in ret:
-                self._maybe_evict_cached_block(block)
-                assert block.ref_cnt == 0
-                block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
-        else:
-            for block in ret:
-                assert block.ref_cnt == 0
-                block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
+        for block in ret:
+            assert block.ref_cnt == 0
+            block.ref_cnt += 1
+            if self.metrics_collector:
+                self.metrics_collector.on_block_allocated(block)
         return ret
+
+    def _get_new_slots(self, num_blocks: int, group_id: int) -> list[KVCacheBlock]:
+        pages_by_use = self._pages_by_use[group_id]
+        cached_slots = self._cached_slots[group_id]
+        ret: list[KVCacheBlock] = []
+        while len(ret) < num_blocks:
+            if self._num_free_slots[group_id]:
+                fullest = next(q for q in reversed(pages_by_use) if q.num_free_blocks)
+                front = fullest.fake_free_list_head.next_free_block
+                assert front is not None
+                page_id = front.block_id
+                page = self._pages[page_id]
+                free_mask = page.free_mask
+            elif cached_slots.num_free_blocks and not self._front_page_is_older(
+                cached_slots.fake_free_list_head.next_free_block
+            ):
+                block = cached_slots.popleft()
+                page_id = self._page_id(group_id, block.block_id)
+                page = self._pages[page_id]
+                page.num_cached -= 1
+                if self.enable_caching:
+                    self._maybe_evict_cached_block(block)
+                self._update_page(page_id, page, page.num_in_use + 1, page.free_mask)
+                ret.append(block)
+                continue
+            else:
+                page_id = self.free_block_queue.popleft().block_id
+                self._take_page(page_id, group_id)
+                page = self._pages[page_id]
+                free_mask = (1 << len(page.slots)) - 1
+            # The page stays the fullest while it gives out its free blocks.
+            num_in_use = page.num_in_use
+            while free_mask and len(ret) < num_blocks:
+                block = page.slots[(free_mask & -free_mask).bit_length() - 1]
+                free_mask &= free_mask - 1
+                num_in_use += 1
+                ret.append(block)
+            self._update_page(page_id, page, num_in_use, free_mask)
+        return ret
+
+    def _front_page(self) -> KVCacheBlock | None:
+        """The first block of the page at the front of free_block_queue."""
+        if self.free_block_queue.num_free_blocks == 0:
+            return None
+        return self.free_block_queue.fake_free_list_head.next_free_block
+
+    def _has_clean_page(self) -> bool:
+        """Whether free_block_queue starts with a page without cached blocks."""
+        front = self._front_page()
+        if front is None:
+            return False
+        page = self._pages[front.block_id]
+        if page.owner != -1:
+            return page.num_cached == 0
+        return front.block_hash is None
+
+    def _front_page_is_older(self, block: KVCacheBlock | None) -> bool:
+        """Whether the front of free_block_queue is clean or was released
+        before ``block``, so taking it keeps the LRU order."""
+        front = self._front_page()
+        if front is None:
+            return False
+        assert block is not None
+        return self._has_clean_page() or front.free_seq < block.free_seq
+
+    def _stamp(self, blocks: Iterable[KVCacheBlock]) -> None:
+        # One batch joins its queue at once, so its blocks share a stamp.
+        self._free_seq += 1
+        for block in blocks:
+            block.free_seq = self._free_seq
+
+    def _take_page(self, page_id: int, group_id: int) -> None:
+        """Give a page popped from free_block_queue to a group.
+
+        Evicts the cached blocks of the page.
+        """
+        page = self._pages[page_id]
+        # A page owned by a multi-block group counts its cached blocks.
+        if self.enable_caching and (page.owner == -1 or page.num_cached):
+            for block in page.slots:
+                self._maybe_evict_cached_block(block)
+        page.num_cached = 0
+        if group_id not in self._block_bytes:
+            block = self.blocks[page_id]
+            block.group_id = group_id
+            page.owner = -1
+            page.slots = [block]
+        elif page.owner != group_id:
+            page.owner = group_id
+            page.slots = [
+                KVCacheBlock(block_id, pool=self, group_id=group_id)
+                for block_id in large_page_block_range(
+                    page_id, self.large_page_bytes, self._block_bytes[group_id]
+                )
+            ]
+
+    # A group with one block per page keeps no page counts: its block is the
+    # page. The helpers below serve groups with more blocks per page.
+
+    def _update_page(
+        self, page_id: int, page: _Page, num_in_use: int, free_mask: int
+    ) -> None:
+        """Set the blocks in use and the free mask of a page, and file the
+        page by its blocks in use while it holds free blocks without a hash."""
+        pages_by_use = self._pages_by_use[page.owner]
+        if page.num_in_use and page.free_mask:
+            pages_by_use[page.num_in_use].remove(self.blocks[page_id])
+        if num_in_use and free_mask:
+            pages_by_use[num_in_use].append(self.blocks[page_id])
+        self._num_free_slots[page.owner] += (
+            free_mask.bit_count() - page.free_mask.bit_count()
+        )
+        page.num_in_use = num_in_use
+        page.free_mask = free_mask
+
+    def _acquire(self, block: KVCacheBlock) -> None:
+        """Take a free block out of the free queues before it is reused."""
+        page_id = self._page_id(block.group_id, block.block_id)
+        page = self._pages[page_id]
+        if page.num_in_use == 0:
+            self.free_block_queue.remove(self.blocks[page_id])
+            free_mask = 0
+            for i, slot in enumerate(page.slots):
+                if slot is block:
+                    continue
+                if slot.block_hash is None:
+                    free_mask |= 1 << i
+                else:
+                    self._cached_slots[block.group_id].append(slot)
+        elif block.block_hash is None:
+            free_mask = page.free_mask & ~(
+                1 << (block.block_id - page.slots[0].block_id)
+            )
+        else:
+            self._cached_slots[block.group_id].remove(block)
+            free_mask = page.free_mask
+        page.num_cached -= block.block_hash is not None
+        self._update_page(page_id, page, page.num_in_use + 1, free_mask)
+
+    def _release(self, block: KVCacheBlock) -> KVCacheBlock | None:
+        """Account a block whose ref_cnt dropped to 0.
+
+        Returns:
+            The first block of the page if no block of the page is in use any
+            more. Else None: the block joins the free blocks of its group.
+
+        """
+        page_id = self._page_id(block.group_id, block.block_id)
+        page = self._pages[page_id]
+        if block.block_hash is not None:
+            page.num_cached += 1
+            self._stamp([block])
+        if page.num_in_use == 1:
+            for slot in page.slots:
+                if slot is not block and slot.block_hash is not None:
+                    self._cached_slots[block.group_id].remove(slot)
+            self._update_page(page_id, page, 0, 0)
+            return self.blocks[page_id]
+        free_mask = page.free_mask
+        if block.block_hash is None:
+            free_mask |= 1 << (block.block_id - page.slots[0].block_id)
+        else:
+            self._cached_slots[block.group_id].append(block)
+        self._update_page(page_id, page, page.num_in_use - 1, free_mask)
+        return None
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
         for block in blocks:
@@ -723,7 +991,13 @@ class BlockPool:
             block.ref_cnt -= 1
             self._reuse_watchers[block.block_id] = on_reuse
             if block.ref_cnt == 0:
-                released.append(block)
+                if block.group_id in self._block_bytes:
+                    page_block = self._release(block)
+                    if page_block is not None:
+                        released.append(page_block)
+                else:
+                    released.append(block)
+        self._stamp(released)
         self.free_block_queue.append_n(released)
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -764,7 +1038,10 @@ class BlockPool:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0:
-                self.free_block_queue.remove(block)
+                if block.group_id in self._block_bytes:
+                    self._acquire(block)
+                else:
+                    self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -794,7 +1071,17 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
-                if block.block_hash is None or not self.enable_caching:
+                if block.group_id in self._block_bytes:
+                    # The page is freed with its last block in use, and
+                    # counts as cached while any of its blocks is.
+                    page_block = self._release(block)
+                    if page_block is None:
+                        continue
+                    cached = self._pages[page_block.block_id].num_cached > 0
+                    block = page_block
+                else:
+                    cached = block.block_hash is not None
+                if not cached or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
                 else:
@@ -804,11 +1091,12 @@ class BlockPool:
         # Blocks to reuse first are prepended to the front of the free queue.
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
+        self._stamp(blocks_to_evict_last)
         self.free_block_queue.append_n(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
 
-    def evict_blocks(self, block_ids: set[int]) -> None:
+    def evict_blocks(self, block_ids: set[int], group_id: int = 0) -> None:
         """Evict blocks from the prefix cache by their block IDs.
 
         only evicts blocks that are currently cached (have a hash). blocks
@@ -817,15 +1105,27 @@ class BlockPool:
 
         Args:
             block_ids: Set of block IDs to evict from cache.
+            group_id: The KV cache group of the block IDs.
 
         """
         for block_id in block_ids:
-            assert block_id < len(self.blocks), (
-                f"Invalid block_id {block_id} >= {len(self.blocks)}. "
-                f"This indicates a bug in the KV connector - workers should "
-                f"only report block IDs that were allocated by the scheduler."
-            )
-            block = self.blocks[block_id]
+            block = self.get_block(group_id, block_id)
+            if (
+                block.group_id in self._block_bytes
+                and block.ref_cnt == 0
+                and block.block_hash is not None
+            ):
+                page_id = self._page_id(group_id, block_id)
+                page = self._pages[page_id]
+                page.num_cached -= 1
+                if page.num_in_use:
+                    self._cached_slots[group_id].remove(block)
+                    self._update_page(
+                        page_id,
+                        page,
+                        page.num_in_use,
+                        page.free_mask | 1 << (block_id - page.slots[0].block_id),
+                    )
             self._maybe_evict_cached_block(block)
 
     def reset_prefix_cache(self) -> bool:
@@ -838,7 +1138,7 @@ class BlockPool:
             False otherwise.
 
         """
-        num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
+        num_used_blocks = self.num_gpu_blocks - self.free_block_queue.num_free_blocks
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
                 "Failed to reset prefix cache because some "
@@ -856,8 +1156,10 @@ class BlockPool:
             )
 
         # Remove all hashes from all blocks.
-        for block in self.blocks:
-            block.reset_hash()
+        for page in self._pages:
+            page.num_cached = 0
+            for block in page.slots:
+                block.reset_hash()
 
         if self.metrics_collector:
             self.metrics_collector.reset()
@@ -869,14 +1171,100 @@ class BlockPool:
 
         return True
 
-    def get_num_free_blocks(self) -> int:
-        """Get the number of free blocks in the pool.
+    def get_num_free_blocks(self, group_id: int = 0) -> int:
+        """Get the number of blocks a group can allocate now.
+
+        Args:
+            group_id: The KV cache group.
 
         Returns:
             The number of free blocks.
 
         """
-        return self.free_block_queue.num_free_blocks
+        n = self.slots_per_page.get(group_id, 1)
+        num_free = n * self.free_block_queue.num_free_blocks
+        if group_id in self._block_bytes:
+            num_free += self._num_free_slots[group_id]
+            num_free += self._cached_slots[group_id].num_free_blocks
+        return num_free
+
+    def can_allocate(
+        self,
+        num_blocks: Sequence[int],
+        hit_blocks: Mapping[int, Sequence[KVCacheBlock]],
+        num_reserved_pages: int,
+    ) -> bool:
+        """Whether every KV cache group can allocate its blocks after it
+        touches its hit blocks, with ``num_reserved_pages`` pages left free.
+
+        A group with one block per page takes one page per block. A group with
+        more blocks per page takes pages only for what its free blocks on
+        in-use pages do not cover, and evicts its cached free blocks on in-use
+        pages only when no page is left. Allocations of different groups can
+        interleave (a request's later Mamba blocks, the reservations of other
+        requests), so the test passes only if every group covers its blocks
+        after all other groups take the most pages they can.
+
+        Args:
+            num_blocks: Blocks to allocate per group, including the hit blocks
+                that are free (ref_cnt 0) and so leave the free queues.
+            hit_blocks: The cache-hit blocks each group with more blocks per
+                page touches.
+            num_reserved_pages: Pages to keep free.
+
+        Returns:
+            True if every group can allocate its blocks.
+
+        """
+        num_pages = self.free_block_queue.num_free_blocks - num_reserved_pages
+        if not self.slots_per_page:
+            # Every block, a free hit included, takes one page.
+            return sum(num_blocks) <= num_pages
+        if not any(num_blocks) and not any(hit_blocks.values()):
+            # Nothing to allocate or touch (a decode step inside its blocks).
+            return num_pages >= 0
+        # Pages taken if every group takes the most it can, and the smallest
+        # gap between the most and the least pages of a group that needs one.
+        total = 0
+        min_gap: int | None = None
+        for group_id, num_group_blocks in enumerate(num_blocks):
+            if group_id not in self._block_bytes:
+                low = high = num_group_blocks
+            else:
+                num_free = self._num_free_slots[group_id]
+                num_cached = self._cached_slots[group_id].num_free_blocks
+                # Free hits pin their pages (or leave the group's cached
+                # blocks) before any group allocates.
+                hit_pages: dict[int, set[int]] = {}  # Page -> its free hit ids.
+                for block in hit_blocks.get(group_id, ()):
+                    if block.ref_cnt or block.is_null:
+                        continue
+                    num_group_blocks -= 1
+                    page_id = self._page_id(group_id, block.block_id)
+                    if self._pages[page_id].num_in_use:
+                        num_cached -= 1
+                    else:
+                        hit_pages.setdefault(page_id, set()).add(block.block_id)
+                # The other blocks of a pinned page join the group's free blocks.
+                for page_id, hit_ids in hit_pages.items():
+                    for slot in self._pages[page_id].slots:
+                        if slot.block_id not in hit_ids:
+                            if slot.block_hash is None:
+                                num_free += 1
+                            else:
+                                num_cached += 1
+                num_pages -= len(hit_pages)
+                uncovered = max(0, num_group_blocks - num_free)
+                n = self.slots_per_page[group_id]
+                low = cdiv(max(0, uncovered - num_cached), n)
+                high = cdiv(uncovered, n)
+            total += high
+            if low and (min_gap is None or high - low < min_gap):
+                min_gap = high - low
+        # A group that needs no page covers its blocks whatever others take.
+        # Every other group must cover them with its least pages after all
+        # other groups take their most.
+        return num_pages >= 0 and (min_gap is None or total - min_gap <= num_pages)
 
     def get_usage(self) -> float:
         """Get the KV cache usage.
@@ -889,7 +1277,7 @@ class BlockPool:
         total_gpu_blocks = self.num_gpu_blocks - 1
         if not total_gpu_blocks:
             return 0
-        return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)
+        return 1.0 - (self.free_block_queue.num_free_blocks / total_gpu_blocks)
 
     def take_events(self) -> list[KVCacheEvent]:
         """Atomically takes all events and clears the queue.

@@ -52,7 +52,9 @@ class KVCacheMetricsCollector:
         )
         self.sample_rate = sample_rate
 
-        self.block_metrics: dict[int, BlockMetricsState] = {}
+        # Keyed by (group_id, block_id): block ids are unique only within a
+        # group under the large-page allocator.
+        self.block_metrics: dict[tuple[int, int], BlockMetricsState] = {}
 
         self._eviction_events: list[KVCacheEvictionEvent] = []
 
@@ -61,15 +63,15 @@ class KVCacheMetricsCollector:
 
     def on_block_allocated(self, block: "KVCacheBlock") -> None:
         if self.should_sample_block():
-            self.block_metrics[block.block_id] = BlockMetricsState()
+            self.block_metrics[(block.group_id, block.block_id)] = BlockMetricsState()
 
     def on_block_accessed(self, block: "KVCacheBlock") -> None:
-        metrics = self.block_metrics.get(block.block_id)
+        metrics = self.block_metrics.get((block.group_id, block.block_id))
         if metrics:
             metrics.record_access()
 
     def on_block_evicted(self, block: "KVCacheBlock") -> None:
-        metrics = self.block_metrics.pop(block.block_id, None)
+        metrics = self.block_metrics.pop((block.group_id, block.block_id), None)
         if not metrics:
             return
 

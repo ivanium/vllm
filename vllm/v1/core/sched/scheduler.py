@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
@@ -345,17 +346,22 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
         )
-        # Mamba managers already account for their speculative state blocks.
+        # Blocks per group of one spec decode step. Mamba managers already
+        # account for their speculative state blocks.
         num_spec_decode_tokens = (
             1 + self.num_spec_tokens + self.num_lookahead_tokens
             if self.num_spec_tokens
             else 0
         )
-        self._spec_decode_step_blocks = sum(
-            cdiv(num_spec_decode_tokens, manager.block_size)
+        self._spec_decode_step_blocks = tuple(
+            0
+            if isinstance(manager.kv_cache_spec, MambaSpec)
+            else cdiv(num_spec_decode_tokens, manager.block_size)
             for manager in self.kv_cache_manager.coordinator.single_type_managers
-            if not isinstance(manager.kv_cache_spec, MambaSpec)
         )
+        # Under the large-page allocator block ids are unique only within a
+        # group, so invalid block ids are (group_id, block_id) pairs.
+        self._large_page_kv = kv_cache_config.allocator == "large_page"
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
@@ -408,15 +414,19 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
-        # TODO: Support models with multiple Mamba specs that require different
-        # prefill checkpoint alignments instead of selecting the first one.
-        self.mamba_prefill_checkpoint_alignment = next(
-            (
-                group.kv_cache_spec.prefill_checkpoint_alignment
-                for group in kv_cache_config.kv_cache_groups
-                if isinstance(group.kv_cache_spec, MambaSpec)
-            ),
-            None,
+        # The scheduler-level checkpoint pre-check must hold for every Mamba
+        # group, so use the lcm of the groups' raw alignments (groups can
+        # differ, e.g. Qwen GDN 64 vs PLE 1). None unless every Mamba group
+        # declares one.
+        mamba_alignments = [
+            group.kv_cache_spec.prefill_checkpoint_alignment
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        self.mamba_prefill_checkpoint_alignment = (
+            math.lcm(*[a for a in mamba_alignments if a is not None])
+            if mamba_alignments and None not in mamba_alignments
+            else None
         )
         self.mamba_has_prefill_checkpoint_blocks = self.has_mamba_layers and all(
             not isinstance(group.kv_cache_spec, MambaSpec)
@@ -1302,39 +1312,41 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
-                reserved_blocks = 0
+                reserved_blocks: tuple[int, ...] | None = ()
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations)
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
-                    reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
-                        + self._spec_decode_step_blocks
-                    )
+                    # None: an in-flight prefill cannot bound its reservation
+                    # this step; retry the admission at the next step.
+                    reserved_blocks = self._async_load_reserved_blocks()
 
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_tokens_past_hit,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    skip_zeroing_group_ids=(
-                        self.connector.get_loaded_kv_cache_group_ids(request)
-                        if load_kv_async and self.connector is not None
-                        else ()
-                    ),
-                    num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
-                    reserved_blocks=reserved_blocks,
-                    has_scheduled_reqs=bool(self.running),
-                )
+                if reserved_blocks is None:
+                    new_blocks = None
+                else:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_tokens_past_hit,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        skip_zeroing_group_ids=(
+                            self.connector.get_loaded_kv_cache_group_ids(request)
+                            if load_kv_async and self.connector is not None
+                            else ()
+                        ),
+                        num_encoder_tokens=num_encoder_tokens,
+                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                        reserved_blocks=reserved_blocks,
+                        has_scheduled_reqs=bool(self.running),
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -1647,9 +1659,10 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _get_new_block_ids_to_zero(self) -> list[int] | None:
+    def _get_new_block_ids_to_zero(self) -> list[int] | list[tuple[int, int]] | None:
         # Drain new attention block ids every step so the manager-side list
         # does not grow unbounded; only kv-cache zeroing consumes them.
+        # Under large_page each entry is a (group_id, block_id) pair.
         new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()
         if not self.needs_kv_cache_zeroing:
             return None
@@ -3157,8 +3170,9 @@ class Scheduler(SchedulerInterface):
             )
         return delay_free or partial_tail_delay, kv_xfer_params
 
-    def _request_remaining_blocks(self, request: Request) -> int:
-        """Blocks `request` still needs to hold its full sequence and be promoted."""
+    def _request_remaining_blocks(self, request: Request) -> tuple[int, ...] | None:
+        """Blocks per group `request` still needs to hold its full sequence and
+        be promoted; None when a group cannot admit the request this step."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
         num_tokens = full_num_tokens
         if self.num_spec_tokens:
@@ -3185,11 +3199,23 @@ class Scheduler(SchedulerInterface):
                 kv_fetch_stages[request] = stage
                 self._kv_fetch_counts[stage] += 1
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
-        """Num blocks in-flight prefills still need to finish (their reservation)."""
-        return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
-        )
+    def _async_load_reserved_blocks(self) -> tuple[int, ...] | None:
+        """Blocks per group an async load must leave free: what in-flight
+        prefills still need to finish (their reservation) plus the load's own
+        spec decode step.
+
+        None when one of the in-flight prefills cannot be admitted this step,
+        in which case its reservation is unbounded and async admissions must
+        wait.
+        """
+        reserved = list(self._spec_decode_step_blocks)
+        for req in self._inflight_prefills:
+            demand = self._request_remaining_blocks(req)
+            if demand is None:
+                return None
+            for group_id, num_blocks in enumerate(demand):
+                reserved[group_id] += num_blocks
+        return tuple(reserved)
 
     def _load_restores_replay_window(self, request: Request) -> bool:
         """Whether the KV connector's load for ``request`` restores every DSV41
@@ -3340,10 +3366,10 @@ class Scheduler(SchedulerInterface):
     def _update_requests_with_invalid_blocks(
         self,
         requests: Iterable[Request],
-        invalid_block_ids: set[int],
+        invalid_block_ids: set[int] | set[tuple[int, int]],
         num_scheduled_tokens: dict[str, int],
         evict_blocks: bool = True,
-    ) -> tuple[set[str], int, set[int]]:
+    ) -> tuple[set[str], int, set[int] | set[tuple[int, int]]]:
         """Identify and update requests affected by invalid KV cache blocks.
 
         This method scans the given requests, detects those with invalid blocks
@@ -3353,7 +3379,9 @@ class Scheduler(SchedulerInterface):
 
         Args:
             requests: The set of requests to scan for invalid blocks.
-            invalid_block_ids: IDs of invalid blocks.
+            invalid_block_ids: IDs of invalid blocks. Under ``large_page``,
+                where block ids are unique only within a group, each entry is
+                a ``(group_id, block_id)`` pair.
             num_scheduled_tokens: req_id -> number of scheduled tokens.
             evict_blocks: Whether to collect blocks for eviction (False for
                 async requests which aren't cached yet).
@@ -3364,69 +3392,92 @@ class Scheduler(SchedulerInterface):
                 invalid blocks.
                 - total_affected_tokens (int): Total number of tokens that must
                 be recomputed across all affected requests.
-                - blocks_to_evict (set[int]): Block IDs to evict from cache,
-                including invalid blocks and downstream dependent blocks.
+                - blocks_to_evict (set[int], or set[(group_id, block_id)] under
+                ``large_page``): Block IDs to evict from cache, including
+                invalid blocks and downstream dependent blocks.
 
         """
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if self._large_page_kv:
+            invalid_per_group: list[set[int]] = [set() for _ in range(len(managers))]
+            for group_id, block_id in cast(set[tuple[int, int]], invalid_block_ids):
+                invalid_per_group[group_id].add(block_id)
+
         affected_req_ids: set[str] = set()
         total_affected_tokens = 0
-        blocks_to_evict: set[int] = set()
+        blocks_to_evict: set[Any] = set()
         # If a block is invalid and shared by multiple requests in the batch,
         # these requests must be rescheduled, but only the first will recompute
         # it. This set tracks blocks already marked for recomputation.
-        marked_invalid_block_ids: set[int] = set()
+        marked_invalid_block_ids: set[Any] = set()
         for request in requests:
             is_affected = False
-            marked_invalid_block = False
             req_id = request.request_id
             # One block-id list per KV cache group; single-group layouts are
-            # enforced by _handle_invalid_blocks.
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            # enforced by _handle_invalid_blocks under uniform_page.
+            block_ids_by_group = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
 
-            req_num_computed_blocks = (
-                req_num_computed_tokens + self.block_size - 1
-            ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
+            # The request resumes at its earliest unmarked invalid block
+            # (in tokens) across all groups; blocks shared with an earlier
+            # request are recomputed by that request and stay counted here.
+            truncate_at: int | None = None
+            for group_id, req_block_ids in enumerate(block_ids_by_group):
+                group_invalid: set[int]
+                if self._large_page_kv:
+                    group_invalid = invalid_per_group[group_id]
+                    block_size = managers[group_id].block_size
+                else:
+                    group_invalid = cast(set[int], invalid_block_ids)
+                    block_size = self.block_size
+                req_num_computed_blocks = cdiv(req_num_computed_tokens, block_size)
+                first_unmarked_idx: int | None = None
+                for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
+                    if block_id not in group_invalid:
+                        continue
+
+                    is_affected = True
+
+                    key = (group_id, block_id) if self._large_page_kv else block_id
+                    if key in marked_invalid_block_ids:
+                        # This invalid block is shared with a previous request
+                        # and was already marked for recomputation.
+                        # This means this request can still consider this block
+                        # as computed when rescheduled.
+                        # Currently this only applies to sync loading; Async
+                        # loading does not yet support block sharing
+                        continue
+
+                    marked_invalid_block_ids.add(key)
+                    if first_unmarked_idx is None:
+                        first_unmarked_idx = idx
+
+                if first_unmarked_idx is None:
                     continue
-
-                is_affected = True
-
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    continue
-
-                marked_invalid_block_ids.add(block_id)
-
-                if marked_invalid_block:
-                    # This request has already marked an invalid block for
-                    # recomputation and updated its num_computed_tokens.
-                    continue
-
-                marked_invalid_block = True
                 # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
-                num_affected_tokens = (
-                    req_num_computed_tokens - request.num_computed_tokens
-                )
-                total_affected_tokens += num_affected_tokens
+                position = first_unmarked_idx * block_size
+                if truncate_at is None or position < truncate_at:
+                    truncate_at = position
 
                 # collect invalid block and all downstream dependent blocks
                 if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    if self._large_page_kv:
+                        blocks_to_evict.update(
+                            (group_id, b) for b in req_block_ids[first_unmarked_idx:]
+                        )
+                    else:
+                        blocks_to_evict.update(req_block_ids[first_unmarked_idx:])
+
+            if truncate_at is not None:
+                request.num_computed_tokens = truncate_at
+                total_affected_tokens += req_num_computed_tokens - truncate_at
 
             if is_affected:
-                if not marked_invalid_block:
+                if truncate_at is None:
                     # All invalid blocks of this request are shared with
                     # previous requests and will be recomputed by them.
                     # Revert to considering only cached tokens as computed.
@@ -3457,7 +3508,9 @@ class Scheduler(SchedulerInterface):
         return set() if self.recompute_kv_load_failures else affected_req_ids
 
     def _handle_invalid_blocks(
-        self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]
+        self,
+        invalid_block_ids: set[int] | set[tuple[int, int]],
+        num_scheduled_tokens: dict[str, int],
     ) -> set[str]:
         """Handle requests affected by invalid KV cache blocks.
 
@@ -3465,9 +3518,10 @@ class Scheduler(SchedulerInterface):
             Set of affected request IDs to skip in update_from_output main loop.
 
         """
-        if len(self.kv_cache_config.kv_cache_groups) > 1:
+        if not self._large_page_kv and len(self.kv_cache_config.kv_cache_groups) > 1:
             # Block IDs are only unique within a group, so a flat set of
-            # invalid block IDs cannot be mapped back to requests.
+            # invalid block IDs cannot be mapped back to requests. (Under
+            # large_page, invalid block ids are (group_id, block_id) pairs.)
             raise RuntimeError(
                 "A KV connector reported block-level load failures "
                 "(invalid_block_ids) which is not supported for models "

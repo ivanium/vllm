@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import math
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -44,6 +45,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_planning import get_kv_cache_configs
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.diffusion_scheduler import (
     DiffusionAsyncScheduler,
@@ -62,6 +64,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheSpec,
     MambaSpec,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
@@ -8191,3 +8194,479 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
     assert "read" not in scheduler.schedule().num_scheduled_tokens
     assert read.next_decode_eligible_step == 7
+
+
+# ---------------------------------------------------------------------------
+# Large-page allocator (DESIGN v3 section 6)
+# ---------------------------------------------------------------------------
+
+
+def _create_large_page_scheduler(
+    *,
+    num_large_pages: int,
+    slots_per_large_page: tuple[int, ...],
+    block_size: int = 16,
+    max_num_batched_tokens: int = 8192,
+    max_num_seqs: int = 16,
+    enable_prefix_caching: bool = True,
+    mamba_num_prefill_checkpoint_blocks: int = 0,
+    mamba: bool = True,
+    num_speculative_tokens: int | None = None,
+) -> Scheduler:
+    """FA + Mamba ("align") two-group scheduler over a large-page BlockPool
+    (built by the coordinator from the KVCacheConfig)."""
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = (
+        SpeculativeConfig(model="ngram", num_speculative_tokens=num_speculative_tokens)
+        if num_speculative_tokens is not None
+        else None
+    )
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=8192,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+            watermark=0.0,
+        ),
+        model_config=model_config,
+        cache_config=CacheConfig(
+            block_size=block_size,
+            enable_prefix_caching=enable_prefix_caching,
+            mamba_cache_mode="align",
+        ),
+        speculative_config=speculative_config,
+    )
+    vllm_config.cache_config.num_gpu_blocks = num_large_pages
+    # Group g's blocks tile a page in slots_per_large_page[g] pieces.
+    page_bytes = math.lcm(*slots_per_large_page)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_large_pages,  # N pages for legacy readers
+        allocator="large_page",
+        large_page_bytes=page_bytes,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["fa"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+                num_blocks=num_large_pages * slots_per_large_page[0],
+                slots_per_large_page=slots_per_large_page[0],
+                row_bytes=page_bytes // slots_per_large_page[0],
+            ),
+            KVCacheGroupSpec(
+                ["mamba" if mamba else "fa2"],
+                (
+                    MambaSpec(
+                        block_size=block_size,
+                        shapes=((1, 1),),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                        num_prefill_checkpoint_blocks=(
+                            mamba_num_prefill_checkpoint_blocks
+                        ),
+                    )
+                    if mamba
+                    else FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=2,
+                        dtype=torch.float32,
+                    )
+                ),
+                num_blocks=num_large_pages * slots_per_large_page[1],
+                slots_per_large_page=slots_per_large_page[1],
+                row_bytes=page_bytes // slots_per_large_page[1],
+            ),
+        ],
+    )
+    register_all_kvcache_specs(vllm_config)
+    return Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=block_size,
+        hash_block_size=block_size,
+        log_stats=True,
+    )
+
+
+def test_large_page_preemption_terminates():
+    """FCFS preemption still terminates when the pool is full: the victim's
+    pages return to the free list and the preempting request is admitted."""
+    scheduler = _create_large_page_scheduler(
+        num_large_pages=9,  # 8 usable pages
+        slots_per_large_page=(2, 2),
+        max_num_batched_tokens=256,
+        enable_prefix_caching=False,
+        mamba=False,
+    )
+
+    # 64 tokens = 4 blocks per group = 2 pages per group; A then B fill all
+    # 8 usable pages.
+    request_a, request_b = create_requests(num_requests=2, num_tokens=64)
+    scheduler.add_request(request_a)
+    output_a = scheduler.schedule()
+    assert output_a.num_scheduled_tokens == {request_a.request_id: 64}
+
+    scheduler.add_request(request_b)
+    output_b = scheduler.schedule()
+    assert output_b.num_scheduled_tokens.get(request_b.request_id) == 64
+    assert scheduler.running == [request_a, request_b]
+
+    # A's first decode token needs a fifth block per group; no page is free,
+    # so A preempts B (FCFS: last running), B's pages return, A proceeds.
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request_a.request_id],
+        req_id_to_index={request_a.request_id: 0},
+        sampled_token_ids=[[0]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(output_a, model_runner_output)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens.get(request_a.request_id) == 1
+    assert request_b.status == RequestStatus.PREEMPTED
+    assert scheduler.running == [request_a]
+
+    # B resumes once A is done. (B's output token from its admission step is
+    # still in flight; process it so B has a token to schedule.)
+    scheduler.update_from_output(
+        output_b,
+        ModelRunnerOutput(
+            req_ids=[request_b.request_id],
+            req_id_to_index={request_b.request_id: 0},
+            sampled_token_ids=[[42]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    scheduler.finish_requests(request_a.request_id, RequestStatus.FINISHED_STOPPED)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens.get(request_b.request_id, 0) > 0
+    assert request_b.status == RequestStatus.RUNNING
+
+
+def test_large_page_spec_decode_allocates_draft_tokens_in_slots():
+    """Spec decode on multi-slot pages: draft tokens take blocks from each
+    group's slot space, per-group block ids stay unique, the free-page
+    invariant holds at every step, and every page returns on finish."""
+    num_large_pages = 9  # 8 usable pages
+    scheduler = _create_large_page_scheduler(
+        num_large_pages=num_large_pages,
+        slots_per_large_page=(2, 2),
+        max_num_batched_tokens=256,
+        mamba=False,
+        num_speculative_tokens=2,
+    )
+    pool = scheduler.kv_cache_manager.block_pool
+    num_usable_pages = num_large_pages - 1
+    req_id = "0"
+
+    def update(output, sampled):
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[req_id],
+                req_id_to_index={req_id: 0},
+                sampled_token_ids=[sampled],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        scheduler.update_draft_token_ids(
+            DraftTokenIds([req_id], [[sampled[-1] + 1, sampled[-1] + 2]])
+        )
+
+    (request,) = create_requests(num_requests=1, num_tokens=16, max_tokens=64)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {req_id: 16}
+    # Prefill: one block per group; each takes a page (2 slots a page).
+    update(output, [10])
+
+    for step in range(5):
+        output = scheduler.schedule()
+        # One sampled token plus the two draft tokens.
+        assert output.num_scheduled_tokens[req_id] == 3
+        ids = scheduler.kv_cache_manager.get_block_ids(req_id)
+        used_pages = 0
+        for group_ids in ids:
+            assert len(set(group_ids)) == len(group_ids)
+            assert all(0 < i < num_large_pages * 2 for i in group_ids)
+            used_pages += len({i // 2 for i in group_ids})
+        assert pool.free_block_queue.num_free_blocks == num_usable_pages - used_pages
+        update(output, [20 + 3 * step, 21 + 3 * step, 22 + 3 * step])
+
+    # 32 tokens: two blocks per group, packed into one page per group.
+    ids = scheduler.kv_cache_manager.get_block_ids(req_id)
+    assert [len(group_ids) for group_ids in ids] == [2, 2]
+    assert pool.free_block_queue.num_free_blocks == num_usable_pages - 2
+
+    scheduler.finish_requests(req_id, RequestStatus.FINISHED_STOPPED)
+    assert pool.free_block_queue.num_free_blocks == num_usable_pages
+    assert pool.get_usage() == 0.0
+
+
+def test_large_page_planner_pool_scheduler_end_to_end():
+    """End to end under ``large_page``: real planner output -> coordinator with
+    the real BlockPool -> scheduler admitting, caching, sharing,
+    preempting and freeing several requests, with pool invariants and
+    per-group block-id uniqueness checked at every step."""
+    num_large_pages = 11  # 10 usable pages
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="facebook/opt-125m",
+            max_model_len=96,
+            trust_remote_code=True,
+            dtype="float16",
+            seed=42,
+            skip_tokenizer_init=True,
+        ),
+        cache_config=CacheConfig(
+            block_size=16,
+            kv_cache_allocator="large_page",
+            enable_prefix_caching=True,
+            mamba_cache_mode="align",
+            num_gpu_blocks_override=num_large_pages,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=8,
+            max_num_batched_tokens=64,
+            max_model_len=96,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+            watermark=0.0,
+        ),
+    )
+    register_all_kvcache_specs(vllm_config)
+    kv_cache_spec: dict[str, KVCacheSpec] = {
+        # One 4 KiB FA block and one 512 B Mamba state per 16 tokens: the
+        # planner must place them at n_g = 1 and 8 slots per 4 KiB page.
+        "fa": FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            kernel_block_sizes=(16,),
+        ),
+        "mamba": MambaSpec(
+            block_size=16,
+            shapes=((4, 64),),
+            dtypes=(torch.float16,),
+            mamba_cache_mode="align",
+            prefill_checkpoint_alignment=16,
+        ),
+    }
+    (kv_cache_config,) = get_kv_cache_configs(vllm_config, [kv_cache_spec], [1 << 30])
+
+    # The planner's output, not a hand-built config, drives the scheduler.
+    assert kv_cache_config.allocator == "large_page"
+    assert kv_cache_config.num_blocks == num_large_pages
+    assert vllm_config.cache_config.block_size == 16  # B, written back
+    group_fa, group_mamba = kv_cache_config.kv_cache_groups
+    assert group_fa.slots_per_large_page == 1
+    assert group_mamba.slots_per_large_page == 8
+    # engine/core.py sets this from the planner's N; replicate it here.
+    vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=16,
+        hash_block_size=16,
+        log_stats=True,
+    )
+    manager = scheduler.kv_cache_manager
+    pool = manager.block_pool
+    n_groups = len(kv_cache_config.kv_cache_groups)
+
+    def check_pool_invariants() -> None:
+        assert 0 <= pool.free_block_queue.num_free_blocks <= num_large_pages - 1
+        assert 0.0 <= pool.get_usage() <= 1.0
+        assert scheduler.get_kv_cache_usage() == pool.get_usage()
+        for g in range(n_groups):
+            n_g = kv_cache_config.kv_cache_groups[g].slots_per_large_page
+            assert 0 <= pool.get_num_free_blocks(g) <= n_g * (num_large_pages - 1)
+
+    def check_block_id_uniqueness() -> None:
+        # Within a group, a non-null block id is held by at most one request,
+        # unless it is a cached prefix block shared by reference.
+        for g in range(n_groups):
+            owners: dict[int, int] = {}
+            for req in scheduler.running:
+                # Null blocks (id 0) pad skipped positions and never own data.
+                ids = [
+                    block_id
+                    for block_id in manager.get_block_ids(req.request_id)[g]
+                    if block_id != 0
+                ]
+                assert len(ids) == len(set(ids))
+                for block_id in ids:
+                    owners[block_id] = owners.get(block_id, 0) + 1
+            for block_id, num_owners in owners.items():
+                if num_owners > 1:
+                    block = pool.get_block(g, block_id)
+                    assert block.block_hash is not None
+                    assert block.ref_cnt >= num_owners
+
+    def drive() -> SchedulerOutput:
+        output = scheduler.schedule()
+        check_pool_invariants()
+        check_block_id_uniqueness()
+        req_ids = list(output.num_scheduled_tokens)
+        if req_ids:
+            scheduler.update_from_output(
+                output,
+                ModelRunnerOutput(
+                    req_ids=req_ids,
+                    req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                    sampled_token_ids=[[0]] * len(req_ids),
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                    pooler_output=[],
+                ),
+            )
+        return output
+
+    def run_to_completion(request) -> None:
+        while request.status not in (
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ):
+            drive()
+
+    # Phase 1: A runs alone; its blocks are cached when it finishes.
+    req_a, req_b = create_requests(
+        2, num_tokens=64, max_tokens=3, same_prompt=True, req_ids=["a", "b"]
+    )
+    scheduler.add_request(req_a)
+    drive()
+    # A's FA table is append-only; capture the prefix blocks while A runs.
+    a_fa_ids = manager.get_block_ids(req_a.request_id)[0]
+    run_to_completion(req_a)
+    assert scheduler.get_num_unfinished_requests() == 0
+
+    # Phase 2: B shares A's 64-token prompt and hits its cached prefix.
+    scheduler.add_request(req_b)
+    drive()
+    assert req_b.status == RequestStatus.RUNNING
+    b_fa_ids = manager.get_block_ids(req_b.request_id)[0]
+    # The first three blocks (48 tokens) are A's cached blocks, reused in
+    # place; B's fourth block is newly allocated.
+    assert b_fa_ids[:3] == a_fa_ids[:3]
+    assert b_fa_ids[3] not in a_fa_ids
+    run_to_completion(req_b)
+
+    # Phase 3: C and D (distinct prompts) each fit individually but not
+    # jointly; growth preempts one of them, and the victim later resumes on
+    # its own cached blocks.
+    req_c, req_d = create_requests(2, num_tokens=64, max_tokens=8, req_ids=["c", "d"])
+    scheduler.add_request(req_c)
+    scheduler.add_request(req_d)
+    saw_preemption = False
+    while scheduler.get_num_unfinished_requests() > 0:
+        drive()
+        saw_preemption |= any(
+            req.status == RequestStatus.PREEMPTED for req in (req_c, req_d)
+        )
+    assert saw_preemption
+
+    # Phase 4: everything freed; resetting the prefix cache returns all pages.
+    assert scheduler.reset_prefix_cache()
+    check_pool_invariants()
+    assert pool.free_block_queue.num_free_blocks == num_large_pages - 1
+    assert pool.get_usage() == 0.0
+
+
+def test_large_page_prefix_cache_survives_allocation_churn():
+    """Concurrent requests finish, and identical prompts then hit the cache
+    while free pages exist.
+
+    Regression test for the eviction treadmill (dbg-hit): with the old
+    allocation order, the tail prefills of the wave consumed the group's
+    cached-free slots (evicting the early finishers' prefixes) while free
+    pages were idle, so the repeated prompts missed.
+    """
+    scheduler = _create_large_page_scheduler(
+        num_large_pages=33,  # 32 usable pages; the wave needs 20, with slack
+        slots_per_large_page=(4, 4),
+        # One 64-token prefill per step: the wave's prefills serialize, so the
+        # late prefills allocate while the early finishers' blocks are
+        # cached-free — the treadmill's trigger.
+        max_num_batched_tokens=64,
+        max_num_seqs=8,
+        mamba=False,
+    )
+    pool = scheduler.kv_cache_manager.block_pool
+
+    def drive() -> None:
+        output = scheduler.schedule()
+        req_ids = list(output.num_scheduled_tokens)
+        if req_ids:
+            scheduler.update_from_output(
+                output,
+                ModelRunnerOutput(
+                    req_ids=req_ids,
+                    req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                    sampled_token_ids=[[0]] * len(req_ids),
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                    pooler_output=[],
+                ),
+            )
+
+    # 8 distinct 64-token prompts run concurrently and finish; their blocks
+    # stay cached-free on owned pages.
+    run1 = create_requests(
+        8, num_tokens=64, max_tokens=4, req_ids=[f"a{i}" for i in range(8)]
+    )
+    for request in run1:
+        scheduler.add_request(request)
+    while scheduler.get_num_unfinished_requests() > 0:
+        drive()
+    assert pool.get_usage() == 0.0
+
+    # Pass 2: create_requests gives request i the prompt [i] * num_tokens, so
+    # b_i repeats a_i exactly; every request must hit the cached prefix (3
+    # full blocks = 48 of 64 tokens; the last block is not a hit).
+    pass2 = create_requests(
+        8, num_tokens=64, max_tokens=4, req_ids=[f"b{i}" for i in range(8)]
+    )
+    for request in pass2:
+        scheduler.add_request(request)
+    hits: dict[str, int] = {}
+    while len(hits) < len(pass2):
+        output = scheduler.schedule()
+        for req_id in output.num_scheduled_tokens:
+            if req_id not in hits:
+                hits[req_id] = scheduler.requests[req_id].num_computed_tokens
+        req_ids = list(output.num_scheduled_tokens)
+        if req_ids:
+            scheduler.update_from_output(
+                output,
+                ModelRunnerOutput(
+                    req_ids=req_ids,
+                    req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                    sampled_token_ids=[[0]] * len(req_ids),
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                    pooler_output=[],
+                ),
+            )
+    assert all(hit >= 48 for hit in hits.values())

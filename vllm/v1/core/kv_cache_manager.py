@@ -202,8 +202,14 @@ class KVCacheManager:
         )
         self.kv_cache_config = kv_cache_config
 
+        # Under the large-page allocator block ids are unique only within a
+        # group, so block ids leave the manager as (group_id, block_id) pairs.
+        self._large_page = kv_cache_config.allocator == "large_page"
+
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
+        # It counts pages, which are blocks unless a group has more blocks per
+        # page.
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
         self.kv_cache_event_metadata = tuple(
@@ -368,6 +374,28 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    def _can_allocate(
+        self,
+        demand: tuple[int, ...],
+        new_computed_block_list: tuple[Sequence[KVCacheBlock], ...],
+        total_computed_tokens: int,
+        num_reserved_pages: int,
+    ) -> bool:
+        """Whether the pool fits ``demand`` blocks per group with
+        ``num_reserved_pages`` pages left free."""
+        if new_computed_block_list is self.empty_kv_cache_blocks.blocks:
+            return self.block_pool.can_allocate(demand, {}, num_reserved_pages)
+        managers = self.coordinator.single_type_managers
+        # Hit blocks of skipped (out-of-window) tokens are not touched.
+        hit_blocks = {
+            group_id: new_computed_block_list[group_id][
+                managers[group_id].get_num_skipped_tokens(total_computed_tokens)
+                // managers[group_id].block_size :
+            ]
+            for group_id in self.block_pool.slots_per_page
+        }
+        return self.block_pool.can_allocate(demand, hit_blocks, num_reserved_pages)
+
     def allocate_slots(
         self,
         request: Request,
@@ -379,7 +407,7 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
-        reserved_blocks: int = 0,
+        reserved_blocks: tuple[int, ...] = (),
         has_scheduled_reqs: bool = True,
         skip_zeroing_group_ids: tuple[int, ...] = (),
     ) -> KVCacheBlocks | None:
@@ -407,9 +435,9 @@ class KVCacheManager:
                 free blocks to hold the full sequence, accounting for prefix cache hits
                 and sliding window. Used as an admission gate to prevent over-admitting
                 requests when chunked prefill would otherwise only check the first chunk
-            reserved_blocks: Number of free blocks that must be left available for
+            reserved_blocks: Blocks per group that must be left available for
                 other in-flight sequences to complete. The actual allocation is only
-                made if it fits within (free blocks - reserved_blocks). Used to gate
+                made if the pool fits them in addition to this request. Used to gate
                 async KV-connector loads so their initial allocation cannot consume
                 blocks an already in-flight (prefilling) sequence is relying on.
             has_scheduled_reqs: Whether any requests are already scheduled to run
@@ -523,7 +551,7 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            full_demand = self.coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,
                 num_tokens=full_num_tokens,
                 new_computed_blocks=new_computed_block_list,
@@ -534,8 +562,12 @@ class KVCacheManager:
                 apply_admission_cap=True,
                 prefill_end=prefill_end,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            if full_demand is None or not self._can_allocate(
+                full_demand,
+                new_computed_block_list,
+                total_computed_tokens,
+                watermark_blocks,
+            ):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -558,7 +590,7 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        demand = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -569,12 +601,20 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
             prefill_end=prefill_end,
         )
+        if demand is None:
+            # A group cannot admit the request this step; retry next step.
+            return None
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
+        if reserved_blocks:
+            demand = tuple(d + r for d, r in zip(demand, reserved_blocks, strict=True))
+        if not self._can_allocate(
+            demand,
+            new_computed_block_list,
+            num_local_computed_tokens + num_external_computed_tokens,
+            watermark_blocks,
+        ):
             # Cannot allocate new blocks
             return None
 
@@ -662,14 +702,20 @@ class KVCacheManager:
         """
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
-    def evict_blocks(self, block_ids: set[int]) -> None:
+    def evict_blocks(self, block_ids: set[int] | set[tuple[int, int]]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
 
         Args:
-            block_ids: Set of block IDs to evict from cache.
+            block_ids: Set of block IDs to evict from cache. Under
+                ``large_page`` block ids are unique only within a group, so
+                each entry is a ``(group_id, block_id)`` pair.
 
         """
-        self.block_pool.evict_blocks(block_ids)
+        if self._large_page:
+            for group_id, block_id in block_ids:  # type: ignore[misc]
+                self.block_pool.evict_blocks({block_id}, group_id)
+            return
+        self.block_pool.evict_blocks(block_ids)  # type: ignore[arg-type]
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -736,15 +782,17 @@ class KVCacheManager:
         """Get block ids covering the request's computed tokens."""
         block_ids = self.get_block_ids(request_id)
         clipped_block_ids: list[list[int]] = []
-        for group, ids in zip(self.kv_cache_config.kv_cache_groups, block_ids):
-            spec = group.kv_cache_spec
+        for manager, ids in zip(self.coordinator.single_type_managers, block_ids):
+            spec = manager.kv_cache_spec
             if not isinstance(spec, AttentionSpec) or isinstance(
                 spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
             ):
                 clipped_block_ids.append(ids)
                 continue
 
-            num_valid_blocks = cdiv(num_computed_tokens, spec.block_size)
+            # Clip in token space: for DCP-sharded groups the spec block size
+            # is per rank, while the manager allocates token-space blocks.
+            num_valid_blocks = cdiv(num_computed_tokens, manager.block_size)
             clipped_block_ids.append(ids[:num_valid_blocks])
         return tuple(clipped_block_ids)
 
@@ -830,8 +878,18 @@ class KVCacheManager:
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 
-    def take_new_block_ids(self) -> list[int]:
-        """Drain and return new attention block IDs for zeroing."""
+    def take_new_block_ids(self) -> list[int] | list[tuple[int, int]]:
+        """Drain and return new attention block IDs for zeroing.
+
+        Under ``large_page`` block ids are unique only within a group, so each
+        entry is a ``(group_id, block_id)`` pair.
+        """
+        if self._large_page:
+            return [
+                (mgr.kv_cache_group_id, block_id)
+                for mgr in self.coordinator.single_type_managers
+                for block_id in mgr.take_new_block_ids()
+            ]
         ids: list[int] = []
         for mgr in self.coordinator.single_type_managers:
             ids.extend(mgr.take_new_block_ids())
@@ -854,18 +912,25 @@ class KVCacheManager:
     def take_kv_cache_block_copies(
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
-        """Drain pending copies and return their retained endpoints."""
-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        """Drain pending copies and return their retained endpoints.
+
+        Each copy carries its ``group_id``: under ``large_page`` block ids
+        are unique only within a group.
+        """
+        pending_copies: list[tuple[int, tuple[KVCacheBlock, KVCacheBlock]]] = []
         for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
+            pending_copies.extend(
+                (mgr.kv_cache_group_id, copy) for copy in mgr.take_pending_cow_copies()
+            )
         copies = [
             KVCacheBlockCopy(
                 src_block_id=source_block.block_id,
                 dst_block_id=cow_block.block_id,
+                group_id=group_id,
             )
-            for source_block, cow_block in pending_copies
+            for group_id, (source_block, cow_block) in pending_copies
         ]
-        retained_blocks = [block for pair in pending_copies for block in pair]
+        retained_blocks = [block for _, pair in pending_copies for block in pair]
         return copies, retained_blocks
 
     def take_boundary_state_offloads(

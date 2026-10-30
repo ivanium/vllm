@@ -122,7 +122,7 @@ class TestKVCacheMetricsCollector:
             with patch("time.monotonic_ns", return_value=t):
                 c.on_block_accessed(block)
 
-        assert len(c.block_metrics[0].access_history) == 3
+        assert len(c.block_metrics[(0, 0)].access_history) == 3
 
     def test_evict_no_accesses(self):
         # lifetime should equal idle if never accessed
@@ -161,7 +161,7 @@ class TestKVCacheMetricsCollector:
         assert abs(sample.lifetime_seconds - 3.0) < 0.001
         assert abs(sample.idle_seconds - 1.0) < 0.001
         assert sample.reuse_gaps_seconds == (1.0,)
-        assert 0 not in c.block_metrics
+        assert (0, 0) not in c.block_metrics
 
     def test_reset(self):
         c = KVCacheMetricsCollector(sample_rate=1.0)
@@ -176,7 +176,7 @@ class TestKVCacheMetricsCollector:
 
         with patch("time.monotonic_ns", return_value=2000000000):
             c.on_block_allocated(KVCacheBlock(block_id=10))
-        assert 10 in c.block_metrics
+        assert (0, 10) in c.block_metrics
 
     def test_huge_time_jump(self):
         c = KVCacheMetricsCollector(sample_rate=1.0)

@@ -910,7 +910,7 @@ def test_hisparse_inflight_host_import_reserves_remaining_gpu_pages():
         apply_admission_cap=True,
     )
 
-    assert required == 4
+    assert sum(required) == 4
 
 
 @pytest.mark.parametrize("host_num_blocks,admitted", [(5, False), (6, True)])
@@ -936,6 +936,9 @@ def test_hisparse_async_admission_requires_full_prompt_host_pages(
     manager = make_hisparse_kv_cache_manager(32, host_num_blocks)
     scheduler.kv_cache_manager = manager
     scheduler.kv_cache_config = manager.kv_cache_config
+    scheduler._spec_decode_step_blocks = (0,) * len(
+        manager.kv_cache_config.kv_cache_groups
+    )
     assert scheduler.scheduler_reserve_full_isl
     inflight = make_request(
         "inflight", list(range(3 * HISPARSE_BLOCK_SIZE)), HISPARSE_BLOCK_SIZE, sha256
@@ -978,6 +981,9 @@ def test_hisparse_admitted_async_loads_can_finish_with_nothing_running(tmp_path)
     manager = make_hisparse_kv_cache_manager(32, 4)
     scheduler.kv_cache_manager = manager
     scheduler.kv_cache_config = manager.kv_cache_config
+    scheduler._spec_decode_step_blocks = (0,) * len(
+        manager.kv_cache_config.kv_cache_groups
+    )
     assert scheduler.scheduler_reserve_full_isl
     first = make_request(
         "first", list(range(3 * HISPARSE_BLOCK_SIZE)), HISPARSE_BLOCK_SIZE, sha256
@@ -1021,11 +1027,12 @@ def test_hisparse_import_capacity_includes_hits_and_cow(
     if evictable:
         host_pool.free_blocks([hit])
     assert host_pool.get_num_free_blocks() == free_blocks
+    # None (deny this step) replaces the former num_gpu_blocks + 1 sentinel.
+    required = coordinator.host_manager.get_num_blocks_to_allocate(
+        "waiting", 32, [hit], 32, local_tokens, 32
+    )
     assert (
-        coordinator.host_manager.get_num_blocks_to_allocate(
-            "waiting", 32, [hit], 32, local_tokens, 32
-        )
-        <= host_pool.get_num_free_blocks()
+        required is not None and required <= host_pool.get_num_free_blocks()
     ) == admitted
 
 
@@ -5316,7 +5323,7 @@ def test_can_fit_full_sequence_swa_cap_admits_long_prompt():
     )
 
 
-@pytest.mark.parametrize(("reserved_blocks", "fits"), [(4, True), (10, False)])
+@pytest.mark.parametrize(("reserved_blocks", "fits"), [((4,), True), ((10,), False)])
 def test_full_sequence_admission_reserves_device_blocks_for_immediate_chunk(
     reserved_blocks, fits
 ):
@@ -6182,6 +6189,139 @@ def test_mamba_reachable_block_mask_large_dcp_stays_sparse():
     assert mask_no_dcp is not None, "Sparse retention expected"
     assert mask_large_dcp is not None, "Large DCP must not force dense caching"
     assert mask_no_dcp == mask_large_dcp, "DCP must not change Mamba retention"
+
+
+def _make_dcp_kv_cache_config(
+    block_size: int, num_blocks: int, dcp: int, draft_sharded: bool
+) -> KVCacheConfig:
+    """A planner-shaped DCP config: the sharded groups' specs hold the
+    per-rank block size (B // dcp), replicated groups hold B."""
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                FullAttentionSpec(
+                    block_size=block_size // dcp,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    dcp_sharded=True,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                MLAAttentionSpec(
+                    block_size=block_size // dcp if draft_sharded else block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    dcp_sharded=draft_sharded,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+        hash_block_size=block_size,
+    )
+
+
+def test_get_block_ids_for_computed_tokens_clips_in_token_space_under_dcp():
+    """The connector-finished path clips a request's block ids to its computed
+    tokens. The clip must use the token-space block size B; the DCP-sharded
+    spec's per-rank block size (B // dcp) would clip dcp times too late and
+    hand uncomputed blocks to the connector."""
+    block_size = 16
+    dcp = 2
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=block_size // dcp,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    dcp_sharded=True,
+                ),
+            )
+        ],
+        hash_block_size=block_size,
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=4096,
+        enable_caching=True,
+        hash_block_size=block_size,
+        scheduler_block_size=block_size,
+        dcp_world_size=dcp,
+    )
+    request = make_request("0", list(range(64)), block_size, sha256)
+    assert manager.allocate_slots(request, 64, 0, manager.empty_kv_cache_blocks)
+
+    ids = manager.get_block_ids("0")[0]
+    assert len(ids) == 4
+    # 20 computed tokens cover 2 token-space blocks (of 16 tokens), not 3
+    # per-rank ones (of 8).
+    assert manager.get_block_ids_for_computed_tokens("0", 20)[0] == ids[:2]
+
+
+def test_prefix_hit_events_use_token_space_block_size_under_dcp():
+    """kv_cache_report_mode="full" emits BlockStored events for reused blocks;
+    under DCP the event block size must be the token-space B (the pool's hash
+    granularity), not the per-rank spec block size."""
+    block_size = 16
+    dcp = 2
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=block_size // dcp,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    dcp_sharded=True,
+                ),
+            )
+        ],
+        hash_block_size=block_size,
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=4096,
+        enable_caching=True,
+        enable_kv_cache_events=True,
+        hash_block_size=block_size,
+        scheduler_block_size=block_size,
+        dcp_world_size=dcp,
+    )
+    req0 = make_request("0", list(range(32)), block_size, sha256)
+    assert manager.allocate_slots(req0, 32, 0, manager.empty_kv_cache_blocks)
+    manager.take_events()
+
+    req1 = make_request("1", list(range(32)) + [1] * 5, block_size, sha256)
+    req1.kv_cache_report_mode = "full"
+    _, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+
+    assert num_computed_tokens == 32
+    (event,) = manager.take_events()
+    assert isinstance(event, BlockStored)
+    assert len(event.block_hashes) == 2
+    assert event.block_size == block_size
+    assert event.group_idx == 0
 
 
 @pytest.mark.parametrize("use_eagle", [False, True])

@@ -122,6 +122,10 @@ class KVCacheCoordinator(ABC):
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            large_page_bytes=kv_cache_config.large_page_bytes,
+            block_bytes=[
+                group.block_bytes for group in kv_cache_config.kv_cache_groups
+            ],
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -198,7 +202,7 @@ class KVCacheCoordinator(ABC):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
-    ) -> int:
+    ) -> tuple[int, ...] | None:
         """Get the number of device blocks needed to be allocated for the request.
 
         Args:
@@ -226,17 +230,19 @@ class KVCacheCoordinator(ABC):
                 state, so it is ignored (0).
 
         Returns:
-            The number of blocks to allocate.
+            The number of blocks to allocate per KV cache group, or None when
+            a group cannot admit the request this step (retry at the next
+            step).
 
         """
-        num_blocks_to_allocate = 0
         if self.retention_interval != 0:
             prefill_end = 0
+        demand_per_group: list[int] = []
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                demand = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -246,7 +252,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                demand = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -256,7 +262,10 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                     prefill_end=prefill_end,
                 )
-        return num_blocks_to_allocate
+            if demand is None:
+                return None
+            demand_per_group.append(demand)
+        return tuple(demand_per_group)
 
     def allocate_new_computed_blocks(
         self,
@@ -382,11 +391,12 @@ class KVCacheCoordinator(ABC):
         for group_idx, group_blocks in enumerate(computed_blocks):
             if group_blocks:
                 manager = self.single_type_managers[group_idx]
-                group = self.kv_cache_config.kv_cache_groups[group_idx]
                 manager.block_pool.emit_cached_block_events(
                     request,
                     len(group_blocks),
-                    group.kv_cache_spec.block_size,
+                    # Token-space block size: for DCP-sharded groups the spec
+                    # block size is per rank.
+                    manager.block_size,
                     group_idx,
                 )
 

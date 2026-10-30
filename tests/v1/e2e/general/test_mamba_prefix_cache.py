@@ -203,7 +203,7 @@ def get_fake_allocate_slots_fn(original_allocate_slots_fn: Callable):
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
-        reserved_blocks: int = 0,
+        reserved_blocks: tuple[int, ...] = (),
         has_scheduled_reqs: bool = True,
         skip_zeroing_group_ids: tuple[int, ...] = (),
     ):
