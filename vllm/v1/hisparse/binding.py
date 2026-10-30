@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side wiring of HiSparse caches to attention layers."""
 
-from collections.abc import Mapping
 from copy import copy
 from typing import TYPE_CHECKING, Any
 
@@ -29,48 +28,29 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MLAAttentionSpec,
-    UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
-from vllm.v1.worker.utils import allocate_kv_cache, select_common_block_size
+from vllm.v1.worker.utils import allocate_kv_cache
 
 if TYPE_CHECKING:
-    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.v1.worker.gpu.block_table import BlockTables
 
 
 def resolve_hisparse_specs(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
-    attn_layers: Mapping[str, "AttentionLayerBase"],
 ) -> dict[str, KVCacheSpec]:
-    """Resolve a common kernel block size for HiSparse MLA specs, and add the
-    resident/hot specs HiSparse derives from them."""
-    mla_specs = {
-        name: spec
-        for name, spec in kv_cache_spec.items()
-        if isinstance(spec, MLAAttentionSpec)
-    }
-    if not mla_specs:
+    """Add the resident/hot specs HiSparse derives from the sparse-MLA specs.
+
+    The planner plans every HiSparse group at the global block size, so the
+    derived specs' block size is a placeholder resolved again at grouping time.
+    """
+    if not any(isinstance(spec, MLAAttentionSpec) for spec in kv_cache_spec.values()):
         return kv_cache_spec
-    block_sizes = {spec.block_size for spec in mla_specs.values()}
-    if len(block_sizes) != 1:
-        raise ValueError("HiSparse requires one scheduler block size.")
-    backends = [attn_layers[name].get_attn_backend() for name in mla_specs]
-    specs = list(mla_specs.values())
-    try:
-        block_size = select_common_block_size(block_sizes.pop(), backends, specs)
-    except ValueError as error:
-        raise ValueError(
-            "HiSparse requires a GPU block size supported by every sparse "
-            f"attention and indexer backend: {error}"
-        ) from error
-    kv_cache_spec = kv_cache_spec | {
-        name: spec.copy_with_new_block_size(block_size)
-        for name, spec in mla_specs.items()
-    }
-    groups = get_hisparse_kv_cache_groups(vllm_config, kv_cache_spec)
-    assert groups is not None
+    result = get_hisparse_kv_cache_groups(vllm_config, kv_cache_spec)
+    if result is None:
+        return kv_cache_spec
+    groups, _ = result
     return kv_cache_spec | {
         layer_name: group.kv_cache_spec
         for group in groups
@@ -83,7 +63,6 @@ def allocate_hisparse_kv_caches(
     kv_cache_config: KVCacheConfig,
     device: torch.device,
     layout: KVCacheLayout,
-    kernel_block_sizes: list[int],
     host_pool: HiSparseHostPool,
 ) -> dict[str, torch.Tensor]:
     """Allocate the host pool separately from the shared device backing."""
@@ -93,27 +72,24 @@ def allocate_hisparse_kv_caches(
         for tensor in kv_cache_config.kv_cache_tensors
         if not tensor.host_resident
     ]
-    kv_caches = allocate_kv_cache(device_config, device, layout, kernel_block_sizes)
+    kv_caches = allocate_kv_cache(device_config, device, layout)
     host_tensors = [
         tensor for tensor in kv_cache_config.kv_cache_tensors if tensor.host_resident
     ]
     (host_size,) = {tensor.size for tensor in host_tensors}
     backing = host_pool.allocate(host_size)
     (host_group_id,) = kv_cache_config.host_group_ids
-    host_spec = kv_cache_config.kv_cache_groups[host_group_id].kv_cache_spec
+    layer_specs = kv_cache_config.kv_cache_groups[host_group_id].layer_kv_cache_specs
+    assert layer_specs is not None
+    host_num_blocks = kv_cache_config.hisparse_host_num_blocks
+    assert host_num_blocks is not None
     for tensor in host_tensors:
-        spec = (
-            host_spec.kv_cache_specs[tensor.layers[0]]
-            if isinstance(host_spec, UniformTypeKVCacheSpecs)
-            else host_spec
-        )
         views = create_kv_cache_views(
             backing,
-            spec,
-            kv_cache_config.num_blocks_of(tensor),
+            layer_specs[tensor.layers[0]],
+            host_num_blocks,
             layout,
             tensor,
-            kernel_block_size=kernel_block_sizes[host_group_id],
         )
         kv_caches.update(zip(tensor.layers, views))
     return kv_caches
@@ -122,7 +98,6 @@ def allocate_hisparse_kv_caches(
 def init_hisparse_kv_cache(
     kv_cache_config: KVCacheConfig,
     device: torch.device,
-    kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
     forward_context: dict[str, Any],
     block_tables: "BlockTables",
@@ -134,7 +109,6 @@ def init_hisparse_kv_cache(
             kv_cache_config,
             device,
             vllm_config.cache_config.get_resolved_kv_cache_layout(),
-            kernel_block_sizes,
             host_pool,
         )
         cache_handles = bind_hisparse_kv_caches(
@@ -226,7 +200,8 @@ def bind_hisparse_kv_caches(
                 kv_caches[cache_name],
                 byte_offset=byte_offset,
                 block_stride=tensor_config.block_stride,
-                num_blocks=kv_cache_config.num_blocks,
+                # The view spans the group's whole kernel-row grid.
+                num_blocks=tensor_config.size // tensor_config.block_stride,
                 block_size=group.kv_cache_spec.block_size,
                 block_table=residency[:, resident_source_index],
                 slot_mapping=block_tables.slot_mappings[group_id],
@@ -258,7 +233,7 @@ def bind_hisparse_kv_caches(
                 raw_tensor,
                 byte_offset=byte_offset,
                 block_stride=tensor_config.block_stride,
-                num_blocks=kv_cache_config.num_blocks,
+                num_blocks=tensor_config.size // tensor_config.block_stride,
                 block_size=group.kv_cache_spec.block_size,
                 block_table=block_tables.input_block_tables[group_id],
             )
