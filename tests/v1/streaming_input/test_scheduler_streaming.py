@@ -83,7 +83,7 @@ def create_scheduler() -> Scheduler:
     vllm_config.cache_config.num_gpu_blocks = 1000
     vllm_config.cache_config.enable_prefix_caching = False
     kv_cache_config = KVCacheConfig(
-        num_blocks=1000,
+        num_pages=1000,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -93,6 +93,7 @@ def create_scheduler() -> Scheduler:
                 ),
             )
         ],
+        block_size=16,
     )
     return Scheduler(
         vllm_config=vllm_config,
@@ -100,7 +101,6 @@ def create_scheduler() -> Scheduler:
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
         block_size=16,
-        hash_block_size=16,
     )
 
 
@@ -399,18 +399,18 @@ class TestStreamingScheduler(unittest.TestCase):
         block_hashes (#49377)."""
         init_none_hash(sha256)
         scheduler = create_scheduler()
-        hash_block_size = scheduler.hash_block_size
+        block_size = scheduler.kv_cache_config.block_size
 
-        # hash_block_size - 1 prompt tokens, so the discarded sampled token
+        # block_size - 1 prompt tokens, so the discarded sampled token
         # completes hash block 0.
-        prompt = list(range(1, hash_block_size))
+        prompt = list(range(1, block_size))
         discarded_token = 999
         session = Request(
             request_id="session",
             prompt_token_ids=list(prompt),
             sampling_params=SamplingParams(max_tokens=16),
             pooling_params=None,
-            block_hasher=get_request_block_hasher(hash_block_size, sha256),
+            block_hasher=get_request_block_hasher(block_size, sha256),
             resumable=True,
         )
         session.append_output_token_ids(discarded_token)

@@ -59,8 +59,7 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_request_block_hasher,
     init_none_hash,
-    resolve_cache_hit_alignment_tokens,
-    resolve_kv_cache_block_sizes,
+    resolve_scheduler_block_size,
     update_kv_cache_capacity,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -95,9 +94,9 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
     fault_tolerant_wrapper,
 )
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheConfig,
     get_kv_cache_spec_kind,
-    is_full_attention_spec,
 )
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -170,7 +169,7 @@ class EngineCore:
                 logger.warning("Disabling chunked prefill for model without KVCache")
                 vllm_config.scheduler_config.enable_chunked_prefill = False
 
-        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        scheduler_block_size = resolve_scheduler_block_size(
             kv_cache_config, vllm_config
         )
 
@@ -181,7 +180,6 @@ class EngineCore:
             include_finished_set=include_finished_set,
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
-            hash_block_size=hash_block_size,
         )
         self._initialize_effective_attention_block_size()
         self.use_spec_decode = vllm_config.speculative_config is not None
@@ -221,7 +219,7 @@ class EngineCore:
             init_none_hash(caching_hash_fn)
 
             self.request_block_hasher = get_request_block_hasher(
-                hash_block_size, caching_hash_fn
+                kv_cache_config.block_size, caching_hash_fn
             )
 
         self.step_fn = (
@@ -281,7 +279,6 @@ class EngineCore:
         layout = resolve_kv_cache_layout(
             vllm_config,
             self.model_executor.get_supported_kv_cache_layouts(),
-            [s for specs in kv_cache_specs for s in specs.values()],
         )
         self.model_executor.set_kv_cache_layout(layout.name)
 
@@ -322,50 +319,13 @@ class EngineCore:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
-        vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
-        kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
-        large_page = scheduler_kv_cache_config.allocator == "large_page"
-        if kv_cache_groups:
-            # Under the large-page allocator the planner already wrote back the
-            # global block size B.
-            if not large_page:
-                # Exclude groups that opt out of prefix caching (e.g. a circular
-                # buffer, a 1-block/req scratch buffer with a small ring block):
-                # their small block_size would otherwise drag the global block_size
-                # below the real allocator block size and desync it from mamba.
-                participating = [
-                    g.kv_cache_spec.block_size
-                    for g in kv_cache_groups
-                    if g.kv_cache_spec.prefix_cacheable
-                ]
-                vllm_config.cache_config.block_size = min(
-                    participating
-                    if participating
-                    else [g.kv_cache_spec.block_size for g in kv_cache_groups]
-                )
+        vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_pages
+        # The planner already wrote back the global block size B on every
+        # config (including the scheduler's deep copy).
+        if scheduler_kv_cache_config.kv_cache_groups:
             update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
 
         vllm_config.validate_block_size()
-
-        # Under the large-page allocator the planner already set
-        # hash_block_size = cache_hit_alignment_tokens = B on every config
-        # (including the scheduler's deep copy).
-        if not large_page:
-            scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
-                scheduler_kv_cache_config, vllm_config
-            )
-            cache_hit_alignment_tokens = resolve_cache_hit_alignment_tokens(
-                scheduler_kv_cache_config,
-                vllm_config,
-                scheduler_block_size,
-                hash_block_size,
-            )
-            # The scheduler's config is a deep copy taken before these are resolved,
-            # so set them there too: the KV connector's scheduler side reads the same
-            # fields as its workers.
-            for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
-                kv_cache_config.hash_block_size = hash_block_size
-                kv_cache_config.cache_hit_alignment_tokens = cache_hit_alignment_tokens
 
         self.model_executor.initialize_from_config(kv_cache_configs)
         kv_transfer_config = vllm_config.kv_transfer_config
@@ -422,7 +382,7 @@ class EngineCore:
         block_sizes = {
             manager.block_size
             for manager in cache_manager.coordinator.single_type_managers
-            if is_full_attention_spec(manager.kv_cache_spec)
+            if isinstance(manager.kv_cache_spec, FullAttentionSpec)
         }
         cache_config.effective_attention_block_size = (
             block_sizes.pop() if len(block_sizes) == 1 else None

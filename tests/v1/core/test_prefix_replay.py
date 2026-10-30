@@ -46,7 +46,7 @@ def _replay_scheduler(
     )
     vllm_config = base.vllm_config
     kv_cache_config = KVCacheConfig(
-        num_blocks=10000,
+        num_pages=10000,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -70,6 +70,7 @@ def _replay_scheduler(
                 ),
             ),
         ],
+        block_size=BLOCK_SIZE,
     )
     scheduler = Scheduler(
         vllm_config=vllm_config,
@@ -346,10 +347,16 @@ def test_kv_load_zeroing_respects_loaded_groups(is_async, loads_window):
         not b.is_null and b.block_id not in hit_ids
         for b in swa_blocks[: local // BLOCK_SIZE]
     )
-    zeroed = set(out.new_block_ids_to_zero or ())
+    zeroed = {
+        (group_id, block_id)
+        for group_id, block_ids in enumerate(out.new_block_ids_to_zero or [])
+        for block_id in block_ids
+    }
     for group_id, blocks in enumerate(manager.get_blocks(request.request_id).blocks):
         new_ids = {
-            b.block_id for b in blocks if not b.is_null and b.block_id not in hit_ids
+            (group_id, b.block_id)
+            for b in blocks
+            if not b.is_null and b.block_id not in hit_ids
         }
         assert new_ids
         if is_async and (group_id == FULL or loads_window):

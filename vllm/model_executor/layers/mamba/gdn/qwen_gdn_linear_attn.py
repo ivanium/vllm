@@ -726,16 +726,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # FlashInfer emits states at one stride for the whole batch, the gcd of
         # the offsets; keeping every offset on the prefix-cache grid keeps that
         # stride a multiple of the grid, which bounds the states emitted. The
-        # large-page planner chooses the block size, and so the grid, after the
-        # specs exist: it lifts the raw layer alignment onto the grid.
+        # planner chooses the block size, and so the grid, after the specs
+        # exist: it lifts the raw layer alignment onto the grid.
         return replace(
             spec,
             num_prefill_checkpoint_blocks=1,
-            prefill_checkpoint_alignment=(
-                self._checkpoint_alignment
-                if vllm_config.cache_config.kv_cache_allocator == "large_page"
-                else get_mamba_prefill_checkpoint_grid(vllm_config)
-            ),
+            prefill_checkpoint_alignment=self._checkpoint_alignment,
         )
 
     @functools.cached_property

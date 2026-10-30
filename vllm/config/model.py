@@ -2040,10 +2040,6 @@ class ModelConfig:
         return self._model_info.has_noops
 
     @property
-    def supports_kv_cache_grouping(self) -> bool:
-        return self._model_info.supports_kv_cache_grouping
-
-    @property
     def has_inner_state(self):
         return self._model_info.has_inner_state
 

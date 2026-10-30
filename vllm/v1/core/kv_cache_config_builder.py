@@ -28,10 +28,8 @@ class KVCacheConfigBuilder(ABC):
     (:func:`vllm.v1.core.kv_cache_planning.get_kv_cache_configs`) is Core-owned;
     this builder supplies the placement decisions: how layers are split into
     groups and how a group list is materialized into tensors for a given block
-    count. Grouping coordination lives in ``DefaultKVCacheConfigBuilder`` (a
-    model implementing :class:`~vllm.model_executor.models.interfaces.
-    SupportsKVCacheGrouping` owns its grouping there); a platform that replaces
-    the builder fully owns its own grouping.
+    count. Grouping coordination lives in ``DefaultKVCacheConfigBuilder``; a
+    platform that replaces the builder fully owns its own grouping.
     """
 
     @abstractmethod
@@ -44,11 +42,6 @@ class KVCacheConfigBuilder(ABC):
 
         Planning passes all workers' layers; profiling passes one worker's.
         Core rejects a result that does not put each layer in exactly one group.
-
-        The default builder honors a model's
-        :class:`~vllm.model_executor.models.interfaces.SupportsKVCacheGrouping`
-        declaration here before falling back to the default grouping; a
-        platform-specific builder decides its own grouping.
         """
         raise NotImplementedError
 
@@ -59,35 +52,14 @@ class KVCacheConfigBuilder(ABC):
         kv_cache_groups: list["KVCacheGroupSpec"],
         num_blocks: int,
     ) -> "KVCacheConfig":
-        """Materialize the groups for exactly ``num_blocks`` blocks.
+        """Materialize the groups for at least ``num_blocks`` blocks per group.
 
-        Each device backing's size is ``bytes_per_block * num_blocks``. All
-        device tensors share one backing allocation unless the builder
-        overrides ``_get_pool_bytes_per_block``. Host-resident tensors, such as
-        HiSparse source storage, are excluded from the device byte accounting
-        and sized independently.
-
-        Under the large-page allocator (``CacheConfig.kv_cache_allocator``),
-        this hook is the worker-local profiling path: ``num_blocks`` is the
+        This hook is the worker-local profiling path: ``num_blocks`` is the
         minimum block count each group must hold, and the placement (slots per
         large page, page bytes) is computed locally from the given groups —
         the engine re-plans with cross-rank memory after profiling.
         """
         raise NotImplementedError
-
-    def _get_pool_bytes_per_block(
-        self,
-        vllm_config: "VllmConfig",
-        kv_cache_groups: list["KVCacheGroupSpec"],
-    ) -> int | None:
-        """Return the device bytes one block ID consumes, or ``None``.
-
-        Private and transitional; expected to go away with worker-driven
-        allocation (RFC #42449). With ``None`` (the default), Core derives the
-        value from a one-block placement with one device backing. Override it
-        only for placements with several device allocations.
-        """
-        return None
 
 
 def get_kv_cache_config_builder(

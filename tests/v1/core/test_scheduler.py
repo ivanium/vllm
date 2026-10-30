@@ -160,7 +160,7 @@ def test_routed_experts_prompt_start_at_prompt_end(max_tokens):
     (request,) = create_requests(num_requests=1, max_tokens=max_tokens)
     request.sampling_params.routed_experts_prompt_start = request.num_prompt_tokens
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
-        scheduler.hash_block_size
+        scheduler.kv_cache_config.block_size
     )
     scheduler.add_request(request)
     scheduler_output = scheduler.schedule()
@@ -194,7 +194,7 @@ def test_routed_experts_prompt_start_at_prompt_end(max_tokens):
 def test_routed_experts_hashes_follow_scheduled_tokens():
     scheduler = create_scheduler(enable_prefix_caching=True, max_num_batched_tokens=64)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
-        scheduler.hash_block_size
+        scheduler.kv_cache_config.block_size
     )
     (request,) = create_requests(
         num_requests=1, num_tokens=160, max_tokens=20, ignore_eos=True
@@ -3787,7 +3787,7 @@ def assert_scheduler_empty(scheduler: Scheduler):
     num_free_blocks = (
         scheduler.kv_cache_manager.block_pool.free_block_queue.num_free_blocks
     )
-    assert num_free_blocks == (scheduler.kv_cache_manager.block_pool.num_gpu_blocks - 1)
+    assert num_free_blocks == (scheduler.kv_cache_manager.block_pool.num_pages - 1)
 
     # NOTE(rob): just the ref count on blocks will be 0. The hash
     # value, etc will remain since we lazily evict for prefix cache.
@@ -3921,7 +3921,7 @@ def create_scheduler_with_priority(
         ec_transfer_config=ec_transfer_config,
     )
     kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,  # A large number of blocks to hold all requests
+        num_pages=num_blocks,  # A large number of blocks to hold all requests
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -3934,6 +3934,7 @@ def create_scheduler_with_priority(
                 ),
             )
         ],
+        block_size=block_size,
     )
     cache_config.num_gpu_blocks = num_blocks
     scheduler = Scheduler(
@@ -3942,7 +3943,6 @@ def create_scheduler_with_priority(
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
         block_size=block_size,
-        hash_block_size=block_size,
     )
     if use_v2_model_runner is None:
         use_v2_model_runner = bool(envs.VLLM_USE_V2_MODEL_RUNNER)
@@ -6414,7 +6414,7 @@ def _create_encoder_decoder_scheduler(
     # KV cache config with both self-attention and cross-attention groups,
     # mirroring an encoder-decoder model like Whisper.
     kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -6436,6 +6436,7 @@ def _create_encoder_decoder_scheduler(
                 ),
             ),
         ],
+        block_size=block_size,
     )
 
     # Construct the scheduler. Since opt-125m is not truly encoder-decoder,
@@ -6445,7 +6446,6 @@ def _create_encoder_decoder_scheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         block_size=block_size,
-        hash_block_size=block_size,
         structured_output_manager=StructuredOutputManager(vllm_config),
     )
 
@@ -7633,7 +7633,7 @@ def _create_hybrid_mamba_connector_scheduler(
     )
     vllm_config.cache_config.num_gpu_blocks = num_blocks
     kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -7655,6 +7655,7 @@ def _create_hybrid_mamba_connector_scheduler(
                 ),
             ),
         ],
+        block_size=block_size,
     )
     register_all_kvcache_specs(vllm_config)
     return Scheduler(
@@ -7662,7 +7663,6 @@ def _create_hybrid_mamba_connector_scheduler(
         kv_cache_config=kv_cache_config,
         structured_output_manager=StructuredOutputManager(vllm_config),
         block_size=block_size,
-        hash_block_size=block_size,
         log_stats=True,
     )
 
@@ -7724,7 +7724,9 @@ def test_hybrid_per_group_hit_divergence_with_connector(
 
     # Evict the FA tail and the middle mamba states; block 0 (both groups)
     # and the deep mamba state at block 3 survive.
-    manager.block_pool.evict_blocks({fa_ids[2], fa_ids[3], mamba_ids[1], mamba_ids[2]})
+    manager.block_pool.evict_blocks(
+        [(0, fa_ids[2]), (0, fa_ids[3]), (1, mamba_ids[1]), (1, mamba_ids[2])]
+    )
 
     # A replay of the prefix plus one extra block now sees diverged
     # per-group hits: FA stops at the evicted tail, while the mamba lookup
@@ -7784,7 +7786,9 @@ def test_hybrid_fa_deeper_hit_respects_connector_lookup_policy(
 
     # Keep all FA blocks; evict every mamba state but block 0. FA reaches 4
     # blocks, the mamba hit only reaches 1 -> diverged (FA > Mamba).
-    manager.block_pool.evict_blocks({mamba_ids[1], mamba_ids[2], mamba_ids[3]})
+    manager.block_pool.evict_blocks(
+        [(1, mamba_ids[1]), (1, mamba_ids[2]), (1, mamba_ids[3])]
+    )
 
     [replay] = create_requests(
         num_requests=1,
@@ -8204,7 +8208,7 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
 def _create_large_page_scheduler(
     *,
     num_large_pages: int,
-    slots_per_large_page: tuple[int, ...],
+    blocks_per_page: tuple[int, ...],
     block_size: int = 16,
     max_num_batched_tokens: int = 8192,
     max_num_seqs: int = 16,
@@ -8245,11 +8249,10 @@ def _create_large_page_scheduler(
         speculative_config=speculative_config,
     )
     vllm_config.cache_config.num_gpu_blocks = num_large_pages
-    # Group g's blocks tile a page in slots_per_large_page[g] pieces.
-    page_bytes = math.lcm(*slots_per_large_page)
+    # Group g's blocks tile a page in blocks_per_page[g] pieces.
+    page_bytes = math.lcm(*blocks_per_page)
     kv_cache_config = KVCacheConfig(
-        num_blocks=num_large_pages,  # N pages for legacy readers
-        allocator="large_page",
+        num_pages=num_large_pages,
         large_page_bytes=page_bytes,
         kv_cache_tensors=[],
         kv_cache_groups=[
@@ -8261,9 +8264,9 @@ def _create_large_page_scheduler(
                     head_size=1,
                     dtype=torch.float32,
                 ),
-                num_blocks=num_large_pages * slots_per_large_page[0],
-                slots_per_large_page=slots_per_large_page[0],
-                row_bytes=page_bytes // slots_per_large_page[0],
+                num_blocks=num_large_pages * blocks_per_page[0],
+                blocks_per_page=blocks_per_page[0],
+                row_bytes=page_bytes // blocks_per_page[0],
             ),
             KVCacheGroupSpec(
                 ["mamba" if mamba else "fa2"],
@@ -8285,11 +8288,12 @@ def _create_large_page_scheduler(
                         dtype=torch.float32,
                     )
                 ),
-                num_blocks=num_large_pages * slots_per_large_page[1],
-                slots_per_large_page=slots_per_large_page[1],
-                row_bytes=page_bytes // slots_per_large_page[1],
+                num_blocks=num_large_pages * blocks_per_page[1],
+                blocks_per_page=blocks_per_page[1],
+                row_bytes=page_bytes // blocks_per_page[1],
             ),
         ],
+        block_size=block_size,
     )
     register_all_kvcache_specs(vllm_config)
     return Scheduler(
@@ -8297,7 +8301,6 @@ def _create_large_page_scheduler(
         kv_cache_config=kv_cache_config,
         structured_output_manager=StructuredOutputManager(vllm_config),
         block_size=block_size,
-        hash_block_size=block_size,
         log_stats=True,
     )
 
@@ -8307,7 +8310,7 @@ def test_large_page_preemption_terminates():
     pages return to the free list and the preempting request is admitted."""
     scheduler = _create_large_page_scheduler(
         num_large_pages=9,  # 8 usable pages
-        slots_per_large_page=(2, 2),
+        blocks_per_page=(2, 2),
         max_num_batched_tokens=256,
         enable_prefix_caching=False,
         mamba=False,
@@ -8367,7 +8370,7 @@ def test_large_page_spec_decode_allocates_draft_tokens_in_slots():
     num_large_pages = 9  # 8 usable pages
     scheduler = _create_large_page_scheduler(
         num_large_pages=num_large_pages,
-        slots_per_large_page=(2, 2),
+        blocks_per_page=(2, 2),
         max_num_batched_tokens=256,
         mamba=False,
         num_speculative_tokens=2,
@@ -8439,7 +8442,6 @@ def test_large_page_planner_pool_scheduler_end_to_end():
         ),
         cache_config=CacheConfig(
             block_size=16,
-            kv_cache_allocator="large_page",
             enable_prefix_caching=True,
             mamba_cache_mode="align",
             num_gpu_blocks_override=num_large_pages,
@@ -8475,21 +8477,19 @@ def test_large_page_planner_pool_scheduler_end_to_end():
     (kv_cache_config,) = get_kv_cache_configs(vllm_config, [kv_cache_spec], [1 << 30])
 
     # The planner's output, not a hand-built config, drives the scheduler.
-    assert kv_cache_config.allocator == "large_page"
-    assert kv_cache_config.num_blocks == num_large_pages
+    assert kv_cache_config.num_pages == num_large_pages
     assert vllm_config.cache_config.block_size == 16  # B, written back
     group_fa, group_mamba = kv_cache_config.kv_cache_groups
-    assert group_fa.slots_per_large_page == 1
-    assert group_mamba.slots_per_large_page == 8
+    assert group_fa.blocks_per_page == 1
+    assert group_mamba.blocks_per_page == 8
     # engine/core.py sets this from the planner's N; replicate it here.
-    vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+    vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_pages
 
     scheduler = Scheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         structured_output_manager=StructuredOutputManager(vllm_config),
         block_size=16,
-        hash_block_size=16,
         log_stats=True,
     )
     manager = scheduler.kv_cache_manager
@@ -8501,7 +8501,7 @@ def test_large_page_planner_pool_scheduler_end_to_end():
         assert 0.0 <= pool.get_usage() <= 1.0
         assert scheduler.get_kv_cache_usage() == pool.get_usage()
         for g in range(n_groups):
-            n_g = kv_cache_config.kv_cache_groups[g].slots_per_large_page
+            n_g = kv_cache_config.kv_cache_groups[g].blocks_per_page
             assert 0 <= pool.get_num_free_blocks(g) <= n_g * (num_large_pages - 1)
 
     def check_block_id_uniqueness() -> None:
@@ -8605,7 +8605,7 @@ def test_large_page_prefix_cache_survives_allocation_churn():
     """
     scheduler = _create_large_page_scheduler(
         num_large_pages=33,  # 32 usable pages; the wave needs 20, with slack
-        slots_per_large_page=(4, 4),
+        blocks_per_page=(4, 4),
         # One 64-token prefill per step: the wave's prefills serialize, so the
         # late prefills allocate while the early finishers' blocks are
         # cached-free — the treadmill's trigger.
