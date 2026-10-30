@@ -769,8 +769,8 @@ def test_async_loads_both_admitted_when_pool_fits():
 
 @pytest.mark.parametrize(
     ("swa_enabled", "block_size", "num_spec_tokens", "num_blocks"),
-    [(False, 16, 3, 8), (True, 16, 3, 17), (True, 64, 31, 40)],
-    ids=["single-group", "multiple-groups", "different-block-sizes"],
+    [(False, 16, 3, 8), (True, 16, 3, 17)],
+    ids=["single-group", "multiple-groups"],
 )
 def test_async_load_reserves_blocks_for_promotion_margin(
     swa_enabled, block_size, num_spec_tokens, num_blocks
@@ -785,9 +785,8 @@ def test_async_load_reserves_blocks_for_promotion_margin(
         num_speculative_tokens=num_spec_tokens,
         disable_hybrid_kv_cache_manager=False,
     )
-    hash_block_size = 16
     kv_cache_config = make_kv_cache_config(
-        hash_block_size, swa_enabled=swa_enabled, sw_size=4096, num_blocks=num_blocks
+        16, swa_enabled=swa_enabled, sw_size=4096, num_blocks=num_blocks
     )
     full_group = kv_cache_config.kv_cache_groups[0]
     full_group.kv_cache_spec = replace(full_group.kv_cache_spec, block_size=block_size)
@@ -803,19 +802,18 @@ def test_async_load_reserves_blocks_for_promotion_margin(
         vllm_config,
         num_blocks=num_blocks,
         kv_cache_config=kv_cache_config,
-        hash_block_size=hash_block_size,
     )
 
     req_a = create_request(
         request_id=1,
-        block_size=hash_block_size,
+        block_size=16,
         num_tokens=block_size * 4,
         do_remote_prefill=True,
         max_tokens=1,
     )
     req_b = create_request(
         request_id=2,
-        block_size=hash_block_size,
+        block_size=16,
         num_tokens=block_size * 3,
         do_remote_prefill=True,
         max_tokens=1,
@@ -881,7 +879,6 @@ def test_async_load_does_not_double_reserve_mamba_spec_blocks(
         vllm_config,
         num_blocks=num_blocks,
         kv_cache_config=kv_cache_config,
-        hash_block_size=block_size,
     )
     reqs = [
         create_request(

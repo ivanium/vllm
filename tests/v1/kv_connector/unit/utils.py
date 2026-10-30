@@ -18,6 +18,7 @@ from vllm.config import (
     DeviceConfig,
     KVTransferConfig,
     ModelConfig,
+    ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
@@ -35,9 +36,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.example_connector import (  # 
 from vllm.platforms import current_platform
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_planning import get_kv_cache_configs
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler, SchedulerOutput
+from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -101,7 +104,7 @@ def assert_scheduler_empty(scheduler: Scheduler):
     num_free_blocks = (
         scheduler.kv_cache_manager.block_pool.free_block_queue.num_free_blocks
     )
-    assert num_free_blocks == (scheduler.kv_cache_manager.block_pool.num_gpu_blocks - 1)
+    assert num_free_blocks == (scheduler.kv_cache_manager.block_pool.num_pages - 1)
 
     # NOTE(rob): just the ref count on blocks will be 0. The hash
     # value, etc will remain since we lazily evict for prefix cache.
@@ -183,13 +186,12 @@ def create_scheduler(
     vllm_config: VllmConfig,
     num_blocks: int = 10000,
     kv_cache_config: KVCacheConfig | None = None,
-    hash_block_size: int | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Initialize Scheduler For Testing."""
     block_size = vllm_config.cache_config.block_size
     if kv_cache_config is None:
         kv_cache_config = KVCacheConfig(
-            num_blocks=num_blocks,  # A large number of blocks to hold all requests
+            num_pages=num_blocks,  # A large number of pages to hold all requests
             kv_cache_tensors=[],
             kv_cache_groups=[
                 KVCacheGroupSpec(
@@ -202,6 +204,7 @@ def create_scheduler(
                     ),
                 )
             ],
+            block_size=block_size,
         )
     vllm_config.cache_config.num_gpu_blocks = num_blocks
 
@@ -214,7 +217,6 @@ def create_scheduler(
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
         block_size=block_size,
-        hash_block_size=hash_block_size,
     )
 
 
@@ -285,7 +287,7 @@ def create_model_runner_output(
     reqs: list[Request],
     finished_sending: set[str] | None = None,
     finished_recving: set[str] | None = None,
-    invalid_block_ids: set[int] | None = None,
+    invalid_block_ids: set[tuple[int, int]] | None = None,
     use_eos: bool = False,
     token_id: int = 0,
     kv_connector_worker_meta: KVConnectorWorkerMetadata | None = None,
@@ -535,8 +537,62 @@ def make_kv_cache_config(
             )
         )
     return KVCacheConfig(
-        num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=kv_cache_groups
+        num_pages=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=kv_cache_groups,
+        block_size=block_size,
     )
+
+
+def make_two_group_large_page_config(num_pages: int = 4) -> KVCacheConfig:
+    """A two-group large-page KVCacheConfig built by the real planner.
+
+    The planner picks 34816 B pages. Group 0 is full attention (four blocks
+    per page); group 1 is sliding window with four kernel blocks per 4096 B
+    block, which does not divide the page, so some of its block ids cross a
+    page end and are never allocated. Unlike `make_kv_cache_config`, every
+    geometry field (row_bytes, large_page_bytes, block_size, ...) is
+    planner-resolved.
+
+    `num_pages` (3 to 5) is the page count. A larger budget makes the planner
+    pick 69632 B pages, which every block divides.
+    """
+    assert 3 <= num_pages <= 5
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="facebook/opt-125m",
+            max_model_len=16,
+            hf_overrides={"max_position_embeddings": 16},
+            skip_tokenizer_init=True,
+        ),
+        cache_config=CacheConfig(block_size=16),
+        parallel_config=ParallelConfig(),
+        scheduler_config=SchedulerConfig(max_model_len=16, is_encoder_decoder=False),
+    )
+    register_all_kvcache_specs(vllm_config)
+    specs = {
+        "fa.0": FullAttentionSpec(
+            block_size=16, num_kv_heads=4, head_size=34, dtype=torch.float16
+        ),
+        "swa.0": SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=16,
+            dtype=torch.float16,
+            sliding_window=16,
+            kernel_block_sizes=(4,),
+        ),
+    }
+    config = get_kv_cache_configs(vllm_config, [specs], [num_pages * 34816])[0]
+    fa, swa = config.kv_cache_groups
+    assert isinstance(fa.kv_cache_spec, FullAttentionSpec)
+    assert isinstance(swa.kv_cache_spec, SlidingWindowSpec)
+    assert config.large_page_bytes == 34816
+    assert config.num_pages == num_pages
+    assert fa.blocks_per_page == 4
+    assert swa.kernel_rows_per_block == 4
+    assert swa.blocks_per_page == 8
+    return config
 
 
 def make_nixl_scheduler(

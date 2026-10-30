@@ -68,7 +68,7 @@ def _run_engine_core_handshake(
         engine_core_module.EngineCore,
         "_initialize_kv_caches",
         lambda self, vllm_config: SimpleNamespace(
-            kv_cache_groups=[object()], allocator="uniform_page"
+            kv_cache_groups=[object()], block_size=16
         ),
     )
     monkeypatch.setattr(
@@ -78,8 +78,8 @@ def _run_engine_core_handshake(
     )
     monkeypatch.setattr(
         engine_core_module,
-        "resolve_kv_cache_block_sizes",
-        lambda kv_cache_config, vllm_config: (16, 16),
+        "resolve_scheduler_block_size",
+        lambda kv_cache_config, vllm_config: 16,
     )
     monkeypatch.setattr(engine_core_module, "freeze_gc_heap", lambda: None)
     monkeypatch.setattr(

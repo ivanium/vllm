@@ -16,7 +16,7 @@ class DummyModelRunnerOutput(ModelRunnerOutput):
         self,
         finished_sending: set[str] | None = None,
         finished_recving: set[str] | None = None,
-        invalid_block_ids: set[int] | None = None,
+        invalid_block_ids: set[tuple[int, int]] | None = None,
         failed_recving: set[str] | None = None,
         expected_finished_count: int = 0,
     ):
@@ -54,7 +54,7 @@ def test_aggregate_workers_output():
     output1 = DummyModelRunnerOutput(
         finished_sending={"req1"}, finished_recving={"req2"}
     )
-    output2 = DummyModelRunnerOutput(invalid_block_ids={1})
+    output2 = DummyModelRunnerOutput(invalid_block_ids={(0, 1)})
 
     aggregated_output = aggregator.aggregate([output1, output2])
 
@@ -62,9 +62,9 @@ def test_aggregate_workers_output():
     aggregated_kv_output = output1.kv_connector_output
     assert aggregated_kv_output.finished_sending is None
     assert aggregated_kv_output.finished_recving is None
-    assert aggregated_kv_output.invalid_block_ids == {1}
+    assert aggregated_kv_output.invalid_block_ids == {(0, 1)}
 
-    output1 = DummyModelRunnerOutput(invalid_block_ids={2})
+    output1 = DummyModelRunnerOutput(invalid_block_ids={(0, 2)})
     output2 = DummyModelRunnerOutput(finished_sending={"req1"})
 
     aggregated_output = aggregator.aggregate([output1, output2])
@@ -73,12 +73,12 @@ def test_aggregate_workers_output():
     aggregated_kv_output = output1.kv_connector_output
     assert aggregated_kv_output.finished_sending == {"req1"}
     assert aggregated_kv_output.finished_recving is None
-    assert aggregated_kv_output.invalid_block_ids == {2}
+    assert aggregated_kv_output.invalid_block_ids == {(0, 2)}
 
-    output1 = DummyModelRunnerOutput(invalid_block_ids={3, 4})
+    output1 = DummyModelRunnerOutput(invalid_block_ids={(0, 3), (0, 4)})
     output2 = DummyModelRunnerOutput(
         finished_recving={"req2"},
-        invalid_block_ids={4, 5},
+        invalid_block_ids={(0, 4), (0, 5)},
         failed_recving={"req3"},
     )
 
@@ -88,7 +88,7 @@ def test_aggregate_workers_output():
     aggregated_kv_output = output1.kv_connector_output
     assert aggregated_kv_output.finished_sending is None
     assert aggregated_kv_output.finished_recving == {"req2"}
-    assert aggregated_kv_output.invalid_block_ids == {3, 4, 5}
+    assert aggregated_kv_output.invalid_block_ids == {(0, 3), (0, 4), (0, 5)}
     assert not aggregated_kv_output.failed_recving
 
     output1 = DummyModelRunnerOutput(finished_recving={"req3"})

@@ -41,7 +41,7 @@ def test_kv_connector_mixin_clears_metadata():
     )
 
     kv_cache_config = KVCacheConfig(
-        num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]
+        num_pages=0, kv_cache_tensors=[], kv_cache_groups=[], block_size=16
     )
     # Initialize the global connector instance.
     # kv_transfer init now syncs engine_id across TP, so unit tests need

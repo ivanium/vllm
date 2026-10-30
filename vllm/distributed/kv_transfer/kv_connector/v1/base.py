@@ -423,14 +423,13 @@ class KVConnectorBase_V1(ABC):
             finished_recving=set(finished_recving or ()),
         )
 
-    def get_block_ids_with_load_errors(self) -> set[int] | set[tuple[int, int]]:
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
         """Get the set of block IDs that failed to load.
 
         Returns:
-            Set of block IDs that encountered load errors.
+            Set of ``(group_id, block_id)`` pairs that encountered load errors
+            (block ids are unique only within a KV cache group).
             Empty set if no load errors occurred.
-            Under the large-page allocator block ids are unique only within a
-            KV cache group, so each entry is a ``(group_id, block_id)`` pair.
 
         Notes:
             - Applies to both sync- and async-loading requests.
@@ -650,19 +649,6 @@ class KVConnectorBase_V1(ABC):
 
         """
         return False, None
-
-    def register_finished_partial_tail(
-        self,
-        request: "Request",
-        block_ids: tuple[list[int], ...],
-        partial_tail_offloads: list[tuple[int, int, int]],
-    ) -> bool:
-        """Register finish-time partial-tail sources before block cleanup.
-
-        Returns True when the connector accepts responsibility for the sources
-        and the request's blocks must remain alive until ``get_finished()``.
-        """
-        return False
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """Take the KV cache events from the connector.

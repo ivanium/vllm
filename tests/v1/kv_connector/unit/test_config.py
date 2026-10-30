@@ -12,19 +12,19 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
 
 pytestmark = pytest.mark.cpu_test
 
 
-class _StubLMCacheMPConnector:
+class _StubLMCacheMPConnector(SupportsHMA):
     """Stand-in for LMCacheMPConnector used in config-translation tests.
 
     The real connector module hard-imports the optional ``lmcache`` package
     at module load time, which is not installed in the cpu_test image. This
     test only asserts on the connector *name* and the ``extra_config`` dict
     produced by ``VllmConfig``, never instantiates the connector, so a bare
-    placeholder class is sufficient. Not subclassing ``SupportsHMA`` mirrors
-    the real connector's HMA support (it does not support HMA either)."""
+    placeholder class is sufficient."""
 
 
 @pytest.fixture

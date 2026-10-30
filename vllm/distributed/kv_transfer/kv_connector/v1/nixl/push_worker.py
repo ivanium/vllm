@@ -196,7 +196,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # D-side: track reqs waiting for P to push.
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
-                meta.local_block_ids, self._physical_blocks_per_logical_kv_block
+                meta.local_block_ids
             )
             assert meta.remote is not None
             remote_engine_id = meta.remote.engine_id
@@ -214,7 +214,12 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 len(meta.local_physical_block_ids),
                 len(meta.remote.block_ids),
             )
-            self._recving_metadata[req_id] = meta
+            # Requests with nothing to receive and nothing awaited (an abort
+            # before allocation stages an empty entry) are never reported
+            # done, so tracking them would leak the entry. Same guard as the
+            # pull worker.
+            if meta.awaiting_kvs or any(meta.local_block_ids):
+                self._recving_metadata[req_id] = meta
 
         # --- D-side: registrations to send to P via NIXL ---
         if metadata.push_registrations:
@@ -505,9 +510,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         logical_local = self._as_grouped_block_ids(local_block_ids)
         logical_remote = self._as_grouped_block_ids(remote_block_ids)
-        physical_local = self._logical_to_kernel_block_ids(
-            logical_local, self._physical_blocks_per_logical_kv_block
-        )
+        physical_local = self._logical_to_kernel_block_ids(logical_local)
 
         push_meta = ReqMeta(
             local_block_ids=logical_local,
@@ -557,7 +560,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # ``_do_start_push_kv`` so mutating it here is safe.
         meta.remote.block_ids = self._remote_logical_to_kernel_block_ids(
             meta.remote.block_ids,
-            remote_info.remote_physical_blocks_per_logical,
             engine_id,
         )
         remote_block_ids = meta.remote.block_ids
@@ -620,12 +622,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 # Multiple targets: write each rank its chunk of local memory.
                 # Hybrid MLA+SSM also lands here: its split handles replicate
                 # the attention descriptors and chunk only the SSM state.
-                split_key = (tp_ratio, remote_block_size)
-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][i]
+                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][i]
             else:
-                local_xfer_side_handle = self.src_xfer_handles_by_block_size[
-                    remote_block_size
-                ]
+                assert self.src_xfer_handle is not None
+                local_xfer_side_handle = self.src_xfer_handle
 
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
                 spec.remote_rank
@@ -668,17 +668,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         local_block_ids = read_spec.local_block_ids
         remote_block_ids = read_spec.remote_block_ids
 
-        remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
-        block_size_ratio = self.transfer_topo.block_size_ratio(
-            remote_info.remote_block_size
-        )
-        if block_size_ratio > 1:
-            local_block_ids, remote_block_ids = (
-                self._map_block_ids_for_block_size_ratio(
-                    local_block_ids, remote_block_ids, block_size_ratio
-                )
-            )
-
         notif_id = f"{remote_request_id}:{self.world_size}".encode()
 
         if len(local_block_ids) == 0:
@@ -691,8 +680,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         remote_block_ids, local_block_ids = self._apply_prefix_caching(
             decode_block_ids=remote_block_ids,
             prefill_block_ids=local_block_ids,
-            decode_physical_per_logical=remote_info.remote_physical_blocks_per_logical,
-            prefill_physical_per_logical=self._physical_blocks_per_logical_kv_block,
         )
 
         local_block_ids = list(local_block_ids)
@@ -711,21 +698,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # Get descs ids.
         remote_block_descs_ids = self._compute_desc_ids(
             block_ids=remote_block_ids,
-            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
-            block_size_ratio=None,
-            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
             region_num_blocks=self.dst_region_num_blocks[dst_engine_id],
             region_group_ids=self.dst_region_group_ids[dst_engine_id],
-            uses_region_group_mapping=self.dst_uses_region_group_mapping[dst_engine_id],
         )
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
-            dst_num_blocks=self.dst_num_blocks[self.engine_id],
-            block_size_ratio=block_size_ratio,
-            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
             region_num_blocks=self.dst_region_num_blocks[self.engine_id],
             region_group_ids=self.region_group_ids,
-            uses_region_group_mapping=self._uses_region_group_mapping,
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
