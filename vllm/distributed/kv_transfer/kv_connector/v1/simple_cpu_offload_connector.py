@@ -167,21 +167,6 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
         self.worker_handler: SimpleCPUOffloadWorker | None = None
 
-        if kv_cache_config is not None and kv_cache_config.allocator == "large_page":
-            # v1 gaps under the large-page allocator: the disk backend needs
-            # per-group slot geometry, and lazy mode walks a single shared
-            # free queue, which the large-page pool splits per group.
-            if disk_mode:
-                raise ValueError(
-                    'kv_offload_backend="disk" is not supported with '
-                    'kv_cache_allocator="large_page".'
-                )
-            if lazy_offload:
-                raise ValueError(
-                    "lazy_offload is not supported with "
-                    'kv_cache_allocator="large_page".'
-                )
-
         if not enable_prefix_caching:
             logger.warning(
                 "Detected prefix caching disabled, disabling CPU offload "
@@ -207,10 +192,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
 
         if role == KVConnectorRole.SCHEDULER:
-            from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+            from vllm.v1.core.kv_cache_utils import resolve_scheduler_block_size
 
             assert kv_cache_config is not None
-            scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            scheduler_block_size = resolve_scheduler_block_size(
                 kv_cache_config, vllm_config
             )
             aligned_num_cpu_blocks = (
@@ -221,7 +206,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 kv_cache_config,
                 cpu_capacity_per_rank,
                 scheduler_block_size=scheduler_block_size,
-                hash_block_size=hash_block_size,
+                block_size=kv_cache_config.block_size,
                 lazy_offload=lazy_offload,
                 disk_capacity_bytes=disk_capacity_bytes if disk_mode else 0,
                 use_page_cache=use_page_cache if disk_mode else False,
