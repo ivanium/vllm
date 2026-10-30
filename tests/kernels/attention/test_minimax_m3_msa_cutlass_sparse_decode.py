@@ -22,6 +22,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseMetadataBuilder,
     MiniMaxM3SparsePrefillMetadata,
     MiniMaxM3SparseTritonImpl,
+    minimax_m3_dense_equivalent_index_slots,
     select_main_backend_and_impl_cls,
 )
 from vllm.models.minimax_m3.nvidia import (
@@ -1229,3 +1230,57 @@ def test_msa_prefill_reads_query_fp8_over_fp8_cache(
     current_platform.synchronize()
     assert query_dtypes == [torch.float8_e4m3fn]
     _assert_close_fp8_prefill(actual, expected)
+
+
+# Dense-equivalent index slot rebase (K3): CPU tensors, no kernel launch.
+_REBASE_PAGE = 128
+_REBASE_HEAD_DIM = 128
+
+
+def _strided_index_cache(num_blocks: int, row: int) -> torch.Tensor:
+    """A [num_blocks, page, head_dim] layer view with an inflated block
+    stride, as the large-page pool produces."""
+    pool = torch.zeros(
+        num_blocks * row + _REBASE_PAGE * _REBASE_HEAD_DIM, dtype=torch.uint8
+    )
+    return pool.as_strided(
+        (num_blocks, _REBASE_PAGE, _REBASE_HEAD_DIM), (row, _REBASE_HEAD_DIM, 1)
+    )
+
+
+def test_dense_index_cache_returns_slot_mapping_unchanged():
+    slot_mapping = torch.tensor([0, 1, 127, 128, 300, -1], dtype=torch.int64)
+    dense = torch.zeros(8, _REBASE_PAGE, _REBASE_HEAD_DIM, dtype=torch.uint8)
+    assert minimax_m3_dense_equivalent_index_slots(slot_mapping, dense) is (
+        slot_mapping
+    )
+
+
+def test_strided_index_cache_maps_to_dense_equivalent_slots():
+    row = 3 * _REBASE_PAGE * _REBASE_HEAD_DIM + 512  # inflated, page-multiple
+    view = _strided_index_cache(4, row)
+    slot_mapping = torch.tensor(
+        [0, 5, 127, 128, 2 * 128 + 7, 3 * 128 + 127, -1],
+        dtype=torch.int64,
+    )
+    remapped = minimax_m3_dense_equivalent_index_slots(slot_mapping, view)
+
+    # The fused insert addresses base + slot * head_dim; every remapped slot
+    # must land on the same byte as (block, offset) addressing of the view.
+    base = view.storage_offset()
+    for sm, rem in zip(slot_mapping.tolist(), remapped.tolist(), strict=True):
+        if sm < 0:
+            assert rem == sm
+            continue
+        block, off = divmod(sm, _REBASE_PAGE)
+        for dim in (0, _REBASE_HEAD_DIM // 2, _REBASE_HEAD_DIM - 1):
+            assert base + rem * _REBASE_HEAD_DIM + dim == (
+                base + block * view.stride(0) + off * _REBASE_HEAD_DIM + dim
+            )
+
+
+def test_strided_index_cache_requires_whole_page_rows():
+    row = _REBASE_PAGE * _REBASE_HEAD_DIM + 1  # not a multiple of head_dim
+    view = _strided_index_cache(2, row)
+    with pytest.raises(AssertionError):
+        minimax_m3_dense_equivalent_index_slots(torch.tensor([0]), view)

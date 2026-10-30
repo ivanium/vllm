@@ -89,6 +89,33 @@ def minimax_m3_rebase_slots_to_page16(
     )
 
 
+def minimax_m3_dense_equivalent_index_slots(
+    slot_mapping: torch.Tensor,
+    index_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Rebase index-cache slots onto the dense page numbering the fused
+    qknorm-rope-insert kernel assumes (``index_cache + slot * kHeadDim``).
+
+    The index cache view is ``[blocks, page, kHeadDim]``. A strided window
+    into the shared pool (large_page) starts block ``b`` at
+    ``b * stride(0)`` elements rather than ``b * page * kHeadDim``, so each
+    slot's block component rescales to the dense-equivalent slot
+    ``(sm // page) * (stride(0) // kHeadDim) + sm % page``. Dense views
+    (uniform_page) return the mapping unchanged. Negative padding sentinels
+    are kept.
+    """
+    page, head_dim = index_cache.shape[1], index_cache.shape[2]
+    if index_cache.stride(0) == page * head_dim:
+        return slot_mapping
+    # Dense page interior; the block row holds a whole number of pages.
+    assert index_cache.stride(1) == head_dim and index_cache.stride(2) == 1
+    assert index_cache.stride(0) % head_dim == 0
+    pages_per_block = index_cache.stride(0) // head_dim
+    clamped = slot_mapping.clamp_min(0)
+    remapped = clamped // page * pages_per_block + clamped % page
+    return torch.where(slot_mapping < 0, slot_mapping, remapped)
+
+
 def minimax_m3_query_token_positions(
     cu_seqlens_q: torch.Tensor,
     prefix_lens: torch.Tensor,

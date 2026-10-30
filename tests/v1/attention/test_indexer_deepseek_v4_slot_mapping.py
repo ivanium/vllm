@@ -390,6 +390,33 @@ def test_compressed_slot_mapping_warmup_includes_index_kpool():
     assert {(key.compress_ratio, key.block_size) for key in keys} == {(32, 2)}
 
 
+def test_compressed_slot_mapping_warmup_keys_on_spec_num_states():
+    """The runtime dispatch passes the compressed group spec's `num_states`
+    as `block_size`; the warmup key must be the same quantity."""
+    from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+        triton_scalar_specialization_rep,
+    )
+
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=128),
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_kpool=2)),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1, cp_kv_cache_interleave_size=1
+        ),
+    )
+
+    (key,) = CompressedSlotMappingKernel().get_warmup_keys(config)
+    num_states = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+        tokens_per_state=2,
+    ).num_states
+    assert num_states == 64
+    assert key.block_size == triton_scalar_specialization_rep(num_states)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_compressed_slot_mapping_inherits_padded_token_slots():
     """A token whose own slot is padded (SWA bounded replay) closes no

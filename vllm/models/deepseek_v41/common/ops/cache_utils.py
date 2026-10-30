@@ -56,6 +56,22 @@ V41_NVFP4_QUANT_BLOCK = 16
 V41_NVFP4_NUM_SCALES = 512 // V41_NVFP4_QUANT_BLOCK  # 32
 
 
+def check_flashmla_flattened_row_ceiling(kv_cache: torch.Tensor) -> None:
+    """Assert FlashMLA's int32 flattened-row ceiling on a paged cache view.
+
+    The kernel flattens the cache into 2-D token-row TMA coordinates
+    (int32): ``num_blocks * (block stride / bytes per token)`` must fit.
+    (Record divisibility and the block-stride magnitude are checked
+    host-side already; this ceiling is not.)
+    """
+    rows_per_block = kv_cache.stride(0) // kv_cache.stride(1)
+    num_rows = kv_cache.shape[0] * rows_per_block
+    assert num_rows <= 2**31 - 1, (
+        f"paged cache view spans {num_rows} flattened token rows, over "
+        "FlashMLA's int32 row-coordinate ceiling"
+    )
+
+
 @triton.jit
 def quantize_and_insert_k_kernel(
     # Input tensors

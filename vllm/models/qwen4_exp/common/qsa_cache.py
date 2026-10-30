@@ -774,7 +774,13 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
             raise ValueError("QSA cache head size must be positive")
         if compress_ratio <= 0:
             raise ValueError("QSA compression ratio must be positive")
-        if cache_config.block_size % compress_ratio:
+        # The block size is final at spec-build time only under uniform_page;
+        # under large_page the engine's block-size selection enforces this
+        # against the resolved block size.
+        if (
+            cache_config.kv_cache_allocator == "uniform_page"
+            and cache_config.block_size % compress_ratio
+        ):
             raise ValueError(
                 "QSA cache block size must be divisible by the compression ratio"
             )
@@ -841,16 +847,19 @@ class QSAKeyStateCache(_QSAStateCache):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Hold the open group's committed keys plus every row a speculative
-        # step stores before acceptance is known, rounded up to whole groups so
-        # the ring divides the attention block size (it joins the LCM that sets
-        # the scheduler block size). Anything narrower lets a rejected draft row
-        # overwrite a committed key the next step needs to close the group.
+        # step stores before acceptance is known, rounded up to whole groups.
+        # Anything narrower lets a rejected draft row overwrite a committed
+        # key the next step needs to close the group. The ring must divide the
+        # attention block size: checked below under uniform_page (the block
+        # size is final at spec-build time there); under large_page the
+        # engine's block-size selection enforces it.
         span = self.compress_ratio + vllm_config.num_speculative_tokens
         capacity = round_up(span, self.compress_ratio)
-        assert self.cache_config.block_size % capacity == 0, (
-            f"QSA ring capacity {capacity} must divide the attention block "
-            f"size {self.cache_config.block_size}"
-        )
+        if self.cache_config.kv_cache_allocator == "uniform_page":
+            assert self.cache_config.block_size % capacity == 0, (
+                f"QSA ring capacity {capacity} must divide the attention block "
+                f"size {self.cache_config.block_size}"
+            )
         return CircularBufferSpec(
             block_size=capacity,
             num_kv_heads=1,

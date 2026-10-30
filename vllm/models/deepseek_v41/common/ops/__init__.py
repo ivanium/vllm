@@ -22,6 +22,7 @@ from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
 
 from .cache_utils import (
     build_flashinfer_mixed_sparse_indices,
+    check_flashmla_flattened_row_ceiling,
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
@@ -32,6 +33,7 @@ from .indexer_k_store import indexer_k_norm_rope_store
 __all__ = [
     "MXFP4_BLOCK_SIZE",
     "build_flashinfer_mixed_sparse_indices",
+    "check_flashmla_flattened_row_ceiling",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
     "dequantize_and_gather_k_cache",
