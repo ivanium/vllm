@@ -5,8 +5,6 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
-from collections.abc import Sequence
-
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -26,18 +24,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
     LookupKeyClient,
 )
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import (
-    resolve_kv_cache_block_sizes,
-)
+from vllm.v1.core.kv_cache_utils import resolve_scheduler_block_size
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
-    get_mamba_prefill_checkpoint_position,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -57,79 +51,6 @@ def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
         return request.prefill_token_ids
     assert request.prompt_token_ids is not None
     return request.prompt_token_ids
-
-
-def _partial_tail_non_mamba_puts(
-    coord: MooncakeStoreCoordinator,
-    req_meta: ReqMeta,
-    block_sizes: Sequence[int],
-) -> list[BoundaryPut]:
-    """Locate the non-Mamba blocks a partial-tail save publishes.
-
-    A later request resumes at the prompt's Mamba checkpoint (``boundary``) only
-    if both pieces of KV are stored:
-
-    - Mamba groups: the state at ``boundary``, handed off by the core as a
-      boundary put of its own, so Mamba groups are not listed here.
-    - Other groups: the KV from the last LCM-aligned normal save up to
-      ``boundary`` plus the group's EAGLE proof margin (``proof_end``). Each
-      block is keyed by the hash at its end, clipped to ``proof_end``.
-
-    Groups whose proof is not computed yet are omitted. For example, with LCM
-    16, blocks of 4 tokens, and a checkpoint at 44, the full-attention blocks
-    are 8-10, keyed at 36, 40 and 44.
-
-    A Mamba state handed off at any other position, i.e. a shared-prefix
-    junction (``--enable-mamba-shared-prefix-checkpoint``), adds no puts here.
-
-    ``block_sizes`` are the per-group block sizes, indexed like
-    ``req_meta.block_ids``.
-    """
-    mamba_tails = [
-        put.num_tokens
-        for put in req_meta.boundary_puts or []
-        if put.group_id in coord.mamba_group_ids
-        and put.num_tokens % block_sizes[put.group_id]
-    ]
-    # The tail is due on the save that first covers the prompt, or when Mamba
-    # hands off its checkpoint state.
-    if not mamba_tails and not req_meta.publish_partial_tail:
-        return []
-    prompt_tokens = req_meta.num_prompt_tokens
-    completed = req_meta.completed_token_len
-    assert prompt_tokens is not None and completed is not None
-    hash_block_size = coord.hash_block_size
-    # Core drops the Mamba checkpoint whenever EAGLE block drop is on, whichever
-    # groups carry the eagle flag.
-    boundary = get_mamba_prefill_checkpoint_position(
-        prompt_tokens, hash_block_size, coord.use_eagle
-    )
-    # Any other sub-block Mamba hand-off is a shared-prefix junction. Its
-    # attention KV, EAGLE proof included, ends on an attention block end no later
-    # than this checkpoint's proof, so the normal and prompt-tail saves store it.
-    if not req_meta.publish_partial_tail and boundary not in mamba_tails:
-        return []
-    num_hashes = len(req_meta.block_hashes)
-    if boundary == 0 or boundary // hash_block_size > num_hashes:
-        return []
-    start = boundary // coord.lcm_block_size * coord.lcm_block_size
-    puts: list[BoundaryPut] = []
-    for group_id, block_size in enumerate(block_sizes):
-        if group_id in coord.mamba_group_ids:
-            continue
-        proof_end = boundary + coord.eagle_proof_margin_by_group.get(group_id, 0)
-        if proof_end > completed or proof_end // hash_block_size > num_hashes:
-            continue
-        group_blocks = req_meta.block_ids[group_id]
-        for block_idx in range(start // block_size, cdiv(proof_end, block_size)):
-            if block_idx >= len(group_blocks):
-                break
-            block_id = group_blocks[block_idx]
-            if block_id == NULL_BLOCK_ID:
-                continue
-            num_tokens = min((block_idx + 1) * block_size, proof_end)
-            puts.append(BoundaryPut(group_id, block_id, num_tokens))
-    return puts
 
 
 class MooncakeStoreScheduler:
@@ -163,8 +84,8 @@ class MooncakeStoreScheduler:
         }
         store_groups = kv_cache_config.prefix_cacheable_groups
 
-        # Align with the engine's own scheduler_block_size and hash_block_size.
-        self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
+        # Align with the engine's own scheduler_block_size and block size.
+        self._scheduler_block_size = resolve_scheduler_block_size(
             kv_cache_config, vllm_config
         )
         mamba_groups = {
@@ -181,28 +102,29 @@ class MooncakeStoreScheduler:
             and not self.save_decode_cache
         )
         self._store_coord: MooncakeStoreCoordinator | None = None
-        self.enable_partial_hash_hits = False
         if not self._capacity_only:
             assert all(
                 spec.mamba_cache_mode == "align" for spec in mamba_groups.values()
             ), "MooncakeStoreScheduler requires mamba_cache_mode='align'"
             self._store_coord = MooncakeStoreCoordinator.from_kv_cache_config(
-                kv_cache_config, vllm_config, self._block_size, self._hash_block_size
+                kv_cache_config,
+                vllm_config,
+                self._scheduler_block_size,
             )
-            self.enable_partial_hash_hits = self._store_coord.enable_partial_hash_hits
 
         self._gpu_block_pool: BlockPool | None = None
         self._num_workers = vllm_config.parallel_config.world_size
         self._next_store_job_id = 0
-        # store_job_id -> (referenced block ids, ranks yet to report completion)
-        self._pinned_saves: dict[int, tuple[list[int], int]] = {}
+        # store_job_id -> (referenced (group_id, block_id) pairs of the pool,
+        # ranks yet to report completion). Block ids are unique only within
+        # their KV cache group.
+        self._pinned_saves: dict[int, tuple[list[tuple[int, int]], int]] = {}
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
         self._request_trackers: dict[str, RequestTracker] = {}  # scheduled new requests
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
-        self._finished_partial_tail_metas: dict[str, ReqMeta] = {}
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
@@ -220,24 +142,18 @@ class MooncakeStoreScheduler:
         if not self.enable_lookup:
             return 0, False
 
-        # Fine-grained hits may land on a hash boundary inside a block; without
-        # partial hits, prefixes shorter than one physical block are skipped.
-        align = (
-            self._hash_block_size if self.enable_partial_hash_hits else self._block_size
-        )
-        if request.num_tokens < align:
+        if request.num_tokens < self._scheduler_block_size:
             return 0, False
 
-        lookup_result = self.client.lookup(
+        num_external_hit_tokens = self.client.lookup(
             request.request_id,
             request.num_tokens,
             request.block_hashes,
             non_block=self.lookup_async,
         )
-        if lookup_result is None:
+        if num_external_hit_tokens is None:
             # Lookup not ready yet; scheduler will retry on a later step.
             return None, False
-        num_external_hit_tokens = lookup_result.hit_length
 
         if num_external_hit_tokens < num_computed_tokens:
             need_to_allocate = 0
@@ -259,7 +175,6 @@ class MooncakeStoreScheduler:
             vllm_cached_tokens=num_computed_tokens,
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=False,
-            tail_key_boundaries=lookup_result.tail_key_boundaries,
         )
 
         return need_to_allocate, self.load_async
@@ -359,14 +274,13 @@ class MooncakeStoreScheduler:
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
-                self._block_size,
+                self._scheduler_block_size,
                 load_spec=load_spec,
                 # A consumer may write decode KV without becoming a prefill
                 # producer. Loads are still carried by the same metadata.
                 skip_save=is_consumer,
                 block_hashes=request_real.block_hashes,
                 num_prompt_tokens=request_real.num_prompt_tokens,
-                save_partial_tail=self.enable_partial_hash_hits,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -413,12 +327,11 @@ class MooncakeStoreScheduler:
 
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
-                        self._block_size,
+                        self._scheduler_block_size,
                         load_spec=load_spec,
                         skip_save=is_consumer,
                         block_hashes=request_real.block_hashes,
                         num_prompt_tokens=request_real.num_prompt_tokens,
-                        save_partial_tail=self.enable_partial_hash_hits,
                     )
                 else:
                     # Decode/chunked request
@@ -456,12 +369,11 @@ class MooncakeStoreScheduler:
 
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
-                        self._block_size,
+                        self._scheduler_block_size,
                         load_spec=None,
                         skip_save=False,
                         block_hashes=unfinished_req.block_hashes,
                         num_prompt_tokens=unfinished_req.num_prompt_tokens,
-                        save_partial_tail=self.enable_partial_hash_hits,
                     )
 
                 if req_meta is not None:
@@ -492,7 +404,7 @@ class MooncakeStoreScheduler:
                 self._request_trackers[request_id] = request_tracker
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
-                    self._block_size,
+                    self._scheduler_block_size,
                     load_spec=load_spec,
                     skip_save=None,
                     block_hashes=unfinished_req.block_hashes,
@@ -512,13 +424,6 @@ class MooncakeStoreScheduler:
             )
 
         self._apply_current_save_block_ids(meta, scheduler_output)
-
-        # Finish-time handoffs arrive after the producing step's metadata was
-        # built. Their exact blocks were pinned when they were registered, so
-        # they remain valid after request cleanup and need no current snapshot.
-        for req_meta in self._finished_partial_tail_metas.values():
-            meta.add_request(req_meta)
-        self._finished_partial_tail_metas.clear()
 
         if not self._capacity_only:
             self._reference_save_blocks(meta)
@@ -555,9 +460,6 @@ class MooncakeStoreScheduler:
         itself is freed, until every rank reports the job done.
         """
         pool = self._gpu_block_pool
-        coord = self._store_coord
-        assert coord is not None
-        block_sizes = [g.kv_cache_spec.block_size for g in coord.kv_cache_groups]
         for req_meta in meta.requests:
             if not req_meta.can_save:
                 continue
@@ -567,12 +469,15 @@ class MooncakeStoreScheduler:
             if req_meta.store_job_id is not None:
                 assert req_meta.store_job_id in self._pinned_saves
                 continue
-            if tail := _partial_tail_non_mamba_puts(coord, req_meta, block_sizes):
-                req_meta.boundary_puts = [*tail, *(req_meta.boundary_puts or [])]
             req_meta.store_job_id = store_job_id = self._next_store_job_id
             self._next_store_job_id += 1
-            block_ids = [put.block_id for put in req_meta.boundary_puts or []]
-            assert NULL_BLOCK_ID not in block_ids, (
+            # Boundary puts carry a store-group index; map it back to the KV
+            # cache group the pool addresses blocks by.
+            block_refs = [
+                (self._store_group_ids[put.group_id], put.block_id)
+                for put in req_meta.boundary_puts or []
+            ]
+            assert all(bid != NULL_BLOCK_ID for _, bid in block_refs), (
                 "A null block cannot back a boundary put"
             )
             if req_meta.token_len_chunk:
@@ -581,8 +486,8 @@ class MooncakeStoreScheduler:
                 # this job's token range: a rank resumes from its own last
                 # successful offset, which lags the scheduler's whenever a save was
                 # skipped or failed, so it may read anywhere below the range.
-                block_ids.extend(
-                    block_id
+                block_refs.extend(
+                    (self._store_group_ids[group_id], block_id)
                     for group_id, group in enumerate(req_meta.block_ids)
                     if group_id not in self._boundary_state_group_ids
                     for block_id in group
@@ -590,84 +495,11 @@ class MooncakeStoreScheduler:
                 )
             # An aligned boundary block may also be present in the request's
             # block table. Take and release exactly one reference per block.
-            block_ids = list(dict.fromkeys(block_ids))
-            assert NULL_BLOCK_ID not in block_ids
-            if not block_ids:
+            block_refs = list(dict.fromkeys(block_refs))
+            if not block_refs:
                 continue
-            self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
-            pool.touch([pool.blocks[block_id] for block_id in block_ids])
-
-    def register_finished_partial_tail(
-        self,
-        request: Request,
-        block_ids: tuple[list[int], ...],
-        partial_tail_offloads: list[tuple[int, int, int]],
-    ) -> bool:
-        """Queue and pin a finish-time tail for the next connector step."""
-        if self.kv_role == "kv_consumer" or not partial_tail_offloads:
-            return False
-        tracker = self._request_trackers.get(request.request_id)
-        if tracker is None or not any(block_ids):
-            return False
-        boundaries = {boundary for _, _, boundary in partial_tail_offloads}
-        if len(boundaries) != 1:
-            raise ValueError(
-                "Partial-tail offloads for one request must share a boundary"
-            )
-        boundary_tokens = next(iter(boundaries))
-        if boundary_tokens > tracker.prefill_end_tokens:
-            return False
-
-        mamba_puts: list[BoundaryPut] = []
-        for group_id, block_id, boundary in partial_tail_offloads:
-            store_group_id = self._store_group_id_by_kv_cache_group_id.get(group_id)
-            if store_group_id not in self._boundary_state_group_ids:
-                return False
-            if block_id == NULL_BLOCK_ID:
-                return False
-            mamba_puts.append(BoundaryPut(store_group_id, block_id, boundary))
-        req_meta = ReqMeta(
-            req_id=request.request_id,
-            token_len_chunk=0,
-            block_ids=tuple(
-                block_ids[group_id].copy() for group_id in self._store_group_ids
-            ),
-            block_hashes=list(request.block_hashes),
-            can_save=True,
-            num_prompt_tokens=request.num_prompt_tokens,
-            prefill_end_tokens=tracker.prefill_end_tokens,
-            boundary_puts=mamba_puts,
-            completed_token_len=request.num_computed_tokens,
-        )
-        coord = self._store_coord
-        assert coord is not None
-        req_meta.boundary_puts = [
-            *_partial_tail_non_mamba_puts(
-                coord,
-                req_meta,
-                [g.kv_cache_spec.block_size for g in coord.kv_cache_groups],
-            ),
-            *mamba_puts,
-        ]
-        pinned_block_ids = list(
-            dict.fromkeys(put.block_id for put in req_meta.boundary_puts)
-        )
-
-        pool = self._gpu_block_pool
-        assert pool is not None, (
-            "GPU block pool must be bound before a finish-time handoff"
-        )
-        assert request.request_id not in self._finished_partial_tail_metas
-        store_job_id = self._next_store_job_id
-        self._next_store_job_id += 1
-        self._pinned_saves[store_job_id] = (pinned_block_ids, self._num_workers)
-        pool.touch([pool.blocks[block_id] for block_id in pinned_block_ids])
-
-        req_meta.store_job_id = store_job_id
-        self._finished_partial_tail_metas[request.request_id] = req_meta
-        tracker.has_pending_offload = True
-        # The store job owns exact block refs, so request cleanup need not wait.
-        return False
+            self._pinned_saves[store_job_id] = (block_refs, self._num_workers)
+            pool.touch([pool.get_block(g, b) for g, b in block_refs])
 
     def _handle_boundary_state_offloads(
         self,
@@ -722,7 +554,6 @@ class MooncakeStoreScheduler:
                     num_prompt_tokens=req_tuple[0].num_prompt_tokens,
                     prefill_end_tokens=tracker.prefill_end_tokens,
                     boundary_puts=accepted,
-                    completed_token_len=tracker.token_len,
                 )
             )
 
@@ -738,17 +569,17 @@ class MooncakeStoreScheduler:
             if pinned is None:
                 # The job referenced no blocks, so nothing was recorded for it.
                 continue
-            block_ids, remaining = pinned
+            block_refs, remaining = pinned
             remaining -= count
             if remaining > 0:
-                self._pinned_saves[store_job_id] = (block_ids, remaining)
+                self._pinned_saves[store_job_id] = (block_refs, remaining)
                 continue
             assert remaining == 0, (
                 f"store job {store_job_id} reported by too many ranks"
             )
             del self._pinned_saves[store_job_id]
             # Tail-first, as elsewhere, so the shared prefix is evicted last.
-            pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
+            pool.free_blocks(pool.get_block(g, b) for g, b in reversed(block_refs))
 
     def has_pending_push_work(self) -> bool:
         """Keep the engine stepping while any store job still holds block refs.
