@@ -18,7 +18,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
     resolve_dcp_kv_block_size,
-    resolve_kv_cache_block_sizes,
+    resolve_scheduler_block_size,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -74,7 +74,7 @@ class UMBPStoreConnectorScheduler:
         codec: BlockIdentityCodec | None,
         topology: RankTopology | None = None,
     ) -> None:
-        self.block_size, resolved_hash_block_size = resolve_kv_cache_block_sizes(
+        self.scheduler_block_size = resolve_scheduler_block_size(
             kv_cache_config, vllm_config
         )
         self.kv_cache_config = kv_cache_config
@@ -96,7 +96,7 @@ class UMBPStoreConnectorScheduler:
         # connectors; it never offloads its own KV.
         self.store_enabled = getattr(transfer_config, "kv_role", None) != "kv_consumer"
         # Request.block_hashes are computed at this size; keys index into them.
-        self.hash_block_size = resolved_hash_block_size
+        self.block_size = kv_cache_config.block_size
         speculative_config = getattr(vllm_config, "speculative_config", None)
         self.use_eagle = bool(
             speculative_config is not None and speculative_config.use_eagle_block_drop()
@@ -134,9 +134,9 @@ class UMBPStoreConnectorScheduler:
             )
             return 0, False
         hashes = request.block_hashes
-        if not hashes or request.num_tokens < self.block_size:
+        if not hashes or request.num_tokens < self.scheduler_block_size:
             return 0, False
-        if num_computed_tokens % self.block_size != 0:
+        if num_computed_tokens % self.scheduler_block_size != 0:
             return 0, False
         group_ids = self.kv_cache_config.prefix_cacheable_group_ids
         # vLLM must execute at least the final prompt token. Returning a hit
@@ -387,11 +387,12 @@ class UMBPStoreConnectorScheduler:
             meta.store_event = event
             self._store_events[event] = _StoreEvent(event_plans)
             if self._gpu_block_pool is not None:
-                self._gpu_block_pool.touch(
+                pool = self._gpu_block_pool
+                pool.touch(
                     [
-                        self._gpu_block_pool.blocks[block_id]
-                        for block_id in dict.fromkeys(
-                            plan.block_id for plan in event_plans
+                        pool.get_block(group_id, block_id)
+                        for group_id, block_id in dict.fromkeys(
+                            plan.group_block_id for plan in event_plans
                         )
                     ]
                 )
@@ -436,7 +437,7 @@ class UMBPStoreConnectorScheduler:
     def _object_hash_at_token_end(
         self, hashes: Sequence[bytes], token_end: int
     ) -> bytes:
-        hash_index = token_end // self.hash_block_size - 1
+        hash_index = token_end // self.block_size - 1
         if hash_index < 0 or hash_index >= len(hashes):
             raise ValueError(
                 f"request has {len(hashes)} hashes, needs index {hash_index}"
@@ -457,11 +458,11 @@ class UMBPStoreConnectorScheduler:
         group_ids = self.kv_cache_config.prefix_cacheable_group_ids
         # Scheduled speculative tokens are not yet verified and have no block
         # hash; a block is storable only once its hash exists.
-        token_count = min(token_count, len(request.block_hashes) * self.hash_block_size)
+        token_count = min(token_count, len(request.block_hashes) * self.block_size)
         previous_saved_tokens = tracker.saved_tokens
         # Hash-aligned rather than block-aligned: a group with smaller blocks
         # than the largest must not wait for that group's block to fill.
-        save_to = tracker.mark_saved(token_count, self.hash_block_size)
+        save_to = tracker.mark_saved(token_count, self.block_size)
         plans: list[BlockTransferPlan] = []
         block_groups = (
             block_ids_override
@@ -518,9 +519,10 @@ class UMBPStoreConnectorScheduler:
                 continue
             del self._store_events[event_id]
             if pool is not None:
-                block_ids = dict.fromkeys(plan.block_id for plan in event.plans)
+                pairs = dict.fromkeys(plan.group_block_id for plan in event.plans)
                 pool.free_blocks(
-                    pool.blocks[block_id] for block_id in reversed(block_ids)
+                    pool.get_block(group_id, block_id)
+                    for group_id, block_id in reversed(list(pairs))
                 )
 
     def has_pending_push_work(self) -> bool:

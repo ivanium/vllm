@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
     KVConnectorTransferResults,
+    SupportsHMA,
 )
 from vllm.forward_context import ForwardContext
 from vllm.v1.attention.backend import AttentionMetadata
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
-class UMBPStoreConnector(KVConnectorBase_V1):
+class UMBPStoreConnector(KVConnectorBase_V1, SupportsHMA):
     """vLLM connector lifecycle shared by every UMBP runtime mode."""
 
     def __init__(
@@ -160,11 +161,11 @@ class UMBPStoreConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
-    def request_finished(
-        self, request: Request, block_ids: list[int]
+    def request_finished_all_groups(
+        self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.request_finished(request, (block_ids,))
+        return self.connector_scheduler.request_finished(request, block_ids)
 
     def update_connector_output(self, connector_output: Any) -> None:
         assert self.connector_scheduler is not None
@@ -247,7 +248,7 @@ class UMBPStoreConnector(KVConnectorBase_V1):
             finished_recving=set(finished_recving or ()),
         )
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
         assert self.connector_worker is not None
         return self.connector_worker.get_block_ids_with_load_errors()
 

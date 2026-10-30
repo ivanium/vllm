@@ -20,7 +20,13 @@ import torch
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
-from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    GroupGeometry,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+)
 
 moriio_connector = importlib.import_module(
     "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector"
@@ -60,6 +66,7 @@ class _FakeScheduler(moriio_connector.MoRIIOConnectorScheduler):  # type: ignore
         self._is_hma_required = False
         self.kv_cache_config = SimpleNamespace(
             kv_cache_groups=[None, None],
+            transfer_group_ids=(0, 1),
             select_transfer_block_ids=lambda block_ids: tuple(block_ids),
         )
         for k, v in attrs.items():
@@ -309,11 +316,9 @@ def test_scheduler_rejects_non_dspark_speculative_hybrid(read_mode):
         )
 
 
-def _dspark_wrapped_attention_config(*, dcp_sharded: bool = True):
-    """Mamba first, so a wrapped full-attention group at index 1 has to be found.
-
-    A bare ``isinstance(FullAttentionSpec)`` misses the wrapper and leaves
-    ``_full_attn_group_idx`` at its initial 0, which is the Mamba group.
+def _dspark_hybrid_attention_config(*, dcp_sharded: bool = True):
+    """Mamba first, so the full-attention group sits at index 1 and must be
+    found there (``_full_attn_group_idx`` must not stay at the Mamba group 0).
     """
     full = FullAttentionSpec(
         block_size=4,
@@ -330,9 +335,7 @@ def _dspark_wrapped_attention_config(*, dcp_sharded: bool = True):
             ),
             SimpleNamespace(
                 enable_kv_transfer=True,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=4, kv_cache_specs={"target": full, "draft": full}
-                ),
+                kv_cache_spec=full,
             ),
         ],
     )
@@ -345,10 +348,10 @@ def _dspark_wrapped_attention_config(*, dcp_sharded: bool = True):
 @pytest.mark.parametrize(
     "dcp_size,dcp_sharded,expected_tail", [(1, True, 4), (4, True, 1), (4, False, 4)]
 )
-def test_scheduler_accepts_dspark_with_wrapped_full_attention(
+def test_scheduler_accepts_dspark_with_attention_after_mamba(
     dcp_size, dcp_sharded, expected_tail, read_mode
 ):
-    config = _dspark_wrapped_attention_config(dcp_sharded=dcp_sharded)
+    config = _dspark_hybrid_attention_config(dcp_sharded=dcp_sharded)
     vllm_config = _gate_vllm_config(
         read_mode=read_mode,
         speculative_config=_spec_config("dspark"),
@@ -367,7 +370,7 @@ def test_scheduler_accepts_dspark_with_wrapped_full_attention(
     spec = config.transfer_groups[1].kv_cache_spec
     manager = FullAttentionManager(
         spec,
-        block_pool=BlockPool(32, enable_caching=False, hash_block_size=4),
+        block_pool=BlockPool(32, enable_caching=False, block_size=4),
         enable_caching=False,
         kv_cache_group_id=1,
         scheduler_block_size=16,
@@ -393,7 +396,7 @@ def test_scheduler_accepts_dspark_with_wrapped_full_attention(
 
 @pytest.mark.usefixtures("restore_moriio_role")
 def test_hybrid_write_clamps_attention_and_excludes_scratch_slots():
-    config = _dspark_wrapped_attention_config()
+    config = _dspark_hybrid_attention_config()
     config.select_transfer_block_ids = lambda blocks: tuple(blocks)
     sched = moriio_connector.MoRIIOConnectorScheduler(
         _gate_vllm_config(read_mode=False, dcp_size=2), "engine", config
@@ -405,7 +408,7 @@ def test_hybrid_write_clamps_attention_and_excludes_scratch_slots():
 
 @pytest.mark.usefixtures("restore_moriio_role")
 def test_hybrid_write_resolves_current_state_instead_of_cached_block_ids():
-    config = _dspark_wrapped_attention_config()
+    config = _dspark_hybrid_attention_config()
     config.select_transfer_block_ids = lambda blocks: tuple(blocks)
     sched = moriio_connector.MoRIIOConnectorScheduler(
         _gate_vllm_config(read_mode=False, dcp_size=2), "engine", config
@@ -427,7 +430,7 @@ def test_hybrid_write_resolves_current_state_instead_of_cached_block_ids():
 def test_hybrid_write_notifies_grouped_slots_or_releases_a_complete_local_hit(
     external_tokens,
 ):
-    config = _dspark_wrapped_attention_config()
+    config = _dspark_hybrid_attention_config()
     config.select_transfer_block_ids = lambda blocks: tuple(blocks)
     sched = moriio_connector.MoRIIOConnectorScheduler(
         _gate_vllm_config(read_mode=False), "engine", config
@@ -464,7 +467,7 @@ def test_hybrid_write_notifies_grouped_slots_or_releases_a_complete_local_hit(
 
 @pytest.mark.usefixtures("restore_moriio_role")
 def test_hybrid_write_keeps_separate_draft_groups_and_their_block_spans():
-    config = _dspark_wrapped_attention_config()
+    config = _dspark_hybrid_attention_config()
     # A disabled cache is absent from the wire. Target and draft may have
     # different token spans, and neither can borrow the other's block IDs.
     draft = SimpleNamespace(
@@ -518,7 +521,7 @@ def test_hybrid_write_keeps_separate_draft_groups_and_their_block_spans():
 def test_hybrid_write_request_finished_defers_free_only_with_blocks_to_send(
     blocks, delay_free
 ):
-    config = _dspark_wrapped_attention_config()
+    config = _dspark_hybrid_attention_config()
     config.select_transfer_block_ids = lambda blocks: tuple(blocks)
     sched = moriio_connector.MoRIIOConnectorScheduler(
         _gate_vllm_config(read_mode=False, dcp_size=2), "engine", config
@@ -542,7 +545,7 @@ def test_hybrid_write_request_finished_defers_free_only_with_blocks_to_send(
 def test_hybrid_write_build_meta_saves_current_state_on_the_final_chunk():
     """Chunked prefill must not ship block ids cached at admission: align-mode
     state slots move between chunks without appending a block."""
-    config = _dspark_wrapped_attention_config()
+    config = _dspark_hybrid_attention_config()
     config.select_transfer_block_ids = lambda blocks: tuple(blocks)
     sched = moriio_connector.MoRIIOConnectorScheduler(
         _gate_vllm_config(read_mode=False, dcp_size=2), "engine", config
@@ -759,11 +762,17 @@ def _make_read_request(remote_block_ids):
 
 @pytest.mark.parametrize("external_tokens", [0, 256])
 @pytest.mark.parametrize("has_mamba", [False, True])
-@pytest.mark.parametrize("zero_ids", [None, [], [101], [101, 102, 202, 999]])
+@pytest.mark.parametrize(
+    "zero_ids", [None, [[], []], [[101], []], [[101, 102, 999], [202]]]
+)
 def test_update_state_drops_decode_recompute_tail_block(
     external_tokens, has_mamba, zero_ids
 ):
-    """Only full hybrid READ destinations skip zeroing; local tails still zero."""
+    """Only full hybrid READ destinations skip zeroing; local tails still zero.
+
+    The zero list is per KV cache group; the filter must drop read
+    destinations from the attention group's list only.
+    """
     sched = _make_read_scheduler()
     sched._has_mamba = has_mamba
     remote_blocks = [[10, 11], [91]] if has_mamba else [[10, 11]]
@@ -788,14 +797,14 @@ def test_update_state_drops_decode_recompute_tail_block(
     meta = sched.build_connector_meta(output)
     assert meta.reqs_to_recv["req"].local_block_ids == expected_blocks
     if zero_ids and has_mamba and external_tokens:
-        before["new_block_ids_to_zero"] = zero_ids[1:]
+        before["new_block_ids_to_zero"] = [zero_ids[0][1:], zero_ids[1]]
     assert asdict(output) == before
 
     # A later local allocation of the same pages must still be zeroed.
-    output.new_block_ids_to_zero = [100, 101, 102]
+    output.new_block_ids_to_zero = [[100, 101, 102], []]
     meta = sched.build_connector_meta(output)
     assert not meta.reqs_to_recv
-    assert output.new_block_ids_to_zero == [100, 101, 102]
+    assert output.new_block_ids_to_zero == [[100, 101, 102], []]
 
 
 def test_update_state_pairs_shorter_local_blocks_with_remote_suffix():
@@ -983,17 +992,89 @@ def test_worker_rejects_incompatible_mamba_specs_before_registration():
         worker.register_kv_caches({"kda.0": object(), "kda.1": object()})
 
 
-def _make_register_worker(caches, geoms, *, disable_hma: bool = True):
+def _lp_view(
+    pool: torch.Tensor, row_bytes: int, num_rows: int, offset: int, spec
+) -> torch.Tensor:
+    """[K, H, N, C] uint8 view of one layer at ``offset`` within each row."""
+    return torch.as_strided(
+        pool,
+        (
+            num_rows,
+            spec.num_heads,
+            spec.num_states,
+            spec.state_content_size_bytes,
+        ),
+        (
+            row_bytes,
+            spec.num_states * spec.state_content_size_bytes,
+            spec.state_content_size_bytes,
+            1,
+        ),
+        storage_offset=offset,
+    )
+
+
+def _make_lp_two_group_setup():
+    """A full + sliding-window two-group large-page pool with distinct
+    per-group geometry (row bytes, block counts)."""
+    full_spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=2, head_size=2, dtype=torch.float16
+    )
+    swa_spec = SlidingWindowSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float16,
+        sliding_window=8,
+    )
+    full_row = 2 * full_spec.page_size_bytes  # two layers per row
+    swa_row = swa_spec.page_size_bytes
+    large_page_bytes = 320  # full-attention blocks cross page ends
+    num_pages = 3
+    pool = torch.zeros(num_pages * large_page_bytes, dtype=torch.uint8)
+    caches = {
+        "full0": _lp_view(pool, full_row, 7, 0, full_spec),
+        "full1": _lp_view(pool, full_row, 7, full_spec.page_size_bytes, full_spec),
+        "swa0": _lp_view(pool, swa_row, 30, 0, swa_spec),
+    }
+    config = KVCacheConfig(
+        num_pages=num_pages,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full0", "full1"],
+                full_spec,
+                num_blocks=7,
+                kernel_rows_per_block=1,
+                row_bytes=full_row,
+            ),
+            KVCacheGroupSpec(
+                ["swa0"],
+                swa_spec,
+                num_blocks=30,
+                blocks_per_page=10,
+                kernel_rows_per_block=1,
+                row_bytes=swa_row,
+            ),
+        ],
+        large_page_bytes=large_page_bytes,
+        block_size=full_spec.block_size,
+    )
+    return caches, config
+
+
+def _make_register_worker(caches, config):
+    """Worker with the real register_kv_caches; the mori engine and the
+    handshake listener are faked, the produced agent metadata is captured."""
     worker = _FakeWorker(
         mode=MoRIIOMode.READ,
         _transfer_layer_names=set(caches),
-        block_size=16,
         engine_id="e0",
-        dst_num_blocks={},
-        block_lens={},
+        kv_cache_config=config,
+        layer_to_spec=moriio_layout.build_layer_to_spec(config),
+        layer_to_group=dict(config.transfer_group_index_by_layer),
         layer_name_to_local_kv_cache_metadata={},
         kv_caches_base_addr={},
-        kv_layer_mr_offset={},
         local_kv_cache_size=[],
         block_window_per_layer=[],
         moriio_wrapper=SimpleNamespace(
@@ -1002,7 +1083,6 @@ def _make_register_worker(caches, geoms, *, disable_hma: bool = True):
             async_wait_reqid=lambda: None,
         ),
         world_size=1,
-        layer_to_spec={},
         backend_name="TRITON_ATTN",
         side_channel_port=6301,
         tp_rank=0,
@@ -1010,88 +1090,152 @@ def _make_register_worker(caches, geoms, *, disable_hma: bool = True):
         is_producer=False,
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="x")),
-            scheduler_config=SimpleNamespace(
-                disable_hybrid_kv_cache_manager=disable_hma
-            ),
         ),
     )
-    worker._is_mamba_layer = lambda _n: False
-    worker._is_mla_cache_layer = lambda _n: False
-    worker._get_layer_transfer_geometry = lambda n, remote_num_blocks=None: geoms[n]
-    worker._iter_layer_registration_regions = lambda n: [(caches[n], caches[n].nbytes)]
-    worker._moriio_handshake_listener = (
-        lambda _m, ready_event, *_a, **_k: ready_event.set()
+    captured = {}
+
+    def _listener(metadata, ready_event, *_a, **_k):
+        captured["metadata"] = metadata
+        ready_event.set()
+
+    worker._moriio_handshake_listener = _listener
+    # The page-aligned shared-MR registration needs the padded GPU pool; the
+    # mori engine is faked here, so a zero-offset stand-in is enough.
+    worker._build_shared_kv_mr = lambda kv_caches: (
+        torch.zeros(4096, dtype=torch.uint8),
+        {name: 0 for name in kv_caches},
     )
-    return worker
+    return worker, captured
 
 
-def test_register_kv_caches_allows_hybrid_divergent_block_len():
-    """GLM-5.2 / MiniMax HMA: divergent per-layer block_len is allowed."""
-    Geom = moriio_layout.LayerTransferGeometry
-    caches = {
-        "layer0": torch.zeros(2, 4, 16, 1, 8, dtype=torch.float16),
-        "layer1": torch.zeros(2, 4, 16, 1, 8, dtype=torch.float16),
-    }
-    # Same tokens-per-block (16); different bytes-per-block (2112 vs 9216).
-    geoms = {
-        "layer0": Geom(4, 16, 2112, 132, 2112, None, None, 1, 1, False),
-        "layer1": Geom(4, 16, 9216, 576, 9216, None, None, 1, 1, False),
-    }
-    worker = _make_register_worker(caches, geoms)
+def test_register_kv_caches_advertises_per_group_geometry():
+    """The handshake carries each transfer group's pool geometry: two
+    groups with different row sizes and block counts must not collapse onto
+    one scalar num_blocks/block_len pair."""
+    caches, config = _make_lp_two_group_setup()
+    worker, captured = _make_register_worker(caches, config)
     worker.register_kv_caches(caches)
 
-    assert worker.block_lens == {"layer0": 2112, "layer1": 9216}
-    assert worker.block_len == 9216
+    metadata = captured["metadata"]
+    assert metadata.version == moriio_common.MORIIO_CONNECTOR_VERSION
+    assert metadata.group_num_blocks == [7, 30]
+    # Divergent row bytes across groups register fine.
+    assert metadata.group_geometries == [GroupGeometry(1, 128), GroupGeometry(1, 32)]
+    assert metadata.attention_block_sizes == {"full0": 4, "full1": 4, "swa0": 4}
 
 
-def test_register_kv_caches_rejects_divergent_block_size():
-    """Without HMA, block_size (tokens/page) must stay uniform."""
-    Geom = moriio_layout.LayerTransferGeometry
-    caches = {
-        "layer0": torch.zeros(2, 4, 16, 1, 8, dtype=torch.float16),
-        "layer1": torch.zeros(2, 4, 16, 1, 8, dtype=torch.float16),
-    }
-    geoms = {
-        "layer0": Geom(4, 16, 2112, 132, 2112, None, None, 1, 1, False),
-        "layer1": Geom(4, 32, 2112, 66, 2112, None, None, 1, 1, False),
-    }
-    worker = _make_register_worker(caches, geoms, disable_hma=True)
-    with pytest.raises(ValueError, match="block size mismatch"):
+def test_register_kv_caches_rejects_row_grid_mismatch_within_group():
+    """Layers of one group share the group's kernel-row grid; a layer view
+    with a different row count is a bug."""
+    caches, config = _make_lp_two_group_setup()
+    pool = caches["full0"].untyped_storage()
+    spec = config.kv_cache_groups[0].kv_cache_spec
+    caches = dict(caches)
+    full1 = torch.empty(0, dtype=torch.uint8)
+    full1.set_(pool, spec.page_size_bytes, (6, 2, 4, 8), (128, 32, 8, 1))
+    caches["full1"] = full1
+    worker, _ = _make_register_worker(caches, config)
+    with pytest.raises(ValueError, match="row count mismatch"):
         worker.register_kv_caches(caches)
 
 
-def test_register_kv_caches_rejects_divergent_block_size_even_if_block_len_differs():
-    """Without HMA, size+len both differing must still raise."""
-    Geom = moriio_layout.LayerTransferGeometry
-    caches = {
-        "layer0": torch.zeros(2, 4, 16, 1, 8, dtype=torch.float16),
-        "layer1": torch.zeros(2, 4, 16, 1, 8, dtype=torch.float16),
-    }
-    # Previously buggy: size+len both differ → registration continued.
-    geoms = {
-        "layer0": Geom(4, 16, 2112, 132, 2112, None, None, 1, 1, False),
-        "layer1": Geom(4, 32, 9216, 288, 9216, None, None, 1, 1, False),
-    }
-    worker = _make_register_worker(caches, geoms, disable_hma=True)
-    with pytest.raises(ValueError, match="block size mismatch"):
+def test_register_kv_caches_rejects_split_backing():
+    """Large-page layer views must share the one pool allocation."""
+    caches, config = _make_lp_two_group_setup()
+    spec = config.kv_cache_groups[1].kv_cache_spec
+    caches = dict(caches)
+    caches["swa0"] = _lp_view(torch.zeros(3 * 320, dtype=torch.uint8), 32, 30, 0, spec)
+    worker, _ = _make_register_worker(caches, config)
+    with pytest.raises(moriio_common.MoRIIOError, match="shared backing"):
         worker.register_kv_caches(caches)
 
 
-def test_register_kv_caches_allows_hma_divergent_block_size():
-    """Gemma4 HMA (#53721): SWA vs full-attn may differ in tokens/page."""
-    Geom = moriio_layout.LayerTransferGeometry
-    caches = {
-        "layer0": torch.zeros(2, 4, 16, 1, 8, dtype=torch.float16),
-        "layer1": torch.zeros(2, 4, 16, 1, 8, dtype=torch.float16),
-    }
-    geoms = {
-        "layer0": Geom(4, 16, 2112, 132, 2112, None, None, 1, 1, False),
-        "layer1": Geom(4, 32, 4224, 132, 4224, None, None, 1, 1, False),
-    }
-    worker = _make_register_worker(caches, geoms, disable_hma=False)
-    worker.register_kv_caches(caches)
-    assert worker.block_lens == {"layer0": 2112, "layer1": 4224}
-    assert worker.block_len == 4224
+_BLOCK_SIZES = {"full0": 4, "full1": 4, "swa0": 4}
+
+
+def _peer_metadata(config, **overrides):
+    groups = config.transfer_groups
+    fields = dict(
+        version=moriio_common.MORIIO_CONNECTOR_VERSION,
+        engine_id="peer",
+        agent_metadata=b"",
+        kv_caches_base_addr=[],
+        attn_backend_name="x",
+        group_num_blocks=[g.num_blocks for g in groups],
+        group_geometries=config.transfer_group_geometries,
+        attention_block_sizes=dict(_BLOCK_SIZES),
+    )
+    fields.update(overrides)
+    return moriio_common.MoRIIOAgentMetadata(**fields)
+
+
+def _geometry_validating_worker(config):
+    return _FakeWorker(kv_cache_config=config, attention_block_sizes=dict(_BLOCK_SIZES))
+
+
+def test_peer_geometry_validation_accepts_matching_peer():
+    _caches, config = _make_lp_two_group_setup()
+    worker = _geometry_validating_worker(config)
+    worker._validate_peer_geometry(_peer_metadata(config))
+
+
+def test_peer_geometry_validation_rejects_wire_version_mismatch():
+    _caches, config = _make_lp_two_group_setup()
+    worker = _geometry_validating_worker(config)
+    with pytest.raises(moriio_common.HandshakeError, match="wire version"):
+        worker._validate_peer_geometry(_peer_metadata(config, version=0))
+
+
+def test_peer_geometry_validation_rejects_group_count_mismatch():
+    _caches, config = _make_lp_two_group_setup()
+    worker = _geometry_validating_worker(config)
+    with pytest.raises(moriio_common.HandshakeError, match="transfer groups"):
+        worker._validate_peer_geometry(
+            _peer_metadata(
+                config,
+                group_num_blocks=[7],
+                group_geometries=[GroupGeometry(1, 128)],
+            )
+        )
+
+
+def test_peer_geometry_validation_rejects_partial_geometry_lists():
+    """Every advertised per-group list is length-checked, not only
+    group_num_blocks: a short group_geometries would be indexed past its end
+    when expanding peer block ids."""
+    _caches, config = _make_lp_two_group_setup()
+    worker = _geometry_validating_worker(config)
+    with pytest.raises(moriio_common.HandshakeError, match="transfer groups"):
+        worker._validate_peer_geometry(
+            _peer_metadata(config, group_geometries=[GroupGeometry(1, 128)])
+        )
+
+
+def test_peer_geometry_validation_rejects_kernel_rows_mismatch():
+    _caches, config = _make_lp_two_group_setup()
+    worker = _geometry_validating_worker(config)
+    with pytest.raises(moriio_common.HandshakeError, match="kernel rows"):
+        worker._validate_peer_geometry(
+            _peer_metadata(
+                config,
+                group_geometries=[GroupGeometry(2, 128), GroupGeometry(1, 32)],
+            )
+        )
+
+
+def test_peer_geometry_validation_rejects_block_size_mismatch():
+    """A peer with a different --block-size pairs its kernel rows 1:1 with
+    ours, so every local block would receive the wrong token slice; the
+    handshake must refuse before any transfer runs."""
+    _caches, config = _make_lp_two_group_setup()
+    worker = _geometry_validating_worker(config)
+    with pytest.raises(moriio_common.HandshakeError, match="same --block-size"):
+        worker._validate_peer_geometry(
+            _peer_metadata(
+                config,
+                attention_block_sizes={"full0": 8, "full1": 8, "swa0": 8},
+            )
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1342,35 +1486,75 @@ def test_worker_compute_mamba_offsets_caches_and_matches_template():
     conv_dim = sum(split.local_proj_dims)
     conv_shape = (conv_dim, split.conv_rows)
     ssm_shape = (2, 4, 4)
-    page_bytes = 256
-    pages = torch.zeros((8, 1, 1, page_bytes), dtype=torch.uint8)
+    state_bytes = (conv_dim * split.conv_rows + 2 * 4 * 4) * 2
+    page, row_bytes, num_pages = 960, 384, 3
+    pool = torch.zeros(num_pages * page, dtype=torch.uint8)
+    num_rows = pool.numel() // row_bytes
+    pages = torch.as_strided(
+        pool,
+        (num_rows, 1, 1, state_bytes),
+        (row_bytes, state_bytes, state_bytes, 1),
+    )
     spec = moriio_connector.MambaSpec(
         block_size=1,
         shapes=(conv_shape, ssm_shape),
         dtypes=(torch.bfloat16, torch.bfloat16),
-        page_size_padded=page_bytes,
+        page_size_padded=state_bytes,
     )
     conv, ssm = moriio_layout.kda_conv_ssm(pages, spec)
-
+    group = dict(
+        kernel_rows_per_block=1,
+        row_bytes=row_bytes,
+        num_blocks=num_pages * page // row_bytes,
+    )
     worker = _FakeWorker(
         kv_caches={"kda.0": pages},
         layer_to_spec={"kda.0": spec},
+        layer_to_group={"kda.0": 0},
+        kv_cache_config=KVCacheConfig(
+            num_pages=num_pages,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["kda.0"],
+                    spec,
+                    num_blocks=group["num_blocks"],
+                    kernel_rows_per_block=1,
+                    row_bytes=row_bytes,
+                )
+            ],
+            large_page_bytes=page,
+            block_size=spec.block_size,
+        ),
         _conv_decomp=split,
         _mamba_offset_templates={},
         tp_rank=0,
         world_size=1,
     )
+    group_geom = GroupGeometry(group["kernel_rows_per_block"], group["row_bytes"])
+    group_num_blocks = group["num_blocks"]
+    remote_meta = SimpleNamespace(
+        group_geometries=[group_geom], group_num_blocks=[group_num_blocks]
+    )
 
     cached_template = None
     for local_slots, remote_slots in _SAMPLE_SLOT_SETS:
         lo, ro, sz, n_conv = worker._compute_mamba_transfer_offsets(
-            "kda.0", local_slots, remote_slots
+            "kda.0", local_slots, remote_slots, remote_meta
         )
         template = moriio_layout.build_mamba_offset_template(
             conv, ssm, split, tp_ratio=1
         )
+        # The worker expands manager slot ids to kernel rows before applying
+        # the template.
         expected = moriio_layout.apply_mamba_offset_template(
-            template, local_slots, remote_slots
+            template,
+            moriio_layout.expand_block_kernel_rows(
+                group_geom, group_num_blocks, local_slots
+            ),
+            moriio_layout.expand_block_kernel_rows(
+                group_geom, group_num_blocks, remote_slots
+            ),
         )
         assert (lo, ro, sz) == expected
         assert n_conv == moriio_layout.compute_mamba_conv_split_count(

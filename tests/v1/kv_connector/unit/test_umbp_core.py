@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import importlib.util
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -13,6 +12,7 @@ from tests.v1.kv_connector.umbp_test_utils import (
     _DelayedLoadWorkerHandle,
     _DelayedStoreWorkerHandle,
     _EmbeddedRuntime,
+    _group_views,
     _kv_cache_config,
     _SchedulerHandle,
     _StoreRecordingWorkerHandle,
@@ -53,23 +53,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.scheduler import (
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.worker import (
     UMBPStoreConnectorWorker,
 )
-from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    GroupGeometry,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
     KVQuantMode,
-    UniformTypeKVCacheSpecs,
-)
-
-mori_available = importlib.util.find_spec("mori") is not None
-
-pytestmark = pytest.mark.skipif(
-    not (current_platform.is_rocm() and mori_available),
-    reason="UMBP is only available on ROCm with the mori package installed",
+    SlidingWindowSpec,
 )
 
 _LAYER1_SPEC = FullAttentionSpec(
@@ -78,38 +70,73 @@ _LAYER1_SPEC = FullAttentionSpec(
 _LAYER2_SPEC = replace(_LAYER1_SPEC, num_kv_heads=2)
 
 
-def _uniform_type_kv_cache_config(
+def _layered_kv_cache_config(
     layer2: FullAttentionSpec = _LAYER2_SPEC,
     *,
-    block_stride: int | None = None,
-    num_blocks: int = 8,
+    num_pages: int = 8,
 ) -> KVCacheConfig:
-    """One UniformTypeKVCacheSpecs group whose two layers have unequal pages.
-
-    Without ``block_stride`` each layer is laid out layer-major with its own
-    page as the block stride; with it both pages share one block-major stride.
-    """
+    """One large-page group whose two layers have unequal per-row bytes."""
     specs = {"layer1": _LAYER1_SPEC, "layer2": layer2}
-    tensors = []
-    offset = 0
-    for name, spec in specs.items():
-        stride = block_stride or spec.page_size_bytes
-        tensors.append(
-            KVCacheTensor(
-                size=stride * num_blocks,
-                layers=[name],
-                layer_stride=stride * num_blocks,
-                block_stride=stride,
-                offset=offset if block_stride else 0,
-            )
-        )
-        offset += spec.page_size_bytes
-    group_spec = UniformTypeKVCacheSpecs.from_specs(specs)
-    assert group_spec is not None
+    row_bytes = sum(spec.page_size_bytes for spec in specs.values())
     return KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=tensors,
-        kv_cache_groups=[KVCacheGroupSpec(list(specs), group_spec)],
+        num_pages=num_pages,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                list(specs),
+                layer2,
+                num_blocks=num_pages,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=row_bytes,
+                layer_kv_cache_specs=dict(specs),
+            )
+        ],
+        large_page_bytes=row_bytes,
+        block_size=16,
+    )
+
+
+def _two_group_kv_cache_config(num_pages: int = 8) -> KVCacheConfig:
+    """Full-attention + sliding-window groups under the large-page allocator.
+
+    Both groups hold at least two blocks per 2048-byte page, so block ids
+    collide across groups; the sliding-window group's 768-byte blocks do not
+    divide a page, so some of its block ids cross a page end.
+    """
+    fa = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
+    )
+    swa = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=3,
+        head_size=4,
+        dtype=torch.float16,
+        sliding_window=64,
+    )
+    return KVCacheConfig(
+        num_pages=num_pages,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["fa"],
+                fa,
+                num_blocks=num_pages * 2,
+                blocks_per_page=2,
+                kernel_rows_per_block=2,
+                row_bytes=512,
+            ),
+            KVCacheGroupSpec(
+                ["swa"],
+                swa,
+                num_blocks=num_pages * 2048 // 768,
+                blocks_per_page=2,
+                kernel_rows_per_block=1,
+                row_bytes=768,
+            ),
+        ],
+        large_page_bytes=2048,
+        block_size=16,
     )
 
 
@@ -214,49 +241,116 @@ def test_namespace_distinguishes_draft_models():
     assert namespace(draft("drafter-a")) != namespace(draft("drafter-a", "v2"))
 
 
-def test_layout_planner_sizes_uniform_type_layers_independently():
-    """A wrapper's page size is the sum of its layers, not any one layer's."""
-    planner = KVLayoutPlanner.from_kv_cache_config(_uniform_type_kv_cache_config())
+def test_layout_planner_sizes_group_layers_independently():
+    """Each layer's object bytes come from its own spec, not the group's."""
+    planner = KVLayoutPlanner.from_kv_cache_config(_layered_kv_cache_config())
 
     assert [region.block_bytes for region in planner.regions] == [64, 128]
     assert [region.object_offset for region in planner.regions] == [0, 64]
     assert planner.object_size == 192
 
 
-def test_uniform_type_block_major_round_trip_stays_within_layer_pages():
-    num_blocks = 8
-    block_bytes = 192
-    planner = KVLayoutPlanner.from_kv_cache_config(
-        _uniform_type_kv_cache_config(block_stride=block_bytes, num_blocks=num_blocks)
+def test_layout_planner_plans_kernel_rows_of_each_block():
+    """Block b of a group lowers to its kernel rows at b * block_bytes."""
+    config = _two_group_kv_cache_config()
+    planner = KVLayoutPlanner.from_kv_cache_config(config)
+    bases = {"fa": 0, "swa": 0}
+
+    def offsets(plan):
+        return [
+            (item.base_address, item.length, item.object_offset) for item in plan.ranges
+        ]
+
+    # fa block 1 is kernel rows 2 and 3 of 512-byte rows.
+    assert offsets(planner.plan_for_block("k", 1, bases, group_id=0)) == [
+        (1024, 512, 0),
+        (1536, 512, 512),
+    ]
+    # swa block b is one 768-byte row at b * 768.
+    assert offsets(planner.plan_for_block("k", 1, bases, group_id=1)) == [(768, 768, 0)]
+    assert offsets(planner.plan_for_block("k", 5, bases, group_id=1)) == [
+        (3840, 768, 0)
+    ]
+
+
+def test_layout_planner_moves_a_head_major_row_as_one_region():
+    """A BHLNC row holds each head of every layer back to back; the object
+    keeps that run whole, since no layer's page is contiguous in it."""
+    fa = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
     )
-    backing = torch.zeros(num_blocks * block_bytes, dtype=torch.uint8)
-    caches = {
-        "layer1": backing.as_strided((num_blocks, 64), (block_bytes, 1)),
-        "layer2": backing.as_strided((num_blocks, 128), (block_bytes, 1), 64),
-    }
+    head_slot = fa.page_size_bytes // fa.num_heads
+    row = 2 * fa.num_heads * head_slot
+    config = KVCacheConfig(
+        num_pages=4,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=4 * row,
+                layers=["a", "b"],
+                layer_stride=head_slot,
+                block_stride=row,
+            )
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["a", "b"],
+                fa,
+                num_blocks=4,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=row,
+            )
+        ],
+        large_page_bytes=row,
+        block_size=16,
+        kv_cache_layout="BHLNC",
+    )
+    planner = KVLayoutPlanner.from_kv_cache_config(config)
+
+    plan = planner.plan_for_block("k", 3, {"a": 0}, group_id=0)
+    assert [(item.base_address, item.length) for item in plan.ranges] == [
+        (3 * row, row)
+    ]
+
+
+def test_plan_for_block_carries_its_group():
+    """A group-scoped plan keeps its group; materialize() must not widen it."""
+    planner = KVLayoutPlanner.from_kv_cache_config(_two_group_kv_cache_config())
+    bases = {"fa": 0, "swa": 0}
+
+    plan = planner.plan_for_block("k", 1, bases, group_id=1)
+
+    assert plan.group_block_id == (1, 1)
+    assert [item.layer_name for item in plan.ranges] == ["swa"]
+
+
+def test_large_page_round_trip_hits_only_the_target_block_rows():
+    config = _two_group_kv_cache_config()
+    planner = KVLayoutPlanner.from_kv_cache_config(config)
+    backing, caches = _group_views(config, group_id=0)
+    _, other_caches = _group_views(config, group_id=1)
+    caches.update(other_caches)
+    backing.copy_(torch.arange(backing.numel(), dtype=torch.int32) % 251)
     planner.register_kv_caches(caches)
 
-    source = planner.plan_registered_block("key", block_id=1)
-    assert [
-        (item.base_address - backing.data_ptr(), item.length, item.object_offset)
-        for item in source.ranges
-    ] == [(192, 64, 0), (256, 128, 64)]
+    source = planner.plan_registered_block("key", block_id=1, group_id=0)
+    view = caches["fa"]
+    assert [(item.base_address - view.data_ptr()) for item in source.ranges] == [
+        1024,
+        1536,
+    ]
 
-    def block(index):
-        return backing[index * block_bytes : (index + 1) * block_bytes]
-
-    block(1).copy_(torch.arange(block_bytes, dtype=torch.uint8))
-    block(4).fill_(0xAB)
+    view[8:10].fill_(0xAB)
     handle = MemoryRuntime().create_worker_handle(
         "namespace", RankTopology(), planner.describe(RankTopology())
     )
     handle.register_buffers(caches)
     handle.publish(handle.store([source]))
-    loaded = handle.load([planner.plan_registered_block("key", block_id=3)])
+    loaded = handle.load([planner.plan_registered_block("key", 3, group_id=0)])
 
     assert loaded.status is TransferJobStatus.COMPLETED
-    assert torch.equal(block(3), block(1))
-    assert torch.all(block(4) == 0xAB)
+    assert torch.equal(view[6:8], view[2:4])
+    assert torch.all(view[8:10] == 0xAB)
 
 
 @pytest.mark.parametrize(
@@ -285,38 +379,33 @@ def test_uniform_type_block_major_round_trip_stays_within_layer_pages():
         ),
     ],
 )
-def test_namespace_fingerprints_uniform_type_layer_specs(baseline, variant):
+def test_namespace_fingerprints_layer_specs(baseline, variant):
     vllm_config = _vllm_config({"mode": "embedded"})
 
     def namespace(layer2):
         return UMBPNamespace.from_vllm_config(
-            vllm_config, _uniform_type_kv_cache_config(layer2)
+            vllm_config, _layered_kv_cache_config(layer2)
         ).value
 
     assert namespace(baseline) == namespace(baseline)
     assert namespace(baseline) != namespace(variant)
 
 
-def test_scheduler_uses_worker_namespace_for_uniform_type_groups(monkeypatch):
-    """The scheduler sees a flattened group spec; keys must still match."""
-    install_memory_runtime(monkeypatch)
-    worker_config = _uniform_type_kv_cache_config(block_stride=192)
+def test_namespace_covers_group_geometry():
+    """The same layers with different kernel-row geometry must not share
+    objects."""
     vllm_config = _vllm_config({"mode": "embedded"})
-    scheduler = UMBPStoreConnector(
-        vllm_config,
-        KVConnectorRole.SCHEDULER,
-        generate_scheduler_kv_cache_config([worker_config]),
-    )
-    worker = UMBPStoreConnector(vllm_config, KVConnectorRole.WORKER, worker_config)
-    try:
-        handshake(scheduler, worker)
 
-        assert scheduler.connector_scheduler.codec.key(b"a") == (
-            worker.connector_worker.codec.key(b"a")
-        )
-    finally:
-        scheduler.shutdown()
-        worker.shutdown()
+    def namespace(kernel_rows_per_block, row_bytes):
+        config = _kv_cache_config()
+        group = config.kv_cache_groups[0]
+        group.kernel_rows_per_block = kernel_rows_per_block
+        group.row_bytes = row_bytes
+        return UMBPNamespace.from_vllm_config(vllm_config, config).value
+
+    assert namespace(2, 512) == namespace(2, 512)
+    assert namespace(2, 512) != namespace(1, 512)
+    assert namespace(2, 512) != namespace(2, 1024)
 
 
 def test_scheduler_defers_lookup_until_worker_handshake(monkeypatch):
@@ -393,46 +482,22 @@ def test_layout_planner_builds_scatter_gather_ranges():
         "key", block_id=3, base_addresses={"layer1": 1000, "layer2": 2000}
     )
 
-    assert [item.base_address for item in plan.ranges] == [4072, 5072]
-    assert [item.object_offset for item in plan.ranges] == [
-        0,
-        planner.regions[0].block_bytes,
-    ]
+    # Block 3 starts at kernel row 6 of each layer's 1024-byte row grid.
+    assert [item.base_address for item in plan.ranges] == [7144, 8168, 8144, 9168]
+    assert [item.length for item in plan.ranges] == [512, 512, 512, 512]
+    assert [item.object_offset for item in plan.ranges] == [0, 512, 1024, 1536]
 
 
 def test_layout_planner_registers_real_tensor_addresses():
     planner = KVLayoutPlanner.from_kv_cache_config(_kv_cache_config())
-    caches = {
-        name: torch.empty_strided(
-            (8, 2, 16, 8),
-            (512, 256, 8, 1),
-            dtype=torch.float16,
-        )
-        for name in ("layer1", "layer2")
-    }
+    _, caches = _group_views(_kv_cache_config())
 
     planner.register_kv_caches(caches)
     plan = planner.plan_registered_block("key", block_id=2)
 
-    assert plan.ranges[0].base_address == caches["layer1"].data_ptr() + 2048
-    assert plan.ranges[1].base_address == caches["layer2"].data_ptr() + 2048
-
-
-def test_layout_planner_expands_kernel_subblocks():
-    planner = KVLayoutPlanner.from_kv_cache_config(_kv_cache_config())
-    caches = {
-        name: torch.empty((8, 2, 16, 8), dtype=torch.float16)
-        for name in ("layer1", "layer2")
-    }
-
-    planner.register_kv_caches(caches)
-    plan = planner.plan_registered_block("key", block_id=2)
-
-    assert len(plan.ranges) == 4
-    assert [item.base_address for item in plan.ranges[:2]] == [
-        caches["layer1"].data_ptr() + 2048,
-        caches["layer1"].data_ptr() + 2560,
-    ]
+    # Block 2 starts at kernel row 4; each layer emits its two rows in order.
+    assert plan.ranges[0].base_address == caches["layer1"].data_ptr() + 4096
+    assert plan.ranges[2].base_address == caches["layer2"].data_ptr() + 4096
 
 
 def test_layout_planner_builds_compact_group_objects():
@@ -441,7 +506,11 @@ def test_layout_planner_builds_compact_group_objects():
             KVRegion("attention.0", 0, 256, 256, 0, 16),
             KVRegion("mamba.0", 1, 512, 512, 256, 32),
             KVRegion("attention.1", 0, 256, 256, 768, 16),
-        )
+        ),
+        group_geometry={
+            0: GroupGeometry(1, 256),
+            1: GroupGeometry(1, 512),
+        },
     )
     addresses = {"attention.0": 1000, "mamba.0": 2000, "attention.1": 3000}
 
@@ -470,7 +539,10 @@ def test_layout_planner_builds_compact_group_objects():
 
 
 def test_layout_planner_rejects_unknown_group():
-    planner = KVLayoutPlanner((KVRegion("attention", 0, 256, 256, 0, 16),))
+    planner = KVLayoutPlanner(
+        (KVRegion("attention", 0, 256, 256, 0, 16),),
+        group_geometry={0: GroupGeometry(1, 256)},
+    )
 
     with pytest.raises(ValueError, match="does not contain cache group 1"):
         planner.plan_for_block("missing", 0, {"attention": 1000}, group_id=1)
@@ -481,12 +553,16 @@ def test_worker_materializes_only_the_requested_group():
         (
             KVRegion("attention", 0, 32, 32, 0, 16),
             KVRegion("mamba", 1, 32, 32, 32, 16),
-        )
+        ),
+        group_geometry={
+            0: GroupGeometry(1, 32),
+            1: GroupGeometry(1, 32),
+        },
     )
     planner.register_kv_caches(
         {
-            "attention": torch.empty((8, 16), dtype=torch.float16),
-            "mamba": torch.empty((8, 16), dtype=torch.float16),
+            "attention": torch.empty((8, 32), dtype=torch.uint8),
+            "mamba": torch.empty((8, 32), dtype=torch.uint8),
         }
     )
     worker = UMBPStoreConnectorWorker(_WorkerHandle(), planner)
@@ -501,7 +577,8 @@ def test_worker_materializes_only_the_requested_group():
 
 def test_materialization_preserves_plan_metadata_after_reregistration():
     """Compact ranges must use current buffers without losing logical identity."""
-    planner = KVLayoutPlanner.from_kv_cache_config(_kv_cache_config())
+    config = _kv_cache_config()
+    planner = KVLayoutPlanner.from_kv_cache_config(config)
     worker = UMBPStoreConnectorWorker(_WorkerHandle(), planner)
     plan = BlockTransferPlan(
         "key",
@@ -511,10 +588,7 @@ def test_materialization_preserves_plan_metadata_after_reregistration():
     )
     previous = None
     for _ in range(2):
-        caches = {
-            name: torch.empty((8, 2, 16, 8), dtype=torch.float16)
-            for name in ("layer1", "layer2")
-        }
+        _, caches = _group_views(config)
         planner.register_kv_caches(caches)
         [actual] = worker._materialize_plans([plan])
         expected = planner.plan_registered_block(
@@ -523,7 +597,7 @@ def test_materialization_preserves_plan_metadata_after_reregistration():
             group_id=0,
         )
         assert actual == replace(plan, ranges=expected.ranges)
-        assert actual.ranges[0].base_address == (caches["layer1"].data_ptr() + 2048)
+        assert actual.ranges[0].base_address == (caches["layer1"].data_ptr() + 4096)
         if previous is not None:
             assert actual.ranges != previous.ranges
         previous = actual
@@ -531,8 +605,8 @@ def test_materialization_preserves_plan_metadata_after_reregistration():
 
 def test_transfer_job_isolates_failed_keys():
     plans = (
-        BlockTransferPlan("key-a", 7),
-        BlockTransferPlan("key-b", 8),
+        BlockTransferPlan("key-a", 7, group_id=0),
+        BlockTransferPlan("key-b", 8, group_id=0),
     )
     job = TransferJobState(plans)
     job.start()
@@ -540,7 +614,7 @@ def test_transfer_job_isolates_failed_keys():
     job.fail(["key-b"], "timeout")
 
     assert job.status is TransferJobStatus.FAILED
-    assert job.failed_block_ids == {8}
+    assert job.failed_block_ids == {(0, 8)}
     assert job.completed_keys == {"key-a"}
 
 
@@ -879,7 +953,7 @@ def test_store_event_owns_refs_until_all_ranks_finish():
     freed = []
     scheduler.bind_gpu_block_pool(
         SimpleNamespace(
-            blocks=[None, None, None, None, block],
+            get_block=lambda group_id, block_id: {(0, 4): block}[(group_id, block_id)],
             touch=lambda blocks: None,
             free_blocks=lambda blocks: freed.extend(blocks),
         )
@@ -934,7 +1008,7 @@ def test_store_events_hold_independent_refs_to_the_same_gpu_block():
     pinned, freed = [], []
     scheduler.bind_gpu_block_pool(
         SimpleNamespace(
-            blocks=list(range(8)),
+            get_block=lambda group_id, block_id: block_id,
             touch=lambda blocks: pinned.extend(blocks),
             free_blocks=lambda blocks: freed.extend(blocks),
         )
@@ -977,6 +1051,61 @@ def test_store_events_hold_independent_refs_to_the_same_gpu_block():
         )
         assert len(freed) == (2 if event_id == 0 else 1)
         assert scheduler.has_pending_push_work() == (event_id != 0)
+
+
+def test_store_event_touches_and_frees_blocks_by_group():
+    """Block ids collide across groups; pool access must key on (group, id)."""
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config({"mode": "embedded"}),
+        _two_group_kv_cache_config(),
+        _SchedulerHandle([]),
+        BlockIdentityCodec(UMBPNamespace("grouped-pool")),
+    )
+    touched, freed = [], []
+    scheduler.bind_gpu_block_pool(
+        SimpleNamespace(
+            get_block=lambda group_id, block_id: (group_id, block_id),
+            touch=lambda blocks: touched.extend(blocks),
+            free_blocks=lambda blocks: freed.extend(blocks),
+        )
+    )
+    request = SimpleNamespace(
+        request_id="r",
+        req_id="r",
+        num_tokens=16,
+        num_computed_tokens=0,
+        block_hashes=[b"a"],
+        block_ids=([1], [1]),
+    )
+    scheduler.update_state_after_alloc(
+        request,
+        SimpleNamespace(get_block_ids=lambda group_ids: ([1], [1])),
+        0,
+    )
+    metadata = scheduler.build_connector_meta(
+        SimpleNamespace(
+            finished_req_ids=set(),
+            preempted_req_ids=set(),
+            scheduled_new_reqs=[request],
+            scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+            num_scheduled_tokens={"r": 16},
+        )
+    )
+
+    assert {(plan.group_id, plan.block_id) for plan in metadata.store_plans} == {
+        (0, 1),
+        (1, 1),
+    }
+    assert touched == [(0, 1), (1, 1)]
+
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=UMBPConnectorWorkerMetadata(
+                store_events={metadata.store_event: StoreEventResult(1)}
+            )
+        )
+    )
+    assert freed == [(1, 1), (0, 1)]
 
 
 def test_scheduler_resumed_request_replaces_stale_block_table():
@@ -1109,7 +1238,7 @@ def test_scheduler_readmission_after_failed_load_uses_new_blocks():
 def test_worker_polls_async_load_without_forward_execution(fail_load):
     handle = _DelayedLoadWorkerHandle()
     worker = UMBPStoreConnectorWorker(handle)
-    plan = BlockTransferPlan("async-load", 1, request_id="req")
+    plan = BlockTransferPlan("async-load", 1, request_id="req", group_id=0)
     worker.start_load_kv(
         None,
         UMBPConnectorMetadata(
@@ -1126,7 +1255,7 @@ def test_worker_polls_async_load_without_forward_execution(fail_load):
         handle.load_job.complete()
 
     assert worker.get_finished(set()) == (None, {"req"})
-    assert worker.get_block_ids_with_load_errors() == ({1} if fail_load else set())
+    assert worker.get_block_ids_with_load_errors() == ({(0, 1)} if fail_load else set())
 
 
 def test_forward_does_not_wait_for_async_loads():
@@ -1331,16 +1460,8 @@ def test_worker_preserves_scheduler_supplied_ranges():
     worker = UMBPStoreConnectorWorker(
         handle, KVLayoutPlanner.from_kv_cache_config(_kv_cache_config())
     )
-    worker.register_kv_caches(
-        {
-            name: torch.empty_strided(
-                (8, 2, 16, 8),
-                (512, 256, 8, 1),
-                dtype=torch.float16,
-            )
-            for name in ("layer1", "layer2")
-        }
-    )
+    _, caches = _group_views(_kv_cache_config())
+    worker.register_kv_caches(caches)
     supplied = BlockTransferPlan(
         key="custom",
         block_id=1,
@@ -1396,14 +1517,7 @@ def test_embedded_connector_core_flow(monkeypatch):
     )
     worker_connector = UMBPStoreConnector(vllm_config, KVConnectorRole.WORKER, config)
     handshake(scheduler_connector, worker_connector)
-    caches = {
-        name: torch.empty_strided(
-            (8, 2, 16, 8),
-            (512, 256, 8, 1),
-            dtype=torch.float16,
-        )
-        for name in ("layer1", "layer2")
-    }
+    _, caches = _group_views(config)
     worker_connector.register_kv_caches(caches)
 
     assert scheduler_connector.get_num_new_matched_tokens(producer, 0) == (0, False)
@@ -1458,19 +1572,8 @@ def test_embedded_runtime_register_store_and_load(monkeypatch):
             "key_namespace": "builtin-embedded-test",
         }
     )
-    source_caches = {
-        name: torch.empty_strided(
-            (8, 2, 16, 8),
-            (512, 256, 8, 1),
-            dtype=torch.float16,
-        )
-        for name in ("layer1", "layer2")
-    }
-    for index, cache in enumerate(source_caches.values()):
-        cache.copy_(
-            torch.arange(cache.numel(), dtype=torch.float16).reshape(cache.shape)
-            + index
-        )
+    source_backing, source_caches = _group_views(config)
+    source_backing.copy_(torch.arange(source_backing.numel(), dtype=torch.int32) % 251)
 
     scheduler_connector = UMBPStoreConnector(
         vllm_config, KVConnectorRole.SCHEDULER, config
@@ -1525,16 +1628,8 @@ def test_embedded_runtime_register_store_and_load(monkeypatch):
     )
     load_metadata = scheduler_connector.build_connector_meta(consumer_output)
 
-    destination_caches = {
-        name: torch.empty_strided(
-            (8, 2, 16, 8),
-            (512, 256, 8, 1),
-            dtype=torch.float16,
-        )
-        for name in source_caches
-    }
-    for cache in destination_caches.values():
-        cache.zero_()
+    destination_backing, destination_caches = _group_views(config)
+    destination_backing.zero_()
     worker_connector.register_kv_caches(destination_caches)
     worker_connector.bind_connector_metadata(load_metadata)
     worker_connector.start_load_kv(None)
@@ -1546,18 +1641,19 @@ def test_embedded_runtime_register_store_and_load(monkeypatch):
     if load_errors:
         raise AssertionError(f"embedded load errors: {sorted(load_errors)}")
 
+    # Manager block b spans kernel rows 2b and 2b + 1 of each layer's view.
     for name in source_caches:
-        if not torch.equal(source_caches[name][1], destination_caches[name][5]):
+        if not torch.equal(source_caches[name][2:4], destination_caches[name][10:12]):
             raise AssertionError(
                 f"{name} block 1 round-trip mismatch: "
-                f"src={source_caches[name][1, 0, 0, 0].item()} "
-                f"dst={destination_caches[name][5, 0, 0, 0].item()}"
+                f"src={source_caches[name][2, 0].item()} "
+                f"dst={destination_caches[name][10, 0].item()}"
             )
-        if not torch.equal(source_caches[name][2], destination_caches[name][6]):
+        if not torch.equal(source_caches[name][4:6], destination_caches[name][12:14]):
             raise AssertionError(
                 f"{name} block 2 round-trip mismatch: "
-                f"src={source_caches[name][2, 0, 0, 0].item()} "
-                f"dst={destination_caches[name][6, 0, 0, 0].item()}"
+                f"src={source_caches[name][4, 0].item()} "
+                f"dst={destination_caches[name][12, 0].item()}"
             )
 
 
@@ -1565,7 +1661,7 @@ def test_embedded_runtime_register_store_and_load(monkeypatch):
 def test_embedded_tp_dcp_rank_store_completeness(monkeypatch, tp_size, dcp_size):
     """A prefix is reusable only after every actual TP worker publishes."""
     install_memory_runtime(monkeypatch)
-    config = _kv_cache_config()
+    config = _kv_cache_config(dcp_size)
     extra = {
         "mode": "embedded",
         "load_async": False,
@@ -1576,7 +1672,7 @@ def test_embedded_tp_dcp_rank_store_completeness(monkeypatch, tp_size, dcp_size)
         "decode_context_parallel_size": dcp_size,
         "world_size": tp_size,
     }
-    token_count = 32 * dcp_size
+    token_count = 32
     request = SimpleNamespace(
         request_id="ranked-producer",
         req_id="ranked-producer",
@@ -1608,10 +1704,7 @@ def test_embedded_tp_dcp_rank_store_completeness(monkeypatch, tp_size, dcp_size)
             num_scheduled_tokens={request.req_id: token_count},
         )
     )
-    caches = {
-        name: torch.empty_strided((8, 2, 16, 8), (512, 256, 8, 1), dtype=torch.float16)
-        for name in ("layer1", "layer2")
-    }
+    _, caches = _group_views(config)
     try:
         for tp_rank in range(tp_size):
             assert scheduler.get_num_new_matched_tokens(consumer, 0) == (0, False)
@@ -1641,7 +1734,7 @@ def test_embedded_tp_dcp_rank_local_store_flow(monkeypatch):
         "embedded",
         lambda config: runtime,
     )
-    config = _kv_cache_config()
+    config = _kv_cache_config(dcp_size=2)
     vllm_config = _vllm_config(
         {"mode": "embedded", "load_async": False},
         rank=1,
@@ -1682,16 +1775,8 @@ def test_embedded_tp_dcp_rank_local_store_flow(monkeypatch):
             block_ids=([3, 4],),
         )
     ]
-    worker_connector.register_kv_caches(
-        {
-            name: torch.empty_strided(
-                (8, 2, 16, 8),
-                (512, 256, 8, 1),
-                dtype=torch.float16,
-            )
-            for name in ("layer1", "layer2")
-        }
-    )
+    _, caches = _group_views(config)
+    worker_connector.register_kv_caches(caches)
 
     metadata = scheduler_connector.build_connector_meta(scheduler_output)
     worker_connector.bind_connector_metadata(metadata)
@@ -1700,6 +1785,7 @@ def test_embedded_tp_dcp_rank_local_store_flow(monkeypatch):
     namespace = UMBPNamespace.from_vllm_config(vllm_config, config).value
     assert runtime.store == {
         f"umbp:vllm:v1:{namespace}:tp1:pcp0:dcp1:pp0:g0:61",
+        f"umbp:vllm:v1:{namespace}:tp1:pcp0:dcp1:pp0:g0:62",
     }
     assert runtime.scheduler_args is not None
     assert runtime.scheduler_args[1].local_namespace == (1, 0, 1, 0)
@@ -1713,7 +1799,7 @@ def test_embedded_logical_hit_requires_all_tp_dcp_objects(monkeypatch):
         "embedded",
         lambda config: runtime,
     )
-    config = _kv_cache_config()
+    config = _kv_cache_config(dcp_size=2)
     vllm_config = _vllm_config(
         {"mode": "embedded", "load_async": False},
         rank=0,
@@ -1730,7 +1816,7 @@ def test_embedded_logical_hit_requires_all_tp_dcp_objects(monkeypatch):
     request = SimpleNamespace(
         request_id="logical",
         num_tokens=65,
-        block_hashes=[b"a", b"b"],
+        block_hashes=[b"a", b"b", b"c", b"d"],
     )
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
@@ -1740,8 +1826,8 @@ def test_embedded_logical_hit_requires_all_tp_dcp_objects(monkeypatch):
         )
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (64, False)
-    runtime.store.remove(scheduler.codec.key_for_namespace(b"b", 0, (1, 0, 1, 0)))
-    assert scheduler.get_num_new_matched_tokens(request, 0) == (32, False)
+    runtime.store.remove(scheduler.codec.key_for_namespace(b"d", 0, (1, 0, 1, 0)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (48, False)
 
 
 @pytest.mark.parametrize("fail_store", [False, True])
@@ -1762,16 +1848,8 @@ def test_worker_localizes_scheduler_plan_key_to_its_tp_rank(
         monkeypatch.setattr(handle, "store", fail)
     codec = BlockIdentityCodec(UMBPNamespace("rank-local"), tp_rank=tp_rank)
     layout = KVLayoutPlanner.from_kv_cache_config(_kv_cache_config())
-    layout.register_kv_caches(
-        {
-            name: torch.empty_strided(
-                (8, 2, 16, 8),
-                (512, 256, 8, 1),
-                dtype=torch.float16,
-            )
-            for name in ("layer1", "layer2")
-        }
-    )
+    _, caches = _group_views(_kv_cache_config())
+    layout.register_kv_caches(caches)
     worker = UMBPStoreConnectorWorker(handle, layout, codec=codec)
     plan = BlockTransferPlan(
         key=BlockIdentityCodec(UMBPNamespace("rank-local")).key(b"hash", 0),
@@ -1820,7 +1898,7 @@ def test_load_localizes_rank_without_changing_request_or_destination(tp_rank):
         (codec.key(b"b", 1), 9, 1, "request"),
     ]
     job = worker._load_jobs["request"][None]
-    assert job.failed_block_ids == {9}
+    assert job.failed_block_ids == {(1, 9)}
 
 
 @pytest.mark.parametrize("empty_group", [False, True])

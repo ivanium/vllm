@@ -44,6 +44,7 @@ Example:
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
@@ -66,8 +67,6 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheSpec,
     KVQuantMode,
-    UniformTypeKVCacheSpecs,
-    iter_layer_specs,
 )
 
 if TYPE_CHECKING:
@@ -112,7 +111,7 @@ def _get_startup_fill_group_ids(kv_cache_config: "KVCacheConfig") -> set[int]:
     group_ids = set()
     for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
         spec = group.kv_cache_spec
-        if any(isinstance(s, CircularBufferSpec) for s in iter_layer_specs(spec)):
+        if isinstance(spec, CircularBufferSpec):
             continue
         if kv_cache_config.needs_kv_cache_zeroing and isinstance(spec, AttentionSpec):
             continue
@@ -336,11 +335,7 @@ class DecodeBenchConnectorScheduler:
             if group_idx in self._startup_fill_group_ids:
                 block_ids_per_group_list.append([])
                 continue
-            is_circular_buffer = all(
-                isinstance(spec, CircularBufferSpec)
-                for spec in iter_layer_specs(group.kv_cache_spec)
-            )
-            if not is_circular_buffer:
+            if not isinstance(group.kv_cache_spec, CircularBufferSpec):
                 num_computed_blocks = cdiv(total_computed_tokens, group_block_size)
                 external_block_start = num_local_computed_tokens // group_block_size
                 assert (
@@ -432,29 +427,27 @@ class DecodeBenchConnectorWorker:
         # Layers whose uint8 KV cache stores plain fp8 values
         self._fp8_dtypes: dict[str, torch.dtype] = {}
         for group in kv_cache_config.kv_cache_groups:
+            layer_specs = group.layer_kv_cache_specs
             for layer_name in group.layer_names:
-                spec = group.kv_cache_spec
-                if isinstance(spec, UniformTypeKVCacheSpecs):
-                    spec = spec.kv_cache_specs[layer_name]
+                spec = (
+                    layer_specs[layer_name]
+                    if layer_specs is not None
+                    else group.kv_cache_spec
+                )
                 fp8_dtype = _get_fp8_dtype(spec, vllm_config.cache_config.cache_dtype)
                 if fp8_dtype is not None:
                     self._fp8_dtypes[layer_name] = fp8_dtype
 
-        # Mapping from KV cache group index to list of layer names in that group
-        self.group_to_layers = {
-            group_idx: list(group.layer_names)
-            for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
-        }
+        # Group geometry maps manager block ids to the kernel rows that index
+        # the group's views.
+        self._kv_cache_config = kv_cache_config
         self._zero_fill_group_ids = {
             group_idx
             for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
-            if any(
-                isinstance(spec, CircularBufferSpec)
-                for spec in iter_layer_specs(group.kv_cache_spec)
-            )
+            if isinstance(group.kv_cache_spec, CircularBufferSpec)
         }
         num_zeroed_groups = len(
-            self.group_to_layers.keys()
+            set(range(len(kv_cache_config.kv_cache_groups)))
             - self._startup_fill_group_ids
             - self._zero_fill_group_ids
         )
@@ -484,8 +477,9 @@ class DecodeBenchConnectorWorker:
         assert self.kv_caches is not None
 
         num_layers = 0
+        groups = self._kv_cache_config.kv_cache_groups
         for group_idx in sorted(self._startup_fill_group_ids):
-            for layer_name in self.group_to_layers[group_idx]:
+            for layer_name in groups[group_idx].layer_names:
                 kv_cache = self.kv_caches.get(layer_name)
                 if isinstance(kv_cache, torch.Tensor):
                     tensors = [kv_cache]
@@ -568,7 +562,12 @@ class DecodeBenchConnectorWorker:
         )
 
         # Get the layers that belong to this group
-        layer_names = self.group_to_layers.get(group_idx, [])
+        layer_names = self._kv_cache_config.kv_cache_groups[group_idx].layer_names
+
+        # The block-indexed layer views are indexed by the group's kernel
+        # rows; a manager block spans kernel_rows_per_block of them.
+        geometry = self._kv_cache_config.group_geometry(group_idx)
+        row_ids = geometry.rows(block_ids)
 
         # Fill only the layers in this group
         for layer_name in layer_names:
@@ -581,16 +580,16 @@ class DecodeBenchConnectorWorker:
             kv_cache = self.kv_caches[layer_name]
 
             # Attention layers store KV as a single block-indexed tensor whose
-            # first dim is num_blocks; fill the requested block rows. Hybrid /
-            # linear-attention layers (e.g. Mamba, Kimi Delta Attention) store
-            # their state as a list/tuple of tensors that are NOT block-indexed
-            # — each tensor is a single state buffer with no num_blocks
-            # dimension — so fill each tensor in its entirety with the same
-            # dummy values.
+            # first dim is the group's kernel-row count; fill the requested
+            # rows. Hybrid / linear-attention layers (e.g. Mamba, Kimi Delta
+            # Attention) store their state as a list/tuple of tensors that are
+            # NOT block-indexed — each tensor is a single state buffer with no
+            # num_blocks dimension — so fill each tensor in its entirety with
+            # the same dummy values.
             if isinstance(kv_cache, torch.Tensor):
                 fill_dtype = self._fp8_dtypes.get(layer_name, kv_cache.dtype)
                 self._fill_block_tensor(
-                    kv_cache, block_ids, fill_mean, fill_std, fill_dtype
+                    kv_cache, row_ids, fill_mean, fill_std, fill_dtype
                 )
             elif isinstance(kv_cache, (list, tuple)) and all(
                 isinstance(t, torch.Tensor) for t in kv_cache
@@ -621,16 +620,17 @@ class DecodeBenchConnectorWorker:
     def _fill_block_tensor(
         self,
         kv_cache: torch.Tensor,
-        block_ids: list[int],
+        row_ids: np.ndarray,
         fill_mean: float,
         fill_std: float,
         fill_dtype: torch.dtype,
     ):
-        """Fill the requested block rows of a block-indexed KV cache tensor.
+        """Fill the requested kernel rows of a block-indexed KV cache tensor.
 
         Args:
-            kv_cache: A KV cache tensor whose first dim is num_blocks.
-            block_ids: Block IDs to fill. IDs that are out of range for this
+            kv_cache: A KV cache tensor whose first dim is the group's
+                kernel-row count.
+            row_ids: Kernel rows to fill. Rows that are out of range for this
                 tensor's first dim are ignored.
             fill_mean: Mean value for the fill.
             fill_std: Standard deviation for the fill.
@@ -638,20 +638,18 @@ class DecodeBenchConnectorWorker:
                 of a uint8 fp8 cache.
 
         """
-        # Convert block_ids to tensor on device
-        block_ids_tensor = torch.tensor(
-            block_ids, dtype=torch.long, device=kv_cache.device
-        )
+        # Convert row_ids to tensor on device
+        row_ids_tensor = torch.from_numpy(row_ids).to(kv_cache.device)
 
-        # Filter invalid block IDs
-        valid_mask = block_ids_tensor < kv_cache.shape[0]
-        valid_block_ids = block_ids_tensor[valid_mask]
+        # Filter invalid row IDs
+        valid_mask = row_ids_tensor < kv_cache.shape[0]
+        valid_row_ids = row_ids_tensor[valid_mask]
 
-        if len(valid_block_ids) == 0:
+        if len(valid_row_ids) == 0:
             return
 
         fill_values = self._make_fill_values(
-            (len(valid_block_ids),) + kv_cache.shape[1:],
+            (len(valid_row_ids),) + kv_cache.shape[1:],
             kv_cache.device,
             fill_dtype,
             fill_mean,
@@ -659,7 +657,7 @@ class DecodeBenchConnectorWorker:
         )
 
         # Batch fill operation
-        kv_cache[valid_block_ids] = fill_values.view(kv_cache.dtype)
+        kv_cache[valid_row_ids] = fill_values.view(kv_cache.dtype)
 
     def _make_fill_values(
         self,

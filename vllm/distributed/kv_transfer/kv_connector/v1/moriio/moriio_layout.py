@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable, Mapping
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import torch
 
@@ -11,26 +11,40 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    GroupGeometry,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
-    UniformTypeKVCacheSpecs,
 )
 
 
 class LayerTransferGeometry(NamedTuple):
-    num_blocks: int
-    block_size: int
-    block_len: int
-    slot_size_bytes: int
-    block_stride: int
-    local_kv_stride: int | None
-    remote_kv_stride: int | None
-    transfers_per_block: int
-    regions_per_block: int
-    split_kv_regions: bool
+    """Row-level byte geometry of one layer's kernel-block view [K, H, N, C]."""
+
+    num_rows: int  # K: rows of the group's row grid covered by the view
+    tokens_per_row: int  # tokens one kernel row holds (the kernel block size)
+    row_len: int  # bytes one kernel row of this layer spans
+    row_stride: int  # bytes between consecutive rows (the group's row_bytes)
+
+
+def expand_block_kernel_rows(
+    group: GroupGeometry, num_blocks: int, block_ids: list[int]
+) -> list[int]:
+    """Kernel row ids of the group's manager blocks, in order.
+
+    Block ``b`` expands to rows ``b * R`` to ``b * R + R - 1`` (``R`` is
+    ``kernel_rows_per_block``). ``num_blocks`` is the owning pool's manager
+    block count (per-deployment, so it differs across peers) and bounds the
+    accepted block ids.
+    """
+    if not block_ids:
+        return []
+    invalid = next((b for b in block_ids if not 0 <= b < num_blocks), None)
+    if invalid is not None:
+        raise ValueError(f"block id {invalid} is outside [0, {num_blocks})")
+    return group.rows(block_ids).tolist()
 
 
 class MambaTransferGeometry(NamedTuple):
@@ -115,18 +129,9 @@ def get_mamba_transfer_geometry(
 def build_layer_to_spec(kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
     layer_to_spec: dict[str, KVCacheSpec] = {}
     for group in kv_cache_config.kv_cache_groups:
-        group_spec = group.kv_cache_spec
-        if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            layer_to_spec.update(
-                {
-                    layer_name: group_spec.kv_cache_specs[layer_name]
-                    for layer_name in group.layer_names
-                }
-            )
-        else:
-            layer_to_spec.update(
-                {layer_name: group_spec for layer_name in group.layer_names}
-            )
+        layer_specs = group.layer_kv_cache_specs or {}
+        for layer_name in group.layer_names:
+            layer_to_spec[layer_name] = layer_specs.get(layer_name, group.kv_cache_spec)
     return layer_to_spec
 
 
@@ -140,184 +145,39 @@ def is_mla_cache_layer(
     return isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
 
 
-def _spec_dim_matches(value: int, expected: int | None) -> bool:
-    return expected is None or value == expected
-
-
-def _kernel_layout_matches(
-    spec: KVCacheSpec, kernel_block_size: int, num_kv_heads: int, head_dim: int
-) -> bool:
-    if kernel_block_size <= 0 or spec.block_size % kernel_block_size != 0:
-        return False
-    return _spec_dim_matches(
-        num_kv_heads, getattr(spec, "num_kv_heads", None)
-    ) and _spec_dim_matches(head_dim, getattr(spec, "head_size", None))
-
-
-def _select_kernel_block_layout(
-    layer_name: str, shape: torch.Size, spec: KVCacheSpec
-) -> tuple[int, int, int]:
-    axis2_matches = _kernel_layout_matches(spec, shape[2], shape[3], shape[4])
-    axis3_matches = _kernel_layout_matches(spec, shape[3], shape[2], shape[4])
-
-    if axis2_matches and axis3_matches and shape[2] != shape[3]:
-        raise ValueError(
-            f"Ambiguous MoRIIO kernel-block K/V cache shape for layer "
-            f"{layer_name}: {tuple(shape)}"
-        )
-    if axis2_matches:
-        return shape[2], shape[3], shape[4]
-    if axis3_matches:
-        return shape[3], shape[2], shape[4]
-
-    raise ValueError(
-        f"Unsupported MoRIIO K/V cache shape for layer {layer_name}: "
-        f"{tuple(shape)} does not contain block size {spec.block_size}"
-    )
-
-
 def get_layer_transfer_geometry(
     layer_name: str,
     kv_cache: torch.Tensor,
     layer_to_spec: Mapping[str, KVCacheSpec],
-    remote_num_blocks: int | None = None,
 ) -> LayerTransferGeometry:
-    spec = layer_to_spec[layer_name]
+    """Row geometry of a layer's large-page kernel-block view.
+
+    Every attention layer view is the standardized ``[K, H, N, C]``: K kernel
+    rows of the group's row grid (one row per kernel block), strided by the
+    group's row bytes. Manager block ids do not address it directly; expand
+    them with ``expand_block_kernel_rows``.
+    """
+    spec = layer_to_spec.get(layer_name)
+    if spec is None:
+        raise ValueError(f"Missing KV cache spec for layer {layer_name}")
     shape = kv_cache.shape
     stride = kv_cache.stride()
     element_size = kv_cache.element_size()
-    is_mla_cache = is_mla_cache_layer(layer_to_spec, layer_name)
-
-    if not is_mla_cache and len(shape) == 5 and shape[0] == 2:
-        _, num_blocks = shape[:2]
-        kernel_blocks_per_block = 1
-        if shape[2] == spec.block_size:
-            block_size, num_kv_heads, head_dim = shape[2:]
-        elif shape[3] == spec.block_size:
-            num_kv_heads, block_size, head_dim = shape[2:]
-        else:
-            kernel_num_blocks = num_blocks
-            kernel_block_size, num_kv_heads, head_dim = _select_kernel_block_layout(
-                layer_name, shape, spec
-            )
-            kernel_blocks_per_block = spec.block_size // kernel_block_size
-            if kernel_num_blocks % kernel_blocks_per_block != 0:
-                raise ValueError(
-                    f"Unsupported MoRIIO K/V cache shape for layer {layer_name}: "
-                    f"{tuple(shape)} has {kernel_num_blocks} kernel blocks, "
-                    f"not divisible by {kernel_blocks_per_block}"
-                )
-            num_blocks = kernel_num_blocks // kernel_blocks_per_block
-            block_size = spec.block_size
-        slot_size_bytes = num_kv_heads * head_dim * element_size
-        block_len = block_size * slot_size_bytes
-        return LayerTransferGeometry(
-            num_blocks=num_blocks,
-            block_size=block_size,
-            block_len=block_len,
-            slot_size_bytes=slot_size_bytes,
-            block_stride=stride[1] * kernel_blocks_per_block,
-            local_kv_stride=stride[0],
-            remote_kv_stride=(
-                stride[1] * kernel_blocks_per_block * (remote_num_blocks or num_blocks)
-            ),
-            transfers_per_block=2,
-            regions_per_block=1,
-            split_kv_regions=True,
-        )
-
-    if not is_mla_cache and len(shape) == 5 and shape[1] == 2:
-        num_blocks = shape[0]
-        if shape[2] == spec.block_size:
-            block_size, num_kv_heads, head_dim = shape[2:]
-            slot_size_bytes = num_kv_heads * head_dim * element_size
-            block_len = block_size * slot_size_bytes
-            return LayerTransferGeometry(
-                num_blocks=num_blocks,
-                block_size=block_size,
-                block_len=block_len,
-                slot_size_bytes=slot_size_bytes,
-                block_stride=stride[0],
-                local_kv_stride=stride[1],
-                remote_kv_stride=stride[1],
-                transfers_per_block=2,
-                regions_per_block=2,
-                split_kv_regions=False,
-            )
-        elif shape[3] == spec.block_size:
-            num_kv_heads, block_size, head_dim = shape[2:]
-        else:
-            kernel_num_blocks = num_blocks
-            kernel_block_size, _, _ = _select_kernel_block_layout(
-                layer_name, shape, spec
-            )
-            kernel_blocks_per_block = spec.block_size // kernel_block_size
-            if kernel_num_blocks % kernel_blocks_per_block != 0:
-                raise ValueError(
-                    f"Unsupported MoRIIO K/V cache shape for layer {layer_name}: "
-                    f"{tuple(shape)} has {kernel_num_blocks} kernel blocks, "
-                    f"not divisible by {kernel_blocks_per_block}"
-                )
-            num_blocks = kernel_num_blocks // kernel_blocks_per_block
-            block_size = spec.block_size
-            block_stride = stride[0] * kernel_blocks_per_block
-            block_len = block_stride * element_size
-            slot_size_bytes = block_len // block_size
-            return LayerTransferGeometry(
-                num_blocks=num_blocks,
-                block_size=block_size,
-                block_len=block_len,
-                slot_size_bytes=slot_size_bytes,
-                block_stride=block_stride,
-                local_kv_stride=None,
-                remote_kv_stride=None,
-                transfers_per_block=1,
-                regions_per_block=1,
-                split_kv_regions=False,
-            )
-        slot_size_bytes = num_kv_heads * head_dim * element_size
-        block_len = block_size * slot_size_bytes
-        return LayerTransferGeometry(
-            num_blocks=num_blocks,
-            block_size=block_size,
-            block_len=block_len,
-            slot_size_bytes=slot_size_bytes,
-            block_stride=stride[0],
-            local_kv_stride=stride[1],
-            remote_kv_stride=stride[1],
-            transfers_per_block=2,
-            regions_per_block=2,
-            split_kv_regions=False,
-        )
-
     if (
         isinstance(spec, AttentionSpec)
         and len(shape) == 4
         and shape[1] == spec.num_heads
-        and shape[2] == spec.num_states
         and shape[3] * element_size == spec.state_content_size_bytes
     ):
-        # Standardized per-layer [B, H, N, C] view (MLA is just H == 1).
-        num_blocks, num_heads, num_states, content_dim = shape
-        slot_size_bytes = num_heads * content_dim * element_size
-        block_len = num_states * slot_size_bytes
         return LayerTransferGeometry(
-            num_blocks=num_blocks,
-            block_size=spec.block_size,
-            block_len=block_len,
-            slot_size_bytes=slot_size_bytes,
-            block_stride=stride[0],
-            local_kv_stride=None,
-            remote_kv_stride=None,
-            transfers_per_block=1,
-            regions_per_block=1,
-            split_kv_regions=False,
+            num_rows=shape[0],
+            tokens_per_row=shape[2],
+            row_len=shape[1] * shape[2] * shape[3] * element_size,
+            row_stride=stride[0] * element_size,
         )
-
-    cache_kind = "MLA" if is_mla_cache else "K/V"
     raise ValueError(
-        f"Unsupported MoRIIO {cache_kind} cache shape for layer "
-        f"{layer_name}: {tuple(shape)}"
+        f"Unsupported MoRIIO KV cache shape for layer {layer_name}: "
+        f"{tuple(shape)}; large-page layer views must be [K, H, N, C]"
     )
 
 
@@ -371,21 +231,10 @@ def iter_layer_registration_regions(
         conv, ssm = kda_conv_ssm(kv_cache, spec)
         geom = get_mamba_transfer_geometry(conv, ssm)
         return [(conv, geom.conv_region_len), (ssm, geom.ssm_region_len)]
-    geometry = cast(
-        LayerTransferGeometry,
-        get_layer_transfer_geometry(layer_name, kv_cache, layer_to_spec),
-    )
-    region_len = geometry.num_blocks * geometry.regions_per_block * geometry.block_len
-    if geometry.regions_per_block == 1:
-        # Padded/interleaved pages stride past block_len: register the strided
-        # span, ending at the last block's bytes so it stays in-allocation.
-        block_stride_bytes = geometry.block_stride * kv_cache.element_size()
-        region_len = max(
-            region_len,
-            (geometry.num_blocks - 1) * block_stride_bytes + geometry.block_len,
-        )
-    if geometry.split_kv_regions:
-        return [(cache, region_len) for cache in kv_cache]
+    geometry = get_layer_transfer_geometry(layer_name, kv_cache, layer_to_spec)
+    # The strided span of every kernel row, ending at the last row's bytes so
+    # the region stays inside the shared pool allocation.
+    region_len = (geometry.num_rows - 1) * geometry.row_stride + geometry.row_len
     return [(kv_cache, region_len)]
 
 
@@ -419,16 +268,32 @@ def merge_contiguous_offsets(
 
 
 def compute_block_transfer_offsets(
-    layer_name: str,
-    kv_cache: torch.Tensor,
-    layer_to_spec: Mapping[str, KVCacheSpec],
+    geometry: LayerTransferGeometry,
+    local_group: GroupGeometry,
+    local_num_blocks: int,
+    remote_group: GroupGeometry,
+    remote_num_blocks: int,
     local_block_ids: list[int],
     remote_block_ids: list[int],
-    remote_num_blocks: int,
     merge_fn: Callable[
         [list[int], list[int], list[int]], tuple[list[int], list[int], list[int]]
     ] = merge_contiguous_offsets,
 ) -> tuple[list[int], list[int], list[int]]:
+    """Byte offsets moving whole manager blocks of one layer between peers.
+
+    Manager block ids expand to kernel rows with each side's own group
+    geometry and pool size (a peer's row bytes and block count can
+    differ). Row ``k`` of the layer's registered region starts at
+    ``k * row stride`` and spans ``geometry.row_len`` bytes, so both sides
+    must split manager blocks into the same number of kernel rows for the
+    rows to pair 1:1.
+    """
+    if local_group.kernel_rows_per_block != remote_group.kernel_rows_per_block:
+        raise ValueError(
+            "MoRIIO peers split manager blocks into a different number of "
+            f"kernel rows: {local_group.kernel_rows_per_block} != "
+            f"{remote_group.kernel_rows_per_block}"
+        )
     # A shorter/empty local list transfers only what decode allocated (READ-mode
     # partial or full-prefix-hit); a longer local list is a genuine bug.
     if len(local_block_ids) > len(remote_block_ids):
@@ -436,60 +301,16 @@ def compute_block_transfer_offsets(
             "local_block_ids longer than remote_block_ids: "
             f"{len(local_block_ids)} > {len(remote_block_ids)}"
         )
-    geometry = cast(
-        LayerTransferGeometry,
-        get_layer_transfer_geometry(
-            layer_name, kv_cache, layer_to_spec, remote_num_blocks
-        ),
+    remote_block_ids = remote_block_ids[: len(local_block_ids)]
+    local_rows = expand_block_kernel_rows(
+        local_group, local_num_blocks, local_block_ids
     )
-    invalid_local = next(
-        (
-            block_id
-            for block_id in local_block_ids
-            if not 0 <= block_id < geometry.num_blocks
-        ),
-        None,
+    remote_rows = expand_block_kernel_rows(
+        remote_group, remote_num_blocks, remote_block_ids
     )
-    if invalid_local is not None:
-        raise ValueError(
-            f"local block id {invalid_local} is outside [0, {geometry.num_blocks})"
-        )
-    invalid_remote = next(
-        (
-            block_id
-            for block_id in remote_block_ids
-            if not 0 <= block_id < remote_num_blocks
-        ),
-        None,
-    )
-    if invalid_remote is not None:
-        raise ValueError(
-            f"remote block id {invalid_remote} is outside [0, {remote_num_blocks})"
-        )
-    element_size = kv_cache.element_size()
-    transfer_size_byte = geometry.block_len
-    per_block = geometry.transfers_per_block
-    total = len(local_block_ids) * per_block
-    offset_local = [0] * total
-    offset_remote = [0] * total
-    sizes = [transfer_size_byte] * total
-
-    w = 0
-    for lb, rb in zip(local_block_ids, remote_block_ids):
-        offset_local[w] = element_size * (lb * geometry.block_stride)
-        offset_remote[w] = element_size * (rb * geometry.block_stride)
-        w += 1
-        if per_block == 2:
-            assert geometry.local_kv_stride is not None
-            assert geometry.remote_kv_stride is not None
-            offset_local[w] = element_size * (
-                geometry.local_kv_stride + lb * geometry.block_stride
-            )
-            offset_remote[w] = element_size * (
-                geometry.remote_kv_stride + rb * geometry.block_stride
-            )
-            w += 1
-
+    offset_local = [row * geometry.row_stride for row in local_rows]
+    offset_remote = [row * remote_group.row_bytes for row in remote_rows]
+    sizes = [geometry.row_len] * len(local_rows)
     return merge_fn(offset_local, offset_remote, sizes)
 
 
@@ -557,8 +378,11 @@ def apply_mamba_offset_template(
 ) -> tuple[list[int], list[int], list[int]]:
     """Apply per-request slot bases to a cached ``MambaOffsetTemplate``.
 
-    Conv sub-projection entries (all slots) come first, followed by one ssm
-    entry per slot.
+    A "slot" here is a kernel row of the registered conv/ssm view: callers
+    expand the mamba group's manager block ids with
+    ``expand_block_kernel_rows`` (each side with its own group geometry)
+    first. Conv sub-projection entries (all slots) come first, followed by
+    one ssm entry per slot.
     """
     if len(local_slots) != len(remote_slots):
         raise ValueError(
@@ -575,9 +399,6 @@ def apply_mamba_offset_template(
     invalid_remote = next((slot for slot in remote_slots if slot < 0), None)
     if invalid_remote is not None:
         raise ValueError(f"remote mamba slot {invalid_remote} must be non-negative")
-    # The peer's KDA slot count is not part of MoRIIOAgentMetadata yet. Do not
-    # compare remote slot IDs against the local pool size: two otherwise
-    # compatible engines may reserve different numbers of slots.
     local_offs: list[int] = []
     remote_offs: list[int] = []
     sizes: list[int] = []
@@ -618,9 +439,12 @@ def compute_mamba_conv_split_count(
 class HeadLayout(NamedTuple):
     """Byte addressing of one attention layer's KV heads in its region.
 
-    Offsets are relative to the layer's registered region. ``plane_offsets``
-    holds the start of the K and V planes when they are stored apart, or
-    ``(0,)`` when K and V are packed into each head's content.
+    Offsets are relative to the layer's registered region and rows are
+    addressed by kernel row id (``block_stride`` is the group's row stride);
+    expand manager block ids with ``expand_block_kernel_rows`` first.
+    ``plane_offsets`` holds the start of the K and V planes when they are
+    stored apart, or ``(0,)`` when K and V are packed into each head's
+    content.
     """
 
     num_heads: int
@@ -663,43 +487,17 @@ def get_layer_head_layout(
     kv_cache: torch.Tensor,
     layer_to_spec: Mapping[str, KVCacheSpec],
 ) -> HeadLayout:
-    """Describe where each KV head of a block lives, from the cache strides."""
+    """Describe where each KV head of a kernel row lives, from the strides."""
     spec = layer_to_spec.get(layer_name)
     if spec is None:
         raise ValueError(f"Missing KV cache spec for layer {layer_name}")
     shape = kv_cache.shape
     stride = kv_cache.stride()
     element_size = kv_cache.element_size()
-    if not is_mla_cache_layer(layer_to_spec, layer_name) and len(shape) == 5:
-        if shape[0] == 2:
-            plane_axis, block_axis = 0, 1
-        elif shape[1] == 2:
-            plane_axis, block_axis = 1, 0
-        else:
-            raise ValueError(f"Unsupported K/V cache shape {tuple(shape)}")
-        if shape[2] == spec.block_size:
-            token_axis, head_axis = 2, 3
-        elif shape[3] == spec.block_size:
-            token_axis, head_axis = 3, 2
-        else:
-            raise ValueError(
-                f"MoRIIO cannot slice KV heads of layer {layer_name}: kernel "
-                f"blocks {tuple(shape)} split the {spec.block_size}-token block"
-            )
-        return HeadLayout(
-            num_heads=shape[head_axis],
-            num_tokens=shape[token_axis],
-            head_bytes=shape[4] * element_size,
-            block_stride=stride[block_axis] * element_size,
-            head_stride=stride[head_axis] * element_size,
-            token_stride=stride[token_axis] * element_size,
-            plane_offsets=(0, stride[plane_axis] * element_size),
-        )
     if (
         isinstance(spec, AttentionSpec)
         and len(shape) == 4
         and shape[1] == spec.num_heads
-        and shape[2] == spec.num_states
         and shape[3] * element_size == spec.state_content_size_bytes
     ):
         return HeadLayout(
@@ -758,8 +556,8 @@ def _element_runs(
 def compute_head_slice_offsets(
     local: HeadLayout,
     remote: HeadLayout,
-    local_block_ids: list[int],
-    remote_block_ids: list[int],
+    local_row_ids: list[int],
+    remote_row_ids: list[int],
     local_head: int,
     remote_head: int,
     num_heads: int,
@@ -767,11 +565,12 @@ def compute_head_slice_offsets(
         [list[int], list[int], list[int]], tuple[list[int], list[int], list[int]]
     ] = merge_contiguous_offsets,
 ) -> tuple[list[int], list[int], list[int]]:
-    """Offsets copying ``num_heads`` heads of each local block into a remote one.
+    """Offsets copying ``num_heads`` heads of each local row into a remote one.
 
     Local heads ``[local_head, local_head + num_heads)`` land on remote heads
     ``[remote_head, remote_head + num_heads)``; every other remote head is
-    left for the producer rank that holds it.
+    left for the producer rank that holds it. Rows are kernel rows; expand
+    manager block ids with ``expand_block_kernel_rows`` first.
     """
     if (
         local.num_tokens != remote.num_tokens
@@ -779,7 +578,7 @@ def compute_head_slice_offsets(
         or len(local.plane_offsets) != len(remote.plane_offsets)
     ):
         raise ValueError(
-            "MoRIIO head slicing needs the same block size, head size and K/V "
+            "MoRIIO head slicing needs the same row length, head size and K/V "
             f"planes on both sides, got local {local} and remote {remote}"
         )
     if not (
@@ -793,10 +592,10 @@ def compute_head_slice_offsets(
             f"[{remote_head}, {remote_head + num_heads}) is outside "
             f"{local.num_heads} / {remote.num_heads} heads"
         )
-    if len(local_block_ids) > len(remote_block_ids):
+    if len(local_row_ids) > len(remote_row_ids):
         raise ValueError(
-            "local_block_ids longer than remote_block_ids: "
-            f"{len(local_block_ids)} > {len(remote_block_ids)}"
+            "local_row_ids longer than remote_row_ids: "
+            f"{len(local_row_ids)} > {len(remote_row_ids)}"
         )
     local_kind, local_runs = _head_runs(local, local_head, num_heads)
     remote_kind, remote_runs = _head_runs(remote, remote_head, num_heads)
@@ -810,7 +609,7 @@ def compute_head_slice_offsets(
     offset_remote: list[int] = []
     sizes: list[int] = []
     for local_plane, remote_plane in zip(local.plane_offsets, remote.plane_offsets):
-        for lb, rb in zip(local_block_ids, remote_block_ids):
+        for lb, rb in zip(local_row_ids, remote_row_ids):
             local_base = local_plane + lb * local.block_stride
             remote_base = remote_plane + rb * remote.block_stride
             for (local_off, size), (remote_off, _) in zip(local_runs, remote_runs):
@@ -885,9 +684,12 @@ def compute_mamba_slice_offsets(
 ) -> tuple[list[int], list[int], list[int], int]:
     """(local, remote, sizes, n_conv) moving one target's share of the state.
 
-    Entries ``[:n_conv]`` address the conv region; the rest the SSM region.
-    Each conv sub-projection and the SSM state are sharded across TP ranks
-    independently, so each is sliced or gathered on its own.
+    ``local_slots``/``remote_slots`` are kernel rows of the registered
+    conv/ssm views; expand manager block ids with
+    ``expand_block_kernel_rows`` first. Entries ``[:n_conv]`` address the conv
+    region; the rest the SSM region. Each conv sub-projection and the SSM
+    state are sharded across TP ranks independently, so each is sliced or
+    gathered on its own.
     """
     if len(local_slots) != len(remote_slots):
         raise ValueError(

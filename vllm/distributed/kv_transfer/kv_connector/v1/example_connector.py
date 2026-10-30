@@ -8,13 +8,14 @@ import safetensors
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.utils import group_slot_mapping
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.hashing import safe_hash
 from vllm.v1.attention.backend import AttentionMetadata
@@ -33,8 +34,9 @@ logger = init_logger(__name__)
 class ReqMeta:
     # Request tokens
     token_ids: torch.Tensor
-    # Slot mappings, should have the same length as token_ids
-    slot_mapping: torch.Tensor
+    # Slot mappings per KV cache group, indexed by group id; each has the
+    # same length as token_ids.
+    slot_mappings: list[torch.Tensor]
     # Is store or load
     is_store: bool
     mm_hashes: list[str]
@@ -42,24 +44,26 @@ class ReqMeta:
     @staticmethod
     def make_meta(
         token_ids: list[int],
-        block_ids: list[int],
+        block_ids: tuple[list[int], ...],
         block_size: int,
+        kv_cache_config: "KVCacheConfig",
         is_store: bool,
         mm_hashes: list[str],
     ) -> "ReqMeta":
         valid_num_tokens = align_to_block_size(len(token_ids), block_size)
         token_ids_tensor = torch.tensor(token_ids)[:valid_num_tokens]
-        block_ids_tensor = torch.tensor(block_ids)
-        num_blocks = block_ids_tensor.shape[0]
-        block_offsets = torch.arange(0, block_size)
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids_tensor.reshape((num_blocks, 1)) * block_size
-        )
-        slot_mapping = slot_mapping.flatten()[:valid_num_tokens]
+        slot_mappings = []
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            slot_mappings.append(
+                group_slot_mapping(
+                    group.kv_cache_spec.block_size,
+                    block_ids[group_id],
+                    valid_num_tokens,
+                )
+            )
         return ReqMeta(
             token_ids=token_ids_tensor,
-            slot_mapping=slot_mapping,
+            slot_mappings=slot_mappings,
             is_store=is_store,
             mm_hashes=mm_hashes,
         )
@@ -72,17 +76,20 @@ class ExampleConnectorMetadata(KVConnectorMetadata):
     def add_request(
         self,
         token_ids: list[int],
-        block_ids: list[int],
+        block_ids: tuple[list[int], ...],
         block_size: int,
+        kv_cache_config: "KVCacheConfig",
         is_store: bool,
         mm_hashes: list[str],
     ) -> None:
         self.requests.append(
-            ReqMeta.make_meta(token_ids, block_ids, block_size, is_store, mm_hashes)
+            ReqMeta.make_meta(
+                token_ids, block_ids, block_size, kv_cache_config, is_store, mm_hashes
+            )
         )
 
 
-class ExampleConnector(KVConnectorBase_V1):
+class ExampleConnector(KVConnectorBase_V1, SupportsHMA):
     # NOTE: This is Simple debug implementation of the KV connector.
     # It save / load the KV cache to / from the disk.
     # It does extra work which will overwrite the existing prefix-cache in GPU
@@ -104,6 +111,12 @@ class ExampleConnector(KVConnectorBase_V1):
         self._storage_path = self._kv_transfer_config.get_from_extra_config(
             "shared_storage_path", "/tmp"
         )
+        # Layer name -> KV cache group id, to pick each layer's slot mapping.
+        self._layer_to_group_id = {
+            layer_name: group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+        }
         logger.info(self._kv_transfer_config)
         logger.info("Shared storage path is %s", self._storage_path)
 
@@ -125,18 +138,16 @@ class ExampleConnector(KVConnectorBase_V1):
             dst_kv_cache_layer: torch.Tensor,
             src_kv_cache: torch.Tensor,
             slot_mapping: torch.Tensor,
-            attn_metadata: AttentionMetadata,
         ) -> None:
             """Inject the KV cache into the layer.
 
             Args:
-                dst_kv_cache_layer (torch.Tensor): the destination KV cache layer,
-                    a standardized [B, H, N, C] per-layer view (H == 1 for MLA).
+                dst_kv_cache_layer (torch.Tensor): the destination KV cache
+                    layer, a [num_rows, H, kernel_block_size, C] per-layer
+                    view (H == 1 for MLA).
                 src_kv_cache (torch.Tensor): the source KV cache.
                 slot_mapping (torch.Tensor): the slot mapping. In shape
                     [num_tokens].
-                attn_metadata (AttentionMetadata): attention metadata for the
-                    current forward pass.
 
             """
             # Deliberate bulk transfers in this reference connector.
@@ -144,16 +155,10 @@ class ExampleConnector(KVConnectorBase_V1):
                 slot_mapping = slot_mapping.to(
                     dst_kv_cache_layer.device, non_blocking=True
                 )
-            if isinstance(attn_metadata, MLACommonMetadata):
-                # [B, 1, N, C] -> [B * N, C]; slot_mapping indexes B * N slots.
-                dst_kv_cache_layer = dst_kv_cache_layer.reshape(
-                    -1, dst_kv_cache_layer.shape[-1]
-                )
-                dst_kv_cache_layer[slot_mapping, ...] = src_kv_cache
-            else:
-                block_idxs = slot_mapping // self._block_size
-                offsets = slot_mapping % self._block_size
-                dst_kv_cache_layer[block_idxs, :, offsets] = src_kv_cache
+            kernel_block_size = dst_kv_cache_layer.shape[2]
+            block_idxs = slot_mapping // kernel_block_size
+            offsets = slot_mapping % kernel_block_size
+            dst_kv_cache_layer[block_idxs, :, offsets] = src_kv_cache
 
         # Get the metadata
         metadata: KVConnectorMetadata = self._get_connector_metadata()
@@ -170,7 +175,7 @@ class ExampleConnector(KVConnectorBase_V1):
                 continue
             logger.info(
                 "Inject KV cache of %d tokens to the paged memory",
-                len(request.slot_mapping),
+                len(request.token_ids),
             )
             for layer_name in forward_context.no_compile_layers:
                 layer = forward_context.no_compile_layers[layer_name]
@@ -190,11 +195,11 @@ class ExampleConnector(KVConnectorBase_V1):
                     kv_cache_cpu = safetensors.torch.load_file(filename)["kv_cache"]
                     kv_cache = kv_cache_cpu.to(kv_cache_layer.device, non_blocking=True)
                 if isinstance(attn_metadata, dict):
+                    group_id = self._layer_to_group_id[layer_name]
                     inject_kv_into_layer(
                         kv_cache_layer,
                         kv_cache,
-                        request.slot_mapping,
-                        attn_metadata[layer_name],
+                        request.slot_mappings[group_id],
                     )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -234,16 +239,15 @@ class ExampleConnector(KVConnectorBase_V1):
         ) -> torch.Tensor:
             """Extract the KV cache from the layer.
 
-            The layer is a standardized [B, H, N, C] per-layer view (H == 1 for MLA).
+            The layer is a [num_rows, H, kernel_block_size, C] per-layer view
+            (H == 1 for MLA).
             """
             # Deliberate bulk transfer in this reference connector.
             with gpu_sync_allowed():
                 slot_mapping = slot_mapping.to(layer.device, non_blocking=True)
-            if isinstance(attn_metadata, MLACommonMetadata):
-                # [B, 1, N, C] -> [B * N, C]; slot_mapping indexes B * N slots.
-                return layer.reshape(-1, layer.shape[-1])[slot_mapping, ...]
-            block_idxs = slot_mapping // self._block_size
-            offsets = slot_mapping % self._block_size
+            kernel_block_size = layer.shape[2]
+            block_idxs = slot_mapping // kernel_block_size
+            offsets = slot_mapping % kernel_block_size
             return layer[block_idxs, :, offsets]
 
         connector_metadata = self._get_connector_metadata()
@@ -253,7 +257,10 @@ class ExampleConnector(KVConnectorBase_V1):
                 filename = self._generate_filename_debug(
                     layer_name, request.token_ids, request.mm_hashes
                 )
-                kv_cache = extract_kv_from_layer(kv_layer, request.slot_mapping)
+                group_id = self._layer_to_group_id[layer_name]
+                kv_cache = extract_kv_from_layer(
+                    kv_layer, request.slot_mappings[group_id]
+                )
                 with gpu_sync_allowed():
                     tensors = {"kv_cache": kv_cache.detach().cpu()}
                 safetensors.torch.save_file(tensors, filename)
@@ -309,6 +316,14 @@ class ExampleConnector(KVConnectorBase_V1):
         if num_external_tokens > 0:
             self._requests_need_load[request.request_id] = request
 
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        # This connector keeps no per-block state; blocks are freed at once.
+        return False, None
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -331,8 +346,9 @@ class ExampleConnector(KVConnectorBase_V1):
             if new_req.req_id in self._requests_need_load:
                 meta.add_request(
                     token_ids=token_ids,
-                    block_ids=new_req.block_ids[0],
+                    block_ids=new_req.block_ids,
                     block_size=self._block_size,
+                    kv_cache_config=self._kv_cache_config,
                     is_store=False,
                     mm_hashes=mm_hashes,
                 )
@@ -345,8 +361,9 @@ class ExampleConnector(KVConnectorBase_V1):
                 if not self._found_match_for_prompt(token_ids, mm_hashes):
                     meta.add_request(
                         token_ids=token_ids,
-                        block_ids=new_req.block_ids[0],
+                        block_ids=new_req.block_ids,
                         block_size=self._block_size,
+                        kv_cache_config=self._kv_cache_config,
                         is_store=True,
                         mm_hashes=mm_hashes,
                     )
@@ -371,12 +388,12 @@ class ExampleConnector(KVConnectorBase_V1):
             # NOTE(rob): For resumed req, new_block_ids is all
             # of the block_ids for the request.
             assert new_block_ids is not None
-            block_ids = new_block_ids[0]
 
             meta.add_request(
                 token_ids=token_ids,
-                block_ids=block_ids,
+                block_ids=new_block_ids,
                 block_size=self._block_size,
+                kv_cache_config=self._kv_cache_config,
                 is_store=False,
                 mm_hashes=[f.identifier for f in request.mm_features],
             )

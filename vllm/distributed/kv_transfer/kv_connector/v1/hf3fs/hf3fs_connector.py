@@ -31,10 +31,12 @@ import numpy as np
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.utils import group_pool_storage
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_metadata_server import (
     Hf3fsGlobalMetadataClient as Hf3fsMetadataClient,
@@ -115,6 +117,9 @@ class AsyncOperationManager:
         self._save_futures: dict[str, list[Future]] = {}
         self._load_futures: dict[str, Future] = {}
         self._pending_finished_requests: set[str] = set()
+        # (group_id, block_id) pairs whose load failed; written by the load
+        # thread, drained by the main thread (thread-safe, as in NIXL).
+        self._load_error_block_ids: queue.Queue[set[tuple[int, int]]] = queue.Queue()
 
         # Initialize resources
         self._init_cuda_resources()
@@ -165,8 +170,14 @@ class AsyncOperationManager:
         self._save_thread.start()
         self._load_thread.start()
 
-    def submit_save_operation(self, request_id: str, block_ids, block_hashes) -> Future:
-        """Submit a save operation for async execution."""
+    def submit_save_operation(
+        self, request_id: str, block_ids: list[list[int]], block_hashes
+    ) -> Future:
+        """Submit a save operation for async execution.
+
+        ``block_ids[i][g]`` is the manager block of token block ``i`` in
+        group ``g``.
+        """
         future: Future[Any] = Future()
         main_stream_event = torch.cuda.Event()
         main_stream_event.record()
@@ -178,8 +189,14 @@ class AsyncOperationManager:
         self._save_futures[request_id].append(future)
         return future
 
-    def submit_load_operation(self, request_id: str, block_ids, block_hashes) -> Future:
-        """Submit a load operation for async execution."""
+    def submit_load_operation(
+        self, request_id: str, block_ids: list[list[int]], block_hashes
+    ) -> Future:
+        """Submit a load operation for async execution.
+
+        ``block_ids[i][g]`` is the manager block of token block ``i`` in
+        group ``g``; id 0 marks positions the group does not hold.
+        """
         future: Future[Any] = Future()
         task = (request_id, block_ids, block_hashes, future)
         self._load_queue.put(task)
@@ -360,15 +377,17 @@ class AsyncOperationManager:
             )
 
             if any(idx is None for idx in page_indices):
-                return self._fail_task("Loaded", "Blocks not found", request_id, future)
+                return self._fail_load_task(
+                    "Blocks not found", request_id, block_ids, future
+                )
 
             # Allocate read buffer
             buffers = self._load_buffer_allocator.alloc_buffer(len(block_ids))
             if buffers is None:
-                return self._fail_task(
-                    "Loaded",
+                return self._fail_load_task(
                     f"Buffer allocation failed for {len(block_ids)} blocks",
                     request_id,
+                    block_ids,
                     future,
                 )
 
@@ -393,8 +412,8 @@ class AsyncOperationManager:
 
             if not read_success:
                 self._load_buffer_allocator.free_buffer(buffers)
-                return self._fail_task(
-                    "Loaded", "Read operation failed", request_id, future
+                return self._fail_load_task(
+                    "Read operation failed", request_id, block_ids, future
                 )
 
             # Step3: Scatter data back to KV cache
@@ -412,9 +431,41 @@ class AsyncOperationManager:
         except Exception as e:
             if buffers is not None:
                 self._load_buffer_allocator.free_buffer(buffers)
-            return self._fail_task(
-                "Loaded", f"Task execution error: {e}", request_id, future
+            return self._fail_load_task(
+                f"Task execution error: {e}", request_id, block_ids, future
             )
+
+    def _fail_load_task(
+        self,
+        error_msg: str,
+        request_id: str,
+        block_ids: list[list[int]],
+        future: Future,
+    ) -> None:
+        """Fail a load task and mark its target blocks invalid for recompute.
+
+        Id 0 is a group's null block: the group intentionally holds nothing
+        there, so only real blocks are reported.
+        """
+        self._load_error_block_ids.put(
+            {
+                (group_id, block_id)
+                for ids in block_ids
+                for group_id, block_id in enumerate(ids)
+                if block_id != 0
+            }
+        )
+        self._fail_task("Loaded", error_msg, request_id, future)
+
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
+        """Return and clear the (group_id, block_id) pairs whose load failed."""
+        result: set[tuple[int, int]] = set()
+        while not self._load_error_block_ids.empty():
+            try:
+                result.update(self._load_error_block_ids.get_nowait())
+            except Empty:
+                break
+        return result
 
     def _fail_task(
         self, operation: str, error_msg: str, request_id: str, future: Future
@@ -463,7 +514,28 @@ class AsyncOperationManager:
 # ============================================================================
 
 
-class HF3FSKVConnector(KVConnectorBase_V1):
+@dataclass
+class _GroupCacheGeometry:
+    """Per-group strided-view geometry for the gather/scatter kernels.
+
+    Every layer view of a group is a strided ``[K, H, N, C]`` view over the
+    group's shared backing storage: ``K`` kernel rows of ``row_bytes`` pack
+    all layers of the group, and manager block ``b`` covers the
+    ``kernel_rows_per_block`` rows from ``b * kernel_rows_per_block``.
+    """
+
+    ptrs: torch.Tensor  # per-layer view base pointers
+    strides: tuple[int, ...]  # element strides of each layer view
+    num_heads: int
+    kernel_block_size: int  # tokens per kernel row (N)
+    content_dim: int
+    total_tokens: int  # K * N
+    # The group's segment in one storage page buffer.
+    segment_offset: int  # in elements
+    segment_numel: int
+
+
+class HF3FSKVConnector(KVConnectorBase_V1, SupportsHMA):
     """HF3FS KV Connector implementation."""
 
     def __init__(
@@ -482,6 +554,14 @@ class HF3FSKVConnector(KVConnectorBase_V1):
         self._block_size = vllm_config.cache_config.block_size
         self._use_mla = vllm_config.model_config.use_mla
         self._model_config = vllm_config.model_config
+        self._num_groups = len(kv_cache_config.kv_cache_groups)
+        # Block ids of different groups are index-aligned by token block only
+        # when every group works at the global block size B (e.g. not
+        # DCP-sharded groups at B // dcp_size).
+        assert all(
+            group.kv_cache_spec.block_size == self._block_size
+            for group in kv_cache_config.kv_cache_groups
+        ), "HF3FS requires every KV cache group at the global block size"
 
         logger.info("Using MLA: %s", self._use_mla)
 
@@ -527,49 +607,70 @@ class HF3FSKVConnector(KVConnectorBase_V1):
     ############################################################
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        self._kv_caches = kv_caches
-        self._setup_kv_cache_config()
+        self._setup_kv_cache_config(kv_caches)
         self._setup_storage_clients()
         self._async_manager = AsyncOperationManager(self)
 
-    def _setup_kv_cache_config(self):
-        first_cache = next(iter(self._kv_caches.values()))
+    def _setup_kv_cache_config(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Derive per-group gather/scatter geometry from the layer views.
+
+        Layers of a group share one backing allocation: each layer view is a
+        strided ``[K, H, N, C]`` view whose row stride packs all layers of the
+        group. One storage page holds one manager block of every local group,
+        so ``bytes_per_page`` sums the per-group segments. Groups with no
+        local layers (PP) are skipped.
+        """
+        config = self._kv_cache_config
+        first_cache = next(iter(kv_caches.values()))
         self._device = first_cache.device
         self._dtype = first_cache.dtype
         element_size = first_cache.element_size()
 
-        # Standardized per-layer [B, H, N, C] view; MLA is just H == 1 with the
-        # latent vector as the content dim.
-        assert len(first_cache.shape) == 4, (
-            f"expected a [B, H, N, C] KV cache view, got {tuple(first_cache.shape)}"
-        )
-        num_blocks, num_heads, block_size, content_dim = first_cache.shape
-        cache_strides = first_cache.stride()
-        assert all(
-            cache.shape == first_cache.shape and cache.stride() == cache_strides
-            for cache in self._kv_caches.values()
-        ), "HF3FS requires uniform KV cache shapes and strides."
+        self._group_geometry: list[_GroupCacheGeometry | None] = []
+        segment_offset = 0
+        for group_id, group in enumerate(config.kv_cache_groups):
+            # The kernels address rows through the view's element strides
+            # while block ids map to rows through the config's pool geometry;
+            # the two must agree.
+            if group_pool_storage(kv_caches, config, group_id) is None:
+                self._group_geometry.append(None)
+                continue
+            views = [kv_caches[n] for n in group.layer_names if n in kv_caches]
+            first_view = views[0]
+            assert len(first_view.shape) == 4 and all(
+                v.shape == first_view.shape and v.stride() == first_view.stride()
+                for v in views
+            ), (
+                "HF3FS requires uniform [K, H, N, C] KV cache views within a "
+                f"group; group {group_id} got "
+                f"{[(tuple(v.shape), v.stride()) for v in views]}"
+            )
+            assert all(v.dtype == self._dtype for v in views), (
+                "HF3FS requires a uniform KV cache dtype across groups"
+            )
+            num_kernel_blocks, num_heads, _, content_dim = first_view.shape
+            kernel_block_size = group.kernel_block_size
+            segment_numel = len(views) * num_heads * self._block_size * content_dim
+            self._group_geometry.append(
+                _GroupCacheGeometry(
+                    ptrs=torch.tensor(
+                        [v.data_ptr() for v in views],
+                        dtype=torch.int64,
+                        device=self._device,
+                    ),
+                    strides=first_view.stride(),
+                    num_heads=num_heads,
+                    kernel_block_size=kernel_block_size,
+                    content_dim=content_dim,
+                    total_tokens=num_kernel_blocks * kernel_block_size,
+                    segment_offset=segment_offset,
+                    segment_numel=segment_numel,
+                )
+            )
+            segment_offset += segment_numel
 
-        self._local_total_tokens = num_blocks * block_size
-        self._local_block_size = block_size
-        self._num_heads = num_heads
-        self._content_dim = content_dim
-        self._kv_cache_strides = cache_strides
-
-        layer_block_size = num_heads * block_size * content_dim * element_size
-        self._bytes_per_page = layer_block_size * len(self._kv_caches)
-        self._shape_per_page = [
-            len(self._kv_caches),
-            num_heads,
-            block_size,
-            content_dim,
-        ]
-
-        self._kvcache_ptrs = torch.tensor(
-            [cache.data_ptr() for cache in self._kv_caches.values()],
-            dtype=torch.int64,
-            device=self._device,
-        )
+        self._bytes_per_page = segment_offset * element_size
+        self._shape_per_page = [segment_offset]
 
     def _setup_storage_clients(self):
         os.makedirs(self._storage_path, exist_ok=True)
@@ -623,13 +724,30 @@ class HF3FSKVConnector(KVConnectorBase_V1):
 
             skip_blocks = request.save_block_op.skip_leading_blocks
             block_hashes = self._generate_block_hashes(request.token_ids, skip_blocks)
-            block_ids = request.block_ids[skip_blocks : skip_blocks + len(block_hashes)]
+            num_blocks = len(block_hashes)
+            # Per token block, the manager block id of each group.
+            per_block_ids = [
+                [group_ids[i] for group_ids in request.block_ids]
+                for i in range(skip_blocks, skip_blocks + num_blocks)
+            ]
+            # A storage page holds one block of every local group, so a token
+            # block is saved only when every local group holds a real block for
+            # it (id 0 is the group's null block, e.g. a sliding-window skip).
+            local_groups = [
+                g for g, geom in enumerate(self._group_geometry) if geom is not None
+            ]
+            pairs = [
+                (ids, block_hash)
+                for ids, block_hash in zip(per_block_ids, block_hashes)
+                if all(ids[g] != 0 for g in local_groups)
+            ]
 
-            for i in range(0, len(block_ids), self._max_device_buffer_count):
-                batch_block_ids = block_ids[i : i + self._max_device_buffer_count]
-                batch_block_hashes = block_hashes[i : i + self._max_device_buffer_count]
+            for i in range(0, len(pairs), self._max_device_buffer_count):
+                batch = pairs[i : i + self._max_device_buffer_count]
                 self._async_manager.submit_save_operation(
-                    request.request_id, batch_block_ids, batch_block_hashes
+                    request.request_id,
+                    [ids for ids, _ in batch],
+                    [block_hash for _, block_hash in batch],
                 )
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -643,16 +761,20 @@ class HF3FSKVConnector(KVConnectorBase_V1):
                 continue
 
             load_op = request.load_block_op
-            block_ids = request.block_ids[: load_op.num_blocks_to_load]
+            num_blocks = load_op.num_blocks_to_load
+            per_block_ids = [
+                [group_ids[i] for group_ids in request.block_ids]
+                for i in range(num_blocks)
+            ]
             block_hashes = self._generate_block_hashes(
-                request.token_ids, load_op.num_computed_blocks, len(block_ids)
+                request.token_ids, load_op.num_computed_blocks, num_blocks
             )
 
-            for i in range(0, len(block_ids), self._max_device_buffer_count):
-                batch_block_ids = block_ids[i : i + self._max_device_buffer_count]
-                batch_block_hashes = block_hashes[i : i + self._max_device_buffer_count]
+            for i in range(0, num_blocks, self._max_device_buffer_count):
                 self._async_manager.submit_load_operation(
-                    request.request_id, batch_block_ids, batch_block_hashes
+                    request.request_id,
+                    per_block_ids[i : i + self._max_device_buffer_count],
+                    block_hashes[i : i + self._max_device_buffer_count],
                 )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -673,14 +795,20 @@ class HF3FSKVConnector(KVConnectorBase_V1):
             return self._async_manager.hf3fs_stats.clone_and_reset()
         return None
 
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
+        """(group_id, block_id) pairs whose load failed, for recompute."""
+        if not hasattr(self, "_async_manager"):
+            return set()
+        return self._async_manager.get_block_ids_with_load_errors()
+
     ############################################################
     # Scheduler Side Methods
     ############################################################
 
-    def request_finished(
+    def request_finished_all_groups(
         self,
         request: "Request",
-        block_ids: list[int],
+        block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         return True, None
 
@@ -701,7 +829,7 @@ class HF3FSKVConnector(KVConnectorBase_V1):
                 state.load_op = LoadBlockInfo(
                     num_computed_blocks=num_computed_tokens // self._block_size,
                     num_blocks_to_load=0,
-                    need_fetch_block_ids=[],
+                    need_fetch_block_ids=[[] for _ in range(self._num_groups)],
                 )
                 return 0, False
 
@@ -723,7 +851,7 @@ class HF3FSKVConnector(KVConnectorBase_V1):
             state.load_op = LoadBlockInfo(
                 num_computed_blocks=num_computed_tokens // self._block_size,
                 num_blocks_to_load=new_hit_tokens // self._block_size,
-                need_fetch_block_ids=[],
+                need_fetch_block_ids=[[] for _ in range(self._num_groups)],
             )
 
             logger.info(
@@ -766,10 +894,16 @@ class HF3FSKVConnector(KVConnectorBase_V1):
             f"expected {expected_blocks}, got {actual_blocks}"
         )
 
-        # Update load operation with allocated block IDs
+        # The load targets are the token blocks
+        # [num_computed_blocks, num_computed_blocks + actual_blocks) of every
+        # group; per-group lists are index-aligned and null-padded.
         if actual_blocks > 0:
-            local_block_ids = blocks.get_unhashed_block_ids()
-            state.load_op.need_fetch_block_ids.extend(local_block_ids)
+            block_ids_by_group = blocks.get_block_ids()
+            start = state.load_op.num_computed_blocks
+            for group_id, group_block_ids in enumerate(block_ids_by_group):
+                state.load_op.need_fetch_block_ids[group_id].extend(
+                    group_block_ids[start : start + actual_blocks]
+                )
             state.phase = "WAITING_TO_LOAD"
 
     def build_connector_meta(
@@ -809,7 +943,9 @@ class HF3FSKVConnector(KVConnectorBase_V1):
             state.token_ids = state.request.prompt_token_ids[
                 :num_tokens_to_compute
             ].copy()
-            state.allocated_block_ids = state.load_op.need_fetch_block_ids.copy()
+            state.allocated_block_ids = [
+                list(ids) for ids in state.load_op.need_fetch_block_ids
+            ]
 
             request_metadata = HF3FSRequestMetadata.from_scheduling_state(
                 state, self._block_size, state.load_op, num_cached_blocks
@@ -867,7 +1003,11 @@ class HF3FSKVConnector(KVConnectorBase_V1):
             ]
             new_block_ids = cached_reqs.new_block_ids[i]
 
-            state.update_tokens_and_blocks(new_token_ids, new_block_ids)
+            state.update_tokens_and_blocks(
+                new_token_ids,
+                new_block_ids,
+                replace_blocks=request_id in cached_reqs.resumed_req_ids,
+            )
 
             # Create save metadata
             request_metadata = HF3FSRequestMetadata.from_scheduling_state(
@@ -933,14 +1073,8 @@ class HF3FSKVConnector(KVConnectorBase_V1):
         self, state: RequestSchedulingState, request, num_tokens_to_compute: int
     ) -> None:
         """Initialize state from new request data."""
-        # Handle different block_ids formats in vLLM 0.9.0+
-        if isinstance(request.block_ids[0], list):
-            unfolded_block_ids = request.block_ids[0].copy()
-        else:
-            unfolded_block_ids = request.block_ids.copy()
-
         state.token_ids = request.prompt_token_ids[:num_tokens_to_compute].copy()
-        state.allocated_block_ids = unfolded_block_ids
+        state.allocated_block_ids = [list(ids) for ids in request.block_ids]
         state.num_saved_blocks = 0
 
     def _generate_block_hashes(
@@ -973,33 +1107,52 @@ class HF3FSKVConnector(KVConnectorBase_V1):
         return block_hashes
 
     def _gather_or_scatter_kv_caches(
-        self, block_ids: list[int], block_buffers, operation: str
+        self, block_ids: list[list[int]], block_buffers, operation: str
     ):
-        for buffer_tensor, block_id in zip(block_buffers, block_ids):
-            start_idx = block_id * self._local_block_size
-            token_indices = list(range(start_idx, start_idx + self._local_block_size))
-            if operation == "gather":
-                gather_scatter_helper.gather_kv_caches(
-                    self._kvcache_ptrs,
-                    self._local_total_tokens,
-                    buffer_tensor,
-                    token_indices,
-                    self._local_block_size,
-                    self._num_heads,
-                    self._content_dim,
-                    self._kv_cache_strides,
-                )
-            else:
-                gather_scatter_helper.scatter_kv_caches(
-                    self._kvcache_ptrs,
-                    self._local_total_tokens,
-                    buffer_tensor,
-                    token_indices,
-                    self._local_block_size,
-                    self._num_heads,
-                    self._content_dim,
-                    self._kv_cache_strides,
-                )
+        """Gather/scatter one storage page buffer per token block.
+
+        ``block_ids[i][g]`` is the manager block of token block ``i`` in
+        group ``g``; id 0 is the group's null block. Manager block ``b`` is
+        the token range ``[b * B, (b + 1) * B)`` of the group's layer views.
+        Each group's data lands in its own segment of the page buffer.
+        """
+        for group_id, geom in enumerate(self._group_geometry):
+            if geom is None:
+                continue
+            for buffer, ids in zip(block_buffers, block_ids):
+                block_id = ids[group_id]
+                if block_id == 0:
+                    # Saves filter out blocks with a null id before submit;
+                    # loads skip positions the group does not hold.
+                    assert operation == "scatter"
+                    continue
+                start = block_id * self._block_size
+                token_indices = list(range(start, start + self._block_size))
+                segment = buffer[
+                    geom.segment_offset : geom.segment_offset + geom.segment_numel
+                ].view(-1, geom.num_heads, self._block_size, geom.content_dim)
+                if operation == "gather":
+                    gather_scatter_helper.gather_kv_caches(
+                        geom.ptrs,
+                        geom.total_tokens,
+                        segment,
+                        token_indices,
+                        geom.kernel_block_size,
+                        geom.num_heads,
+                        geom.content_dim,
+                        geom.strides,
+                    )
+                else:
+                    gather_scatter_helper.scatter_kv_caches(
+                        geom.ptrs,
+                        geom.total_tokens,
+                        segment,
+                        token_indices,
+                        geom.kernel_block_size,
+                        geom.num_heads,
+                        geom.content_dim,
+                        geom.strides,
+                    )
 
     def _compute_prefix_hash(
         self, token_ids: list[int], previous_hash: str = ""
