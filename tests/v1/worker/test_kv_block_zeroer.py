@@ -11,6 +11,7 @@ from tests.v1.attention.utils import dense_kv_cache_views
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
+    GroupGeometry,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
@@ -32,8 +33,9 @@ def _large_page_two_group_config() -> KVCacheConfig:
     per block, row of 512 bytes.
     """
     return KVCacheConfig(
-        num_blocks=4,
+        num_pages=4,
         kv_cache_tensors=[],
+        block_size=8,
         kv_cache_groups=[
             KVCacheGroupSpec(
                 layer_names=["a.0"],
@@ -41,7 +43,7 @@ def _large_page_two_group_config() -> KVCacheConfig:
                     block_size=8, num_kv_heads=1, head_size=8, dtype=torch.float16
                 ),
                 num_blocks=5,
-                slots_per_large_page=1,
+                blocks_per_page=1,
                 kernel_rows_per_block=2,
                 row_bytes=1536,
             ),
@@ -55,12 +57,11 @@ def _large_page_two_group_config() -> KVCacheConfig:
                     sliding_window=16,
                 ),
                 num_blocks=32,
-                slots_per_large_page=8,
+                blocks_per_page=8,
                 kernel_rows_per_block=1,
                 row_bytes=512,
             ),
         ],
-        allocator="large_page",
         large_page_bytes=4096,
     )
 
@@ -77,7 +78,7 @@ def _large_page_zeroers(
     zeroers = []
     views = []
     for group_id, group in enumerate(cfg.kv_cache_groups):
-        num_rows = cfg.num_blocks * cfg.large_page_bytes // group.row_bytes
+        num_rows = cfg.num_pages * cfg.large_page_bytes // group.row_bytes
         row_el = group.row_bytes // 4
         view = torch.ones((num_rows, row_el), dtype=torch.int32, device=device)
         views.append(view)
@@ -90,8 +91,8 @@ def _large_page_zeroers(
                 ],
                 kernel_block_sizes=kernel_block_sizes,
                 static_forward_context={layer_name: SimpleNamespace(kv_cache=view)},
-                num_blocks=num_rows,
-                kernel_rows_per_block=group.kernel_rows_per_block,
+                num_rows=num_rows,
+                geometry=cfg.group_geometry(group_id),
             )
         )
     return zeroers, views
@@ -133,6 +134,38 @@ def test_large_page_zeroer_maps_manager_ids_to_kernel_rows(monkeypatch):
     assert uploaded[1].tolist() == [3, 19]
 
 
+def test_zeroer_dedups_same_address_keeps_wider_span():
+    """Two layer views sharing a base address (e.g. KV sharing) contribute one
+    segment whose page span is the widest of the overlays, so a newly
+    allocated block is fully zeroed for every overlaying layer."""
+    device = torch.device("cpu")
+    num_blocks = 4
+    backing = torch.ones((num_blocks, 8), dtype=torch.int32)
+    narrow = backing[:, :4]
+    assert narrow.data_ptr() == backing.data_ptr()
+    spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=8, dtype=torch.float16
+    )
+    zeroer = KVBlockZeroer(
+        device,
+        attn_groups_iter=[AttentionGroup(None, ["l0", "l1"], spec, 0)],
+        kernel_block_sizes=[4],
+        static_forward_context={
+            "l0": SimpleNamespace(kv_cache=narrow),
+            "l1": SimpleNamespace(kv_cache=backing),
+        },
+        num_rows=num_blocks,
+        geometry=GroupGeometry(1, 0),
+    )
+
+    assert zeroer._meta is not None
+    seg_addrs, seg_block_strides, seg_page_sizes, _, _, n_segs = zeroer._meta
+    assert n_segs == 1
+    assert seg_addrs.tolist() == [backing.data_ptr()]
+    assert seg_block_strides.tolist() == [8]
+    assert seg_page_sizes.tolist() == [8]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_large_page_zeroing_covers_only_allocated_rows():
     """Zeroing a block of one group zeroes exactly that group's kernel rows
@@ -155,7 +188,7 @@ def test_large_page_zeroing_covers_only_allocated_rows():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_large_page_zero_kernel_rows_covers_page_zero():
+def test_zero_null_page_covers_page_zero():
     """zero_null_page re-zeroes the reserved page 0 after dummy writes, per
     group on that group's kernel-row grid. Only rows fully inside page 0 are
     zeroed (floor): a row crossing the page end would extend into page 1,
@@ -167,7 +200,8 @@ def test_large_page_zero_kernel_rows_covers_page_zero():
     for view in views:
         view.fill_(7)
 
-    worker_utils.zero_null_page(zeroers, cfg)
+    for zeroer in zeroers:
+        zeroer.zero_null_page(cfg.large_page_bytes)
     torch.accelerator.synchronize()
 
     for group_id, (view, group) in enumerate(zip(views, cfg.kv_cache_groups)):
@@ -216,7 +250,8 @@ def test_attention_blocks_are_zeroed(spec):
         static_forward_context={
             layer_name: SimpleNamespace(kv_cache=storage),
         },
-        num_blocks=4,
+        num_rows=4,
+        geometry=GroupGeometry(1, 0),
     )
 
     zeroer.zero_block_ids([1])
@@ -225,56 +260,6 @@ def test_attention_blocks_are_zeroed(spec):
     expected = torch.ones_like(storage)
     expected[1] = 0
     assert torch.equal(storage, expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_layers_in_one_group_may_use_different_kernel_pages_per_block():
-    """Derive kernel pages per block from each layer's allocation."""
-    device = torch.device("cuda")
-    num_blocks = 4
-    spec = SlidingWindowSpec(
-        block_size=2,
-        num_kv_heads=1,
-        head_size=1,
-        dtype=torch.int32,
-        sliding_window=2,
-    )
-    # Two kernel pages per logical block.
-    wide = torch.ones((num_blocks * 2, 3), dtype=torch.int32, device=device)
-    # One kernel page per logical block, carved out of a larger allocation so
-    # an over-strided write lands in the guard region instead of faulting or
-    # silently hitting another tensor.
-    narrow_backing = torch.ones((num_blocks * 3, 5), dtype=torch.int32, device=device)
-    narrow = narrow_backing[:num_blocks]
-
-    zeroer = KVBlockZeroer(
-        device,
-        attn_groups_iter=[
-            AttentionGroup(
-                None,
-                ["wide", "narrow"],
-                spec,
-                0,
-            )
-        ],
-        kernel_block_sizes=[1],
-        static_forward_context={
-            "wide": SimpleNamespace(kv_cache=wide),
-            "narrow": SimpleNamespace(kv_cache=narrow),
-        },
-        num_blocks=num_blocks,
-    )
-
-    zeroer.zero_block_ids([num_blocks - 1])
-    torch.accelerator.synchronize()
-
-    expected_wide = torch.ones_like(wide)
-    expected_wide[2 * (num_blocks - 1) :] = 0
-    assert torch.equal(wide, expected_wide)
-
-    expected_narrow = torch.ones_like(narrow_backing)
-    expected_narrow[num_blocks - 1] = 0
-    assert torch.equal(narrow_backing, expected_narrow)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -288,7 +273,7 @@ def test_block_ids_are_not_overwritten_while_copy_is_in_flight():
     # in-flight copy behavior without constructing model attention groups.
     zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
     zeroer.device = device
-    zeroer.kernel_rows_per_block = 1
+    zeroer.geometry = GroupGeometry(1, 0)
     zeroer._meta = (
         torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
         torch.tensor([page_size_el], dtype=torch.int64, device=device),
@@ -327,7 +312,7 @@ def test_non_uniform_page_sizes():
 
     zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
     zeroer.device = device
-    zeroer.kernel_rows_per_block = 1
+    zeroer.geometry = GroupGeometry(1, 0)
 
     seg_page_sizes = [page_size_a, page_size_b]
     max_ps = max(seg_page_sizes)
@@ -373,7 +358,7 @@ def test_packed_segment_zeros_only_its_last_block_page():
 
     zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
     zeroer.device = device
-    zeroer.kernel_rows_per_block = 1
+    zeroer.geometry = GroupGeometry(1, 0)
     zeroer._meta = (
         torch.tensor(
             [backing.data_ptr() + page_offset_el * backing.element_size()],
@@ -423,7 +408,8 @@ def test_large_dsv4_launch_geometry(monkeypatch):
             name: SimpleNamespace(kv_cache=storage)
             for name, storage in storages.items()
         },
-        num_blocks=1,
+        num_rows=1,
+        geometry=GroupGeometry(1, 0),
     )
 
     assert zeroer._meta is not None
@@ -466,7 +452,7 @@ def test_warmup_compiles_for_all_block_counts():
 
     zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
     zeroer.device = device
-    zeroer.kernel_rows_per_block = 1
+    zeroer.geometry = GroupGeometry(1, 0)
     zeroer._meta = (
         torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
         torch.tensor([page_size_el], dtype=torch.int64, device=device),
@@ -504,7 +490,6 @@ def test_warmup_respects_available_block_count():
 
     zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
     zeroer.device = device
-    zeroer.kernel_rows_per_block = 1
     zeroer._meta = (
         torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
         torch.tensor([page_size_el], dtype=torch.int64, device=device),
@@ -551,7 +536,8 @@ def test_zeroes_exactly_one_block_per_layer(layout: KVCacheLayout):
         attn_groups_iter=iter(groups),
         kernel_block_sizes=[spec.block_size],
         static_forward_context=ctx,
-        num_blocks=num_blocks,
+        num_rows=num_blocks,
+        geometry=GroupGeometry(1, 0),
     )
     zeroer.zero_block_ids([2])
     torch.accelerator.synchronize()

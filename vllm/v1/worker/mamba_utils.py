@@ -23,7 +23,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -664,12 +663,8 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
     batch_memcpy_kernel[grid](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=BLOCK_SIZE)
 
 
-def _get_mamba_spec_for_layer(
-    kv_cache_group: KVCacheGroupSpec, layer_name: str
-) -> MambaSpec:
+def _get_mamba_spec(kv_cache_group: KVCacheGroupSpec) -> MambaSpec:
     kv_cache_spec = kv_cache_group.kv_cache_spec
-    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-        kv_cache_spec = kv_cache_spec.kv_cache_specs[layer_name]
     assert isinstance(kv_cache_spec, MambaSpec)
     return kv_cache_spec
 
@@ -690,12 +685,10 @@ def get_mamba_groups(kv_cache_config: KVCacheConfig) -> dict[MambaSpec, list[int
     mamba_groups: dict[MambaSpec, set[int]] = {}
     for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
         kv_cache_spec = kv_cache_group.kv_cache_spec
-        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-            kv_cache_spec = kv_cache_spec.first_spec
         if not isinstance(kv_cache_spec, MambaSpec):
             continue
         for layer_name in kv_cache_group.layer_names:
-            mamba_spec = _get_mamba_spec_for_layer(kv_cache_group, layer_name)
+            mamba_spec = _get_mamba_spec(kv_cache_group)
             mamba_groups.setdefault(mamba_spec, set()).add(i)
     assert len(mamba_groups) > 0, "no mamba layers in the model"
     return {spec: sorted(ids) for spec, ids in mamba_groups.items()}
@@ -746,9 +739,7 @@ class MambaCopyBuffers:
         entries_per_req = sum(
             len(
                 copy_funcs[
-                    _get_mamba_spec_for_layer(
-                        kv_cache_config.kv_cache_groups[gid], layer_name
-                    ).mamba_type
+                    _get_mamba_spec(kv_cache_config.kv_cache_groups[gid]).mamba_type
                 ]
             )
             for gid in mamba_group_ids
@@ -857,9 +848,7 @@ class MambaSpecDecodeGPUContext:
         total_states = sum(
             len(
                 copy_funcs_by_spec[
-                    _get_mamba_spec_for_layer(
-                        kv_cache_config.kv_cache_groups[gid], layer_name
-                    )
+                    _get_mamba_spec(kv_cache_config.kv_cache_groups[gid])
                 ]
             )
             for gid in mamba_group_ids
@@ -991,10 +980,10 @@ class MambaSpecDecodeGPUContext:
         idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             kv_cache_group = kv_cache_config.kv_cache_groups[mamba_group_id]
+            mamba_spec = _get_mamba_spec(kv_cache_group)
+            state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
             layer_names = kv_cache_group.layer_names
             for layer_name in layer_names:
-                mamba_spec = _get_mamba_spec_for_layer(kv_cache_group, layer_name)
-                state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
                 attention = forward_context[layer_name]
                 kv_caches: list[torch.Tensor] = attention.kv_cache
                 if len(kv_caches) < len(state_copy_funcs):
@@ -1365,10 +1354,10 @@ def collect_mamba_copy_meta(
         block_ids = req_state.block_ids[mamba_group_id]
         dest_block_id = block_ids[dest_block_idx]
         kv_cache_group = kv_cache_config.kv_cache_groups[mamba_group_id]
+        mamba_spec = _get_mamba_spec(kv_cache_group)
+        state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
         layer_names = kv_cache_group.layer_names
         for layer_name in layer_names:
-            mamba_spec = _get_mamba_spec_for_layer(kv_cache_group, layer_name)
-            state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
             attention = forward_context[layer_name]
             kv_caches: list[torch.Tensor] = attention.kv_cache
             for state, state_copy_func in zip(kv_caches, state_copy_funcs):

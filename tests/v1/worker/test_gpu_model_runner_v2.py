@@ -19,7 +19,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -99,7 +98,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner.vocab_size = 1
     runner.max_num_reqs = 1
     runner.max_num_tokens = 2
-    runner.device = torch.device("cuda")
+    runner.device = torch.device("cpu")
 
     raw_spec = CircularBufferSpec(
         block_size=8,
@@ -114,18 +113,13 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
         dtype=torch.bfloat16,
     )
     kv_cache_config = KVCacheConfig(
-        num_blocks=1,
+        num_pages=1,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(
-                layer_names=["raw"],
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=8,
-                    kv_cache_specs={"raw": raw_spec},
-                ),
-            ),
+            KVCacheGroupSpec(layer_names=["raw"], kv_cache_spec=raw_spec),
             KVCacheGroupSpec(layer_names=["compressed"], kv_cache_spec=compressed_spec),
         ],
+        block_size=compressed_spec.block_size,
     )
 
     class FakeAttnCGSupport:
@@ -194,12 +188,13 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
         num_speculative_blocks=num_speculative_blocks,
     )
     kv_cache_config = KVCacheConfig(
-        num_blocks=1,
+        num_pages=1,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(["attention"], full_attention_spec),
             KVCacheGroupSpec(["kda"], mamba_spec),
         ],
+        block_size=attention_block_size,
     )
     parallel_config = SimpleNamespace(
         decode_context_parallel_size=dcp_size,

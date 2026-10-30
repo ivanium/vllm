@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
@@ -33,7 +33,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
@@ -43,7 +42,6 @@ from vllm.v1.worker.utils import (
     allocate_kv_cache,
     bind_kv_cache_to_layers,
     customize_attention_spec,
-    map_kv_caches_to_kernel_blocks,
     prepare_kernel_block_sizes,
 )
 
@@ -152,7 +150,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 spec = replace(spec, is_draft=True)
             kv_cache_spec[layer_name] = spec
     if vllm_config.attention_config.hisparse_config is not None:
-        kv_cache_spec = resolve_hisparse_specs(vllm_config, kv_cache_spec, attn_layers)
+        kv_cache_spec = resolve_hisparse_specs(vllm_config, kv_cache_spec)
     return kv_cache_spec
 
 
@@ -247,8 +245,6 @@ def init_attn_backend(
                 )
 
             layer_kv_cache_spec: KVCacheSpec = kv_cache_group_spec.kv_cache_spec
-            if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
             # Split on per-rank num_heads_q so layers with different Q-head
             # counts (e.g. a spec-decode draft head and its target) get separate
@@ -267,7 +263,7 @@ def init_attn_backend(
 
     # Phase 2: pick a kernel block size per kv cache group that is supported
     # by all backends within that group.
-    kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
+    kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config)
 
     if current_platform.is_xpu():
         for kv_cache_group_id, selected_kernel_block_size in enumerate(
@@ -399,12 +395,10 @@ def init_kv_cache(
     forward_context: dict[str, Any],
     kv_cache_config: KVCacheConfig,
     device: torch.device,
-    kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
     kv_cache_allocation_context: AbstractContextManager | None = None,
     *,
     block_tables: "BlockTables | None" = None,
-    attn_groups: Iterable[AttentionGroup] = (),
 ) -> dict[str, Any]:
     allocation_context = kv_cache_allocation_context or nullcontext()
     with allocation_context:
@@ -413,7 +407,6 @@ def init_kv_cache(
             kv_caches = init_hisparse_kv_cache(
                 kv_cache_config,
                 device,
-                kernel_block_sizes,
                 vllm_config,
                 forward_context,
                 block_tables,
@@ -423,7 +416,6 @@ def init_kv_cache(
                 kv_cache_config,
                 device,
                 vllm_config.cache_config.get_resolved_kv_cache_layout(),
-                kernel_block_sizes,
             )
     for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
         kv_caches[layer_name] = kv_caches[target]
@@ -432,12 +424,8 @@ def init_kv_cache(
     num_attn_module = (
         2 if vllm_config.model_config.hf_config.model_type == "longcat_flash" else 1
     )
-    bindable_caches = map_kv_caches_to_kernel_blocks(
-        {name: cache for name, cache in kv_caches.items() if name in forward_context},
-        attn_groups,
-    )
     bind_kv_cache_to_layers(
-        bindable_caches,
+        {name: cache for name, cache in kv_caches.items() if name in forward_context},
         forward_context,
         num_attn_module,
         kv_cache_groups=kv_cache_config.kv_cache_groups,

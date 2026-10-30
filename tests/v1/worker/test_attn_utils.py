@@ -23,8 +23,7 @@ from tests.v1.attention.utils import (
     dense_kv_cache_views,
 )
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
-from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, MultipleOf
-from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport
 from vllm.v1.hisparse.binding import allocate_hisparse_kv_caches
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -34,7 +33,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheTensor,
     MLAAttentionSpec,
-    SparseCacheRole,
     compute_layout_strides,
 )
 from vllm.v1.worker.gpu import attn_utils
@@ -47,70 +45,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.utils import (
     AttentionGroup,
     allocate_kv_cache,
-    copy_kv_cache_blocks_inplace,
     customize_attention_spec,
-    map_kv_caches_to_kernel_blocks,
 )
-
-
-@pytest.mark.parametrize(
-    ("enabled", "block_size", "main_sizes", "indexer_sizes", "expected"),
-    [
-        (True, 256, [64], [64], 64),
-        (True, 64, [32, 64], [16, 32], 32),
-        (True, 64, [MultipleOf(16)], [32], 32),
-        (True, 64, [64], [32], None),
-        (False, 256, [64], [64], 256),
-    ],
-)
-def test_get_kv_cache_spec_resolves_hisparse_block_size(
-    monkeypatch, enabled, block_size, main_sizes, indexer_sizes, expected
-):
-    """Resolve shared MLA geometry before planning; leave other specs alone."""
-    specs = {
-        "main": MLAAttentionSpec(
-            block_size=block_size, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
-        ),
-        "indexer": MLAAttentionSpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=128,
-            dtype=torch.bfloat16,
-            cache_role=SparseCacheRole.INDEXER,
-        ),
-        "dense": FullAttentionSpec(
-            block_size=block_size, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
-        ),
-    }
-    layers = {}
-    for name, sizes in zip(specs, [main_sizes, indexer_sizes, [block_size]]):
-        backend = SimpleNamespace(
-            get_name=lambda name=name: name,
-            customize_spec=AttentionBackend.customize_spec,
-            get_supported_kernel_block_sizes=lambda _=None, sizes=sizes: sizes,
-        )
-        layers[name] = SimpleNamespace(
-            get_kv_cache_spec=lambda _, spec=specs[name]: spec,
-            get_attn_backend=lambda backend=backend: backend,
-            is_draft_layer=False,
-        )
-    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_: layers)
-    monkeypatch.setattr(
-        attn_utils_module, "get_hisparse_kv_cache_groups", lambda *_: []
-    )
-    config = SimpleNamespace(
-        attention_config=SimpleNamespace(hisparse_config=object() if enabled else None)
-    )
-    if expected is None:
-        with pytest.raises(ValueError, match="supported by every sparse"):
-            attn_utils.get_kv_cache_spec(config)
-        return
-
-    resolved = attn_utils.get_kv_cache_spec(config)
-    assert resolved["main"].block_size == resolved["indexer"].block_size == expected
-    dense_backend = layers["dense"].get_attn_backend()
-    assert resolved["dense"] == customize_attention_spec(dense_backend, specs["dense"])
-    assert all(spec.block_size == block_size for spec in specs.values())
 
 
 def test_get_kv_cache_spec_tags_draft_layers(monkeypatch):
@@ -507,7 +443,6 @@ def test_init_hisparse_rolls_back_host_pool(monkeypatch, failure_phase, shared):
         attn_utils_module.init_hisparse_kv_cache(
             SimpleNamespace(),
             torch.device("cpu"),
-            [],
             vllm_config,
             {},
             SimpleNamespace(),
@@ -548,21 +483,22 @@ def test_reshape_padded_kv_cache_strides_by_padded_page():
 
 @pytest.mark.parametrize(
     (
-        "kernel_block_sizes",
-        "expected_num_blocks",
+        "kernel_rows_per_block",
+        "expected_num_rows",
         "expected_num_states",
     ),
     [
-        (None, 4, 64),
-        ([256], 4, 64),
-        ([64], 16, 16),
+        (1, 4, 64),
+        (4, 16, 16),
     ],
 )
 def test_allocate_compressed_mla_cache(
-    kernel_block_sizes: list[int] | None,
-    expected_num_blocks: int,
+    kernel_rows_per_block: int,
+    expected_num_rows: int,
     expected_num_states: int,
 ):
+    """allocate_kv_cache binds kernel-row views: a manager block of 256 tokens
+    (64 states) is bound as kernel_rows_per_block kernel rows."""
     spec = MLAAttentionSpec(
         block_size=256,
         num_kv_heads=1,
@@ -570,52 +506,34 @@ def test_allocate_compressed_mla_cache(
         dtype=torch.bfloat16,
         tokens_per_state=4,
     )
-    num_pages = 4
+    row_bytes = spec.page_size_bytes // kernel_rows_per_block
     config = KVCacheConfig(
-        num_blocks=num_pages,
+        num_pages=4,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=num_pages * spec.page_size_bytes,
+                size=4 * spec.page_size_bytes,
                 layers=["layer.0"],
-                layer_stride=num_pages * spec.page_size_bytes,
-                block_stride=spec.page_size_bytes,
+                layer_stride=4 * spec.page_size_bytes,
+                block_stride=row_bytes,
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(["layer.0"], spec)],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer.0"],
+                spec,
+                num_blocks=4,
+                blocks_per_page=2,
+                kernel_rows_per_block=kernel_rows_per_block,
+                row_bytes=row_bytes,
+            )
+        ],
+        large_page_bytes=2 * spec.page_size_bytes,
+        block_size=256,
     )
 
-    caches = allocate_kv_cache(
-        config, torch.device("cpu"), KVCacheLayout.LBHNC, kernel_block_sizes
-    )
+    caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.LBHNC)
 
-    assert caches["layer.0"].shape == (expected_num_blocks, 1, expected_num_states, 128)
-
-
-@pytest.mark.parametrize("layout", list(KVCacheLayout))
-def test_copy_kv_cache_blocks_shared_storage(layout: KVCacheLayout):
-    num_blocks = 4
-    num_layers = 2
-    spec = FullAttentionSpec(
-        block_size=2,
-        num_kv_heads=2,
-        head_size=2,
-        dtype=torch.float32,
-    )
-    raw = torch.zeros(num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8)
-    caches = dense_kv_cache_views(raw, spec, num_blocks, num_layers, layout)
-
-    for layer_idx, cache in enumerate(caches):
-        for block_idx in range(num_blocks):
-            cache[block_idx].fill_(10 * layer_idx + block_idx)
-
-    expected = [[cache[i].clone() for i in range(num_blocks)] for cache in caches]
-    copies = [KVCacheBlockCopy(src_block_id=0, dst_block_id=2)]
-
-    copy_kv_cache_blocks_inplace(caches, num_blocks, copies)
-
-    for layer_idx, cache in enumerate(caches):
-        torch.testing.assert_close(cache[2], expected[layer_idx][0])
-        torch.testing.assert_close(cache[1], expected[layer_idx][1])
+    assert caches["layer.0"].shape == (expected_num_rows, 1, expected_num_states, 128)
 
 
 def test_fixed_block_stride_propagates_outward_in_lhbnc():
@@ -643,91 +561,6 @@ def test_fixed_block_stride_propagates_outward_in_lhbnc():
     assert strides[0] == strides[2] * spec.num_heads
 
 
-def test_copy_kv_cache_blocks_separate_head_groups():
-    # LHBNC stores each head group separately, so a block's bytes are scattered
-    # across L*H regions.
-    layout = KVCacheLayout.LHBNC
-    num_blocks = 4
-    num_layers = 2
-    spec = FullAttentionSpec(
-        block_size=2,
-        num_kv_heads=2,
-        head_size=2,
-        dtype=torch.float32,
-        num_head_slots=2,
-        state_content_bytes=2 * 2 * 4,
-    )
-    raw = torch.zeros(num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8)
-    caches = dense_kv_cache_views(raw, spec, num_blocks, num_layers, layout)
-
-    for layer_idx, cache in enumerate(caches):
-        for block_idx in range(num_blocks):
-            for head_idx in range(cache.shape[1]):
-                cache[block_idx, head_idx].fill_(
-                    100 * layer_idx + 10 * head_idx + block_idx
-                )
-
-    expected = [[cache[i].clone() for i in range(num_blocks)] for cache in caches]
-    copy_kv_cache_blocks_inplace(
-        caches,
-        num_blocks,
-        [KVCacheBlockCopy(src_block_id=0, dst_block_id=2)],
-    )
-
-    for layer_idx, cache in enumerate(caches):
-        torch.testing.assert_close(cache[2], expected[layer_idx][0])
-        torch.testing.assert_close(cache[1], expected[layer_idx][1])
-
-
-@pytest.mark.parametrize(
-    "layout,num_layers",
-    [
-        (KVCacheLayout.LBHNC, 2),
-        # Splitting needs a manager block to be one dense page, which a
-        # block-outermost layout only gives when the block holds one layer.
-        (KVCacheLayout.BLHNC, 1),
-    ],
-)
-def test_copy_kv_cache_blocks_with_virtual_block_splitting(
-    layout: KVCacheLayout, num_layers: int
-):
-    num_blocks = 4
-    physical_per_logical = 2
-    spec = FullAttentionSpec(
-        block_size=4,
-        num_kv_heads=1,
-        head_size=2,
-        dtype=torch.float32,
-    )
-    raw = torch.zeros(num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8)
-    caches = dense_kv_cache_views(
-        raw,
-        spec,
-        num_blocks,
-        num_layers,
-        layout,
-        kernel_block_size=spec.block_size // physical_per_logical,
-    )
-
-    for layer_idx, cache in enumerate(caches):
-        for block_idx in range(cache.shape[0]):
-            cache[block_idx].fill_(100 * layer_idx + block_idx)
-    expected = [[cache[i].clone() for i in range(cache.shape[0])] for cache in caches]
-
-    copy_kv_cache_blocks_inplace(
-        caches,
-        num_blocks,
-        [KVCacheBlockCopy(src_block_id=0, dst_block_id=2)],
-    )
-
-    dst_start = 2 * physical_per_logical
-    for layer_idx, cache in enumerate(caches):
-        for physical_idx in range(physical_per_logical):
-            torch.testing.assert_close(
-                cache[dst_start + physical_idx], expected[layer_idx][physical_idx]
-            )
-
-
 def test_allocate_hisparse_kv_caches_host_pool_and_view_less_specs():
     """Host tensors get their own backing; view-less specs keep the raw one."""
     spec = FullAttentionSpec(
@@ -737,7 +570,7 @@ def test_allocate_hisparse_kv_caches_host_pool_and_view_less_specs():
     resident_spec = HiSparseResidentSpec(block_size=2, page_size=page)
     device_size = 4 * page
     config = KVCacheConfig(
-        num_blocks=4,
+        num_pages=4,
         hisparse_host_num_blocks=3,
         kv_cache_tensors=[
             KVCacheTensor(
@@ -761,10 +594,16 @@ def test_allocate_hisparse_kv_caches_host_pool_and_view_less_specs():
             ),
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(["source"], spec, host_resident=True),
+            KVCacheGroupSpec(
+                ["source"],
+                spec,
+                host_resident=True,
+                layer_kv_cache_specs={"source": spec},
+            ),
             KVCacheGroupSpec(["indexer"], spec),
             KVCacheGroupSpec(["resident"], resident_spec),
         ],
+        block_size=2,
     )
     host_buffers: list[torch.Tensor] = []
 
@@ -776,7 +615,6 @@ def test_allocate_hisparse_kv_caches_host_pool_and_view_less_specs():
         config,
         torch.device("cpu"),
         KVCacheLayout.LBHNC,
-        [2, 2, 2],
         SimpleNamespace(allocate=host_allocator),
     )
     assert len(config.kv_cache_tensors) == 3
@@ -832,32 +670,11 @@ def _packed_group(tokens_per_state, row_bytes, supported_sizes):
     return AttentionGroup(backend, ["layer.0"], spec, 0)
 
 
-def test_packed_compressed_group_gets_kernel_block_table():
-    """A packed indexer cache whose kernel needs 64-state pages gets a table and
-    a bound view in kernel blocks that address the same packed-block rows."""
-    row, stride_rows = 132, 5 * 64
-    group = _packed_group(4, row, [128, 256])
-    group.create_metadata_builders(_VLLM_CONFIG, "cpu", kernel_block_size=1024)
-    assert group.get_metadata_builder().kv_cache_spec.block_size == 256
-
-    backing = torch.arange(3 * stride_rows).repeat_interleave(row)
-    manager = backing.view(3, 1, stride_rows, row)[:, :, :256]
-    pages = map_kv_caches_to_kernel_blocks({"layer.0": manager}, [group])["layer.0"]
-    metadata = create_common_attn_metadata(BatchSpec([2048], [1]), 1024, "cpu")
-    metadata.block_table_tensor = torch.tensor([[0, 2]], dtype=torch.int32)
-    table = group.build_metadata(metadata)
-    assert table.tolist() == [[0, 1, 2, 3, 10, 11, 12, 13]]
-    assert torch.equal(pages[table[0, 4:], 0].flatten(0, 1), manager[2, 0])
-
-
 def test_split_group_maps_manager_block_table():
-    """Groups split in a dense layout keep manager block tables; builders get
-    b * blocks_per_kv_block + j against the view allocated in kernel blocks."""
+    """A group split into kernel blocks keeps manager block tables and maps
+    them to kernel blocks b * rows_per_block + j."""
     group = _packed_group(4, 132, [128, 256])
     group.create_metadata_builders(_VLLM_CONFIG, "cpu", kernel_block_size=256)
-    kernel_view = torch.zeros(12, 1, 64, 132)
-    bound = map_kv_caches_to_kernel_blocks({"layer.0": kernel_view}, [group])
-    assert bound["layer.0"] is kernel_view
 
     metadata = create_common_attn_metadata(BatchSpec([2048], [1]), 1024, "cpu")
     metadata.block_table_tensor = torch.tensor([[0, 2]], dtype=torch.int32)
@@ -875,11 +692,3 @@ def test_split_blocks_align_to_kernel_blocks(block_size, page_states):
     spec = customize_attention_spec(group.backend, group.kv_cache_spec)
     spec = spec.copy_with_new_block_size(block_size)
     assert spec.get_block_stride_alignment() == max(page_states * 132, 1)
-
-
-def test_packed_token_cache_cannot_be_split():
-    group = _packed_group(1, 1152, [64])
-    group.create_metadata_builders(_VLLM_CONFIG, "cpu", kernel_block_size=1024)
-    packed = torch.zeros(3, 1, 2048, 1152, dtype=torch.uint8)[:, :, :1024]
-    with pytest.raises(ValueError, match="cannot be split"):
-        map_kv_caches_to_kernel_blocks({"layer.0": packed}, [group])

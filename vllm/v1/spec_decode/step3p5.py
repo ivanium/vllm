@@ -10,11 +10,7 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.utils import get_draft_quant_config
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import (
-    KVCacheConfig,
-    KVCacheSpec,
-    UniformTypeKVCacheSpecs,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
@@ -184,31 +180,9 @@ class Step3p5MTPProposer(EagleProposer):
         layer_to_gid: dict[str, int] = {}
         layer_to_spec: dict[str, KVCacheSpec] = {}
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-            group_spec = group.kv_cache_spec
             for layer_name in group.layer_names:
                 layer_to_gid[layer_name] = gid
-                if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                    if layer_name in group_spec.kv_cache_specs:
-                        layer_to_spec[layer_name] = group_spec.kv_cache_specs[
-                            layer_name
-                        ]
-                    else:
-                        target_layer_name = getattr(
-                            all_attn_layers.get(layer_name),
-                            "kv_sharing_target_layer_name",
-                            None,
-                        )
-                        if (
-                            target_layer_name
-                            and target_layer_name in group_spec.kv_cache_specs
-                        ):
-                            layer_to_spec[layer_name] = group_spec.kv_cache_specs[
-                                target_layer_name
-                            ]
-                        else:
-                            layer_to_spec[layer_name] = group_spec
-                else:
-                    layer_to_spec[layer_name] = group_spec
+                layer_to_spec[layer_name] = group.kv_cache_spec
 
         attention_groups: dict[tuple[tuple[str, str], int], AttentionGroup] = {}
         for layer_name in sorted(self._draft_attn_layer_names):

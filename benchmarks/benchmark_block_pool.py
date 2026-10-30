@@ -14,7 +14,7 @@ def main(args):
     for allocate_block in args.allocate_blocks:
         # Enforce a GC collect ahead to minimize the impact among runs
         gc.collect()
-        block_pool = BlockPool(num_gpu_blocks=args.num_gpu_blocks, enable_caching=True)
+        block_pool = BlockPool(num_pages=args.num_gpu_blocks, enable_caching=True)
 
         get_blocks_times = TimeCollector(TimeCollector.US)
         free_blocks_times = TimeCollector(TimeCollector.US)

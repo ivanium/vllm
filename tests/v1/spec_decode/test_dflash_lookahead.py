@@ -71,8 +71,9 @@ def _create_dflash_scheduler(num_speculative_tokens: int) -> Scheduler:
         speculative_config=speculative_config,
     )
     kv_cache_config = KVCacheConfig(
-        num_blocks=NUM_BLOCKS,
+        num_pages=NUM_BLOCKS,
         kv_cache_tensors=[],
+        block_size=BLOCK_SIZE,
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["layer"],

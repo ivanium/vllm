@@ -563,6 +563,7 @@ def test_compute_slot_mapping_uses_named_launcher_inputs(monkeypatch) -> None:
         total_cp_rank=1,
         cp_kv_cache_interleave_size=1,
         block_table_stride=128,
+        kernel_block_size=16,
     )
     launches: list[tuple[Any, ...]] = []
 
@@ -581,6 +582,7 @@ def test_compute_slot_mapping_uses_named_launcher_inputs(monkeypatch) -> None:
         "TOTAL_CP_WORLD_SIZE": 2,
         "TOTAL_CP_RANK": 1,
         "CP_KV_CACHE_INTERLEAVE_SIZE": 1,
+        "KERNEL_BLOCK_SIZE": 16,
         "PAD_ID": PAD_SLOT_ID,
         "BLOCK_SIZE": owner.triton_block_size,
     }
