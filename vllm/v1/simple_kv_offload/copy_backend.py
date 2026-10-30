@@ -15,8 +15,12 @@ from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
     CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
     BatchMemcpyParams,
+    LargePageCopyGeometry,
+    LargePageMemcpyParams,
+    build_large_page_params,
     build_params,
     copy_blocks,
+    copy_blocks_large_page,
 )
 
 logger = init_logger(__name__)
@@ -26,8 +30,8 @@ class DmaCopyBackend:
     """cuMemcpyBatchAsync copy backend (background thread)."""
 
     def __init__(self) -> None:
-        self._store_params: BatchMemcpyParams | None = None
-        self._load_params: BatchMemcpyParams | None = None
+        self._store_params: BatchMemcpyParams | LargePageMemcpyParams | None = None
+        self._load_params: BatchMemcpyParams | LargePageMemcpyParams | None = None
         self._load_stream: torch.cuda.Stream | None = None
         self._store_stream: torch.cuda.Stream | None = None
         self._queue: queue.SimpleQueue | None = None
@@ -42,23 +46,65 @@ class DmaCopyBackend:
         load_stream: torch.cuda.Stream,
         store_stream: torch.cuda.Stream,
     ) -> None:
+        self._start(
+            store_params=build_params(
+                gpu_caches,
+                cpu_caches,
+                store_stream,
+                src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+            ),
+            load_params=build_params(
+                cpu_caches,
+                gpu_caches,
+                load_stream,
+                src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+            ),
+            device=device,
+            load_stream=load_stream,
+            store_stream=store_stream,
+        )
+
+    def init_large_page(
+        self,
+        geometry: LargePageCopyGeometry,
+        device: torch.device,
+        load_stream: torch.cuda.Stream,
+        store_stream: torch.cuda.Stream,
+    ) -> None:
+        """Init for the large-page allocator: per-block address copies."""
+        self._start(
+            store_params=build_large_page_params(
+                geometry,
+                src_is_gpu=True,
+                stream=store_stream,
+                src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+            ),
+            load_params=build_large_page_params(
+                geometry,
+                src_is_gpu=False,
+                stream=load_stream,
+                src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+            ),
+            device=device,
+            load_stream=load_stream,
+            store_stream=store_stream,
+        )
+
+    def _start(
+        self,
+        store_params: BatchMemcpyParams | LargePageMemcpyParams,
+        load_params: BatchMemcpyParams | LargePageMemcpyParams,
+        device: torch.device,
+        load_stream: torch.cuda.Stream,
+        store_stream: torch.cuda.Stream,
+    ) -> None:
         self._load_stream = load_stream
         self._store_stream = store_stream
 
         # Stores read the live KV cache -> STREAM (paired with the compute-done
         # wait in get_finished); loads read stable pinned host memory -> ANY.
-        self._store_params = build_params(
-            gpu_caches,
-            cpu_caches,
-            store_stream,
-            src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
-        )
-        self._load_params = build_params(
-            cpu_caches,
-            gpu_caches,
-            load_stream,
-            src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
-        )
+        self._store_params = store_params
+        self._load_params = load_params
 
         self._queue = queue.SimpleQueue()
         self._thread = threading.Thread(
@@ -72,6 +118,7 @@ class DmaCopyBackend:
         self,
         src_blocks: list[int],
         dst_blocks: list[int],
+        group_ids: list[int],
         is_store: bool,
         event_idx: int,
         events_list: list[tuple[int, torch.Event]],
@@ -83,6 +130,7 @@ class DmaCopyBackend:
             (
                 src_blocks,
                 dst_blocks,
+                group_ids,
                 params,
                 is_store,
                 event_idx,
@@ -115,6 +163,7 @@ class DmaCopyBackend:
             (
                 src_blocks,
                 dst_blocks,
+                group_ids,
                 params,
                 is_store,
                 event_idx,
@@ -124,7 +173,10 @@ class DmaCopyBackend:
             stream = store_stream if is_store else load_stream
             if wait_event is not None:
                 stream.wait_event(wait_event)
-            copy_blocks(src_blocks, dst_blocks, params)
+            if isinstance(params, LargePageMemcpyParams):
+                copy_blocks_large_page(src_blocks, dst_blocks, group_ids, params)
+            else:
+                copy_blocks(src_blocks, dst_blocks, params)
             event = torch.Event()
             event.record(stream)
             events_list.append((event_idx, event))

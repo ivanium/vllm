@@ -59,6 +59,7 @@ from vllm.v1.request import Request
 from vllm.v1.simple_kv_offload.manager import (
     SimpleCPUOffloadScheduler,
     StoreRequestState,
+    TransferMeta,
 )
 
 
@@ -431,9 +432,8 @@ def test_secondary_hash_block_stored_metadata() -> None:
         num_stored_blocks=[0],
     )
 
-    gpu_block_ids, advanced_per_group, block_meta = sched._select_eager_blocks_to_store(
-        state,
-        ([gpu_block.block_id],),
+    gpu_block_ids, group_ids, advanced_per_group, block_meta = (
+        sched._select_eager_blocks_to_store(state, ([gpu_block.block_id],))
     )
     assert gpu_block_ids == [gpu_block.block_id]
     assert advanced_per_group == [1]
@@ -442,9 +442,7 @@ def test_secondary_hash_block_stored_metadata() -> None:
 
     cpu_block = sched.cpu_block_pool.get_new_blocks(1)[0]
     sched._process_store_completion(
-        gpu_block_ids,
-        [cpu_block.block_id],
-        block_meta,
+        TransferMeta(gpu_block_ids, [cpu_block.block_id], group_ids, block_meta)
     )
 
     primary_event_hash = maybe_convert_block_hash(get_block_hash(primary_hash))
@@ -620,8 +618,7 @@ def test_mamba_block_size_not_scaled() -> None:
     gpu_blk._block_hash = mamba_hash  # type: ignore[attr-defined]
 
     sched._process_store_completion(
-        gpu_block_ids=[gpu_blk.block_id],
-        cpu_block_ids=[cpu_blk.block_id],
+        TransferMeta([gpu_blk.block_id], [cpu_blk.block_id], [0])
     )
 
     events = list(sched.take_events())
@@ -665,8 +662,7 @@ def test_multi_group_fa_block_stored_group_idx() -> None:
             raw_hash, group_id=gidx
         )
         sched._process_store_completion(
-            gpu_block_ids=[gpu_blk.block_id],
-            cpu_block_ids=[cpu_blk.block_id],
+            TransferMeta([gpu_blk.block_id], [cpu_blk.block_id], [0])
         )
 
     events = list(sched.take_events())
