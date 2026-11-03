@@ -4,6 +4,7 @@
 
 import copy
 import gc
+import weakref
 from collections.abc import Callable
 from dataclasses import replace
 from math import lcm
@@ -435,6 +436,16 @@ def test_hisparse_residency_update_sends_only_changed_pages():
 
     assert update[request.request_id].pages == [0]
     assert update[request.request_id].block_ids == ([0],)
+
+    # Reuse callbacks must not keep the coordinator alive after its owner exits.
+    coordinator_ref = weakref.ref(coordinator)
+    pool_ref = weakref.ref(pool)
+    del coordinator, hot_manager, manager, pool
+    gc.collect()
+    assert coordinator_ref() is None
+    # Collect the pool after releasing the coordinator's untracked block lists.
+    gc.collect()
+    assert pool_ref() is None
 
 
 def test_hisparse_readmitted_request_resends_its_full_residency():

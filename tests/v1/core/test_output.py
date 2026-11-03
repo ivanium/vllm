@@ -13,6 +13,8 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.output import NewRequestData
 
 
@@ -147,6 +149,15 @@ def test_strip_covered_mm_data_shm_address_item() -> None:
     stripped = strip_covered_mm_data([feature], num_computed_tokens=250)
 
     assert stripped[0].data is address_item
+
+
+def test_scheduler_long_block_ids_are_untracked() -> None:
+    """Long scheduler payloads must avoid GC traversal before serialization."""
+    blocks = KVCacheBlocks(([KVCacheBlock(i) for i in range(256)], []))
+    ids = blocks.get_block_ids()
+    assert ids == (list(range(256)), [])
+    assert not gc.is_tracked(ids[0])
+    assert gc.is_tracked(ids[1])
 
 
 def test_unpickled_long_lists_are_untracked() -> None:

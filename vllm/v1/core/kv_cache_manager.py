@@ -8,6 +8,7 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.utils.gc_utils import untrack_long_lists
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
@@ -104,7 +105,9 @@ class KVCacheBlocks:
         )
         if allow_none and all(len(group) == 0 for group in groups):
             return None
-        return tuple([blk.block_id for blk in group] for group in groups)
+        block_ids = tuple([blk.block_id for blk in group] for group in groups)
+        untrack_long_lists(block_ids)
+        return block_ids
 
     def get_unhashed_block_ids(self) -> list[int]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance."""

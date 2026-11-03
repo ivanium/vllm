@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -199,6 +200,16 @@ class HiSparseCoordinator:
         # Unpinned GPU block id -> (request, page) pairs still reading it.
         self._owners: dict[int, set[tuple[str, int]]] = {}
 
+        # Pools must not keep the owner of their untracked block lists alive.
+        coordinator_ref = weakref.ref(self)
+
+        def on_block_reused(block: KVCacheBlock) -> None:
+            coordinator = coordinator_ref()
+            if coordinator is not None:
+                coordinator._on_block_reused(block)
+
+        self._block_reuse_callback = on_block_reused
+
     def _get_request_state(self, request_id: str) -> _HiSparseRequestState:
         state = self.request_states.get(request_id)
         if state is None:
@@ -376,7 +387,7 @@ class HiSparseCoordinator:
             return False
         for manager, block in zip(self.resident_managers, blocks):
             self._owners.setdefault(block.block_id, set()).add((request_id, page_idx))
-            manager.block_pool.unpin_blocks([block], self._on_block_reused)
+            manager.block_pool.unpin_blocks([block], self._block_reuse_callback)
         state.pinned_clean.discard(page_idx)
         state.unpinned_pages.add(page_idx)
         return True
@@ -937,7 +948,7 @@ class HiSparseCoordinator:
                     page_idx in state.valid_pages
                     and page_idx not in state.pending_pages
                 ):
-                    manager.block_pool.unpin_blocks([block], self._on_block_reused)
+                    manager.block_pool.unpin_blocks([block], self._block_reuse_callback)
                 else:
                     continue
                 manager.drop_resident_page(request_id, page_idx)
