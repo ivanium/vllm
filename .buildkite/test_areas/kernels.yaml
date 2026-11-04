@@ -580,8 +580,10 @@ steps:
   - vllm/v1/kv_cache_interface.py
   - tests/v1/attention/utils.py
   - tests/kernels/attention/test_minimax_m3.py
+  - tests/kernels/attention/test_minimax_m3_sparse_pa_page16.py
   commands:
     - pytest -v -s tests/kernels/attention/test_minimax_m3.py
+    - pytest -v -s tests/kernels/attention/test_minimax_m3_sparse_pa_page16.py
 
 - label: ":nvidia: (B200) Kernels Shard %N"
   key: kernels-b200

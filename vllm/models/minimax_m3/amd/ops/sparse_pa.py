@@ -11,6 +11,9 @@ except ModuleNotFoundError:
     import triton.language as tl
 
 from vllm.models.minimax_m3.common.ops.sparse_attn import SPARSE_BLOCK_SIZE
+from vllm.models.minimax_m3.common.sparse_attention import (
+    minimax_m3_page16_pages_per_block,
+)
 
 ASM_PAGE_SIZE = 16
 PAGES_PER_SPARSE_BLOCK = SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE
@@ -358,42 +361,96 @@ def _sides_are_packed(k_cache: torch.Tensor, v_cache: torch.Tensor) -> bool:
     return v_cache.shape[0] != k_cache.shape[0]
 
 
-def minimax_m3_sparse_block_page_stride(
-    k_cache: torch.Tensor, v_cache: torch.Tensor
-) -> int:
-    """How many page ids one sparse block spans.
+def minimax_m3_sparse_pa_page16_views(
+    kv_cache: torch.Tensor,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Page-16 K/V views over a bound ``[B, 2, N, C]`` paged cache.
 
-    Each side owns ``PAGES_PER_SPARSE_BLOCK`` pages. When the sides are dense
-    planes a block is exactly that wide; when they interleave, a block covers
-    both sides' pages and V is reached from the same page id at a fixed offset.
+    Returns ``(kv_cache_k, kv_cache_v, pages_per_block)``: the SHUFFLE tensors
+    AITER's page-16 writer and attend kernels address, and how many page-16
+    ids one block row spans. Page ``p`` sits at element offset
+    ``p * 16 * C``, so a block's ids advance by the physical block row
+    (``kv_cache.stride(0)``): its own dense extent for a dense cache, or the
+    whole group row for a strided window into the shared large-page buffer.
+    When both K/V sides share a block row the V view is offset by one side's
+    pages, so both sides answer to the same page id.
     """
-    return PAGES_PER_SPARSE_BLOCK * (2 if _sides_are_packed(k_cache, v_cache) else 1)
+    x = ASM_PAGE_SIZE // kv_cache.element_size()
+    if head_dim % x != 0:
+        raise RuntimeError(
+            "MiniMax-M3 AITER sparse PA requires head_dim divisible by "
+            f"16 / dtype_size, got head_dim={head_dim}, x={x}"
+        )
+    num_blocks, _, block_size, content = kv_cache.shape
+    assert content == num_kv_heads * head_dim
+    assert block_size % ASM_PAGE_SIZE == 0
+    pages_in_side = block_size // ASM_PAGE_SIZE
+    page_row = ASM_PAGE_SIZE * content
+    key_cache, value_cache = kv_cache.unbind(1)
+    if key_cache.is_contiguous() and value_cache.is_contiguous():
+        # Each side is a dense plane and is page-numbered on its own.
+        k_src, v_src = key_cache, value_cache
+        v_page_offset = 0
+    elif (
+        kv_cache.stride(1) == block_size * content
+        and kv_cache.stride(2) == content
+        and kv_cache.stride(3) == 1
+    ):
+        # Both sides share one block row, dense or strided.
+        k_src = v_src = kv_cache
+        v_page_offset = pages_in_side
+    else:
+        raise RuntimeError(
+            "MiniMax-M3 AITER sparse PA needs each K/V head slot stored as "
+            "whole 16-token pages, but the resolved KV cache layout gives "
+            "neither dense planes nor block-contiguous pages."
+        )
+    pages_per_block = minimax_m3_page16_pages_per_block(kv_cache)
+    # The grid ends at the last block's own pages: a strided block row holds
+    # other layers' pages past them, and those gap pages are never addressed.
+    num_phys16 = (num_blocks - 1) * pages_per_block + v_page_offset + pages_in_side
+    kv_cache_k = k_src.as_strided(
+        (num_phys16, num_kv_heads, head_dim // x, ASM_PAGE_SIZE, x),
+        (page_row, ASM_PAGE_SIZE * head_dim, ASM_PAGE_SIZE * x, x, 1),
+    )
+    # Offsetting V by half a block lets both sides share one page id.
+    kv_cache_v = v_src.as_strided(
+        (num_phys16, num_kv_heads, ASM_PAGE_SIZE // x, head_dim, x),
+        (page_row, ASM_PAGE_SIZE * head_dim, head_dim * x, x, 1),
+    )[v_page_offset:]
+    return kv_cache_k, kv_cache_v, pages_per_block
 
 
-# K/V sides sharing one block, which is how many sides' pages a block spans.
-# The attend publishes two head slots and the indexer's side cache one, and
-# specs that mix HNC shapes narrow the resolved layout to a block-compact one
-# (LHBNC is not), so this path always lands on an interleaved block.
+# K/V sides sharing one dense block, which is how many sides' pages a block
+# spans. The attend publishes two head slots and the indexer's side cache one,
+# and specs that mix HNC shapes narrow the resolved layout to a block-compact
+# one (LHBNC is not), so this path always lands on an interleaved block. It is
+# only the default rebase width: callers pass the physical pages-per-block.
 PAGE16_SIDES_PER_BLOCK = 2
 
 
 def minimax_m3_rebase_block_table_to_page16(
     block_table: torch.Tensor,
+    pages_per_block: int = PAGE16_SIDES_PER_BLOCK * PAGES_PER_SPARSE_BLOCK,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Rebase a logical page table onto AITER's page-16 page numbering.
 
     The page ids AITER's top-k emits for the attend are
-    ``block_table[blk] * pages_per_block + j``, and ``pages_per_block`` is fixed
-    at AITER build time to one side's pages. An interleaved block spans both
-    sides, so the only way to reach its pages through that kernel is to hand it
-    a table already scaled to the wider stride. The caller does this once per
-    step, since every sparse layer resolves its selection through the same
-    table.
+    ``table[blk] * PAGES_PER_SPARSE_BLOCK + j``: the multiplier is fixed at
+    AITER build time to one side's pages, while a block physically spans
+    ``pages_per_block`` page-16 pages (both sides' pages when they share a
+    block, the whole group row under a shared large-page buffer). Handing the
+    kernel a table pre-scaled by ``pages_per_block // PAGES_PER_SPARSE_BLOCK``
+    lands its ids on the physical rows. The caller does this once per step,
+    since every sparse layer resolves its selection through the same table.
     """
+    assert pages_per_block % PAGES_PER_SPARSE_BLOCK == 0
     if out is None:
         out = torch.empty_like(block_table)
-    return torch.mul(block_table, PAGE16_SIDES_PER_BLOCK, out=out)
+    return torch.mul(block_table, pages_per_block // PAGES_PER_SPARSE_BLOCK, out=out)
 
 
 def _gluon_scale_arg(
@@ -439,6 +496,7 @@ def minimax_m3_sparse_attn_decode_aiter(
     num_kv_heads: int,
     sm_scale: float,
     output: torch.Tensor,  # [batch * decode_query_len, num_heads, head_dim]
+    block_page_stride: int,  # physical page-16 pages per block row
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     decode_query_len: int = 1,
@@ -457,7 +515,7 @@ def minimax_m3_sparse_attn_decode_aiter(
                 block_table,
                 seq_lens,
                 decode_query_len,
-                minimax_m3_sparse_block_page_stride(k_cache, v_cache),
+                block_page_stride,
             )
         )
     assert sparse_context_lens is not None
@@ -487,6 +545,7 @@ def minimax_m3_sparse_attn_prefill_aiter(
     num_kv_heads: int,
     sm_scale: float,
     output: torch.Tensor,
+    block_page_stride: int,  # physical page-16 pages per block row
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     sparse_bt: torch.Tensor | None = None,
@@ -503,7 +562,7 @@ def minimax_m3_sparse_attn_prefill_aiter(
             block_table,
             query_req_id,
             query_abs_pos,
-            minimax_m3_sparse_block_page_stride(k_cache, v_cache),
+            block_page_stride,
         )
     assert sparse_ctx is not None
     _run_gluon_decode(

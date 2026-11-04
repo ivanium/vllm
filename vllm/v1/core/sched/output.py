@@ -23,13 +23,11 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
     from vllm.v1.request import Request
 else:
     AuxOutputConnectorMetadata = object
     ECConnectorMetadata = object
     KVConnectorMetadata = object
-    KVCacheBlockCopy = object
     LoRARequest = object
     MultiModalFeatureSpec = object
     PoolingParams = object
@@ -296,14 +294,8 @@ class SchedulerOutput:
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
-    # Under the large-page allocator block ids are unique only within a group,
-    # so each entry is a (group_id, block_id) pair.
-    new_block_ids_to_zero: list[int] | list[tuple[int, int]] | None = None
-
-    # CoW copies to apply after zeroing new blocks and before forward.
-    # Each copy's group_id names its KV cache group (block ids are unique
-    # only within a group under the large-page allocator).
-    kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+    # Indexed by KV cache group: block ids are unique only within a group.
+    new_block_ids_to_zero: list[list[int]] | None = None
 
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None

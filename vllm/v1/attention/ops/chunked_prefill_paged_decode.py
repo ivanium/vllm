@@ -27,13 +27,16 @@ def has_native_kv_cache_layout(
 ) -> bool:
     """Return whether KV cache blocks can use the native ROCm pairing.
 
-    The native reshape_and_cache writer assumes packed blocks. If cache update
-    needs reshape_and_cache_flash for a stride-padded hybrid layout, decode
-    should use the matching Triton path too.
+    The native reshape_and_cache writer assumes packed blocks, and the custom
+    paged-attention kernels address blocks with 32-bit offset math. If cache
+    update needs reshape_and_cache_flash for a stride-padded hybrid or
+    large-page layout, decode should use the matching Triton path too.
     """
     return (
         key_cache.stride(0) == key_cache.shape[1:].numel()
         and value_cache.stride(0) == value_cache.shape[1:].numel()
+        and key_cache.numel() <= torch.iinfo(torch.int32).max
+        and value_cache.numel() <= torch.iinfo(torch.int32).max
     )
 
 
@@ -401,8 +404,9 @@ def chunked_prefill_paged_decode(
     )
     has_native_layout = has_native_kv_cache_layout(key_cache, value_cache)
     # Force Triton for non-standard blocks like Qwen3's 544 and for
-    # stride-padded hybrid layouts. The latter use reshape_and_cache_flash
-    # during cache update, so keep decode on the matching stride-aware path.
+    # stride-padded hybrid or large-page layouts. The latter use
+    # reshape_and_cache_flash during cache update, so keep decode on the
+    # matching stride-aware path.
     is_pow2 = block_size > 0 and (block_size & (block_size - 1) == 0)
     if not is_pow2 or not has_native_layout:
         use_custom = False

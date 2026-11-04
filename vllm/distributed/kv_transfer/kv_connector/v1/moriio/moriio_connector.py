@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+    MORIIO_CONNECTOR_VERSION,
     ROLE,
     EngineId,
     HandshakeError,
@@ -55,7 +56,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     pod_index,
     resolve_host_ip,
     set_role,
-    zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
     MoRIIOWrapper,
@@ -76,6 +76,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_layout import (
     compute_head_slice_offsets,
     compute_mamba_conv_split_count,
     compute_mamba_slice_offsets,
+    expand_block_kernel_rows,
     get_layer_head_layout,
     get_layer_transfer_geometry,
     get_mamba_state_layout,
@@ -99,18 +100,20 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.network_utils import (
     make_zmq_path,
     make_zmq_socket,
+    zmq_socket_ctx,
 )
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    GroupGeometry,
     KVCacheConfig,
     MambaSpec,
     SlidingWindowSpec,
-    is_full_attention_spec,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
@@ -401,8 +404,12 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_transfer_results()
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
-        """Blocks whose MoRIIO read failed, for the scheduler to recompute."""
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
+        """Blocks whose MoRIIO read failed, for the scheduler to recompute.
+
+        Block ids are unique only within a KV cache group, so each entry is a
+        ``(group_id, block_id)`` pair.
+        """
         if self.connector_worker is None:
             return set()
         return self.connector_worker.get_block_ids_with_load_errors()
@@ -595,7 +602,7 @@ class MoRIIOConnectorScheduler:
         self._is_hma_required = (
             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
             and any(
-                not is_full_attention_spec(g.kv_cache_spec)
+                not isinstance(g.kv_cache_spec, FullAttentionSpec)
                 for g in kv_cache_config.transfer_groups
             )
         )
@@ -606,8 +613,10 @@ class MoRIIOConnectorScheduler:
                 type(g.kv_cache_spec).__name__
                 for g in kv_cache_config.transfer_groups
                 if not (
-                    is_full_attention_spec(g.kv_cache_spec)
-                    or isinstance(g.kv_cache_spec, (SlidingWindowSpec, MambaSpec))
+                    isinstance(
+                        g.kv_cache_spec,
+                        (FullAttentionSpec, SlidingWindowSpec, MambaSpec),
+                    )
                 )
             ]
             if unsupported:
@@ -667,7 +676,7 @@ class MoRIIOConnectorScheduler:
         self._full_attn_group_idx = 0
         self._full_attn_block_size = self.block_size
         for gi, group in enumerate(kv_cache_config.kv_cache_groups):
-            if is_full_attention_spec(group.kv_cache_spec):
+            if isinstance(group.kv_cache_spec, FullAttentionSpec):
                 self._full_attn_group_idx = gi
                 self._full_attn_block_size = getattr(
                     group.kv_cache_spec, "block_size", self.block_size
@@ -1399,16 +1408,19 @@ class MoRIIOConnectorScheduler:
         ):
             # Hybrid models zero recycled attention pages that held Mamba state.
             # Host-submitted READs overwrite these pages and can race zeroing.
-            # Hybrid READ metadata puts the aligned attention pages first.
+            # Hybrid READ metadata puts the aligned attention pages first; they
+            # belong to the attention KV cache group.
+            attn_kv_group = self.kv_cache_config.transfer_group_ids[
+                self._attn_group_ids[0]
+            ]
             read_dst_block_ids = {
                 b
                 for _, block_ids in self._reqs_need_recv.values()
                 for b in block_ids[0]
             }
-            scheduler_output.new_block_ids_to_zero = [
-                b
-                for b in scheduler_output.new_block_ids_to_zero
-                if b not in read_dst_block_ids
+            zero_ids = scheduler_output.new_block_ids_to_zero
+            zero_ids[attn_kv_group] = [
+                b for b in zero_ids[attn_kv_group] if b not in read_dst_block_ids
             ]
 
         for req_id, (req, block_ids) in self._reqs_need_save.items():
@@ -1745,6 +1757,7 @@ class MoRIIOConnectorWorker:
         )
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.is_producer = self.kv_transfer_config.is_kv_producer
+        self.kv_cache_config = kv_cache_config
         self.layer_to_spec = build_layer_to_spec(kv_cache_config)
         # we transfer by layer, but store by kv cache group
         self.layer_to_group = dict(kv_cache_config.transfer_group_index_by_layer)
@@ -1854,15 +1867,9 @@ class MoRIIOConnectorWorker:
             dict()
         )
         self.remote_moriio_metadata: dict[EngineId, MoRIIOAgentMetadata] = {}
-        self.slot_size_bytes = 0
 
         self.load_ready_flag: dict[str, bool] = {}
         self.write_ready_flags: dict[str, bool] = {}
-        self.kv_cache_shape = None
-        self.block_shape = None
-        self.kv_element_size = 0
-        self.kv_cache_shapes: dict[str, torch.Size] = {}
-        self.block_lens: dict[str, int] = {}
 
         # Map of engine_id -> {agent_name0, agent_name1..}.
         self._remote_agents: dict[EngineId, set[str]] = {}
@@ -1885,14 +1892,8 @@ class MoRIIOConnectorWorker:
         # rank will still only pull from a single remote TP worker.
         self.kv_caches_base_addr: dict[EngineId, list[int]] = {}
 
-        # Number of MoRIIO regions. Currently one region per cache
-        # (so 1 per layer for MLA, otherwise 2 per layer)
-        self.num_regions = 0
         self.num_layers = 0
 
-        # Map of engine_id -> num_blocks. All ranks in the same deployment will
-        # have the same number of blocks.
-        self.dst_num_blocks: dict[EngineId, int] = {}
         # In-progress READ transfers: req_id -> {layer_name: [statuses]}.
         # A KDA layer posts two reads (conv + ssm), so a layer maps to a list.
         self._recving_transfers: defaultdict[ReqId, dict] = defaultdict(dict)
@@ -1902,11 +1903,11 @@ class MoRIIOConnectorWorker:
         # Used by _pop_done_transfers to abort transfers whose RDMA
         # completion is lost, instead of hanging forever.
         self._recving_transfers_start: dict[str, float] = {}
-        # Destination attention blocks per in-flight recv. Failed non-HMA reads
-        # report these to the scheduler's single-group recovery path.
-        self._recving_local_blocks: dict[ReqId, list[int]] = {}
+        # Destination blocks per in-flight recv, tagged with their KV cache
+        # group: block ids are unique only within a group.
+        self._recving_local_blocks: dict[ReqId, set[tuple[int, int]]] = {}
         # Drained by get_block_ids_with_load_errors.
-        self._invalid_block_ids: set[int] = set()
+        self._invalid_block_ids: set[tuple[int, int]] = set()
         # This step's posted reads, awaited in start_load_kv before the forward.
         self._reads_issued_this_step: list = []
 
@@ -2144,7 +2145,7 @@ class MoRIIOConnectorWorker:
         path = make_zmq_path("tcp", host, base_port)
         logger.debug("mori handshake starting listening on path: %s", path)
 
-        with zmq_ctx(zmq.ROUTER, path) as sock:
+        with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
             ready_event.set()
             while True:
                 identity, msg = sock.recv_multipart()
@@ -2202,7 +2203,7 @@ class MoRIIOConnectorWorker:
         logger.debug("handshake Querying metadata on path: %s", path)
 
         # Send query for the request.
-        with zmq_ctx(zmq.DEALER, path) as sock:
+        with zmq_socket_ctx(path, zmq.DEALER, bind=False) as sock:
             logger.debug("prepare send msg INSTAZNCE: %s", path)
             sock.send(MoRIIOConstants.GET_META_MSG)
             received_frame = sock.recv_multipart()
@@ -2211,7 +2212,16 @@ class MoRIIOConnectorWorker:
 
             metadata_bytes = received_frame[1]
             decoder = msgspec.msgpack.Decoder(MoRIIOAgentMetadata)
-            metadata = decoder.decode(metadata_bytes)
+            try:
+                metadata = decoder.decode(metadata_bytes)
+            except msgspec.DecodeError as e:
+                raise HandshakeError(
+                    f"MoRIIO handshake with {host}:{port} returned undecodable "
+                    f"metadata ({e}); the peer likely runs an incompatible "
+                    "connector wire version (local MORIIO_CONNECTOR_VERSION="
+                    f"{MORIIO_CONNECTOR_VERSION})"
+                ) from e
+            self._validate_peer_geometry(metadata)
             got_metadata_time = time.perf_counter()
             logger.info(
                 "MoRIIO handshake: get metadata took: %s",
@@ -2394,23 +2404,60 @@ class MoRIIOConnectorWorker:
         )
         return alias
 
-    def _get_layer_transfer_geometry(
-        self, layer_name: str, remote_num_blocks: int | None = None
-    ) -> LayerTransferGeometry:
-        geometry = get_layer_transfer_geometry(
+    def _get_layer_transfer_geometry(self, layer_name: str) -> LayerTransferGeometry:
+        return get_layer_transfer_geometry(
             layer_name,
             self.kv_caches[layer_name],
             self.layer_to_spec,
-            remote_num_blocks,
         )
-        # get_layer_transfer_geometry also serves mamba layers, whose geometry
-        # is a different NamedTuple with no block fields. Every caller here is
-        # on the attention path (mamba layers return before reaching it), so
-        # narrow the type instead of leaking the union.
-        assert isinstance(geometry, LayerTransferGeometry), (
-            f"layer {layer_name} is a mamba layer; use get_mamba_transfer_geometry"
+
+    def _local_group_geometry(self, group_id: int) -> GroupGeometry:
+        return self.kv_cache_config.group_geometry(
+            self.kv_cache_config.transfer_group_ids[group_id]
         )
-        return geometry
+
+    def _validate_peer_geometry(self, metadata: MoRIIOAgentMetadata) -> None:
+        """Fail the handshake on a peer whose wire or row grids don't match."""
+        if metadata.version != MORIIO_CONNECTOR_VERSION:
+            raise HandshakeError(
+                f"MoRIIO peer runs connector wire version {metadata.version}, "
+                f"this engine runs {MORIIO_CONNECTOR_VERSION}; mixed-version "
+                "deployments cannot pair (the pool geometry handshake is not "
+                "backward compatible)"
+            )
+        n_groups = len(self.kv_cache_config.transfer_groups)
+        for name, values in (
+            ("group_num_blocks", metadata.group_num_blocks),
+            ("group_geometries", metadata.group_geometries),
+        ):
+            if len(values) != n_groups:
+                raise HandshakeError(
+                    f"MoRIIO peer advertised {len(values)} transfer groups in "
+                    f"{name}, this engine has {n_groups}; the two sides must "
+                    "run the same model and KV cache grouping"
+                )
+        for group_id, local in enumerate(self.kv_cache_config.transfer_groups):
+            remote_rows = metadata.group_geometries[group_id].kernel_rows_per_block
+            if remote_rows != local.kernel_rows_per_block:
+                raise HandshakeError(
+                    f"MoRIIO peer splits transfer group {group_id} into "
+                    f"{remote_rows} kernel rows per block, this engine uses "
+                    f"{local.kernel_rows_per_block}; rows pair 1:1, so both "
+                    "sides must resolve the same kernel block size"
+                )
+        # Rows pair 1:1, so a peer holding a different number of tokens per
+        # block would slice the wrong tokens into every local block.
+        for layer_name, remote in metadata.attention_block_sizes.items():
+            local_size = self.attention_block_sizes.get(layer_name)
+            if local_size is not None and remote != local_size:
+                raise HandshakeError(
+                    f"Layer {layer_name} holds {local_size} tokens per block "
+                    f"here and {remote} on the peer. Hybrid models size "
+                    "attention blocks to the per-rank recurrent state, so MLA "
+                    "models with different prefill and decode TP sizes get "
+                    "different block sizes; pass the same --block-size to "
+                    "both instances"
+                )
 
     def _iter_layer_registration_regions(
         self, layer_name: str
@@ -2424,19 +2471,19 @@ class MoRIIOConnectorWorker:
     def _build_shared_kv_mr(
         self, kv_caches: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, int]]:
+        """One page-aligned region over the shared large-page pool.
+
+        Returns the region tensor and each layer view's byte offset in it.
+        """
         page_size = 4096
-        backing = next(iter(kv_caches.values())).view(torch.uint8)
-        nbytes = backing.untyped_storage().nbytes()
-        base = torch.as_strided(backing, (nbytes,), (1,), 0)
+        any_view = next(iter(kv_caches.values()))
+        storage = any_view.untyped_storage()
+        nbytes = storage.nbytes()
+        base = torch.empty(0, dtype=torch.uint8, device=any_view.device)
+        base.set_(storage, 0, (nbytes,), (1,))
         ptr = base.data_ptr()
         slack = ptr % page_size
-        end = 0
-        for layer_name in kv_caches:
-            _, region_len = next(
-                iter(self._iter_layer_registration_regions(layer_name))
-            )
-            end = max(end, kv_caches[layer_name].data_ptr() - ptr + region_len)
-        reg_nbytes = ((slack + end + page_size - 1) // page_size) * page_size
+        reg_nbytes = round_up(slack + nbytes, page_size)
         if reg_nbytes > nbytes:
             raise ValueError(
                 f"shared KV backing too small for page-aligned MR: "
@@ -2497,159 +2544,63 @@ class MoRIIOConnectorWorker:
                     "state layout; set VLLM_SSM_CONV_STATE_LAYOUT=DS"
                 )
             self._conv_decomp = derive_mamba_conv_split(mamba_spec, self.world_size)
-        # KDA layers use packed pages with different geometry; only record
-        # attention tensor shapes here.
-        self.kv_cache_shapes = {
-            layer_name: kv_cache.shape
-            for layer_name, kv_cache in kv_caches.items()
-            if not self._is_mamba_layer(layer_name)
-        }
-
-        # Geometry selection must pick an attention layer (never a KDA tuple):
-        # prefer a standard 5-D K/V layer, else the first attention layer.
-        attn_items = [
-            (layer_name, kv_cache)
-            for layer_name, kv_cache in kv_caches.items()
-            if not self._is_mamba_layer(layer_name)
-        ]
-        first_layer_name, first_kv_cache = next(
-            (
-                (layer_name, kv_cache)
-                for layer_name, kv_cache in attn_items
-                if (
-                    not self._is_mla_cache_layer(layer_name)
-                    and len(kv_cache.shape) == 5
-                    and (kv_cache.shape[0] == 2 or kv_cache.shape[1] == 2)
-                )
-            ),
-            attn_items[0] if attn_items else next(iter(kv_caches.items())),
-        )
-        kv_elem_size = first_kv_cache.element_size()
-
-        use_mla = self._is_mla_cache_layer(first_layer_name)
-        first_geometry = self._get_layer_transfer_geometry(first_layer_name)
-
-        if use_mla:
-            # MLA case.
-            block_rank = 2  # [block_size, latent_dim]
-            block_shape = first_kv_cache.shape[-block_rank:]
-        else:
-            # [2, num_blocks, ...] or [num_blocks, 2, ...]
-            block_rank = 3  # [block_size, kv_heads, head_dim]
-            block_shape = first_kv_cache.shape[-block_rank:]
-        self.num_blocks = first_geometry.num_blocks
-        self.slot_size_bytes = first_geometry.slot_size_bytes
-        if first_geometry.block_size != self.block_size:
-            # DeepSeek-V3 / MLA backends (e.g. FlashMLA) override the
-            # configured block_size at attention-layer creation time, so
-            # the KV cache tensor is laid out with a different (usually
-            # larger) block_size than vllm_config.cache_config.block_size.
-            # Trust the actual tensor shape and reconcile.
-            logger.info(
-                "KV cache block_size=%d differs from config block_size=%d; "
-                "using actual tensor shape (attention backend override).",
-                first_geometry.block_size,
-                self.block_size,
+        # Every layer view is a strided [K, H, N, C] view (mamba: packed
+        # [K, 1, 1, C] bytes) over one shared large-page pool; the whole pool
+        # registers as a single memory region.
+        if len({id(t.untyped_storage()) for t in kv_caches.values()}) != 1:
+            raise MoRIIOError(
+                "MoRIIO large-page KV cache layers must be views over one "
+                "shared backing allocation"
             )
-            self.block_size = first_geometry.block_size
-        # block size in bytes
-        self.block_len = first_geometry.block_len
-        self.kv_cache_shape = first_kv_cache.shape
-        self.block_shape = block_shape
-        self.kv_element_size = kv_elem_size
-
-        self.dst_num_blocks[self.engine_id] = self.num_blocks
         kv_caches_base_addr = []
-        caches_data = []
         self.layer_base_addr_index = {}
         base_addr_idx = 0
-        # HMA (#53721 Gemma4 SWA, GLM-5.2 DSA, MiniMax): transfers already
-        # size RDMA from per-layer geometry, so allow divergent block_len
-        # (bytes) always, and divergent block_size (tokens/page) only when
-        # the hybrid KV cache manager is enabled. Without HMA, block_size
-        # must stay uniform for the peer page handshake.
-        hma_enabled = (
-            not self.vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
-        )
+        group_num_rows: dict[int, int] = {}
 
         for layer_name in kv_caches:
             self.layer_base_addr_index[layer_name] = base_addr_idx
             if self._is_mamba_layer(layer_name):
                 # KDA layer: two whole-tensor regions (conv, ssm); no block-size
                 # geometry (recurrent state is per-slot, not paged).
-                for cache, region_len in self._iter_layer_registration_regions(
+                for cache, _region_len in self._iter_layer_registration_regions(
                     layer_name
                 ):
-                    base_addr = cache.data_ptr()
-                    caches_data.append((base_addr, region_len, cache.device.index, ""))
-                    kv_caches_base_addr.append(base_addr)
+                    kv_caches_base_addr.append(cache.data_ptr())
                     base_addr_idx += 1
                 continue
             geometry = self._get_layer_transfer_geometry(layer_name)
-            if geometry.block_size != self.block_size:
-                if not hma_enabled:
-                    raise ValueError(
-                        "MoRIIO KV cache block size mismatch for layer "
-                        f"{layer_name}: {geometry.block_size} != "
-                        f"{self.block_size}"
-                    )
-                logger.debug(
-                    "MoRIIO HMA per-layer block_size for %s: %d "
-                    "(page/default %d); continuing with per-layer sizes.",
-                    layer_name,
-                    geometry.block_size,
-                    self.block_size,
-                )
-            if geometry.block_len != self.block_len:
-                # Unlike block_size above, divergent block_len is allowed
-                # unconditionally (not gated on hma_enabled) -- it covers
-                # non-hybrid models too, e.g. GLM-5.2 DSA's per-layer
-                # geometry. Don't attribute it to HMA in the log.
-                logger.debug(
-                    "MoRIIO per-layer block_len for %s: %d "
-                    "(page/default %d); continuing with per-layer sizes.",
-                    layer_name,
-                    geometry.block_len,
-                    self.block_len,
-                )
-            # num_blocks is advertised as a single scalar to the peer, so must it
-            # be uniform
-            if geometry.num_blocks != self.num_blocks:
+            group_id = self.layer_to_group[layer_name]
+            group = self.kv_cache_config.transfer_groups[group_id]
+            group_geometry = self._local_group_geometry(group_id)
+            if geometry.row_stride != group_geometry.row_bytes:
                 raise ValueError(
-                    "MoRIIO KV cache num_blocks mismatch for layer "
-                    f"{layer_name}: {geometry.num_blocks} != {self.num_blocks}"
+                    f"MoRIIO KV cache row stride mismatch for layer "
+                    f"{layer_name}: view stride {geometry.row_stride} != "
+                    f"group row_bytes {group_geometry.row_bytes}"
                 )
-            self.block_lens[layer_name] = geometry.block_len
-            for cache, region_len in self._iter_layer_registration_regions(layer_name):
-                base_addr = cache.data_ptr()
-                caches_data.append((base_addr, region_len, cache.device.index, ""))
-                kv_caches_base_addr.append(base_addr)
+            if (
+                geometry.tokens_per_row * group_geometry.kernel_rows_per_block
+                != group.kv_cache_spec.num_states
+            ):
+                raise ValueError(
+                    f"MoRIIO KV cache kernel row mismatch for layer "
+                    f"{layer_name}: {geometry.tokens_per_row} tokens/row * "
+                    f"{group_geometry.kernel_rows_per_block} rows != block of "
+                    f"{group.kv_cache_spec.num_states} states"
+                )
+            num_rows = group_num_rows.setdefault(group_id, geometry.num_rows)
+            if geometry.num_rows != num_rows:
+                raise ValueError(
+                    f"MoRIIO KV cache row count mismatch for layer "
+                    f"{layer_name}: {geometry.num_rows} != {num_rows}; every "
+                    "layer of a group shares the group's kernel-row grid"
+                )
+            for cache, _region_len in self._iter_layer_registration_regions(layer_name):
+                kv_caches_base_addr.append(cache.data_ptr())
                 base_addr_idx += 1
 
-        shared_backing = (
-            all(isinstance(t, torch.Tensor) for t in kv_caches.values())
-            and len({id(t.untyped_storage()) for t in kv_caches.values()}) == 1
-        )
-        shared_mr = None
-        if shared_backing:
-            reg_tensor, self.kv_layer_mr_offset = self._build_shared_kv_mr(kv_caches)
-            shared_mr = self.moriio_wrapper.register_local_tensor(reg_tensor)
-
-        # Say it out loud when the groups disagree. This is expected on a hybrid
-        # model and used to be fatal, so a run that silently had one page size
-        # and a run that has three should not look identical in the log.
-        distinct_block_lens = sorted(set(self.block_lens.values()))
-        if len(distinct_block_lens) > 1:
-            self.block_len = max(distinct_block_lens)
-            logger.info(
-                "MoRIIO registered %d attention layers with %d distinct block "
-                "lengths (bytes): %s; transfer sizes and strides are per layer, "
-                "and %d is the page advertised to the peer.",
-                len(self.block_lens),
-                len(distinct_block_lens),
-                distinct_block_lens,
-                self.block_len,
-            )
+        reg_tensor, self.kv_layer_mr_offset = self._build_shared_kv_mr(kv_caches)
+        shared_mr = self.moriio_wrapper.register_local_tensor(reg_tensor)
 
         for layer_name, kv_cache in kv_caches.items():
             if layer_name not in self.layer_name_to_local_kv_cache_metadata:
@@ -2666,38 +2617,18 @@ class MoRIIOConnectorWorker:
                 conv, ssm = kda_conv_ssm(
                     kv_cache, cast(MambaSpec, self.layer_to_spec[layer_name])
                 )
-                logger.debug(
-                    "MoRIIO KDA register %s: conv shape=%s stride=%s contig=%s "
-                    "storage_nbytes=%s ; ssm shape=%s stride=%s contig=%s "
-                    "storage_nbytes=%s",
-                    layer_name,
-                    tuple(conv.shape),
-                    tuple(conv.stride()),
-                    conv.is_contiguous(),
-                    conv.untyped_storage().nbytes(),
-                    tuple(ssm.shape),
-                    tuple(ssm.stride()),
-                    ssm.is_contiguous(),
-                    ssm.untyped_storage().nbytes(),
-                )
                 for tensor in (conv, ssm):
                     alias = self._contiguous_byte_alias(tensor)
                     meta = self.moriio_wrapper.register_local_tensor(alias)
                     self.layer_name_to_local_kv_cache_metadata[layer_name].append(meta)
                     self.local_kv_cache_size.append(alias.numel())
             else:
-                moriio_mem_metadata = shared_mr or (
-                    self.moriio_wrapper.register_local_tensor(kv_cache)
-                )
-                self.layer_name_to_local_kv_cache_metadata[layer_name].append(
-                    moriio_mem_metadata
-                )
+                self.layer_name_to_local_kv_cache_metadata[layer_name].append(shared_mr)
                 self.local_kv_cache_size.append(
                     kv_cache.nelement() * kv_cache.element_size()
                 )
 
         self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
-        self.num_regions = len(caches_data)
         self._record_slice_layouts(kv_caches)
         self.num_layers = len(self.kv_caches.keys())
 
@@ -2732,13 +2663,15 @@ class MoRIIOConnectorWorker:
             )
             assert len(self.block_window_per_layer) == self.num_layers
 
+        transfer_groups = self.kv_cache_config.transfer_groups
         metadata = MoRIIOAgentMetadata(
+            version=MORIIO_CONNECTOR_VERSION,
             engine_id=self.engine_id,
             agent_metadata=self.moriio_wrapper.get_agent_metadata(),
             kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id],
-            num_blocks=self.num_blocks,
-            block_len=self.block_len,
             attn_backend_name=self.backend_name,
+            group_num_blocks=[group.num_blocks for group in transfer_groups],
+            group_geometries=self.kv_cache_config.transfer_group_geometries,
             kv_head_layouts={
                 name: layout.to_wire() for name, layout in self.kv_head_layouts.items()
             },
@@ -2778,9 +2711,9 @@ class MoRIIOConnectorWorker:
         self.attention_block_sizes: dict[str, int] = {}
         for layer_name, kv_cache in kv_caches.items():
             if not self._is_mamba_layer(layer_name):
-                self.attention_block_sizes[layer_name] = (
-                    self._get_layer_transfer_geometry(layer_name).block_size
-                )
+                self.attention_block_sizes[layer_name] = self.layer_to_spec[
+                    layer_name
+                ].block_size
             if self._is_mamba_layer(layer_name):
                 assert self._conv_decomp is not None
                 conv, ssm = kda_conv_ssm(
@@ -2987,8 +2920,8 @@ class MoRIIOConnectorWorker:
         modes: RDMA may still write into its blocks, so the forward must not
         consume them. If every READ is terminal, attention-only failures are
         reported via get_block_ids_with_load_errors. Hybrid failures are
-        re-raised because the scheduler's recovery path does not support
-        multiple cache groups.
+        re-raised: recompute recovery would replay tokens without the
+        recurrent state, so the step fails instead.
         """
         statuses = self._reads_issued_this_step
         self._reads_issued_this_step = []
@@ -3022,17 +2955,19 @@ class MoRIIOConnectorWorker:
     def _record_failed_recv(self, req_id: ReqId) -> None:
         """Hand a failed attention-only read to scheduler recovery.
 
-        The scheduler's invalid-block recovery currently assumes exactly one
-        KV cache group. Reporting IDs for a hybrid request would crash it while
-        unpacking the request's groups, so match NIXL and keep HMA failures out
-        of this API until scheduler recovery carries group identity.
+        Hybrid (mamba) failures fail the step in _await_reads_issued_this_step
+        instead, so they are never reported here.
         """
         if self._has_mamba:
             return
         self._invalid_block_ids.update(self._recving_local_blocks.get(req_id, ()))
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
-        """Drain the blocks whose read failed, for the scheduler to recompute."""
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
+        """Drain the blocks whose read failed, for the scheduler to recompute.
+
+        Block ids are unique only within a KV cache group, so each entry is a
+        ``(group_id, block_id)`` pair.
+        """
         invalid, self._invalid_block_ids = self._invalid_block_ids, set()
         return invalid
 
@@ -3564,13 +3499,15 @@ class MoRIIOConnectorWorker:
             total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
             is_mla=self._is_mla_cache_layer(layer_name),
         )
+        group_id = self.layer_to_group[layer_name]
         local, remote, sizes = compute_block_transfer_offsets(
-            layer_name=layer_name,
-            kv_cache=self.kv_caches[layer_name],
-            layer_to_spec=self.layer_to_spec,
+            geometry=self._get_layer_transfer_geometry(layer_name),
+            local_group=self._local_group_geometry(group_id),
+            local_num_blocks=self.kv_cache_config.transfer_groups[group_id].num_blocks,
+            remote_group=remote_moriio_meta.group_geometries[group_id],
+            remote_num_blocks=remote_moriio_meta.group_num_blocks[group_id],
             local_block_ids=local_block_ids,
             remote_block_ids=remote_block_ids,
-            remote_num_blocks=remote_moriio_meta.num_blocks,
             merge_fn=lambda local, remote, sizes: self.merge_contiguous_blocks(
                 local, remote, sizes, assume_sorted=False
             ),
@@ -3595,21 +3532,6 @@ class MoRIIOConnectorWorker:
             local = [x + local_off for x in local]
             remote = [x + remote_off for x in remote]
         return local, remote, sizes
-
-    def _check_peer_block_size(
-        self, layer_name: str, remote_moriio_meta: MoRIIOAgentMetadata
-    ) -> None:
-        """Blocks are copied as units, so both sides must hold as many tokens."""
-        remote = remote_moriio_meta.attention_block_sizes.get(layer_name)
-        local = self.attention_block_sizes.get(layer_name)
-        if remote is not None and local is not None and remote != local:
-            raise MoRIIOError(
-                f"Layer {layer_name} holds {local} tokens per block here and "
-                f"{remote} on the peer. Hybrid models size attention blocks to "
-                "the per-rank recurrent state, so MLA models with different "
-                "prefill and decode TP sizes get different block sizes; pass the "
-                "same --block-size to both instances"
-            )
 
     def _block_copy_matches_peer(
         self, layer_name: str, remote_moriio_meta: MoRIIOAgentMetadata
@@ -3645,11 +3567,24 @@ class MoRIIOConnectorWorker:
                 "layout on both sides; the cache layout of this layer cannot "
                 "be sliced by head, or the peer runs an older vLLM"
             )
+        group_id = self.layer_to_group[layer_name]
+        # Rows pair 1:1, so both sides expand their own manager block ids with
+        # their own group geometry and pool size.
+        local_rows = expand_block_kernel_rows(
+            self._local_group_geometry(group_id),
+            self.kv_cache_config.transfer_groups[group_id].num_blocks,
+            local_block_ids,
+        )
+        remote_rows = expand_block_kernel_rows(
+            remote_moriio_meta.group_geometries[group_id],
+            remote_moriio_meta.group_num_blocks[group_id],
+            remote_block_ids,
+        )
         offsets = compute_head_slice_offsets(
             local_layout,
             HeadLayout.from_wire(remote_wire),
-            local_block_ids,
-            remote_block_ids,
+            local_rows,
+            remote_rows,
             target.local_head,
             target.remote_head,
             target.num_heads,
@@ -3676,15 +3611,44 @@ class MoRIIOConnectorWorker:
                 f"Heterogeneous-TP WRITE of mamba layer {layer_name} needs the "
                 "peer's state layout; the peer runs an older vLLM"
             )
+        local_rows, remote_rows = self._mamba_rows(
+            layer_name, local_slots, remote_slots, remote_moriio_meta
+        )
         return compute_mamba_slice_offsets(
             self.mamba_state_layouts[layer_name],
             MambaStateLayout.from_wire(remote_wire),
-            local_slots,
-            remote_slots,
+            local_rows,
+            remote_rows,
             target.local_slice,
             target.local_slices,
             target.remote_slice,
             target.remote_slices,
+        )
+
+    def _mamba_rows(
+        self,
+        layer_name: str,
+        local_slots: list[int],
+        remote_slots: list[int],
+        remote_moriio_meta: MoRIIOAgentMetadata,
+    ) -> tuple[list[int], list[int]]:
+        """Expand mamba manager block ids to kernel rows of the conv/ssm views.
+
+        Each side expands with its own group geometry: the remote slot grid
+        differs whenever the peer's page size or slot count does.
+        """
+        group_id = self.layer_to_group[layer_name]
+        return (
+            expand_block_kernel_rows(
+                self._local_group_geometry(group_id),
+                self.kv_cache_config.transfer_groups[group_id].num_blocks,
+                local_slots,
+            ),
+            expand_block_kernel_rows(
+                remote_moriio_meta.group_geometries[group_id],
+                remote_moriio_meta.group_num_blocks[group_id],
+                remote_slots,
+            ),
         )
 
     def _region_session_indices(self, layer_name: str) -> list[int]:
@@ -3731,6 +3695,7 @@ class MoRIIOConnectorWorker:
         layer_name: str,
         local_slots: list[int],
         remote_slots: list[int],
+        remote_moriio_meta: MoRIIOAgentMetadata,
         remote_tp_size: int | None = None,
     ) -> tuple[list[int], list[int], list[int], int]:
         """Compute (local, remote, sizes, n_conv) for a KDA layer.
@@ -3755,8 +3720,11 @@ class MoRIIOConnectorWorker:
                 tp_ratio,
             )
             self._mamba_offset_templates[layer_name] = template
+        local_rows, remote_rows = self._mamba_rows(
+            layer_name, local_slots, remote_slots, remote_moriio_meta
+        )
         local_offs, remote_offs, sizes = apply_mamba_offset_template(
-            template, local_slots, remote_slots
+            template, local_rows, remote_rows
         )
         n_conv = compute_mamba_conv_split_count(local_slots, self._conv_decomp)
         return local_offs, remote_offs, sizes, n_conv
@@ -3768,6 +3736,7 @@ class MoRIIOConnectorWorker:
         region_sessions: list[int],
         local_slots: list[int],
         remote_slots: list[int],
+        remote_moriio_meta: MoRIIOAgentMetadata,
         remote_tp_size: int,
         request_id: str,
         deadline: float,
@@ -3782,6 +3751,7 @@ class MoRIIOConnectorWorker:
             layer_name,
             local_slots,
             remote_slots,
+            remote_moriio_meta,
             remote_tp_size=remote_tp_size,
         )
         statuses: list = []
@@ -3947,7 +3917,8 @@ class MoRIIOConnectorWorker:
         for layer_name in self.layer_name_to_local_kv_cache_metadata:
             region_sessions = self._region_session_indices(layer_name)
             statuses = []
-            if self._is_mamba_layer(layer_name):
+            is_mamba_layer = self._is_mamba_layer(layer_name)
+            if is_mamba_layer:
                 local_mamba = self._mamba_blocks_for_layer(layer_name, local_block_ids)
                 remote_mamba = self._mamba_blocks_for_layer(
                     layer_name, remote_block_ids
@@ -3975,6 +3946,7 @@ class MoRIIOConnectorWorker:
                     region_sessions,
                     local_mamba,
                     remote_mamba,
+                    remote_moriio_meta,
                     remote_tp_size,
                     request_id,
                     _sq_deadline,
@@ -4009,15 +3981,17 @@ class MoRIIOConnectorWorker:
             with self.moriio_wrapper.lock:
                 self._recving_transfers[request_id][layer_name] = statuses
                 self._recving_transfers_start.setdefault(request_id, time.monotonic())
-                # Destination blocks, kept for _record_failed_recv.
-                if self._has_mamba:
-                    failed_recv_blocks = local_attn
-                else:
-                    failed_recv_blocks = [
-                        block_id for group in local_block_ids for block_id in group
-                    ]
-                self._recving_local_blocks.setdefault(
-                    request_id, list(failed_recv_blocks)
+                # Destination blocks of this layer, tagged with their KV cache
+                # group for _record_failed_recv: block ids are unique only
+                # within a group.
+                kv_group_id = self.kv_cache_config.transfer_group_ids[
+                    self.layer_to_group[layer_name]
+                ]
+                self._recving_local_blocks.setdefault(request_id, set()).update(
+                    (kv_group_id, block_id)
+                    for block_id in (
+                        local_mamba if is_mamba_layer else local_layer_blocks
+                    )
                 )
                 self._reads_issued_this_step.extend(statuses)
                 self._recving_transfers_callback_addr[request_id] = (

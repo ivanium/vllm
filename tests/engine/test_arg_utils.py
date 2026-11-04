@@ -1087,17 +1087,7 @@ def test_get_batch_defaults_gb10_stays_on_small_tier(
     assert seqs[UsageContext.OPENAI_API_SERVER] == expected_api_seqs
 
 
-def test_kv_cache_allocator_cli():
-    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    args = parser.parse_args([])
-    assert args.kv_cache_allocator == "uniform_page"
-    args = parser.parse_args(["--kv-cache-allocator", "large_page"])
-    assert args.kv_cache_allocator == "large_page"
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--kv-cache-allocator", "bogus"])
-
-
-def _large_page_vllm_config(**kwargs):
+def _kv_cache_vllm_config(**kwargs):
     from vllm.config import CUDAGraphMode, ParallelConfig, SchedulerConfig, VllmConfig
 
     kwargs.setdefault(
@@ -1108,7 +1098,7 @@ def _large_page_vllm_config(**kwargs):
             skip_tokenizer_init=True,
         ),
     )
-    kwargs.setdefault("cache_config", CacheConfig(kv_cache_allocator="large_page"))
+    kwargs.setdefault("cache_config", CacheConfig())
     kwargs.setdefault("parallel_config", ParallelConfig())
     kwargs.setdefault(
         "scheduler_config",
@@ -1122,33 +1112,7 @@ def _large_page_vllm_config(**kwargs):
     return VllmConfig(**kwargs)
 
 
-def test_large_page_allocator_rejects_hisparse():
-    from vllm.config.attention import HiSparseConfig
-
-    with pytest.raises(ValueError, match="does not support HiSparse"):
-        _large_page_vllm_config(
-            model_config=ModelConfig(
-                model="facebook/opt-125m",
-                max_model_len=2048,
-                skip_tokenizer_init=True,
-                hf_overrides={"index_topk": 128},
-            ),
-            attention_config=AttentionConfig(hisparse_config=HiSparseConfig()),
-        )
-
-
-def test_large_page_allocator_rejects_flex_attention():
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-    with pytest.raises(ValueError, match="FLEX_ATTENTION"):
-        _large_page_vllm_config(
-            attention_config=AttentionConfig(
-                backend=AttentionBackendEnum.FLEX_ATTENTION
-            ),
-        )
-
-
-def test_large_page_allocator_rejects_unsupported_platform(monkeypatch):
+def test_kv_cache_rejects_unsupported_platform(monkeypatch):
     """Platforms opt in: an out-of-tree runner that binds dense per-layer
     caches would silently misread large-page views."""
     from vllm.platforms import current_platform
@@ -1159,58 +1123,4 @@ def test_large_page_allocator_rejects_unsupported_platform(monkeypatch):
         classmethod(lambda cls: False),
     )
     with pytest.raises(ValueError, match="is not supported on"):
-        _large_page_vllm_config()
-
-
-def test_large_page_allocator_prefix_match_unit_deferred_to_planner():
-    """prefix_match_unit is checked against the resolved global block size B
-    in the planner, not against the requested block size at config time."""
-    _large_page_vllm_config(
-        cache_config=CacheConfig(
-            kv_cache_allocator="large_page", prefix_match_unit=128
-        ),
-    )
-
-
-def test_large_page_allocator_connector_allowlist():
-    from vllm.config import KVTransferConfig
-
-    # Only NixlConnector and SimpleCPUOffloadConnector are supported.
-    for connector in ("NixlConnector", "SimpleCPUOffloadConnector"):
-        _large_page_vllm_config(
-            kv_transfer_config=KVTransferConfig(
-                kv_connector=connector, kv_role="kv_both"
-            ),
-        )
-    with pytest.raises(ValueError, match="MooncakeStoreConnector"):
-        _large_page_vllm_config(
-            kv_transfer_config=KVTransferConfig(
-                kv_connector="MooncakeStoreConnector", kv_role="kv_both"
-            ),
-        )
-    # MultiConnector is unwrapped; every child must be supported.
-    _large_page_vllm_config(
-        kv_transfer_config=KVTransferConfig(
-            kv_connector="MultiConnector",
-            kv_role="kv_both",
-            kv_connector_extra_config={
-                "connectors": [
-                    {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
-                    {"kv_connector": "SimpleCPUOffloadConnector", "kv_role": "kv_both"},
-                ]
-            },
-        ),
-    )
-    with pytest.raises(ValueError, match="OffloadingConnector"):
-        _large_page_vllm_config(
-            kv_transfer_config=KVTransferConfig(
-                kv_connector="MultiConnector",
-                kv_role="kv_both",
-                kv_connector_extra_config={
-                    "connectors": [
-                        {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
-                        {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"},
-                    ]
-                },
-            ),
-        )
+        _kv_cache_vllm_config()

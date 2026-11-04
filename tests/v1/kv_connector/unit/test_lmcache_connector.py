@@ -1,17 +1,114 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
+import types
 from collections.abc import Iterator
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
+from tests.v1.kv_connector.unit.utils import create_vllm_config, make_kv_cache_config
 from vllm.distributed.kv_events import BlockStored
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVConnectorRole,
+    SupportsHMA,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
     LMCacheConnectorV1,
     LMCacheKVEvents,
 )
 from vllm.v1.outputs import KVConnectorOutput
+
+
+def test_lmcache_connector_supports_hma():
+    """The connector must be group-aware to address per-group KV pools."""
+    assert issubclass(LMCacheConnectorV1, SupportsHMA)
+
+
+class _OldLMCacheImpl:
+    """The released-lmcache interface: no kv_cache_config, no group hooks."""
+
+    def __init__(self, vllm_config, role, parent):
+        pass
+
+    def request_finished(self, request, block_ids):
+        return False, None
+
+
+class _CoReleasedLMCacheImpl:
+    """The interface of the lmcache co-released with this vLLM."""
+
+    def __init__(self, vllm_config, role, parent, kv_cache_config):
+        pass
+
+    def request_finished_all_groups(self, request, block_ids):
+        return False, None
+
+
+def _install_fake_lmcache(monkeypatch: pytest.MonkeyPatch, impl_cls: type) -> None:
+    """Stand in a fake lmcache package exposing ``impl_cls`` as the connector
+    impl, so the default (external) path can be exercised without lmcache."""
+    adapter: Any = types.ModuleType("lmcache.integration.vllm.vllm_v1_adapter")
+    adapter.LMCacheConnectorV1Impl = impl_cls
+    monkeypatch.setitem(
+        sys.modules, "lmcache.integration.vllm.vllm_v1_adapter", adapter
+    )
+    for name in ("lmcache", "lmcache.integration", "lmcache.integration.vllm"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+
+
+def test_default_path_rejects_released_lmcache_impl(monkeypatch):
+    """A released lmcache impl (3-arg init, no group hooks) must fail at
+    construction with an error that names the missing capability."""
+    _install_fake_lmcache(monkeypatch, _OldLMCacheImpl)
+    with pytest.raises(RuntimeError, match="request_finished_all_groups"):
+        LMCacheConnectorV1(
+            create_vllm_config(kv_connector="LMCacheConnectorV1"),
+            KVConnectorRole.SCHEDULER,
+            make_kv_cache_config(block_size=16),
+        )
+
+
+def test_default_path_accepts_co_released_lmcache_impl(monkeypatch):
+    _install_fake_lmcache(monkeypatch, _CoReleasedLMCacheImpl)
+    connector = LMCacheConnectorV1(
+        create_vllm_config(kv_connector="LMCacheConnectorV1"),
+        KVConnectorRole.SCHEDULER,
+        make_kv_cache_config(block_size=16),
+    )
+    assert isinstance(connector._lmcache_engine, _CoReleasedLMCacheImpl)
+
+
+def test_connector_rejects_non_token_paged_transfer_group():
+    """Hybrid attention+Mamba configs must fail at connector init: Mamba
+    groups are not token-paged, so per-token slot mappings cannot address
+    them."""
+    with pytest.raises(ValueError, match="MambaSpec"):
+        LMCacheConnectorV1(
+            create_vllm_config(kv_connector="LMCacheConnectorV1"),
+            KVConnectorRole.SCHEDULER,
+            make_kv_cache_config(block_size=16, mamba_enabled=True),
+        )
+
+
+def test_request_finished_all_groups_delegates_to_engine():
+    connector = LMCacheConnectorV1.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = MagicMock()
+    connector._lmcache_engine.request_finished_all_groups.return_value = (
+        False,
+        {"first_tok": 42},
+    )
+
+    request = MagicMock()
+    block_ids = ([0, 1], [7, 9])
+    result = connector.request_finished_all_groups(request, block_ids)
+
+    connector._lmcache_engine.request_finished_all_groups.assert_called_once_with(
+        request, block_ids
+    )
+    assert result == (False, {"first_tok": 42})
 
 
 @pytest.fixture
@@ -793,7 +890,8 @@ def test_legacy_layerwise_engine_does_not_reuse_storers_on_empty_steps():
     """Empty steps must not advance generators exhausted by the last forward."""
 
     class LegacyLayerwiseEngine:
-        layerwise_storers: list[Iterator[None]]
+        def __init__(self):
+            self.layerwise_storers: list[Iterator[None]] = []
 
         def save_kv_layer(self, *args, **kwargs):
             self.layerwise_storers.append(iter([None]))

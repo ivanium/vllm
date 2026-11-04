@@ -10,7 +10,6 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHashWithGroupId,
     KVCacheBlock,
-    KVCacheBlockCopy,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     HiSparseHotManager,
@@ -28,6 +27,7 @@ from vllm.v1.hisparse.types import (
 from vllm.v1.kv_cache_interface import (
     HiSparseResidentSpec,
     KVCacheConfig,
+    large_pages_needed,
 )
 from vllm.v1.request import Request
 
@@ -165,12 +165,17 @@ class HiSparseCoordinator:
             self.gpu_pool = self.resident_managers[0].block_pool
             # Requests start reading from host once the shared pool runs this
             # low, so admissions find evictable pages rather than pinned ones.
-            hot_cost = sum(manager.blocks_per_request for manager in hot_managers)
-            self.transition_watermark = max(hot_cost, kv_cache_config.num_blocks // 10)
+            # In pages: one page holds at least blocks_per_page blocks of a
+            # group.
+            hot_pages = sum(
+                large_pages_needed(
+                    manager.blocks_per_request,
+                    groups[manager.kv_cache_group_id].blocks_per_page,
+                )
+                for manager in hot_managers
+            )
+            self.transition_watermark = max(hot_pages, kv_cache_config.num_pages // 10)
 
-        # Host copies handed to the worker, by destination block id, until it
-        # reports having run them.
-        self._retained_copies: dict[int, tuple[KVCacheBlock, KVCacheBlock]] = {}
         # request -> prefix length an external load is still filling in.
         self._pending_imports: dict[str, int] = {}
         # Requests whose resident pages were all non-null when last scanned.
@@ -184,9 +189,11 @@ class HiSparseCoordinator:
         # Published host block hash -> GPU copies of that page, readable until
         # the pool reuses them. Lets a host prefix hit come back GPU-resident.
         self.copies: dict[BlockHashWithGroupId, tuple[KVCacheBlock, ...]] = {}
-        self._copy_by_block: dict[int, BlockHashWithGroupId] = {}
-        # Unpinned GPU block id -> (request, page) pairs still reading it.
-        self._owners: dict[int, set[tuple[str, int]]] = {}
+        # GPU copies live in per-group block-id spaces, so both indexes key by
+        # (group_id, block_id).
+        self._copy_by_block: dict[tuple[int, int], BlockHashWithGroupId] = {}
+        # Unpinned GPU block -> (request, page) pairs still reading it.
+        self._owners: dict[tuple[int, int], set[tuple[str, int]]] = {}
 
     def _get_request_state(self, request_id: str) -> _HiSparseRequestState:
         state = self.request_states.get(request_id)
@@ -211,37 +218,6 @@ class HiSparseCoordinator:
         # allocation admission counted on has run (see update_residency).
         state.pages_to_adopt = max(state.pages_to_adopt, num_host_pages)
         state.copies_recorded_blocks = max(state.copies_recorded_blocks, num_host_pages)
-
-    def take_host_block_copies(self) -> tuple[KVCacheBlockCopy, ...]:
-        """Drain host copy-on-write work, retaining both endpoints.
-
-        The worker runs the copies in the step that carries them, so the
-        endpoints are released when that step's output comes back.
-        """
-        if self.host_manager is None:
-            return ()
-        pairs = self.host_manager.take_host_cow_copies()
-        for source_block, cow_block in pairs:
-            self._retained_copies[cow_block.block_id] = (source_block, cow_block)
-        return tuple(
-            KVCacheBlockCopy(
-                src_block_id=source_block.block_id,
-                dst_block_id=cow_block.block_id,
-            )
-            for source_block, cow_block in pairs
-        )
-
-    def release_completed_host_copies(self, dst_block_ids: Iterable[int]) -> None:
-        """Release the endpoints of host copies the worker reports having run."""
-        blocks: list[KVCacheBlock] = []
-        for dst_block_id in dst_block_ids:
-            pair = self._retained_copies.pop(dst_block_id, None)
-            if pair is not None:
-                blocks.extend(pair)
-        if not blocks:
-            return
-        assert self.host_manager is not None
-        self.host_manager.block_pool.free_blocks(reversed(blocks))
 
     def get_host_block_pool(self) -> BlockPool | None:
         manager = self.host_manager
@@ -310,15 +286,17 @@ class HiSparseCoordinator:
             blocks.append(block)
         self._drop_copy(host_block.block_hash)
         self.copies[host_block.block_hash] = tuple(blocks)
-        for block in blocks:
-            self._copy_by_block[block.block_id] = host_block.block_hash
+        for manager, block in zip(self.resident_managers, blocks):
+            self._copy_by_block[(manager.kv_cache_group_id, block.block_id)] = (
+                host_block.block_hash
+            )
 
     def _drop_copy(self, host_hash: BlockHashWithGroupId) -> None:
         blocks = self.copies.pop(host_hash, None)
         if blocks is None:
             return
-        for block in blocks:
-            self._copy_by_block.pop(block.block_id, None)
+        for manager, block in zip(self.resident_managers, blocks):
+            self._copy_by_block.pop((manager.kv_cache_group_id, block.block_id), None)
 
     # ------------------------------------------------------------------
     # Residency: pinning, unpinning and losing pages
@@ -364,7 +342,9 @@ class HiSparseCoordinator:
         if blocks is None:
             return False
         for manager, block in zip(self.resident_managers, blocks):
-            self._owners.setdefault(block.block_id, set()).add((request_id, page_idx))
+            self._owners.setdefault(
+                (manager.kv_cache_group_id, block.block_id), set()
+            ).add((request_id, page_idx))
             manager.block_pool.unpin_blocks([block], self._on_block_reused)
         state.pinned_clean.discard(page_idx)
         state.unpinned_pages.add(page_idx)
@@ -383,10 +363,11 @@ class HiSparseCoordinator:
             self._unpin_page(request_id, state, page_idx)
 
     def _on_block_reused(self, block: KVCacheBlock) -> None:
-        host_hash = self._copy_by_block.get(block.block_id)
+        key = (block.group_id, block.block_id)
+        host_hash = self._copy_by_block.get(key)
         if host_hash is not None:
             self._drop_copy(host_hash)
-        for request_id, page_idx in self._owners.pop(block.block_id, ()):
+        for request_id, page_idx in self._owners.pop(key, ()):
             self._lose_page(request_id, page_idx)
 
     def _lose_page(self, request_id: str, page_idx: int) -> None:
@@ -398,7 +379,7 @@ class HiSparseCoordinator:
             block = manager.drop_resident_page(request_id, page_idx)
             if block is None:
                 continue
-            owners = self._owners.get(block.block_id)
+            owners = self._owners.get((manager.kv_cache_group_id, block.block_id))
             if owners is not None:
                 owners.discard((request_id, page_idx))
         state.unpinned_pages.discard(page_idx)
@@ -425,10 +406,13 @@ class HiSparseCoordinator:
             self._adopt_copies(request_id, state, host_blocks[: state.pages_to_adopt])
             state.pages_to_adopt = 0
         if not self._can_read_from_host(request_id):
-            assert self.gpu_pool is not None
-            if (
-                self.gpu_pool.get_num_free_blocks() >= self.transition_watermark
-                and not self._fills_admission_window(request_id)
+            assert self.gpu_pool is not None and self.host_group_id is not None
+            # The host group takes no device blocks, so its free count is the
+            # pool's free pages.
+            if self.gpu_pool.get_num_free_blocks(
+                self.host_group_id
+            ) >= self.transition_watermark and not self._fills_admission_window(
+                request_id
             ):
                 return
             for manager in self.hot_managers:
@@ -761,7 +745,7 @@ class HiSparseCoordinator:
         )
 
     def has_pending_work(self) -> bool:
-        return bool(self.spills_to_send or self.pending_spills or self._retained_copies)
+        return bool(self.spills_to_send or self.pending_spills)
 
     def update_spills(
         self,
@@ -843,7 +827,6 @@ class HiSparseCoordinator:
             blocks=blocks,
             num_cached_blocks=publication.num_cached_blocks,
             num_full_blocks=min(state.ready_prefix_pages, publication.num_pages),
-            block_size=self.host_manager.block_size,
             kv_cache_group_id=self.host_manager.kv_cache_group_id,
         )
         self.host_manager.block_pool.free_blocks(reversed(blocks))
@@ -884,7 +867,9 @@ class HiSparseCoordinator:
                 if block.is_null:
                     continue
                 if page_idx in state.unpinned_pages:
-                    owners = self._owners.get(block.block_id)
+                    owners = self._owners.get(
+                        (manager.kv_cache_group_id, block.block_id)
+                    )
                     if owners is not None:
                         owners.discard((request_id, page_idx))
                 elif (

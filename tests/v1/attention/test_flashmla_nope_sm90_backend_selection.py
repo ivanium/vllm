@@ -35,7 +35,6 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 from vllm.v1.worker.utils import (
-    AttentionGroup,
     allocate_kv_cache,
     prepare_kernel_block_sizes,
     select_common_block_size,
@@ -111,7 +110,7 @@ def test_flashmla_bf16_nope_accepts_packed_manager_blocks():
     layers = ["layer.0", "layer.1"]
     page_size = spec.page_size_bytes
     config = KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[
             KVCacheTensor(
                 size=num_blocks * len(layers) * page_size,
@@ -120,16 +119,25 @@ def test_flashmla_bf16_nope_accepts_packed_manager_blocks():
                 block_stride=len(layers) * page_size,
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(layers, spec)],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layers,
+                spec,
+                num_blocks=num_blocks,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=len(layers) * page_size,
+            )
+        ],
+        large_page_bytes=len(layers) * page_size,
+        block_size=1152,
     )
-    groups = [[AttentionGroup(FlashMLASparseBackend, layers, spec, 0)]]
 
-    kernel_block_sizes = prepare_kernel_block_sizes(config, groups)
+    kernel_block_sizes = prepare_kernel_block_sizes(config)
     caches = allocate_kv_cache(
         config,
         torch.device("cpu"),
         KVCacheLayout.BLHNC,
-        kernel_block_sizes,
     )
 
     assert kernel_block_sizes == [1152]

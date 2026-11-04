@@ -126,7 +126,6 @@ def can_initialize(
         layout = resolve_kv_cache_layout(
             vllm_config,
             self.model_executor.get_supported_kv_cache_layouts(),
-            [spec for worker_specs in kv_cache_specs for spec in worker_specs.values()],
         )
         self.model_executor.set_kv_cache_layout(layout.name)
         kv_cache_configs = get_kv_cache_configs(
@@ -135,7 +134,7 @@ def can_initialize(
             [10 * GiB_bytes],
         )
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
-        vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
+        vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_pages
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:
             vllm_config.cache_config.block_size = min(

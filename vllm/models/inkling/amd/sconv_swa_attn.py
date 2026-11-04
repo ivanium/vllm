@@ -10,8 +10,7 @@ attn-output, mlp-output), packed head-major into one block:
     D = head_dim(K) + head_dim(V) + hidden/H(attn) + hidden/H(mlp)
 
 ``D`` is TP-invariant; per rank we store ``H/TP`` heads of width ``D``. The conv
-reads/writes this cache out-of-band via a custom backend; the (smaller) conv page
-is padded up to the uniform attention page by ``unify_kv_cache_spec_page_size``.
+reads/writes this cache out-of-band via a custom backend.
 """
 
 from __future__ import annotations

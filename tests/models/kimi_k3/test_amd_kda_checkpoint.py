@@ -65,14 +65,12 @@ def _builder(
     num_prefill_checkpoint_blocks: int = 1,
     mamba_cache_mode: str = "align",
     block_size: int = BLOCK_SIZE,
-    prefix_match_unit: int | None = None,
     num_spec: int = 0,
 ) -> KimiK3ROCmKDAMetadataBuilder:
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B", block_size=block_size
     )
     vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
-    vllm_config.cache_config.prefix_match_unit = prefix_match_unit
     if num_spec:
         vllm_config.speculative_config = _StubSpeculativeConfig(num_spec)
     builder = KimiK3ROCmKDAMetadataBuilder(
@@ -91,10 +89,7 @@ def _builder(
         vllm_config=vllm_config,
         device=torch.device("cuda"),
     )
-    vllm_config.cache_config.hash_block_size = prefix_match_unit or block_size
-    vllm_config.cache_config.cache_hit_alignment_tokens = (
-        prefix_match_unit or block_size
-    )
+    vllm_config.cache_config.block_size = block_size
     return builder
 
 
@@ -435,37 +430,6 @@ def test_conv_checkpoint_reads_row_strided_projection() -> None:
     store_conv_checkpoints(x, conv_state, cu, _i32([192]), _i32([4]), STATE_LEN)
 
     torch.testing.assert_close(conv_state[4], x[192 - STATE_LEN : 192].transpose(0, 1))
-
-
-def test_finer_prefix_match_unit_moves_checkpoint_to_hash_grid() -> None:
-    # A partial prefix hit matches at prefix_match_unit, so a state captured
-    # only at block boundaries is too coarse to resume from. Block 256 with
-    # unit 128 moves a 700-token prompt's checkpoint from 512 to 640.
-    md = _build(
-        BatchSpec(seq_lens=[700], query_lens=[700]),
-        block_size=256,
-        prefix_match_unit=128,
-    )
-
-    assert md.checkpoint is not None
-    torch.testing.assert_close(md.checkpoint.checkpoint_offsets, _i32([640]))
-    # Slot is still block-indexed: cdiv(700, 256) - 2 = 1, request 0 owns 0..2.
-    torch.testing.assert_close(md.checkpoint.state_indices, _i32([1]))
-
-
-def test_checkpoint_metadata_skips_unaligned_offset() -> None:
-    # The scheduler declines a boundary off the published alignment and
-    # reserves nothing, so the builder has to reach the same verdict or it
-    # writes a block nobody hashed.
-    # Block 192, unit 96: a 700-token prompt's last hash boundary is 672, which
-    # is 32 tokens off the chunk grid.
-    md = _build(
-        BatchSpec(seq_lens=[700], query_lens=[700]),
-        block_size=192,
-        prefix_match_unit=96,
-    )
-
-    assert md.checkpoint is None
 
 
 # ---------------------------------------------------------------------------

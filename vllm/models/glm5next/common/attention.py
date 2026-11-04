@@ -87,12 +87,11 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
     kpool compress kernel inside the indexer op — the cache only provides the
     addressing, which is identical for both schemes.
 
-    Under ``uniform_page`` the indexer shares one block with the co-located
-    MLA (a single ``MLAAttentionSpec`` / block_table); under ``large_page``
-    they are separate groups on the same token grid. ``block_size`` is the
-    model-wide ``cache_config.block_size``. DeepGEMM's paged-MQA kernel takes
-    32- or 64-state pages (only 64 on SM120), which ``Glm5NextIndexerBackend``
-    declares as its kernel block sizes.
+    The indexer and the co-located MLA are separate groups on the same token
+    grid. ``block_size`` is the model-wide ``cache_config.block_size``.
+    DeepGEMM's paged-MQA kernel takes 32- or 64-state pages (only 64 on
+    SM120), which ``Glm5NextIndexerBackend`` declares as its kernel block
+    sizes.
     """
 
     def __init__(
@@ -162,15 +161,8 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
         # read by its redo.
         span = self._index_kpool + vllm_config.num_speculative_tokens
         ring = self._index_kpool * next_power_of_2(cdiv(span, self._index_kpool))
-        # The ring must divide the attention block size: checked below under
-        # uniform_page (the block size is final at spec-build time there);
-        # under large_page the engine's block-size selection enforces it.
-        if self.cache_config.kv_cache_allocator == "uniform_page":
-            assert self.cache_config.block_size % ring == 0, (
-                f"Glm5NextTailCache: cache_config.block_size "
-                f"({self.cache_config.block_size}) must be a multiple of the "
-                f"tail ring ({ring})"
-            )
+        # The ring must divide the attention block size; the engine's
+        # block-size selection enforces it.
         return CircularBufferSpec(
             block_size=ring,
             num_kv_heads=2,

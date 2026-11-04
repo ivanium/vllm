@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""MoRIIO transfer geometry over large-page kernel-row views.
+
+Every layer view is the standardized ``[K, H, N, C]`` (one kernel block per
+row, rows strided by the group's row bytes over the shared pool); manager
+block ``b`` expands to kernel rows ``b * R`` to ``b * R + R - 1``.
+"""
 
 import importlib.util
 import math
@@ -12,23 +18,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    GroupGeometry,
     MambaSpec,
     MLAAttentionSpec,
 )
 
 from .utils import make_moriio_writer
-
-aiter_available = importlib.util.find_spec("aiter") is not None
-mori_available = importlib.util.find_spec("mori") is not None
-
-if not (current_platform.is_rocm() and mori_available):
-    pytest.skip(
-        "MoRIIOs are only available on ROCm with mori package installed",
-        allow_module_level=True,
-    )
 
 moriio_common = importlib.import_module(
     "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common"
@@ -54,9 +51,11 @@ set_role = moriio_common.set_role
 MoRIIOWrapper = moriio_engine.MoRIIOWrapper
 MoRIIOWriter = moriio_engine.MoRIIOWriter
 
+LayerTransferGeometry = moriio_layout.LayerTransferGeometry
+
 
 def _full_spec(
-    block_size: int = 4, num_kv_heads: int = 2, head_size: int = 3
+    block_size: int = 16, num_kv_heads: int = 2, head_size: int = 2
 ) -> FullAttentionSpec:
     return FullAttentionSpec(
         block_size=block_size,
@@ -66,41 +65,276 @@ def _full_spec(
     )
 
 
-def _mla_spec(block_size: int = 4) -> MLAAttentionSpec:
+def _mla_spec(block_size: int = 16) -> MLAAttentionSpec:
     return MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
-        head_size=3,
+        head_size=1,
         dtype=torch.bfloat16,
     )
 
 
-def _worker(
-    kv_caches: dict[str, torch.Tensor],
-    layer_to_spec: dict[str, object],
-    num_blocks: int = 8,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        kv_caches=kv_caches,
-        layer_to_spec=layer_to_spec,
-        num_blocks=num_blocks,
-        block_size=4,
+def _view(
+    pool: torch.Tensor,
+    row_bytes: int,
+    num_rows: int,
+    spec,
+    offset: int = 0,
+    head_major: bool = False,
+) -> torch.Tensor:
+    """One layer's [K, H, N, C] uint8 view at ``offset`` within each row."""
+    heads, tokens, content = (
+        spec.num_heads,
+        spec.num_states,
+        spec.state_content_size_bytes,
+    )
+    if head_major:
+        strides = (row_bytes, content, heads * content, 1)
+    else:
+        strides = (row_bytes, tokens * content, content, 1)
+    return torch.as_strided(
+        pool, (num_rows, heads, tokens, content), strides, storage_offset=offset
     )
 
 
-def _remote_meta(num_blocks: int = 16) -> SimpleNamespace:
-    return SimpleNamespace(num_blocks=num_blocks)
+def test_layer_geometry_from_kernel_row_view():
+    # row 1024; the layer holds 2 heads * 16 tokens * 8 content bytes per row.
+    spec = _full_spec()
+    pool = torch.zeros(2 * 16 * 1024, dtype=torch.uint8)
+    view = _view(pool, 1024, 8, spec, offset=512)
+
+    geometry = moriio_layout.get_layer_transfer_geometry("layer", view, {"layer": spec})
+
+    assert geometry == LayerTransferGeometry(
+        num_rows=8,
+        tokens_per_row=16,
+        row_len=2 * 16 * 8,
+        row_stride=1024,
+    )
 
 
-def _wrapper_for_messages() -> Any:
-    wrapper = MoRIIOWrapper.__new__(MoRIIOWrapper)
-    wrapper.lock = threading.Lock()
-    wrapper.done_remote_allocate_req_dict = {}
-    wrapper.done_req_ids = []
-    wrapper.done_write_cache_req_ids = []
-    wrapper._write_done_counts = {}
-    wrapper._terminal_transfer_ids = OrderedDict()
-    return wrapper
+def test_layer_geometry_rejects_non_large_page_views():
+    spec = _full_spec()
+    cache = torch.empty((2, 8, 16, 2, 8), dtype=torch.bfloat16)  # 5-D split K/V
+    with pytest.raises(ValueError, match="must be \\[K, H, N, C\\]"):
+        moriio_layout.get_layer_transfer_geometry("layer", cache, {"layer": spec})
+
+    with pytest.raises(ValueError, match="Missing KV cache spec"):
+        moriio_layout.get_layer_transfer_geometry("layer", cache, {})
+
+
+def test_expand_block_kernel_rows_keeps_block_order():
+    group = GroupGeometry(kernel_rows_per_block=2, row_bytes=512)
+    rows = moriio_layout.expand_block_kernel_rows(group, 3, [2, 0])
+    assert rows == [4, 5, 0, 1]
+
+
+def test_expand_block_kernel_rows_bounds():
+    group = GroupGeometry(kernel_rows_per_block=1, row_bytes=512)
+    with pytest.raises(ValueError, match="block id 3 is outside"):
+        moriio_layout.expand_block_kernel_rows(group, 3, [3])
+    with pytest.raises(ValueError, match="block id -1 is outside"):
+        moriio_layout.expand_block_kernel_rows(group, 3, [-1])
+
+
+def test_block_transfer_offsets_pair_rows_across_peer_geometries():
+    """Local and remote expand the same manager ids with their own geometry.
+
+    Local: row 512, R=2 -> block 1 is rows 2, 3. Remote (half the heads):
+    row 256, R=2 -> block 3 is rows 6, 7. Rows pair 1:1; sizes are the
+    layer's per-row bytes.
+    """
+    spec = _full_spec()
+    pool = torch.zeros(2 * 16 * 1280, dtype=torch.uint8)
+    view = _view(pool, 512, 8, spec)
+    geometry = moriio_layout.get_layer_transfer_geometry("layer", view, {"layer": spec})
+    local_group = GroupGeometry(2, 512)
+    remote_group = GroupGeometry(2, 256)
+
+    local, remote, sizes = moriio_layout.compute_block_transfer_offsets(
+        geometry, local_group, 3, remote_group, 4, [1], [3]
+    )
+
+    assert local == [2 * 512, 3 * 512]
+    assert remote == [6 * 256, 7 * 256]
+    assert sizes == [256, 256]
+
+
+def test_block_transfer_offsets_merge_dense_consecutive_rows():
+    # Single-layer group: one row is exactly the layer content, so adjacent
+    # rows merge into one read on both sides.
+    spec = _full_spec(num_kv_heads=1, head_size=8)
+    row = spec.page_size_bytes
+    pool = torch.zeros(2 * 16 * row, dtype=torch.uint8)
+    view = _view(pool, row, 16, spec)
+    geometry = moriio_layout.get_layer_transfer_geometry("layer", view, {"layer": spec})
+    group = GroupGeometry(1, row)
+
+    local, remote, sizes = moriio_layout.compute_block_transfer_offsets(
+        geometry, group, 16, group, 16, [0, 1], [4, 5]
+    )
+
+    # Local blocks 0, 1 are rows 0, 1; remote blocks 4, 5 are rows 4, 5.
+    assert local == [0]
+    assert remote == [4 * row]
+    assert sizes == [2 * row]
+
+
+def test_block_transfer_offsets_rejects_kernel_row_split_mismatch():
+    spec = _full_spec()
+    pool = torch.zeros(2 * 16 * 1024, dtype=torch.uint8)
+    view = _view(pool, 512, 8, spec)
+    geometry = moriio_layout.get_layer_transfer_geometry("layer", view, {"layer": spec})
+    local_group = GroupGeometry(2, 512)
+    remote_group = GroupGeometry(1, 512)
+
+    with pytest.raises(ValueError, match="kernel rows"):
+        moriio_layout.compute_block_transfer_offsets(
+            geometry, local_group, 4, remote_group, 8, [0], [0]
+        )
+
+
+def test_block_transfer_offsets_bounds_use_each_sides_group():
+    spec = _full_spec()
+    pool = torch.zeros(2 * 16 * 1024, dtype=torch.uint8)
+    view = _view(pool, 512, 8, spec)
+    geometry = moriio_layout.get_layer_transfer_geometry("layer", view, {"layer": spec})
+    local_group = GroupGeometry(1, 512)
+    # The peer's pool is smaller: its group has 4 blocks, not 8.
+    remote_group = GroupGeometry(1, 512)
+
+    with pytest.raises(ValueError, match="block id 8 is outside"):
+        moriio_layout.compute_block_transfer_offsets(
+            geometry, local_group, 8, remote_group, 4, [8], [0]
+        )
+    with pytest.raises(ValueError, match="block id 4 is outside"):
+        moriio_layout.compute_block_transfer_offsets(
+            geometry, local_group, 8, remote_group, 4, [0], [4]
+        )
+
+
+def test_local_block_ids_longer_than_remote_raises():
+    # A longer local list is a genuine bug here and must fail loudly; the WRITE
+    # producer save path trims lookahead blocks before they reach this layer.
+    spec = _full_spec()
+    pool = torch.zeros(2 * 16 * 1024, dtype=torch.uint8)
+    view = _view(pool, 512, 8, spec)
+    geometry = moriio_layout.get_layer_transfer_geometry("layer", view, {"layer": spec})
+    group = GroupGeometry(1, 512)
+
+    with pytest.raises(ValueError, match="longer than remote_block_ids"):
+        moriio_layout.compute_block_transfer_offsets(
+            geometry, group, 8, group, 8, [1, 3, 6, 7], [4, 5]
+        )
+
+
+def test_shorter_local_block_ids_still_transfers_only_what_decode_allocated():
+    # READ-mode partial transfer keeps its shorter-local behavior.
+    spec = _full_spec()
+    pool = torch.zeros(2 * 16 * 1024, dtype=torch.uint8)
+    view = _view(pool, 512, 8, spec)
+    geometry = moriio_layout.get_layer_transfer_geometry("layer", view, {"layer": spec})
+    group = GroupGeometry(1, 512)
+
+    local, _, _ = moriio_layout.compute_block_transfer_offsets(
+        geometry, group, 8, group, 8, [1], [4, 5]
+    )
+    assert len(local) == 1
+
+
+def test_empty_local_block_ids_is_free_only_noop():
+    spec = _full_spec()
+    pool = torch.zeros(2 * 16 * 1024, dtype=torch.uint8)
+    view = _view(pool, 512, 8, spec)
+    geometry = moriio_layout.get_layer_transfer_geometry("layer", view, {"layer": spec})
+    group = GroupGeometry(1, 512)
+
+    assert moriio_layout.compute_block_transfer_offsets(
+        geometry, group, 8, group, 8, [], [4, 5]
+    ) == ([], [], [])
+
+
+def test_registration_region_spans_strided_rows():
+    spec = _full_spec()
+    pool = torch.zeros(2 * 16 * 1024, dtype=torch.uint8)
+    view = _view(pool, 1024, 8, spec, offset=512)
+
+    regions = moriio_layout.iter_layer_registration_regions(
+        "layer", view, {"layer": spec}
+    )
+
+    assert len(regions) == 1
+    assert regions[0][0].data_ptr() == view.data_ptr()
+    # Strided span: every row, ending at the last row's content.
+    assert regions[0][1] == 7 * 1024 + 256
+
+
+def test_head_slice_offsets_address_kernel_rows():
+    # Head-major rows: [K, 4, 2, 16], head stride 16, token stride 64,
+    # row 128.
+    spec = FullAttentionSpec(
+        block_size=2, num_kv_heads=4, head_size=4, dtype=torch.bfloat16
+    )
+    pool = torch.zeros(2 * 16 * 128, dtype=torch.uint8)
+    view = _view(pool, 128, 16, spec, head_major=True)
+    layout = moriio_layout.get_layer_head_layout("layer", view, {"layer": spec})
+    assert layout.block_stride == 128
+
+    # Write local heads [1, 3) of row 2 into remote heads [0, 2) of row 5:
+    # one run of two adjacent heads per token.
+    local, remote, sizes = moriio_layout.compute_head_slice_offsets(
+        layout, layout, [2], [5], 1, 0, 2
+    )
+
+    assert local == [2 * 128 + 16, 2 * 128 + 64 + 16]
+    assert remote == [5 * 128, 5 * 128 + 64]
+    assert sizes == [32, 32]
+
+
+def test_two_groups_expand_their_own_geometry():
+    """Full + sliding-window groups: same block ids, different row grids.
+
+    This is the large-page contract the old scalar-num_blocks handshake
+    broke: each group's pool geometry (row bytes, block count) is its own.
+    """
+    full_spec = _full_spec()
+    swa_spec = _full_spec(num_kv_heads=1)
+    pool = torch.zeros(2 * 16 * 1280, dtype=torch.uint8)
+    full_view = _view(pool, 512, 7, full_spec, offset=0)
+    swa_view = _view(pool, 256, 15, swa_spec, offset=0)
+    layer_to_spec = {"full0": full_spec, "swa0": swa_spec}
+    full_geometry = moriio_layout.get_layer_transfer_geometry(
+        "full0", full_view, layer_to_spec
+    )
+    swa_geometry = moriio_layout.get_layer_transfer_geometry(
+        "swa0", swa_view, layer_to_spec
+    )
+    full_group = GroupGeometry(2, 512)
+    swa_group = GroupGeometry(2, 256)
+
+    full_offsets = moriio_layout.compute_block_transfer_offsets(
+        full_geometry, full_group, 3, full_group, 3, [1], [2]
+    )
+    swa_offsets = moriio_layout.compute_block_transfer_offsets(
+        swa_geometry, swa_group, 6, swa_group, 6, [1], [2]
+    )
+
+    # Block 1 is rows 2-3 of 512B rows in the full group and of 256B rows in
+    # the swa group. Row bytes are the layers' per-row content (256 and 128).
+    assert full_offsets == ([2 * 512, 3 * 512], [4 * 512, 5 * 512], [256, 256])
+    assert swa_offsets == ([2 * 256, 3 * 256], [4 * 256, 5 * 256], [128, 128])
+    # And the swa group admits block ids the full group does not have.
+    assert moriio_layout.compute_block_transfer_offsets(
+        swa_geometry, swa_group, 6, swa_group, 6, [5], [4]
+    )[0] == [10 * 256, 11 * 256]
+    with pytest.raises(ValueError, match="outside"):
+        moriio_layout.compute_block_transfer_offsets(
+            full_geometry, full_group, 3, full_group, 3, [5], [4]
+        )
+
+
+def _remote_meta() -> SimpleNamespace:
+    return SimpleNamespace()
 
 
 def _write_task(layer_name: str, transfer_id: str = "xfer") -> Any:
@@ -115,227 +349,6 @@ def _write_task(layer_name: str, transfer_id: str = "xfer") -> Any:
         remote_notify_port=7000,
         remote_ip="127.0.0.1",
     )
-
-
-@pytest.mark.parametrize(
-    ("shape", "spec", "remote_num_blocks", "expected_geometry", "expected_offsets"),
-    [
-        pytest.param(
-            (2, 8, 4, 2, 3),
-            _full_spec(),
-            16,
-            {
-                "block_stride": 24,
-                "local_kv_stride": 192,
-                "remote_kv_stride": 384,
-                "split_kv_regions": True,
-            },
-            ([48, 144, 432, 528], [192, 240, 960, 1008], [48, 48, 48, 48]),
-            id="separated",
-        ),
-        pytest.param(
-            (8, 2, 4, 2, 3),
-            _full_spec(),
-            16,
-            {
-                "block_stride": 48,
-                "local_kv_stride": 24,
-                "remote_kv_stride": 24,
-                "split_kv_regions": False,
-            },
-            ([96, 288], [384, 480], [96, 96]),
-            id="interleaved",
-        ),
-        pytest.param(
-            (2, 8, 2, 4, 3),
-            _full_spec(),
-            16,
-            {
-                "block_size": 4,
-                "block_stride": 24,
-                "local_kv_stride": 192,
-                "remote_kv_stride": 384,
-                "split_kv_regions": True,
-            },
-            ([48, 144, 432, 528], [192, 240, 960, 1008], [48, 48, 48, 48]),
-            id="shuffled-separated",
-        ),
-        pytest.param(
-            (8, 2, 2, 4, 3),
-            _full_spec(),
-            16,
-            {
-                "block_size": 4,
-                "block_stride": 48,
-                "local_kv_stride": 24,
-                "remote_kv_stride": 24,
-                "split_kv_regions": False,
-            },
-            ([96, 288], [384, 480], [96, 96]),
-            id="shuffled-interleaved",
-        ),
-        pytest.param(
-            (2, 16, 2, 2, 3),
-            _full_spec(),
-            16,
-            {
-                "num_blocks": 8,
-                "block_size": 4,
-                "block_stride": 24,
-                "local_kv_stride": 192,
-                "remote_kv_stride": 384,
-                "split_kv_regions": True,
-            },
-            ([48, 144, 432, 528], [192, 240, 960, 1008], [48, 48, 48, 48]),
-            id="separated-kernel-blocks",
-        ),
-        pytest.param(
-            (16, 2, 2, 2, 3),
-            _full_spec(),
-            16,
-            {
-                "num_blocks": 8,
-                "block_size": 4,
-                "block_stride": 48,
-                "local_kv_stride": None,
-                "remote_kv_stride": None,
-                "transfers_per_block": 1,
-            },
-            ([96, 288], [384, 480], [96, 96]),
-            id="interleaved-kernel-blocks",
-        ),
-        pytest.param(
-            (2, 32, 8, 2, 3),
-            _full_spec(block_size=16, num_kv_heads=8),
-            8,
-            {
-                "num_blocks": 4,
-                "block_size": 16,
-                "block_len": 768,
-                "block_stride": 384,
-                "local_kv_stride": 1536,
-                "remote_kv_stride": 3072,
-                "split_kv_regions": True,
-            },
-            (
-                [768, 2304, 3840, 5376],
-                [3072, 3840, 9216, 9984],
-                [768, 768, 768, 768],
-            ),
-            id="separated-kernel-axis-from-spec",
-        ),
-        pytest.param(
-            (32, 2, 8, 2, 3),
-            _full_spec(block_size=16, num_kv_heads=8),
-            8,
-            {
-                "num_blocks": 4,
-                "block_size": 16,
-                "block_len": 1536,
-                "block_stride": 768,
-                "local_kv_stride": None,
-                "remote_kv_stride": None,
-                "transfers_per_block": 1,
-            },
-            ([1536, 4608], [6144, 7680], [1536, 1536]),
-            id="interleaved-kernel-axis-from-spec",
-        ),
-        pytest.param(
-            (8, 1, 4, 3),
-            _mla_spec(),
-            16,
-            {
-                "block_stride": 12,
-                "local_kv_stride": None,
-                "remote_kv_stride": None,
-                "transfers_per_block": 1,
-            },
-            ([24, 72], [96, 120], [24, 24]),
-            id="mla-key-only",
-        ),
-    ],
-)
-def test_supported_layouts_compute_expected_geometry_and_offsets(
-    shape, spec, remote_num_blocks, expected_geometry, expected_offsets
-):
-    cache = torch.empty(shape, dtype=torch.bfloat16)
-    worker = _worker({"layer": cache}, {"layer": spec})
-
-    geometry = moriio_layout.get_layer_transfer_geometry(
-        "layer", cache, worker.layer_to_spec, remote_num_blocks=remote_num_blocks
-    )
-    for field, expected in expected_geometry.items():
-        assert getattr(geometry, field) == expected
-
-    assert (
-        moriio_layout.compute_block_transfer_offsets(
-            "layer",
-            cache,
-            worker.layer_to_spec,
-            [1, 3],
-            [4, 5],
-            remote_num_blocks,
-        )
-        == expected_offsets
-    )
-
-
-def test_kernel_block_layout_without_spec_dimensions_rejects_ambiguous_axes():
-    cache = torch.empty((2, 32, 8, 2, 3), dtype=torch.bfloat16)
-    worker = _worker(
-        {"layer": cache},
-        {"layer": SimpleNamespace(block_size=16)},
-    )
-
-    with pytest.raises(ValueError, match="Ambiguous MoRIIO kernel-block"):
-        moriio_layout.get_layer_transfer_geometry(
-            "layer", cache, worker.layer_to_spec, remote_num_blocks=8
-        )
-
-
-def test_mixed_layers_compute_distinct_offsets_per_layer():
-    kv_caches = {
-        "separated": torch.empty((2, 8, 4, 2, 3), dtype=torch.bfloat16),
-        "interleaved": torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16),
-        "indexer": torch.empty((8, 1, 4, 3), dtype=torch.bfloat16),
-    }
-    worker = _worker(
-        kv_caches,
-        {
-            "separated": _full_spec(),
-            "interleaved": _full_spec(),
-            "indexer": _mla_spec(),
-        },
-    )
-
-    separated = moriio_layout.compute_block_transfer_offsets(
-        "separated",
-        kv_caches["separated"],
-        worker.layer_to_spec,
-        [1, 3],
-        [4, 5],
-        _remote_meta().num_blocks,
-    )
-    interleaved = moriio_layout.compute_block_transfer_offsets(
-        "interleaved",
-        kv_caches["interleaved"],
-        worker.layer_to_spec,
-        [1, 3],
-        [4, 5],
-        _remote_meta().num_blocks,
-    )
-    indexer = moriio_layout.compute_block_transfer_offsets(
-        "indexer",
-        kv_caches["indexer"],
-        worker.layer_to_spec,
-        [1, 3],
-        [4, 5],
-        _remote_meta().num_blocks,
-    )
-
-    assert separated != interleaved
-    assert separated != indexer
-    assert interleaved != indexer
 
 
 def test_write_transfer_plan_caches_offsets_per_layer_geometry():
@@ -354,9 +367,6 @@ def test_write_transfer_plan_caches_offsets_per_layer_geometry():
 
         def _region_session_indices(self, layer_name):
             return [list(self.kv_caches).index(layer_name)]
-
-        def _check_peer_block_size(self, layer_name, remote_moriio_meta):
-            pass
 
         def _compute_block_transfer_offsets(
             self,
@@ -426,7 +436,6 @@ def test_hybrid_write_attention_uses_its_own_group_not_the_first_group():
         kv_caches={"draft": torch.empty((8, 1, 4, 3))},
         layer_to_group={"draft": 2},
         _region_session_indices=lambda _: [5],
-        _check_peer_block_size=lambda layer_name, remote_moriio_meta: None,
         _compute_block_transfer_offsets=Mock(return_value=([1], [2], [3])),
     )
     writer = make_moriio_writer(worker)
@@ -452,11 +461,12 @@ def test_hybrid_write_posts_both_regions_before_layer_completion():
     info = RemoteAllocInfo(block_ids=[[], [7], [9]])
     wrapper.done_remote_allocate_req_dict["xfer"] = info
     wrapper.write_remote_data = Mock(side_effect=["conv-status", "ssm-status"])
+    peer_meta = SimpleNamespace()
     worker = SimpleNamespace(
         moriio_wrapper=wrapper,
         tp_rank=0,
         get_engine_name_with_dp=lambda name, rank: name,
-        _get_built_session=lambda name: (["conv-session", "ssm-session"], None),
+        _get_built_session=lambda name: (["conv-session", "ssm-session"], peer_meta),
         _is_mamba_layer=lambda name: True,
         _mamba_payload_index_by_layer={"kda": 2},
         _region_session_indices=lambda name: [0, 1],
@@ -476,7 +486,7 @@ def test_hybrid_write_posts_both_regions_before_layer_completion():
 
     task.event.synchronize.assert_called_once()
     worker._compute_mamba_transfer_offsets.assert_called_once_with(
-        "kda", [3], [9], remote_tp_size=2
+        "kda", [3], [9], peer_meta, remote_tp_size=2
     )
     assert wrapper.write_remote_data.call_args_list[0].args == (
         [2, 4, 8],
@@ -639,6 +649,17 @@ def test_late_remote_blocks_message_is_ignored_after_transfer_done():
     assert "xfer" not in wrapper.done_remote_allocate_req_dict
 
 
+def _wrapper_for_messages() -> Any:
+    wrapper = MoRIIOWrapper.__new__(MoRIIOWrapper)
+    wrapper.lock = threading.Lock()
+    wrapper.done_remote_allocate_req_dict = {}
+    wrapper.done_req_ids = []
+    wrapper.done_write_cache_req_ids = []
+    wrapper._write_done_counts = {}
+    wrapper._terminal_transfer_ids = OrderedDict()
+    return wrapper
+
+
 @pytest.mark.parametrize(
     ("role", "payload", "expected"),
     [
@@ -744,132 +765,6 @@ def test_moriio_wrapper_rejects_invalid_messages(role, payload, match):
 
     with pytest.raises(MoRIIOError, match=match):
         wrapper._handle_message(payload)
-
-
-def test_local_block_ids_longer_than_remote_raises():
-    # A longer local list is a genuine bug here and must fail loudly; the WRITE
-    # producer save path trims lookahead blocks before they reach this layer.
-    cache = torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16)  # interleaved
-    worker = _worker({"layer": cache}, {"layer": _full_spec()})
-
-    with pytest.raises(ValueError, match="longer than remote_block_ids"):
-        moriio_layout.compute_block_transfer_offsets(
-            "layer",
-            cache,
-            worker.layer_to_spec,
-            [1, 3, 6, 7],
-            [4, 5],
-            _remote_meta().num_blocks,
-        )
-
-
-def test_shorter_local_block_ids_still_transfers_only_what_decode_allocated():
-    # READ-mode partial transfer keeps its shorter-local behavior.
-    cache = torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16)
-    worker = _worker({"layer": cache}, {"layer": _full_spec()})
-
-    short = moriio_layout.compute_block_transfer_offsets(
-        "layer", cache, worker.layer_to_spec, [1], [4, 5], _remote_meta().num_blocks
-    )
-    assert len(short[0]) == 1
-
-
-@pytest.mark.parametrize(
-    ("local_block_ids", "remote_block_ids", "match"),
-    [
-        ([-1], [0], "local block id -1"),
-        ([0], [8], "remote block id 8"),
-    ],
-)
-def test_block_ids_must_fit_registered_regions(
-    local_block_ids, remote_block_ids, match
-):
-    cache = torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16)
-    worker = _worker({"layer": cache}, {"layer": _full_spec()})
-
-    with pytest.raises(ValueError, match=match):
-        moriio_layout.compute_block_transfer_offsets(
-            "layer",
-            cache,
-            worker.layer_to_spec,
-            local_block_ids,
-            remote_block_ids,
-            _remote_meta(num_blocks=8).num_blocks,
-        )
-
-
-def test_empty_local_block_ids_is_free_only_noop():
-    cache = torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16)
-    worker = _worker({"layer": cache}, {"layer": _full_spec()})
-
-    assert moriio_layout.compute_block_transfer_offsets(
-        "layer", cache, worker.layer_to_spec, [], [4, 5], _remote_meta().num_blocks
-    ) == ([], [], [])
-
-
-def test_registration_regions_do_not_split_interleaved_or_mla_cache():
-    separated = torch.empty((2, 8, 4, 2, 3), dtype=torch.bfloat16)
-    interleaved = torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16)
-    indexer = torch.empty((8, 1, 4, 3), dtype=torch.bfloat16)
-    worker = _worker(
-        {
-            "separated": separated,
-            "interleaved": interleaved,
-            "indexer": indexer,
-        },
-        {
-            "separated": _full_spec(),
-            "interleaved": _full_spec(),
-            "indexer": _mla_spec(),
-        },
-    )
-
-    separated_regions = moriio_layout.iter_layer_registration_regions(
-        "separated", separated, worker.layer_to_spec
-    )
-    interleaved_regions = moriio_layout.iter_layer_registration_regions(
-        "interleaved", interleaved, worker.layer_to_spec
-    )
-    indexer_regions = moriio_layout.iter_layer_registration_regions(
-        "indexer", indexer, worker.layer_to_spec
-    )
-
-    assert [region[0].data_ptr() for region in separated_regions] == [
-        separated[0].data_ptr(),
-        separated[1].data_ptr(),
-    ]
-    assert separated_regions[0][1] == 8 * 48
-    assert separated_regions[1][1] == 8 * 48
-
-    assert len(interleaved_regions) == 1
-    assert interleaved_regions[0][0].data_ptr() == interleaved.data_ptr()
-    assert interleaved_regions[0][1] == 8 * 2 * 48
-
-    assert len(indexer_regions) == 1
-    assert indexer_regions[0][0].data_ptr() == indexer.data_ptr()
-    assert indexer_regions[0][1] == 8 * 24
-
-
-def test_registration_regions_use_layer_num_blocks():
-    cache = torch.empty((4, 2, 4, 2, 3), dtype=torch.bfloat16)
-    worker = _worker({"layer": cache}, {"layer": _full_spec()}, num_blocks=8)
-
-    regions = moriio_layout.iter_layer_registration_regions(
-        "layer", cache, worker.layer_to_spec
-    )
-
-    assert len(regions) == 1
-    assert regions[0][1] == 4 * 2 * 48
-
-
-def test_unsupported_shape_raises_value_error():
-    # A 4-D view whose head/state/content dims all disagree with the spec (a
-    # standardized [B, H, N, C] view for _full_spec would be (8, 2, 4, 6)).
-    cache = torch.empty((8, 3, 5, 7), dtype=torch.bfloat16)
-    worker = _worker({"layer": cache}, {"layer": _full_spec()})
-
-    with pytest.raises(ValueError, match="Unsupported MoRIIO K/V cache shape"):
-        moriio_layout.get_layer_transfer_geometry("layer", cache, worker.layer_to_spec)
 
 
 # ---------------------------------------------------------------------------

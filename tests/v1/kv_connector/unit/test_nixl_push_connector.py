@@ -57,12 +57,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, GroupGeometry
 from vllm.v1.outputs import KVConnectorOutput
 
 from .test_nixl_desc_geometry import (
     _large_page_remote_meta,
     _make_large_page_worker,
+    make_lp_kv_cache_config,
 )
 from .utils import create_request, expand_strided_descs, make_nixl_push_scheduler
 
@@ -389,8 +390,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._failed_remote_engines = set()
         w._invalid_remote_engines = set()
         w._handshake_lock = threading.RLock()
-        w._physical_blocks_per_logical_kv_block = 1
-        w._uses_region_group_mapping = False
+        w.kv_cache_config = make_lp_kv_cache_config(block_size=16)
         w.region_group_ids = [0]
         w._transfer_layer_names = ()
         w._transfer_layer_region_indices = ()
@@ -398,12 +398,15 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._transfer_layer_group_ids = ()
         w.dst_region_num_blocks = {}
         w.dst_region_group_ids = {}
-        w.dst_uses_region_group_mapping = {}
         w.dst_region_mem_types = {}
-        w._dst_kernel_rows_per_block = {}
+        w._dst_group_geometries = {}
         # Single non-hybrid attention group, matching the stub block id lists.
         w._has_mamba = False
         w._is_csa_linear = False
+        w._conv_decomp = None
+        w._ssm_region_indices = []
+        w._ple_region_index = None
+        w._ple_group_index = None
         w._group_spec_types = (FullAttentionSpec,)
         w._engine_ttl = 0.0
         w._engine_last_active = {}
@@ -641,7 +644,7 @@ class TestPushWriterStartLoadKv:
         # path here.
         w._send_heartbeats = lambda metadata: None
         # Stub logical-to-kernel mapping used by reqs_to_recv.
-        w._logical_to_kernel_block_ids = lambda x, ratio: x
+        w._logical_to_kernel_block_ids = lambda x: x
 
         meta = NixlConnectorMetadata()
         meta.push_registrations = {
@@ -695,7 +698,7 @@ def test_do_start_push_kv_defers_then_writes_when_handshake_ready():
     re-drive with the handshake ready the WRITE is issued with a correct
     ReqMeta."""
     w = _StubWriterWorker.fresh()
-    w._logical_to_kernel_block_ids = lambda x, ratio: x
+    w._logical_to_kernel_block_ids = lambda x: x
     xfer_calls: list[dict[str, Any]] = []
     w._xfer_blocks_for_req = lambda **kw: xfer_calls.append(kw)
 
@@ -735,7 +738,7 @@ def test_do_start_push_kv_drops_request_on_handshake_failure():
     the failure is logged. Blocks are reclaimed by the lease/watchdog, matching
     the old blocking behaviour."""
     w = _StubWriterWorker.fresh()
-    w._logical_to_kernel_block_ids = lambda x, ratio: x
+    w._logical_to_kernel_block_ids = lambda x: x
     xfer_calls: list[dict[str, Any]] = []
     w._xfer_blocks_for_req = lambda **kw: xfer_calls.append(kw)
     failures: list[dict[str, Any]] = []
@@ -802,10 +805,9 @@ def _eviction_worker(engine_ttl: float) -> NixlPushConnectorWorker:
     w.nixl_wrapper = MagicMock()
     w.dst_xfer_side_handles = {}
     w.kv_caches_base_addr = {}
-    w.dst_num_blocks = {}
     w.tp_mappings = {}
     w.transfer_topo = None
-    w._logical_to_kernel_block_ids = lambda blocks, ratio: blocks
+    w._logical_to_kernel_block_ids = lambda blocks: blocks
     w.writes = []
     w._xfer_blocks_for_req = lambda req_id, meta: w.writes.append(req_id)
     return w
@@ -893,7 +895,7 @@ def test_start_load_kv_refreshes_engine_last_active_on_d_side():
     mid-stream once it passes its TTL."""
     w = _StubWriterWorker.fresh()
     w._send_heartbeats = lambda metadata: None
-    w._logical_to_kernel_block_ids = lambda x, ratio: x
+    w._logical_to_kernel_block_ids = lambda x: x
     # Connected prefill engine (already handshaked in).
     w._remote_agents["prefill-engine"] = {(0, 0): "agent-p"}
 
@@ -904,6 +906,30 @@ def test_start_load_kv_refreshes_engine_last_active_on_d_side():
 
     assert w._engine_last_active["prefill-engine"] > stale
     assert "req" in w._recving_metadata
+
+
+def test_start_load_kv_skips_metadata_for_aborted_preallocation_recv():
+    """An abort before allocation stages an empty recv (awaiting_kvs=False,
+    no local blocks) so the scheduler can drop the request cleanly. Push mode
+    never reports such a request done, so storing its metadata would leak the
+    entry in ``_recving_metadata`` until shutdown."""
+    w = _StubWriterWorker.fresh()
+    w._send_heartbeats = lambda metadata: None
+    w._logical_to_kernel_block_ids = lambda x: x
+
+    params = {
+        "remote_block_ids": (),
+        "remote_engine_id": "prefill-engine",
+        "remote_request_id": "p-req",
+        "remote_host": "localhost",
+        "remote_port": 1234,
+        "tp_size": 1,
+    }
+    meta = NixlConnectorMetadata()
+    meta.add_new_req_to_recv("aborted", [], params, awaiting_kvs=False)
+    w.start_load_kv(meta)
+
+    assert "aborted" not in w._recving_metadata
 
 
 def test_start_load_kv_skips_liveness_for_unconnected_engine():
@@ -1061,13 +1087,10 @@ class TestPushWriterNotifs:
         """A submission error remains a failure even if later polls succeed."""
         w = self._pollable_worker()
         request_id = self._make_sending_req(w)
-        w.transfer_topo.block_size_ratio.return_value = 1
         w._apply_prefix_caching = MagicMock(return_value=([[1]], [[1]]))
         w._compute_desc_ids = MagicMock(return_value=[0])
-        w.dst_num_blocks = {w.engine_id: 8}
         w.dst_region_num_blocks[w.engine_id] = [8]
         w.dst_region_group_ids[w.engine_id] = [0]
-        w.dst_uses_region_group_mapping[w.engine_id] = False
         w.nixl_wrapper.make_prepped_xfer.return_value = 101
         w.nixl_wrapper.transfer.side_effect = RuntimeError("submit")
         if release_fails:
@@ -1366,7 +1389,7 @@ class TestPushWriterNegative:
         """Empty metadata must not wake the writer or enqueue anything."""
         w = _StubWriterWorker.fresh()
         w._send_heartbeats = lambda metadata: None
-        w._logical_to_kernel_block_ids = lambda x, ratio: x
+        w._logical_to_kernel_block_ids = lambda x: x
 
         meta = NixlConnectorMetadata()
         w.start_load_kv(meta)
@@ -1455,48 +1478,6 @@ class TestPushPipelineParallel:
         metadata.add_new_req_to_recv("req-default", ([0],), params)
         assert metadata.reqs_to_recv["req-default"].pp_size == 1
 
-    def test_add_remote_agent_slices_remote_regions_to_local_pp_window(self):
-        """With PP>1 the producer registered regions for the full model, but
-        this worker holds only a contiguous layer slice; add_remote_agent
-        trims the remote region list to [offset : offset + num_local_regions]
-        before building descriptors. We stop right after the slice via a
-        sentinel on the next collaborator call."""
-        block_len = 4096 * 16
-        w = _StubWriterWorker.fresh()  # seeds writer-thread state for teardown
-        w.pp_size = 2
-        w._remote_region_offset = 2  # this worker owns layers [2, 4)
-        w.block_len_per_layer = [block_len, block_len]  # 2 local layers
-        w.nixl_wrapper = MagicMock()
-
-        class _StopAfterSlice(RuntimeError):
-            pass
-
-        w.transfer_topo = MagicMock()
-        w.transfer_topo.register_remote_engine.side_effect = _StopAfterSlice()
-
-        meta = NixlAgentMetadata(
-            engine_id="p-engine",
-            agent_metadata=b"agent",
-            kv_caches_base_addr=[10, 11, 12, 13],  # full 4-layer model
-            device_id=0,
-            num_blocks=4,
-            block_lens=[block_len] * 4,
-            # Non-interleaved: consecutive blocks abut, so stride == block length.
-            block_strides=[block_len] * 4,
-            kv_cache_layout="HND",
-            block_size=16,
-            ssm_sizes=(0, 0),
-            attn_backend_name="FLASH_ATTN",
-            physical_blocks_per_logical_kv_block=1,
-        )
-
-        with pytest.raises(_StopAfterSlice):
-            w.add_remote_agent(meta, remote_tp_rank=0, remote_tp_size=1)
-
-        # Sliced down to this worker's layer window (regions [2:4]).
-        assert meta.kv_caches_base_addr == [12, 13]
-        assert meta.block_lens == [block_len, block_len]
-
 
 class TestPushWriterMlaReplication:
     """MLA latent KV is replicated across D's TP ranks, so when D_TP > P_TP
@@ -1520,7 +1501,6 @@ class TestPushWriterMlaReplication:
         w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
             remote_tp_size=len(d_ranks),
             remote_block_size=16,
-            remote_physical_blocks_per_logical=1,
         )
         # D_TP > P_TP => negative ratio (one P rank feeds |ratio| D ranks).
         w.transfer_topo.tp_ratio.return_value = -len(d_ranks)
@@ -1534,10 +1514,11 @@ class TestPushWriterMlaReplication:
                 rank_offset_factor=0,
             )
         }
-        w._logical_to_kernel_block_ids = lambda block_ids, ratio: block_ids
+        w._logical_to_kernel_block_ids = lambda block_ids: block_ids
         w.dst_region_group_ids[engine_id] = [0]
+        w._dst_group_geometries[engine_id] = w.kv_cache_config.transfer_group_geometries
         w.dst_xfer_side_handles = {engine_id: {r: 1000 + r for r in d_ranks}}
-        w.src_xfer_handles_by_block_size = {16: 2000}
+        w.src_xfer_handle = 2000
         w._remote_agents = {engine_id: {(0, r): f"agent-{r}" for r in d_ranks}}
         return w, engine_id
 
@@ -1603,7 +1584,6 @@ class TestPushWriterMlaReplication:
         w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
             remote_tp_size=4,
             remote_block_size=16,
-            remote_physical_blocks_per_logical=1,
         )
         w.transfer_topo.tp_ratio.return_value = -2
         w.transfer_topo.handshake_target_ranks.return_value = (0, 1)
@@ -1615,11 +1595,13 @@ class TestPushWriterMlaReplication:
                 rank_offset_factor=0,
             )
         }
-        w._logical_to_kernel_block_ids = lambda block_ids, ratio: block_ids
+        w._logical_to_kernel_block_ids = lambda block_ids: block_ids
         w.region_group_ids = [0, 1, 2, 3]
         w.dst_region_group_ids[engine_id] = [0, 1, 2, 3]
+        # Identity kernel mapping for each of the four groups.
+        w._dst_group_geometries[engine_id] = [GroupGeometry(1, 0)] * 4
         w.dst_xfer_side_handles = {engine_id: {0: 1000, 1: 1001}}
-        w.src_xfer_handles_by_tp_ratio = {(-2, 16): [2000, 2001]}
+        w.src_xfer_handles_by_tp_ratio = {-2: [2000, 2001]}
 
         writes = []
 
@@ -1679,16 +1661,13 @@ class TestPushPrefixCaching:
         w.use_mla = False
         w.block_size = 16
         w.num_regions = 1
-        w._physical_blocks_per_logical_kv_block = 1
 
         w.transfer_topo = MagicMock()
         w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-            remote_physical_blocks_per_logical=1,
             remote_block_size=16,
             remote_tp_size=1,
         )
         w.transfer_topo.tp_ratio.return_value = 1
-        w.transfer_topo.block_size_ratio.return_value = 1
         w.tp_mappings = {
             engine_id: TPMapping(
                 source_ranks_per_group=((0,),),
@@ -1697,25 +1676,21 @@ class TestPushPrefixCaching:
                 rank_offset_factor=0,
             )
         }
-        w.dst_num_blocks = {engine_id: 10_000, w.engine_id: 10_000}
         w.dst_region_num_blocks = {
             engine_id: [10_000],
             w.engine_id: [10_000],
         }
         w.dst_region_group_ids = {engine_id: [0], w.engine_id: [0]}
-        w.dst_uses_region_group_mapping = {
-            engine_id: False,
-            w.engine_id: False,
-        }
         w.dst_xfer_side_handles = {engine_id: {0: 5000}}
-        w.src_xfer_handles_by_block_size = {16: 2000}
+        w.src_xfer_handle = 2000
+        w._dst_group_geometries[engine_id] = w.kv_cache_config.transfer_group_geometries
 
         # Stub only the NIXL WRITE; kernel expansion, prefix-cache trim, desc
         # computation and count assertions all run for real.
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.make_prepped_xfer.return_value = 7
         w._ensure_handshake = lambda *a, **k: None
-        w._logical_to_kernel_block_ids = lambda x, ratio: x
+        w._logical_to_kernel_block_ids = lambda x: x
         return w, engine_id
 
     @staticmethod
@@ -1755,7 +1730,7 @@ class TestPushPrefixCaching:
     def test_different_region_groups_require_layer_routing(self, layer_name_routing):
         """A layer mapped to a pooled remote region can still receive its blocks."""
         w, engine_id = self._worker_driving_xfer()
-        w.dst_region_group_ids[engine_id] = [-1]
+        w.dst_region_group_ids[engine_id] = [1]
         if layer_name_routing:
             w._transfer_layer_group_ids = (0,)
         reg = _registration_data("req-groups", local_block_ids=([500, 501],))
@@ -1786,14 +1761,12 @@ def _agent_metadata(
         agent_metadata=b"agent",
         kv_caches_base_addr=base_addresses,
         device_id=7,
-        num_blocks=2,
         block_lens=block_lens,
         block_strides=list(block_lens if block_strides is None else block_strides),
         kv_cache_layout="LBHNC",
         block_size=16,
         ssm_sizes=(0, 0),
         attn_backend_name="FLASH_ATTN",
-        physical_blocks_per_logical_kv_block=1,
         region_members=region_layers,
     )
 
@@ -1816,22 +1789,16 @@ def _layer_routing_worker(
     return worker
 
 
-@pytest.mark.parametrize(
-    ("region_num_blocks", "expected"),
-    [(None, [1, 2, 15, 21, 22]), ([4, 7, 5], [1, 2, 9, 12, 13])],
-)
-def test_layer_group_ids_route_descriptor_blocks(region_num_blocks, expected):
+def test_layer_group_ids_route_descriptor_blocks():
     worker = _layer_routing_worker(
         [["a", "a.swa"], ["b"]], {"a": 0, "a.swa": 1, "b": 0}
     )
     desc_ids = worker._compute_desc_ids(
         block_ids=[[1, 2], [5]],
-        dst_num_blocks=10,
-        block_size_ratio=None,
-        physical_blocks_per_logical=1,
-        region_num_blocks=region_num_blocks,
+        region_num_blocks=[4, 7, 5],
+        region_group_ids=[0, 0, 0],
     )
-    assert desc_ids.tolist() == expected
+    assert desc_ids.tolist() == [1, 2, 9, 12, 13]
 
 
 def test_layer_metadata_round_trip():
@@ -1987,7 +1954,6 @@ def test_layer_descriptors_pair_layers_across_asymmetric_pp_split(
     worker.block_len_per_layer = [128, 128]
     worker.block_stride_per_layer = [256, 512]
     worker._region_is_mla = [False, False]
-    worker.num_blocks = 4
     worker.region_num_blocks = local_num_blocks
     worker.device_id = 0
 
@@ -1997,7 +1963,6 @@ def test_layer_descriptors_pair_layers_across_asymmetric_pp_split(
         [128, 128, 128],
         [256, 512, 1024],
     )
-    consumer.num_blocks = 4
     consumer.region_num_blocks = remote_num_blocks
     worker._align_remote_regions_by_layer(consumer)
 
@@ -2007,18 +1972,18 @@ def test_layer_descriptors_pair_layers_across_asymmetric_pp_split(
 
     plan = TPMapping(((0,), (0,)), (0,), {0: 0}, 0)
     # Builders emit one strided run per region; expand to per-block descriptors.
-    local_descs = expand_strided_descs(
-        worker._build_fa_local([0x1000, 0x2000], block_size_ratio=1)
-    )
-    remote_descs = expand_strided_descs(
-        worker._build_fa_remote(plan, consumer, block_size_ratio=1)
-    )
+    local_descs = expand_strided_descs(worker._build_fa_local([0x1000, 0x2000]))
+    remote_descs = expand_strided_descs(worker._build_fa_remote(plan, consumer))
     local_counts = [local_num_blocks[i] for i in worker._transfer_layer_region_indices]
     local_ids = worker._compute_desc_ids(
-        [[1, 2], [3]], 4, None, 1, region_num_blocks=local_counts
+        [[1, 2], [3]],
+        region_num_blocks=local_counts,
+        region_group_ids=[0] * len(local_counts),
     )
     remote_ids = worker._compute_desc_ids(
-        [[0, 1], [2]], 4, None, 1, region_num_blocks=consumer.region_num_blocks
+        [[0, 1], [2]],
+        region_num_blocks=consumer.region_num_blocks,
+        region_group_ids=[0] * len(consumer.region_num_blocks),
     )
     assert len(local_descs) == sum(local_counts)
     assert len(remote_descs) == sum(consumer.region_num_blocks)
@@ -2155,12 +2120,10 @@ def test_layer_handshake_rejects_unsupported_geometry(
     worker.use_mla = False
     worker.nixl_wrapper = MagicMock()
     worker.kv_caches_base_addr = defaultdict(dict)
-    worker.dst_num_blocks = {}
     worker.tp_mappings = {}
     worker.transfer_topo = TransferTopology(
         tp_rank=0,
         tp_size=1,
-        block_size=local_block_size,
         engine_id=worker.engine_id,
         is_mla=False,
         is_mamba=False,
@@ -2173,7 +2136,7 @@ def test_layer_handshake_rejects_unsupported_geometry(
     worker.nixl_wrapper.add_remote_agent.assert_not_called()
     worker.nixl_wrapper.prep_xfer_dlist.assert_not_called()
     assert not worker.tp_mappings
-    assert not worker.dst_num_blocks
+    assert not worker.dst_region_num_blocks
     assert not worker.kv_caches_base_addr
     with pytest.raises(KeyError):
         worker.transfer_topo.get_engine_info(metadata.engine_id)
@@ -2196,7 +2159,10 @@ class TestPushLargePageHandshake:
         # Per-group kernel-row regions, and the peer's kernel rows per block
         # used to expand its manager block ids into kernel-block desc ids.
         assert worker.region_group_ids == [0, 0, 1]
-        assert worker._dst_kernel_rows_per_block[meta.engine_id] == [2, 1]
+        assert (
+            worker._dst_group_geometries[meta.engine_id]
+            == worker.kv_cache_config.transfer_group_geometries
+        )
 
     def test_push_large_page_rejects_unequal_block_size(self):
         worker = _make_large_page_worker(NixlPushConnectorWorker)

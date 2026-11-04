@@ -231,9 +231,10 @@ def create_scheduler(
             dtype=torch.float32,
         )
     kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,  # A large number of blocks to hold all requests
+        num_pages=num_blocks,  # A large number of blocks to hold all requests
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+        block_size=block_size,
     )
     cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(vllm_config)

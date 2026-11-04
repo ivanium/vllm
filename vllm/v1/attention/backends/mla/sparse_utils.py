@@ -69,6 +69,13 @@ def flat_kv_row_view(
     return rows, block_stride_rows
 
 
+def slots_to_flat_rows(
+    slots: torch.Tensor, block_size: int, block_stride_rows: int
+) -> torch.Tensor:
+    """Rows of a `flat_kv_row_view` that hold the given dense slot ids."""
+    return (slots // block_size) * block_stride_rows + slots % block_size
+
+
 # Kernel with prefill workspace support and valid count tracking
 
 

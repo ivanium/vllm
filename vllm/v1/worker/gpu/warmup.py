@@ -25,8 +25,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
     large_page_block_range,
+    large_pages_needed,
 )
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -48,8 +48,6 @@ def _reserved_block_count(
     `KVCacheManager.allocate_slots` reserves: the token range plus
     `num_lookahead_tokens`, where the speculator writes the KV of its drafts.
     """
-    if isinstance(kvcache_spec, UniformTypeKVCacheSpecs):
-        kvcache_spec = kvcache_spec.first_spec
     if isinstance(kvcache_spec, CircularBufferSpec):
         # Circular caches keep one physical ring block for the request lifetime.
         return 1
@@ -92,17 +90,14 @@ def _block_id_allocator(
 ) -> Callable[[int, int], list[int]]:
     """Sequential block-id hand-out for warmup `SchedulerOutput`s.
 
-    Under large_page each group takes whole pages from one page counter that
-    skips page 0 (every group's null block), so dummy blocks of different
-    groups never share bytes; otherwise one counter spans all groups.
+    Each group takes whole pages from one page counter that skips page 0
+    (every group's null block), so dummy blocks of different groups never
+    share bytes.
     """
-    if kv_cache_config.allocator != "large_page":
-        counter = count(1)
-        return lambda num_blocks, group_id: [next(counter) for _ in range(num_blocks)]
-
     groups = kv_cache_config.kv_cache_groups
     next_page = count(1)
     free_ids: list[list[int]] = [[] for _ in groups]
+
     page_bytes = kv_cache_config.large_page_bytes
 
     def alloc(num_blocks: int, group_id: int) -> list[int]:
@@ -119,13 +114,11 @@ def _block_id_allocator(
     return alloc
 
 
-def _large_page_pages_needed(
-    kv_cache_config: KVCacheConfig, block_counts: list[int]
-) -> int:
+def _pages_needed(kv_cache_config: KVCacheConfig, block_counts: list[int]) -> int:
     """Upper bound on the large pages `_block_id_allocator` takes for these
     per-group counts."""
     return sum(
-        cdiv(n, group.slots_per_large_page)
+        large_pages_needed(n, group.blocks_per_page)
         for group, n in zip(kv_cache_config.kv_cache_groups, block_counts)
     )
 
@@ -166,20 +159,14 @@ def run_mixed_prefill_decode_warmup(
         for decode, prefill in zip(decode_block_counts, decode_prefill_block_counts)
     ]
     prefill_block_counts = [block_count(prefill_len, s) for s in kv_cache_specs]
-    required_blocks = sum(decode_block_counts) + sum(prefill_block_counts)
     kv_cache_config = model_runner.kv_cache_config
-    if kv_cache_config.allocator == "large_page":
-        # Page 0 is reserved; each group takes whole pages.
-        required = _large_page_pages_needed(
-            kv_cache_config,
-            [d + p for d, p in zip(decode_block_counts, prefill_block_counts)],
-        )
-        available = kv_cache_config.num_blocks - 1
-        fits = required <= available
-    else:
-        fits = model_runner.kv_cache_config.num_blocks > required_blocks
-        available = model_runner.kv_cache_config.num_blocks
-        required = required_blocks
+    # Page 0 is reserved; each group takes whole pages.
+    required = _pages_needed(
+        kv_cache_config,
+        [d + p for d, p in zip(decode_block_counts, prefill_block_counts)],
+    )
+    available = kv_cache_config.num_pages - 1
+    fits = required <= available
     if not fits:
         logger.warning(
             "Skipping V2 mixed prefill+decode warmup because only %s KV blocks "
@@ -373,23 +360,12 @@ def _warmup_kernels(
         # Reserve block 0 (null block) and ensure we have enough blocks.
         # Encoder-only models allocate no KV blocks, so this cap doesn't apply.
         kv_cache_config = model_runner.kv_cache_config
-        if kv_cache_config.allocator == "large_page":
-            # Conservative: each request rounds its blocks up to whole pages.
-            pages_per_req = _large_page_pages_needed(
-                kv_cache_config, decode_block_counts
-            )
-            num_reqs = min(
-                num_reqs,
-                max(1, (kv_cache_config.num_blocks - 1) // pages_per_req),
-            )
-        else:
-            num_reqs = min(
-                num_reqs,
-                max(
-                    1,
-                    (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req,
-                ),
-            )
+        # Conservative: each request rounds its blocks up to whole pages.
+        pages_per_req = _pages_needed(kv_cache_config, decode_block_counts)
+        num_reqs = min(
+            num_reqs,
+            max(1, (kv_cache_config.num_pages - 1) // pages_per_req),
+        )
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
 
@@ -414,12 +390,8 @@ def _warmup_kernels(
 
     # The KV-block zeroing kernel is driven by the scheduler's
     # new_block_ids_to_zero, so none of the steps below reach it.
-    if model_runner.kv_cache_config.allocator == "large_page":
-        for zeroer in getattr(model_runner, "kv_block_zeroers", None) or []:
-            if zeroer is not None:
-                zeroer.warmup(1)
-    elif model_runner.kv_block_zeroer is not None:
-        model_runner.kv_block_zeroer.warmup(model_runner.kv_cache_config.num_blocks)
+    for zeroer in model_runner.kv_block_zeroers.values():
+        zeroer.warmup(1)
 
     # Step 1: Prefill all requests with 1 + decode_query_len prompt tokens each.
     new_reqs = [

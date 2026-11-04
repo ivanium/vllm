@@ -24,7 +24,6 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import current_stream
-from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.hisparse.layout import HISPARSE_HOT_SUFFIX
 from vllm.v1.hisparse.runtime import (
     HiSparseCacheHandle,
@@ -37,7 +36,6 @@ from vllm.v1.kv_cache_interface import (
     HiSparseHotSpec,
     KVCacheConfig,
 )
-from vllm.v1.worker.utils import copy_kv_cache_blocks_inplace
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
@@ -345,8 +343,6 @@ class HiSparseConnectorWorker:
             None,
         )
         self._pending_invalid_block_ids: list[int] = []
-        # Destination block ids of host copies this worker has run.
-        self._completed_host_copy_dst_ids: list[int] = []
         self._post_forward_transfers: list[SparseKVPageTransfer] = []
         self._enqueued_transfer_ids: list[int] = []
         self._pending_transfer_events: deque[tuple[torch.Event, tuple[int, ...]]] = (
@@ -431,7 +427,6 @@ class HiSparseConnectorWorker:
         self._clear_forward_mirror_state()
         for handle in self.cache_handles:
             handle.all_context_pages_resident = metadata.all_context_pages_resident
-        self._copy_host_blocks(metadata.host_block_copies, previous_host_write_event)
         transfers = (
             metadata.command.page_transfers if metadata.command is not None else []
         )
@@ -520,27 +515,6 @@ class HiSparseConnectorWorker:
             )
         )
         state.num_tokens = 0
-
-    def _copy_host_blocks(
-        self,
-        host_block_copies: Sequence[KVCacheBlockCopy],
-        previous_host_write_event: torch.Event,
-    ) -> None:
-        if not host_block_copies:
-            return
-        self._completed_host_copy_dst_ids.extend(
-            copy.dst_block_id for copy in host_block_copies
-        )
-        if self.shared_host_region is None or get_tensor_model_parallel_rank() == 0:
-            if self.host_caches:
-                previous_host_write_event.synchronize()
-            copy_kv_cache_blocks_inplace(
-                self.host_caches,
-                self.host_num_blocks,
-                host_block_copies,
-            )
-        if self.shared_host_region is not None:
-            get_tp_group().barrier()
 
     def invalidate_blocks(
         self, block_ids: list[int], request_state_indices: torch.Tensor
@@ -943,12 +917,6 @@ class HiSparseConnectorWorker:
         transfers = self._post_forward_transfers
         self._post_forward_transfers = []
         self._submit_transfers(transfers)
-
-    def take_completed_host_copies(self) -> list[int]:
-        """Drain host copies this worker has enqueued for this step."""
-        completed = self._completed_host_copy_dst_ids
-        self._completed_host_copy_dst_ids = []
-        return completed
 
     def take_transfer_updates(self) -> tuple[list[int], list[int]]:
         enqueued = self._enqueued_transfer_ids

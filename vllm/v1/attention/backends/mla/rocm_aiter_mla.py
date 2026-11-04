@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING, ClassVar, Final, cast
 import torch
 
 from vllm import envs
-from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
+from vllm._aiter_ops import (
+    flat_kv_buffer_rows,
+    is_aiter_found_and_supported,
+    rocm_aiter_ops,
+)
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_dcp_group
@@ -37,6 +41,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
     max_decode_query_len,
 )
+from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
 from vllm.v1.attention.backends.mla.triton_mla import _compute_num_kv_splits
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
@@ -259,7 +264,7 @@ def _gluon_kv_cache_in_bounds(kv_cache_bytes: int | None) -> bool:
     if kv_cache_bytes is None or kv_cache_bytes <= _GLUON_MAX_KV_CACHE_BYTES:
         return True
     logger.warning_once(
-        "KV cache is %.1f GiB per layer, past the 2 GiB where the Gluon MLA "
+        "KV cache view spans %.1f GiB, past the 2 GiB where the Gluon MLA "
         "kernel drops its KV bounds mask; using the padded ASM decode instead. "
         "Lower --gpu-memory-utilization or --max-model-len to get Gluon back.",
         kv_cache_bytes / (1 << 30),
@@ -513,7 +518,7 @@ class AiterMLABackend(MLACommonBackend):
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         # The aiter MLA decode kernel always operates with page_size=1
-        # internally (the wrapper flattens kv_buffer via .view(-1, 1, 1, H)).
+        # internally (the wrapper flattens kv_buffer to a row view).
         # We support any kernel_block_size by expanding block-level indices
         # into per-token flat indices in the metadata builder.
         return [MultipleOf(1)]
@@ -903,6 +908,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # (e.g. 16 with Eagle3), we expand block-level indices into per-token
         # flat indices since the aiter kernel always uses page_size=1 internally.
         self.kernel_block_size = kv_cache_spec.block_size
+        # Physical rows between consecutive blocks of a layer's cache view,
+        # resolved lazily from the bound cache (see _kv_block_stride_rows).
+        # MLACommonMetadataBuilder does not keep layer_names; we need it to
+        # find the bound cache.
+        self.layer_names = layer_names
+        self._block_stride_rows: int | None = None
         # Generic Triton indexes physical KV blocks; segmented MLA indexes
         # TILE subpages of them.
         self._dcp_verify_page_size = (
@@ -919,7 +930,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             * parallel_config.cp_kv_cache_interleave_size
         )
 
-        # In the flat view (.view(-1,1,1,H)), each token is its own page,
+        # In the flat row view, each token is its own page,
         # so max_num_pages_per_req = max_model_len regardless of
         # kernel_block_size.
         max_num_pages_per_req = vllm_config.model_config.max_model_len
@@ -938,7 +949,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # being used.
 
         # paged_kv_last_page_len is always 1s (the aiter kernel always sees
-        # page_size=1 after .view(-1,1,1,H) flattening), so we create it
+        # page_size=1 in the flat row view), so we create it
         # once and reuse slices in both eager and cudagraph modes.
         self.paged_kv_last_page_len = torch.ones(
             max_num_reqs, dtype=torch.int32, device=device
@@ -977,13 +988,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # _build_decode needs the cache dtype to pick the decode kernel; keep
         # the normalized string instead of dropping it at the end of __init__.
         self._kv_cache_dtype_str = kv_cache_dtype_str
-        # Sized per layer, matching the flat KV tensor the kernel is handed.
-        num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
-        self._kv_cache_bytes = (
-            None
-            if num_gpu_blocks is None
-            else num_gpu_blocks * kv_cache_spec.page_size_bytes
-        )
+        # Resolved lazily from the bound cache (see _flat_kv_cache_bytes).
+        self._kv_cache_bytes: int | None = None
         # MLAAttention quantizes decode Q to FP8 before calling this backend
         # whenever the KV cache is FP8 and supports_quant_query_input is true.
         q_dtype = (
@@ -1393,6 +1399,49 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         metadata.fp8_prefill_max_q_len = prefill.max_query_len
         metadata.fp8_prefill_num_partial_tiles = num_partial_tiles
 
+    def _flat_kv_cache_bytes(self) -> int | None:
+        """Bytes of the flat row view of the bound cache the kernels read.
+
+        A large-page layer view strides its blocks over the group's other
+        layers, so the flat view spans them too. None before binding (memory
+        profiling), when no kernel runs.
+        """
+        if self._kv_cache_bytes is None:
+            layer = self.vllm_config.compilation_config.static_forward_context[
+                self.layer_names[0]
+            ]
+            if layer.kv_cache.numel() == 0:
+                return None
+            rows = flat_kv_buffer_rows(layer.kv_cache)
+            self._kv_cache_bytes = rows.numel() * rows.element_size()
+        return self._kv_cache_bytes
+
+    def _kv_block_stride_rows(self) -> int:
+        """Physical rows between consecutive blocks of a layer's cache view.
+
+        A large-page layer view strides each block by the whole group's row,
+        so the flat row index of (block b, token i) is
+        ``b * block_stride_rows + i``. Read once from the bound cache; a build
+        that runs before binding (memory profiling) falls back to the dense
+        block stride, whose indices the dry run never consumes.
+        """
+        if self._block_stride_rows is None:
+            layer = self.vllm_config.compilation_config.static_forward_context[
+                self.layer_names[0]
+            ]
+            kv_cache = layer.kv_cache
+            if kv_cache.numel() == 0:
+                assert self.kernel_block_size is not None
+                return self.kernel_block_size
+            rows, block_stride_rows = flat_kv_row_view(kv_cache, kv_cache.shape[1])
+            num_rows = rows.shape[0]
+            assert num_rows <= 2**31 - 1, (
+                "ROCM_AITER_MLA addresses the KV cache with int32 row indices; "
+                f"this cache spans {num_rows} rows"
+            )
+            self._block_stride_rows = block_stride_rows
+        return self._block_stride_rows
+
     def _build_dcp_verify_row_view(
         self,
         qlen: int,
@@ -1485,7 +1534,16 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             f"DCP verify needs {max_local_blocks} blocks per request but the "
             f"block table only has {block_table.shape[1]}"
         )
-        if pages_per_block == 1:
+        if self._use_triton_dcp_verify:
+            # The Triton kernel indexes physical KV blocks by their id.
+            page_block_stride = pages_per_block
+        else:
+            # The segmented kernel reads a flat subpage view of the cache, so
+            # page ids stride blocks by the physical row count.
+            block_stride_rows = self._kv_block_stride_rows()
+            assert block_stride_rows % page_size == 0
+            page_block_stride = block_stride_rows // page_size
+        if page_block_stride == 1:
             per_req_page_table = block_table[:num_reqs, :max_local_pages]
         else:
             subpage_offsets = torch.arange(
@@ -1494,7 +1552,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 device=block_table.device,
             )
             per_req_page_table = (
-                block_table[:num_reqs, :max_local_blocks, None] * pages_per_block
+                block_table[:num_reqs, :max_local_blocks, None] * page_block_stride
                 + subpage_offsets
             ).flatten(1)[:, :max_local_pages]
         # Broadcast the request's page list across its rows instead of
@@ -1587,11 +1645,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 seq_lens_for_kernel.cumsum(dim=0, dtype=torch.int32),
             ]
         )
+        kv_cache_bytes = self._flat_kv_cache_bytes()
         use_gluon_decode = AiterMLAHelper.use_gluon_decode(
             self._decode_num_heads,
             int(max_qo_len),
             self._kv_cache_dtype_str,
-            self._kv_cache_bytes,
+            kv_cache_bytes,
         )
         use_gluon_verify = AiterMLAHelper.use_gluon_verify(
             self._decode_num_heads,
@@ -1599,7 +1658,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             self._kv_cache_dtype_str,
             self.dcp_world_size,
             causal,
-            self._kv_cache_bytes,
+            kv_cache_bytes,
         )
         dcp_route = _DCPDecodeRoute.PLAIN
         if self.dcp_world_size > 1:
@@ -1623,8 +1682,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             # Expand block_table entries into per-token flat indices.
             # When kernel_block_size=1, this degrades to a direct copy (identical
             # to the original _copy_page_indices_kernel).
-            # When kernel_block_size=K>1, block_table entry b covering K tokens
-            # gets expanded to flat indices b*K, b*K+1, ..., b*K+(K-1).
+            # Block b's tokens sit at flat rows b*block_stride_rows + i, where
+            # block_stride_rows is the layer view's physical block stride in
+            # rows (kernel_block_size only for a densely packed view).
             # Chunk count comes from the block table width, an upper bound on
             # tokens per request that is available host-side, so this adds no
             # device synchronisation. Programs whose chunk lies past
@@ -1640,6 +1700,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 block_table_tensor.stride(1),
                 paged_kv_indptr,
                 seq_lens_device,
+                self._kv_block_stride_rows(),
                 KERNEL_BLOCK_SIZE=self.kernel_block_size,
                 BLOCK_SIZE=1024,
                 CLAMP_TAIL=varlen_decode,
@@ -1921,6 +1982,7 @@ def _expand_page_indices_kernel(
     block_table_stride_1,
     cu_num_tokens,
     num_real_tokens,
+    block_stride_rows,
     KERNEL_BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     CLAMP_TAIL: tl.constexpr = False,
@@ -1928,15 +1990,16 @@ def _expand_page_indices_kernel(
     """Expand block table entries into per-token flat page indices.
 
     The aiter MLA kernel always operates with page_size=1 internally
-    (kv_buffer is flattened via .view(-1, 1, 1, H)). This kernel converts
+    (kv_buffer is flattened to a row view). This kernel converts
     block-level indices from the block table into individual token positions
     in the flattened KV buffer.
 
-    When KERNEL_BLOCK_SIZE=1: block_idx=t, offset=0, flat=block_id
-    (equivalent to a direct copy -- no regression from the original kernel).
-
-    When KERNEL_BLOCK_SIZE=K: block table entry b (covering K tokens)
-    is expanded to flat indices b*K, b*K+1, ..., b*K+(K-1).
+    Block b's tokens sit at flat rows ``b * block_stride_rows + i``:
+    ``block_stride_rows`` is the layer view's physical block stride in rows,
+    which exceeds KERNEL_BLOCK_SIZE when other layers' rows sit between the
+    blocks (large-page layout). When KERNEL_BLOCK_SIZE=1 and the view is
+    dense: block_idx=t, offset=0, flat=block_id (equivalent to a direct copy
+    -- no regression from the original kernel).
 
     With CLAMP_TAIL, entries past num_real_tokens[req] (padding a request's
     page list out to its kernel length) repeat the request's first page, so
@@ -1977,8 +2040,10 @@ def _expand_page_indices_kernel(
     # elsewhere, so a unit column stride must not be assumed.
     block_ids = tl.load(row_ptr + block_idx * block_table_stride_1, mask=mask)
 
-    # Compute flat index in the flattened kv_buffer
-    flat_indices = block_ids * KERNEL_BLOCK_SIZE + offset_in_block
+    # Compute flat index in the flattened kv_buffer. The product reaches
+    # past 2**31 rows on large pools, so do the math in int64; the builder
+    # asserts the row space fits the int32 output buffer.
+    flat_indices = block_ids.to(tl.int64) * block_stride_rows + offset_in_block
 
     tl.store(
         page_indices + start_idx + token_offsets,
@@ -2669,14 +2734,12 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         # skip_reduce with NUM_SEGMENTS>1 returns the partials and never writes
         # `out`. Pass None rather than aliasing q_mla: if that ever stops
         # holding, this fails loudly instead of scribbling over the query.
+        # The flat row view stays valid on strided (large-page) caches; its
+        # subpage view matches the page ids _fill_dcp_verify_page_table emits.
+        kv_rows = flat_kv_buffer_rows(kv_c_and_k_pe_cache)
         segment_partials = _get_segmented_mla_decode()(
             q_mla,
-            kv_c_and_k_pe_cache.view(
-                -1,
-                verify.page_size,
-                1,
-                kv_c_and_k_pe_cache.shape[-1],
-            ),
+            kv_rows.view(-1, verify.page_size, 1, kv_rows.shape[-1]),
             None,
             verify.qo_indptr,
             verify.row_lens,
@@ -2813,7 +2876,9 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 dtype=decode.attn_out_dtype,
                 device=q_nope.device,
             )
-            kv_buffer = kv_c_and_k_pe_cache.reshape(-1, kv_c_and_k_pe_cache.shape[-1])
+            kv_buffer = flat_kv_buffer_rows(kv_c_and_k_pe_cache).view(
+                -1, kv_c_and_k_pe_cache.shape[-1]
+            )
             mla_gluon = _get_mla_gluon()
             mla_gluon(
                 q_nope=q_nope,
@@ -2856,7 +2921,9 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 dtype=decode.attn_out_dtype,
                 device=q_nope.device,
             )
-            kv_buffer = kv_c_and_k_pe_cache.reshape(-1, kv_c_and_k_pe_cache.shape[-1])
+            kv_buffer = flat_kv_buffer_rows(kv_c_and_k_pe_cache).view(
+                -1, kv_c_and_k_pe_cache.shape[-1]
+            )
             assert attn_metadata.causal, (
                 "AITER MLA small-head verify MTP is causal-only"
             )
@@ -3008,7 +3075,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             # through aiter's native entry point on the DCP path.
             _, lse = _get_aiter_mla_decode()(
                 mla_padded_q,
-                kv_buffer.view(-1, 1, 1, mla_padded_q.shape[-1]),
+                flat_kv_buffer_rows(kv_buffer),
                 o,
                 decode.qo_indptr,
                 decode.paged_kv_indptr,

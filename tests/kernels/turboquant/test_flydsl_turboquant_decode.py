@@ -259,3 +259,76 @@ def test_flydsl_matches_reference(num_seqs, seq_len, num_kv_heads, qg, kv_block_
     ref = _reference_attention(q_bf16.cpu(), k_ref, v_ref, seq_lens.cpu(), scale)
 
     torch.testing.assert_close(out.cpu().float(), ref, atol=ATOL, rtol=0.0)
+
+
+def _strided_block_view(kv_cache: torch.Tensor, gap_bytes: int) -> torch.Tensor:
+    """Re-home the blocks of a dense cache at a padded stride, mimicking the
+    per-layer view of a large-page cache whose stride(0) spans the whole
+    layer group (other layers' blocks sit in the gaps).
+    """
+    assert kv_cache.dtype == torch.uint8
+    num_blocks = kv_cache.shape[0]
+    block_bytes = kv_cache.stride(0)
+    stride_bytes = block_bytes + gap_bytes
+    backing = torch.zeros(
+        num_blocks * stride_bytes, dtype=torch.uint8, device=kv_cache.device
+    )
+    backing.view(num_blocks, stride_bytes)[:, :block_bytes] = kv_cache.view(
+        num_blocks, block_bytes
+    )
+    view = backing.as_strided(kv_cache.shape, (stride_bytes, *kv_cache.stride()[1:]))
+    assert view.stride(0) == stride_bytes
+    return view
+
+
+@pytest.mark.parametrize(
+    "num_kv_heads,qg",
+    [
+        (8, 8),  # Qwen2.5-72B class
+        pytest.param(
+            4,
+            6,  # MiniMax-M2.5 class (GQA-6 sibling kernel)
+            marks=pytest.mark.skipif(
+                not is_flydsl_gqa6_available(),
+                reason="FlyDSL GQA-6 sibling kernel not available",
+            ),
+        ),
+    ],
+)
+def test_flydsl_strided_cache_view(num_kv_heads, qg):
+    """The kernel must take the cache block stride from the tensor.
+
+    A large-page layer view has stride(0) wider than one block; a kernel
+    using the baked dense-layout stride reads gap bytes for every block
+    past block 0 and fails this check.
+    """
+    centroids, q_bf16, kv_cache, block_table, seq_lens, k_ref, v_ref = _build_cache(
+        4, num_kv_heads, 1024, qg, 16
+    )
+    kv_cache = _strided_block_view(kv_cache, gap_bytes=kv_cache.stride(0) + 64)
+    scale = 1.0 / (HEAD_SIZE**0.5)
+    identity = torch.eye(HEAD_SIZE, dtype=torch.float32, device="cuda")
+
+    out = flydsl_turboquant_decode_attention(
+        query=q_bf16,
+        kv_cache=kv_cache,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        Pi=identity,
+        centroids=centroids,
+        scale=scale,
+        mse_bits=4,
+        key_packed_size=KEY_DATA_BYTES + 2,
+        value_quant_bits=4,
+        value_packed_size=KEY_DATA_BYTES + 4,
+        key_fp8=False,
+        norm_correction=False,
+        PiT=identity.T.contiguous(),
+        max_seq_len=1024,
+        max_num_kv_splits=32,
+        sinks=None,
+    )
+
+    ref = _reference_attention(q_bf16.cpu(), k_ref, v_ref, seq_lens.cpu(), scale)
+
+    torch.testing.assert_close(out.cpu().float(), ref, atol=ATOL, rtol=0.0)

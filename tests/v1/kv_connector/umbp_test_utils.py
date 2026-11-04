@@ -28,7 +28,6 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheTensor,
 )
 
 
@@ -236,22 +235,53 @@ def handshake(scheduler_connector, worker_connector) -> None:
     )
 
 
-def _kv_cache_config() -> KVCacheConfig:
+def _kv_cache_config(dcp_size: int = 1) -> KVCacheConfig:
+    """One two-layer full-attention group under the large-page allocator.
+
+    A 16-token manager block spans two kernel rows; each layer holds half of
+    one ``row_bytes`` row. DCP shards tokens across ranks, so the group spec
+    holds 16 // dcp_size tokens per block, as the planner writes it.
+    """
     spec = FullAttentionSpec(
-        block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
+        block_size=16 // dcp_size, num_kv_heads=2, head_size=8, dtype=torch.float16
     )
+    page_bytes = spec.page_size_bytes
     return KVCacheConfig(
-        num_blocks=8,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=8192,
-                layers=["layer1", "layer2"],
-                layer_stride=4096,
-                block_stride=1024,
+        num_pages=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer1", "layer2"],
+                spec,
+                num_blocks=8,
+                blocks_per_page=1,
+                kernel_rows_per_block=2,
+                row_bytes=page_bytes,
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(["layer1", "layer2"], spec)],
+        large_page_bytes=2 * page_bytes,
+        block_size=16,
     )
+
+
+def _group_views(
+    config: KVCacheConfig, group_id: int = 0
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Per-layer strided views over one backing storage, as workers hand them."""
+    group = config.kv_cache_groups[group_id]
+    row_bytes = group.row_bytes
+    rows = group.num_blocks * group.kernel_rows_per_block
+    backing = torch.empty(rows * row_bytes, dtype=torch.uint8)
+    specs = group.layer_kv_cache_specs or dict.fromkeys(
+        group.layer_names, group.kv_cache_spec
+    )
+    views = {}
+    offset = 0
+    for name in group.layer_names:
+        part = specs[name].page_size_bytes // group.kernel_rows_per_block
+        views[name] = backing.as_strided((rows, part), (row_bytes, 1), offset)
+        offset += part
+    return backing, views
 
 
 def _vllm_config(extra: dict, **parallel_overrides) -> SimpleNamespace:
@@ -269,7 +299,6 @@ def _vllm_config(extra: dict, **parallel_overrides) -> SimpleNamespace:
         cache_config=SimpleNamespace(
             block_size=16,
             enable_prefix_caching=True,
-            prefix_match_unit=None,
         ),
         model_config=SimpleNamespace(
             model="test-model",

@@ -33,10 +33,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector i
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheTensor,
     SlidingWindowSpec,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
@@ -127,67 +127,44 @@ BLOCK_SIZE = 16
 NUM_KV_HEADS = 1
 HEAD_SIZE = 16
 DTYPE = torch.float16
-_BYTES_PER_BLOCK = BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE * 2 * DTYPE.itemsize
 
 
 def _make_kv_cache_config(
     num_blocks: int = 100,
     swa_enabled: bool = False,
 ) -> KVCacheConfig:
-    """Build KVCacheConfig with non-empty kv_cache_tensors.
-
-    SimpleCPUOffloadConnector requires kv_cache_tensors with real sizes
-    (used by _derive_cpu_config).
-    """
-    fa_layers = ["layer0", "layer2"]
+    """One large page per block; each group's row holds its two layers."""
+    specs: dict[tuple[str, ...], AttentionSpec] = {
+        ("layer0", "layer2"): FullAttentionSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            dtype=DTYPE,
+        )
+    }
+    if swa_enabled:
+        specs[("layer1", "layer3")] = SlidingWindowSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            dtype=DTYPE,
+            sliding_window=128,
+        )
     groups = [
         KVCacheGroupSpec(
-            fa_layers,
-            FullAttentionSpec(
-                block_size=BLOCK_SIZE,
-                num_kv_heads=NUM_KV_HEADS,
-                head_size=HEAD_SIZE,
-                dtype=DTYPE,
-            ),
+            list(layers),
+            spec,
+            num_blocks=num_blocks,
+            row_bytes=spec.page_size_bytes * len(layers),
         )
+        for layers, spec in specs.items()
     ]
-    # Each group packs its two layers densely; groups overlay one allocation.
-    layer_stride = _BYTES_PER_BLOCK * num_blocks
-    size = 2 * layer_stride
-    tensors = [
-        KVCacheTensor(
-            size=size,
-            layers=fa_layers,
-            layer_stride=layer_stride,
-            block_stride=_BYTES_PER_BLOCK,
-        )
-    ]
-    if swa_enabled:
-        sw_layers = ["layer1", "layer3"]
-        groups.append(
-            KVCacheGroupSpec(
-                sw_layers,
-                SlidingWindowSpec(
-                    block_size=BLOCK_SIZE,
-                    num_kv_heads=NUM_KV_HEADS,
-                    head_size=HEAD_SIZE,
-                    dtype=DTYPE,
-                    sliding_window=128,
-                ),
-            )
-        )
-        tensors.append(
-            KVCacheTensor(
-                size=size,
-                layers=sw_layers,
-                layer_stride=layer_stride,
-                block_stride=_BYTES_PER_BLOCK,
-            )
-        )
     return KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=tensors,
+        num_pages=num_blocks,
+        kv_cache_tensors=[],
         kv_cache_groups=groups,
+        large_page_bytes=max(g.row_bytes for g in groups),
+        block_size=BLOCK_SIZE,
     )
 
 

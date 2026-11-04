@@ -11,11 +11,9 @@ from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
     Any,
-    NamedTuple,
     NewType,
     TypeAlias,
     TypeVar,
-    overload,
 )
 
 from vllm import envs
@@ -27,19 +25,14 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
-    iter_layer_specs,
 )
-from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
 
 if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
-    from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 
 
 # BlockHash represents the hash of a single KV-cache block used for
@@ -172,7 +165,7 @@ class KVCacheBlock:
         default=None, repr=False, compare=False, kw_only=True
     )
     # KV cache group that owns the block id; block ids are unique only within
-    # a group under the large-page allocator.
+    # a group.
     group_id: int = field(default=0, compare=False, kw_only=True)
     # The hash key (block hash + group id) of the block, only available
     # when the block is full and cached.
@@ -255,14 +248,6 @@ def trim_null_head(blocks: _BlockSeq) -> _BlockSeq:
     """``blocks`` without its leading null blocks; ``blocks`` itself if none."""
     nhl = null_head_len(blocks)
     return blocks[nhl:] if nhl else blocks
-
-
-class KVCacheBlockCopy(NamedTuple):
-    src_block_id: int
-    dst_block_id: int
-    # KV cache group both blocks belong to; block ids are unique only within
-    # a group under the large-page allocator.
-    group_id: int = 0
 
 
 class FreeKVCacheBlockQueue:
@@ -757,239 +742,49 @@ def resolve_dcp_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> KVCache
     block_size = resolve_dcp_kv_block_size(spec, dcp_world_size)
     if block_size == spec.block_size:
         return spec
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        return replace(
-            spec,
-            block_size=block_size,
-            kv_cache_specs={
-                name: resolve_dcp_kv_cache_spec(layer_spec, dcp_world_size)
-                for name, layer_spec in spec.kv_cache_specs.items()
-            },
-        )
     return replace(spec, block_size=block_size)
 
 
-def partial_hash_hits_enabled(
-    kv_cache_groups: Sequence[KVCacheGroupSpec],
-    hash_block_size: int,
-    dcp_world_size: int = 1,
-    manager_classes: Sequence[type["SingleTypeKVCacheManager"]] | None = None,
-) -> bool:
-    """Whether aligned Mamba states support sub-block prefix-cache hits.
-
-    If ``manager_classes`` (one per group) is given, also require every other
-    prefix-cacheable group to support fine-grained lookups.
-    """
-    if not any(
-        isinstance(spec, MambaSpec)
-        and spec.mamba_cache_mode == "align"
-        and (
-            (dcp_world_size == 1 and spec.block_size > hash_block_size)
-            or (dcp_world_size > 1 and spec.block_size >= hash_block_size)
-        )
-        for group in kv_cache_groups
-        for spec in iter_layer_specs(group.kv_cache_spec)
-    ):
-        return False
-    if manager_classes is None:
-        return True
-    unsupported_managers = {
-        manager_cls.__name__
-        for group, manager_cls in zip(kv_cache_groups, manager_classes)
-        if group.kv_cache_spec.prefix_cacheable
-        and not manager_cls.supports_fine_grained_hash_lookup
-        and resolve_dcp_kv_block_size(group.kv_cache_spec, dcp_world_size)
-        != hash_block_size
-    }
-    if unsupported_managers:
-        logger.warning_once(
-            "Disabling fine-grained prefix-cache hits because these KV "
-            "cache managers require block-aligned lookups: %s.",
-            ", ".join(sorted(unsupported_managers)),
-        )
-        return False
-    return True
-
-
-def eagle_proof_margin(
-    block_size: int, hash_block_size: int, fine_grained_lookup: bool
-) -> int:
-    """Tokens an EAGLE group matches past a cache hit before dropping them.
-
-    Fine-grained lookups drop one hash unit; others drop one cache block.
-    """
-    if fine_grained_lookup and block_size > hash_block_size:
-        return hash_block_size
-    return block_size
-
-
-def resolve_kv_cache_block_sizes(
+def resolve_scheduler_block_size(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
-) -> tuple[int, int]:
-    """Resolve (scheduler_block_size, hash_block_size).
+) -> int:
+    """Resolve the scheduler block size.
 
-    - ``scheduler_block_size`` is the token-alignment invariant used by the
-      scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size * dcp``. Multiple groups: LCM of every
-      group's effective block size. Attention groups are scaled by DCP;
-      Mamba groups keep their full per-rank state and are not scaled.
-    - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
-      is computed. Single group: equals scheduler block size, and any other
-      ``cache_config.prefix_match_unit`` is rejected while block hashing is
-      active. Multiple groups:
-      ``cache_config.prefix_match_unit`` override if set, else the GCD of
-      group block sizes; every group's block size must be divisible by it.
-      Returns the scheduler block size (i.e. disables finer hashing) if block
-      hashing is inactive or a mamba group is not using cache mode "align".
-    - Under the large-page allocator the planner fixed ``hash_block_size`` at
-      the global block size B; the scheduler block size is the LCM of B and
-      every group's block size (none-mode Mamba groups keep a private one).
+    The planner fixed the hash granularity at the global block size B
+    (``kv_cache_config.block_size``); every prefix-cacheable group's
+    block size equals B. The scheduler block size is the LCM of B and every
+    group's block size, which covers none-mode Mamba groups that keep a
+    private block size. Attention groups are scaled by DCP; Mamba groups
+    keep their full per-rank state and are not scaled.
     """
-    cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
-    groups = kv_cache_config.kv_cache_groups
-
-    if kv_cache_config.allocator == "large_page":
-        hash_block_size = kv_cache_config.hash_block_size
-        assert hash_block_size is not None
-        scheduler_block_size = math.lcm(
-            hash_block_size,
-            *(resolve_dcp_kv_block_size(g.kv_cache_spec, dcp) for g in groups),
-        )
-        return scheduler_block_size, hash_block_size
-
-    if len(groups) <= 1:
-        if groups and not groups[0].kv_cache_spec.dcp_sharded:
-            dcp = 1
-        bs = cache_config.block_size * dcp
-        # Reject a prefix_match_unit that would otherwise be silently ignored.
-        if (
-            cache_config.prefix_match_unit not in (None, bs)
-            and len(groups) == 1
-            and (
-                cache_config.enable_prefix_caching
-                or vllm_config.kv_transfer_config is not None
-            )
-        ):
-            raise ValueError(
-                f"Invalid prefix_match_unit={cache_config.prefix_match_unit}; "
-                "with a single KV cache group, prefix-cache hits land on the "
-                f"block size ({bs}). Unset it or set it to {bs}."
-            )
-        return bs, bs
-
-    group_block_sizes = [
-        resolve_dcp_kv_block_size(g.kv_cache_spec, dcp) for g in groups
-    ]
-    scheduler_block_size = math.lcm(*group_block_sizes)
-
-    logger.info_once("kv cache group sizes %s", tuple(group_block_sizes))
-    logger.info_once("kv lcm block sizes %s", scheduler_block_size)
-
-    # Block hashes are only consumed by prefix caching and KV connectors
-    # (P/D, offloading); when neither is active, keep hash_block_size equal
-    # to the scheduler block size.
-    connector_enabled = vllm_config.kv_transfer_config is not None
-    if not (cache_config.enable_prefix_caching or connector_enabled):
-        return scheduler_block_size, scheduler_block_size
-
-    # Mamba groups outside align mode break divisibility; back off to the
-    # scheduler block size. Read the mode from the resolved group spec because
-    # its block size may have been updated independently of cache_config.
-    if any(
-        isinstance(spec, MambaSpec) and spec.mamba_cache_mode != "align"
-        for group in groups
-        for spec in iter_layer_specs(group.kv_cache_spec)
-    ):
-        return scheduler_block_size, scheduler_block_size
-
-    hashing_sizes = [
-        block_size
-        for group, block_size in zip(groups, group_block_sizes)
-        if group.kv_cache_spec.prefix_cacheable
-    ] or group_block_sizes
-    requested = cache_config.prefix_match_unit
-    hash_block_size = requested if requested is not None else math.gcd(*hashing_sizes)
-    if any(bs % hash_block_size != 0 for bs in hashing_sizes):
-        raise ValueError(
-            f"Invalid prefix_match_unit={hash_block_size}; prefix-cacheable "
-            "KV cache group block sizes must be divisible by prefix_match_unit. "
-            f"Got group block sizes={group_block_sizes}, "
-            f"prefix-cacheable={hashing_sizes}."
-        )
-    prefix_alignments = {
-        spec.tokens_per_state
-        for group in groups
-        for spec in iter_layer_specs(group.kv_cache_spec)
-        if spec.prefix_cacheable
-        and isinstance(spec.tokens_per_state, int)
-        and spec.tokens_per_state > 1
-    }
-    cache_hit_alignment = (
-        hash_block_size
-        if partial_hash_hits_enabled(groups, hash_block_size, dcp)
-        else scheduler_block_size
+    return math.lcm(
+        kv_cache_config.block_size,
+        *(
+            resolve_dcp_kv_block_size(g.kv_cache_spec, dcp)
+            for g in kv_cache_config.kv_cache_groups
+        ),
     )
-    if any(cache_hit_alignment % alignment for alignment in prefix_alignments):
-        raise ValueError(
-            f"Invalid prefix_match_unit={hash_block_size}; prefix-cache boundaries "
-            "must align with each spec's per-state compression. "
-            f"Got alignments={sorted(prefix_alignments)}."
-        )
-    return scheduler_block_size, hash_block_size
-
-
-def resolve_cache_hit_alignment_tokens(
-    kv_cache_config: KVCacheConfig,
-    vllm_config: VllmConfig,
-    scheduler_block_size: int,
-    hash_block_size: int,
-) -> int:
-    """Token granularity at which prefix-cache hits land.
-
-    Mirrors the alignment the hybrid KV cache coordinator pushes to its
-    managers: fine-grained hits land on ``hash_block_size``, all others on
-    ``scheduler_block_size``.
-    """
-    groups = kv_cache_config.kv_cache_groups
-    if not vllm_config.cache_config.enable_prefix_caching or len(groups) <= 1:
-        return scheduler_block_size
-    manager_classes = []
-    for group in groups:
-        manager_cls = KVCacheSpecRegistry.get_manager_class(
-            group.kv_cache_spec, group.role
-        )
-        assert manager_cls is not None
-        manager_classes.append(manager_cls)
-    if partial_hash_hits_enabled(
-        groups,
-        hash_block_size,
-        vllm_config.parallel_config.decode_context_parallel_size,
-        manager_classes,
-    ):
-        return hash_block_size
-    return scheduler_block_size
 
 
 def get_request_block_hasher(
-    hash_block_size: int,
+    block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
 ) -> Callable[[Request], list[BlockHash]]:
     """Returns a function which computes the list of un-computed block hashes
     of a request.
 
-    Hashes are computed at ``hash_block_size`` granularity and chained over the
+    Hashes are computed at ``block_size`` granularity and chained over the
     full prefix, so each hash uniquely fingerprints the prefix ending at its
-    boundary. Coarser group block sizes and partial-cache boundaries reuse
-    these hashes directly (see ``BlockHashListWithBlockSize``).
+    boundary.
     """
 
     def request_block_hasher(request: Request) -> list[BlockHash]:
-        start_token_idx = len(request.block_hashes) * hash_block_size
+        start_token_idx = len(request.block_hashes) * block_size
         num_tokens = request.num_tokens
 
-        if start_token_idx + hash_block_size > num_tokens:
+        if start_token_idx + block_size > num_tokens:
             # Early stop when there no new full blocks created.
             return []
 
@@ -1001,7 +796,7 @@ def get_request_block_hasher(
                 curr_mm_idx, _ = get_mm_features_in_window(
                     mm_features,
                     start_token_idx,
-                    start_token_idx + hash_block_size,
+                    start_token_idx + block_size,
                 )
 
         prev_block_hash_value = (
@@ -1009,7 +804,7 @@ def get_request_block_hasher(
         )
         new_block_hashes: list[BlockHash] = []
         while True:
-            end_token_idx = start_token_idx + hash_block_size
+            end_token_idx = start_token_idx + block_size
             if end_token_idx > num_tokens:
                 # We only hash full blocks
                 break
@@ -1026,7 +821,7 @@ def get_request_block_hasher(
             )
 
             new_block_hashes.append(block_hash)
-            start_token_idx += hash_block_size
+            start_token_idx += block_size
             prev_block_hash_value = block_hash
 
         return new_block_hashes
@@ -1037,15 +832,14 @@ def get_request_block_hasher(
 def large_page_blocks_per_request(spec: KVCacheSpec, vllm_config: VllmConfig) -> int:
     """Blocks of one group that one max-model-len request holds.
 
-    Large-page allocator sizer/capacity accounting: the max-model-len block
-    count (window and state groups: their admission cap) plus the speculative
-    lookahead and a copy-on-write reserve. Mamba and ring groups already carry
-    their speculative blocks in ``max_memory_usage_bytes``.
+    Sizer/capacity accounting: the max-model-len block count (window and state
+    groups: their admission cap) plus the speculative lookahead. Mamba and ring
+    groups already carry their speculative blocks in ``max_memory_usage_bytes``.
     """
     blocks = cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
     if not isinstance(spec, (MambaSpec, CircularBufferSpec)):
         blocks += cdiv(vllm_config.num_speculative_tokens, spec.block_size)
-    return blocks + 1
+    return blocks
 
 
 def get_max_concurrency_for_kv_cache_config(
@@ -1056,11 +850,8 @@ def get_max_concurrency_for_kv_cache_config(
     A request at max_model_len consumes whole blocks from each group's block
     table — cdiv(per-request bytes, page bytes) of the group's spec — and all
     device groups draw those block ids from one shared pool, so the per-request
-    total is the sum over groups. The memory/page ratio is identical whether
-    a group carries an aggregated UniformTypeKVCacheSpecs (worker config) or
-    a representative per-layer spec (scheduler config), so both capacity
-    call sites agree. Under the large-page allocator the pool is pages, and a
-    page holds ``slots_per_large_page`` blocks of one group.
+    total is the sum over groups. The pool is pages, and a page holds
+    ``blocks_per_page`` blocks of one group.
 
     Host groups use a separate pool; the smaller concurrency limit applies.
     """
@@ -1072,13 +863,13 @@ def get_max_concurrency_for_kv_cache_config(
                 group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
                 group.kv_cache_spec.page_size_bytes,
             )
-            / group.slots_per_large_page
+            / group.blocks_per_page
         )
         if group.host_resident:
             host_blocks_per_request += required
         else:
             num_blocks_per_request += required
-    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
+    limits = [kv_cache_config.num_pages / num_blocks_per_request]
     if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None
         limits.append(
@@ -1092,7 +883,7 @@ def generate_scheduler_kv_cache_config(
 ) -> KVCacheConfig:
     """Generate the KV cache configuration for the scheduler."""
     assert all(
-        [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
+        [cfg.num_pages == kv_cache_configs[0].num_pages for cfg in kv_cache_configs]
     )
     assert all(
         cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks
@@ -1113,15 +904,7 @@ def generate_scheduler_kv_cache_config(
     ), "KV cache pool geometry differs across workers"
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
-    cfg = copy.deepcopy(kv_cache_configs[0])
-    for group in cfg.kv_cache_groups:
-        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-            # All layers in the UniformTypeKVCacheSpecs have the same type,
-            # so use an arbitrary one to initialize the scheduler.
-            group.kv_cache_spec = next(
-                iter(group.kv_cache_spec.kv_cache_specs.values())
-            )
-    return cfg
+    return copy.deepcopy(kv_cache_configs[0])
 
 
 def get_kv_cache_capacity(
@@ -1159,112 +942,3 @@ def update_kv_cache_capacity(
         f"{max_model_len:,}",
         max_concurrency,
     )
-
-
-class BlockHashListWithBlockSize:
-    """Convert block-hash granularity from `hash_block_size` to `target_block_size`.
-    Used when KV cache groups have different block sizes: `hash_block_size`
-    is the size used to compute the original `block_hashes`; `target_block_size`
-    is the group's actual block size.
-
-    Currently, only scaling up by an integer factor is supported (i.e.,
-    `target_block_size` is a multiple of `hash_block_size`). Conversion is
-    performed lazily on access for efficiency. Each `hash_block_size` hash is
-    already chained over its entire prefix, so the hash at the last
-    `hash_block_size` boundary of a `target_block_size` block uniquely
-    fingerprints that block's prefix; we use it directly.
-
-    Example (`hash_block_size` = 16, `target_block_size` = 32):
-    the second 16-size hash already covers tokens 0-31, so it is the 32-size
-    hash:
-
-    Block hashes with block_size 16:
-    | Token Range | 0-15 | 16-31 | 32-47 | 48-63 |
-    |-------------|------|-------|-------|-------|
-    | Hash        | A    | B     | C     | D     |
-
-    Block hashes with block_size 32:
-    | Token Range | 0-31 | 32-63 |
-    |-------------|------|-------|
-    | Hash        | B    | D     |
-
-    Args:
-        block_hashes: Block hashes to convert, computed at `hash_block_size`.
-        hash_block_size: Block size at which `block_hashes` were computed.
-        target_block_size: Desired block size; must be a multiple of `hash_block_size`.
-
-    """
-
-    def __init__(
-        self,
-        block_hashes: list[BlockHash],
-        hash_block_size: int,
-        target_block_size: int,
-    ):
-        self.block_hashes = block_hashes
-        assert target_block_size % hash_block_size == 0
-        self.scale_factor = target_block_size // hash_block_size
-
-    def __len__(self) -> int:
-        return len(self.block_hashes) // self.scale_factor
-
-    @overload
-    def __getitem__(self, idx: int) -> BlockHash: ...
-
-    @overload
-    def __getitem__(self, idx: slice) -> list[BlockHash]: ...
-
-    def __getitem__(self, idx):
-        if isinstance(idx, int):
-            return self._get_value_at(idx)
-
-        if isinstance(idx, slice):
-            start, stop, step = idx.indices(len(self))
-            return [self._get_value_at(i) for i in range(start, stop, step)]
-
-        raise TypeError(f"Invalid index type: {type(idx)!r}")
-
-    def __iter__(self) -> Iterator[BlockHash]:
-        for i in range(len(self)):
-            yield self._get_value_at(i)
-
-    def _get_value_at(self, idx: int) -> BlockHash:
-        # The last hash_block_size hash within the target block already chains
-        # over the whole prefix, so it is the target block's hash.
-        return self.block_hashes[(idx + 1) * self.scale_factor - 1]
-
-
-BlockHashList = list[BlockHash] | BlockHashListWithBlockSize
-
-
-def resolve_block_hashes(
-    block_hashes: BlockHashList,
-    hash_block_size: int,
-    block_size: int,
-    *,
-    supports_fine_grained_hash_lookup: bool = False,
-    alignment_tokens: int | None = None,
-) -> BlockHashList:
-    """Resolve the block-hash view at ``block_size``.
-
-    When ``block_size`` equals ``hash_block_size``, reuse the precomputed block
-    hashes directly; otherwise view them at ``block_size`` granularity.
-    Fine-grained lookup keeps the original hashes for partial cache hits.
-    """
-    if block_size == hash_block_size:
-        return block_hashes
-    if isinstance(block_hashes, BlockHashListWithBlockSize):
-        # Already a block-size view
-        assert block_hashes.scale_factor == block_size // hash_block_size
-        return block_hashes
-    # Fine-grained partial hits keep the raw hashes. The caller passes
-    # alignment_tokens = hash_block_size to enable them, else >= block_size.
-    if (
-        supports_fine_grained_hash_lookup
-        and alignment_tokens is not None
-        and alignment_tokens < block_size
-        and block_size % alignment_tokens == 0
-    ):
-        return block_hashes
-    assert block_size % hash_block_size == 0
-    return BlockHashListWithBlockSize(block_hashes, hash_block_size, block_size)

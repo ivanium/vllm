@@ -53,7 +53,7 @@ class KVCacheMetricsCollector:
         self.sample_rate = sample_rate
 
         # Keyed by (group_id, block_id): block ids are unique only within a
-        # group under the large-page allocator.
+        # group.
         self.block_metrics: dict[tuple[int, int], BlockMetricsState] = {}
 
         self._eviction_events: list[KVCacheEvictionEvent] = []

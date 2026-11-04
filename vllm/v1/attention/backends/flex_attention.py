@@ -45,7 +45,6 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
-    KVCacheLayout,
     is_quantized_kv_cache,
 )
 
@@ -125,12 +124,6 @@ class FlexAttentionBackend(AttentionBackend):
     @classmethod
     def supports_batch_invariance(cls) -> bool:
         return True
-
-    @classmethod
-    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        # Flex flattens the (B, N) block/token axes into a single token dim, which
-        # only LBNHC's strides allow as a zero-copy view of the layer cache.
-        return (KVCacheLayout.LBNHC,)
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
@@ -846,7 +839,6 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
 
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
-        self.cache_config = vllm_config.cache_config
 
         self.num_heads_q = self.model_config.get_num_attention_heads(
             self.parallel_config
@@ -1016,21 +1008,27 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
 
         block_size = self.kv_cache_spec.block_size
         max_possible_seq_len = self.model_config.max_model_len
-        num_gpu_blocks = self.cache_config.num_gpu_blocks
-
-        assert num_gpu_blocks is not None, (
-            "FlexAttention requires num_gpu_blocks to be set"
-        )
-        total_cache_tokens = num_gpu_blocks * block_size
+        uses_paged_kv = not isinstance(self.kv_cache_spec, EncoderOnlyAttentionSpec)
+        if uses_paged_kv:
+            # Block tables hold kernel block ids: rows of the layer views.
+            kv_cache = self.vllm_config.compilation_config.static_forward_context[
+                self.layer_names[0]
+            ].kv_cache
+            num_kernel_blocks = kv_cache.shape[0]
+        else:
+            # Encoder-only attention reads no KV cache; its dummy block table
+            # only names block 0.
+            num_kernel_blocks = 1
+        total_cache_tokens = num_kernel_blocks * block_size
 
         inverse_block_table = physical_to_logical_mapping(
-            block_table_tensor, seq_lens, block_size, num_gpu_blocks
+            block_table_tensor, seq_lens, block_size, num_kernel_blocks
         )
         if self.persistent_physical_to_logical is None:
             max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
             self.persistent_physical_to_logical = torch.empty(
                 max_num_seqs,
-                num_gpu_blocks,
+                num_kernel_blocks,
                 dtype=torch.long,
                 device=self.device,
             )
@@ -1076,7 +1074,6 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             copy_to_persistent(self.persistent_rswa_prefix_lens, rswa_prefix_lens)
             rswa_prefix_lens = self.persistent_rswa_prefix_lens
 
-        uses_paged_kv = not isinstance(self.kv_cache_spec, EncoderOnlyAttentionSpec)
         logical_mask_mod = (
             bidirectional_mask_mod
             if uses_paged_kv and not common_attn_metadata.causal
@@ -1347,9 +1344,11 @@ class FlexAttentionImpl(AttentionImpl):
             hs = self.head_size
             key_cache, value_cache = kv_cache.split(hs, dim=-1)
 
-            # Flatten (num_blocks, block_size) into a single token dim.
-            key_cache = key_cache.view(-1, self.num_kv_heads, self.head_size)
-            value_cache = value_cache.view(-1, self.num_kv_heads, self.head_size)
+            # Flatten (num_blocks, block_size) into a single token dim. The
+            # layer view may be strided across other layers of its KV cache
+            # group, so densify with a copy instead of viewing in place.
+            key_cache = key_cache.contiguous().view(-1, self.num_kv_heads, hs)
+            value_cache = value_cache.contiguous().view(-1, self.num_kv_heads, hs)
             query, key_tensor, value_tensor = map(
                 lambda x: self.view_as_4d(x).permute(0, 2, 1, 3),
                 (query, key_cache, value_cache),

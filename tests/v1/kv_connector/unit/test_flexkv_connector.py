@@ -21,7 +21,12 @@ import torch
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.config.kv_transfer import KVRole
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.base import supports_hma
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 
 from .utils import create_vllm_config
 
@@ -44,7 +49,27 @@ def _make_vllm_config(
 
 
 def _make_kv_cache_config() -> KVCacheConfig:
-    return MagicMock(spec=KVCacheConfig)
+    return KVCacheConfig(
+        num_pages=4,
+        kv_cache_tensors=[],
+        block_size=16,
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+                num_blocks=4,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=64,
+            )
+        ],
+        large_page_bytes=64,
+    )
 
 
 def _make_flexkv_module(
@@ -125,6 +150,66 @@ class TestFlexKVConnectorImportError:
         assert "https://github.com/taco-project/FlexKV" in str(exc_info.value)
 
 
+class TestFlexKVConnectorIncompatibleImpl:
+    """A pre-large-page FlexKV must be rejected with a clear error at init,
+    not a bare TypeError/AttributeError on first use."""
+
+    @pytest.mark.parametrize(
+        "impl_cls",
+        [
+            # Released FlexKV: 2-arg constructor, no large-page hooks.
+            type(
+                "OldFlexKVConnectorV1Impl",
+                (),
+                {"__init__": lambda self, vllm_config, role: None},
+            ),
+            # 3-arg constructor but still missing the per-group hooks.
+            type(
+                "NewCtorOldHooksImpl",
+                (),
+                {"__init__": lambda self, vllm_config, role, kv_cache_config: None},
+            ),
+        ],
+        ids=["two-arg-constructor", "missing-all-groups-hooks"],
+    )
+    def test_old_flexkv_impl_rejected(self, impl_cls):
+        from vllm.distributed.kv_transfer.kv_connector.v1.flexkv_connector import (
+            FlexKVConnectorV1,
+        )
+
+        flexkv_mod = types.ModuleType("flexkv")
+        integration_mod = types.ModuleType("flexkv.integration")
+        vllm_mod = types.ModuleType("flexkv.integration.vllm")
+        adapter_mod = types.ModuleType("flexkv.integration.vllm.vllm_v1_adapter")
+        adapter_mod.FlexKVConnectorV1Impl = impl_cls  # type: ignore[attr-defined]
+        flexkv_mod.integration = integration_mod  # type: ignore[attr-defined]
+        integration_mod.vllm = vllm_mod  # type: ignore[attr-defined]
+        vllm_mod.vllm_v1_adapter = adapter_mod  # type: ignore[attr-defined]
+        mods = {
+            "flexkv": flexkv_mod,
+            "flexkv.integration": integration_mod,
+            "flexkv.integration.vllm": vllm_mod,
+            "flexkv.integration.vllm.vllm_v1_adapter": adapter_mod,
+        }
+        # Build the configs outside the sys.modules patch: their lazy imports
+        # must not be recorded as patch additions (patch.dict would evict them
+        # on exit and a later import would re-register torch ops).
+        vllm_config = _make_vllm_config()
+        kv_cache_config = _make_kv_cache_config()
+        with (
+            patch.dict(sys.modules, mods),
+            pytest.raises(RuntimeError, match="(?i)too old") as exc_info,
+        ):
+            FlexKVConnectorV1(
+                vllm_config=vllm_config,
+                role=KVConnectorRole.WORKER,
+                kv_cache_config=kv_cache_config,
+            )
+
+        assert "kv_cache_config" in str(exc_info.value)
+        assert "request_finished_all_groups" in str(exc_info.value)
+
+
 class TestFlexKVConnectorDelegation:
     """All public API methods should be forwarded to the impl."""
 
@@ -134,6 +219,34 @@ class TestFlexKVConnectorDelegation:
         cfg = _make_vllm_config()
         connector = _build_connector(cfg, impl)
         return connector, impl
+
+    def test_impl_receives_kv_cache_config(self):
+        """The impl is constructed with the KV cache config so it can read
+        the large-page group geometry, and the connector supports HMA."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.flexkv_connector import (
+            FlexKVConnectorV1,
+        )
+
+        impl = MagicMock()
+        vllm_config = _make_vllm_config()
+        kv_cache_config = _make_kv_cache_config()
+        flexkv_mod, adapter_mod = _make_flexkv_module(impl)
+        mods = {
+            "flexkv": flexkv_mod,
+            "flexkv.integration": flexkv_mod.integration,
+            "flexkv.integration.vllm": flexkv_mod.integration.vllm,
+            "flexkv.integration.vllm.vllm_v1_adapter": adapter_mod,
+        }
+        with patch.dict(sys.modules, mods):
+            connector = FlexKVConnectorV1(
+                vllm_config=vllm_config,
+                role=KVConnectorRole.WORKER,
+                kv_cache_config=kv_cache_config,
+            )
+        adapter_mod.FlexKVConnectorV1Impl.assert_called_once_with(
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
+        )
+        assert supports_hma(connector)
 
     def test_shutdown(self, connector_and_impl):
         connector, impl = connector_and_impl
@@ -206,6 +319,14 @@ class TestFlexKVConnectorDelegation:
         impl.request_finished.assert_called_once_with(req, [1, 2, 3])
         assert result == (True, {"key": "val"})
 
+    def test_request_finished_all_groups(self, connector_and_impl):
+        connector, impl = connector_and_impl
+        req = MagicMock()
+        impl.request_finished_all_groups.return_value = (True, {"key": "val"})
+        result = connector.request_finished_all_groups(req, ([1, 2], [3]))
+        impl.request_finished_all_groups.assert_called_once_with(req, ([1, 2], [3]))
+        assert result == (True, {"key": "val"})
+
     def test_take_events(self, connector_and_impl):
         connector, impl = connector_and_impl
         impl.take_events.return_value = iter([])
@@ -221,9 +342,10 @@ class TestFlexKVConnectorDelegation:
 
     def test_get_block_ids_with_load_errors(self, connector_and_impl):
         connector, impl = connector_and_impl
-        impl.get_block_ids_with_load_errors.return_value = {7, 8}
+        # Under large_page the impl reports (group_id, block_id) pairs.
+        impl.get_block_ids_with_load_errors.return_value = {(0, 7), (1, 8)}
         result = connector.get_block_ids_with_load_errors()
-        assert result == {7, 8}
+        assert result == {(0, 7), (1, 8)}
 
     def test_wait_for_layer_load(self, connector_and_impl):
         connector, impl = connector_and_impl

@@ -1360,13 +1360,13 @@ def minimax_m3_index_decode(
                 "MiniMax-M3 fused decode sparse-table construction requires "
                 f"one index head, got {num_idx_heads}"
             )
-        if block_page_stride not in (
-            PAGES_PER_SPARSE_BLOCK,
-            2 * PAGES_PER_SPARSE_BLOCK,
+        if (
+            block_page_stride < PAGES_PER_SPARSE_BLOCK
+            or block_page_stride % PAGES_PER_SPARSE_BLOCK != 0
         ):
             raise ValueError(
-                "MiniMax-M3 fused decode sparse-table page stride must be "
-                f"{PAGES_PER_SPARSE_BLOCK} or {2 * PAGES_PER_SPARSE_BLOCK}, "
+                "MiniMax-M3 fused decode sparse-table page stride must be a "
+                f"multiple of {PAGES_PER_SPARSE_BLOCK} (one side's pages), "
                 f"got {block_page_stride}"
             )
         expected_sparse_shape = (total_q, topk * PAGES_PER_SPARSE_BLOCK)

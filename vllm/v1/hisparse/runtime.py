@@ -24,6 +24,7 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.torch_utils import async_tensor_h2d, current_stream
 from vllm.v1.attention.backend import max_decode_query_len
+from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
 from vllm.v1.hisparse.types import SparseKVResidencyUpdate
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
@@ -89,10 +90,11 @@ class PagedCacheView:
         row_bytes = row_width * itemsize
         if block_stride % (block_size * row_bytes):
             return cls(cache, cache, block_size, block_size)
-        attention_cache = (
-            raw_tensor[byte_offset:].view(dtype).view(-1, block_size, row_width)
-        )
-        return cls(cache, attention_cache, block_size, block_stride // row_bytes)
+        # Flat token rows from the first block to the end of the last one;
+        # other groups' rows between this view's blocks are never indexed.
+        rows, rows_per_block = flat_kv_row_view(cache, block_size)
+        attention_cache = rows.view(-1, block_size, row_width)
+        return cls(cache, attention_cache, block_size, rows_per_block)
 
 
 @dataclass(frozen=True)

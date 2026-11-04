@@ -814,9 +814,7 @@ def set_dcp_capture_context(
     # attention is not baked into the graph.
     if block_tables.cp_size == 1:
         return
-    num_kv_blocks: int | list[int] = kv_cache_config.num_blocks
-    if kv_cache_config.allocator == "large_page":
-        num_kv_blocks = [g.num_blocks for g in kv_cache_config.kv_cache_groups]
+    num_kv_blocks = [g.num_blocks for g in kv_cache_config.kv_cache_groups]
     set_dummy_context(
         input_batch,
         block_tables,
@@ -1059,7 +1057,7 @@ def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
     )
 
     runner.initialize_kv_cache(minimal_config, is_profiling=True)
-    runner.cache_config.num_gpu_blocks = minimal_config.num_blocks
+    runner.cache_config.num_gpu_blocks = minimal_config.num_pages
 
 
 def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
@@ -1078,8 +1076,6 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         runner.model_state._mamba_spec = None
     if hasattr(runner, "kv_caches"):
         runner.kv_caches.clear()
-    if hasattr(runner, "kv_caches_by_layer"):
-        runner.kv_caches_by_layer.clear()
     if hasattr(runner, "attn_groups"):
         runner.attn_groups.clear()
     if hasattr(runner, "kv_cache_config"):

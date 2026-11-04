@@ -227,28 +227,6 @@ def test_head_slices_land_byte_exact(
         assert not remote_view[0].any()
 
 
-def test_head_slices_of_separate_kv_planes():
-    """Legacy [2, num_blocks, block_size, heads, head_dim] caches move K and V."""
-    spec = _spec(4)
-    torch.manual_seed(0)
-    local = torch.randint(0, 255, (2, 3, 4, 4, 4), dtype=torch.uint8)
-    remote = torch.zeros((2, 3, 4, 2, 4), dtype=torch.uint8)
-    local_layout = get_layer_head_layout("l", local, {"l": spec})
-    remote_layout = get_layer_head_layout("l", remote, {"l": _spec(2)})
-    offsets = compute_head_slice_offsets(
-        local_layout,
-        remote_layout,
-        [1],
-        [2],
-        local_head=2,
-        remote_head=0,
-        num_heads=2,
-    )
-    _apply(offsets, local.view(-1), remote.view(-1))
-    assert torch.equal(remote[:, 2], local[:, 1, :, 2:4])
-    assert not remote[:, :2].any()
-
-
 def test_token_major_head_slices_merge_to_one_run_per_token():
     spec = _spec(4)
     buffer = torch.zeros(spec.page_size_bytes * 2, dtype=torch.uint8)

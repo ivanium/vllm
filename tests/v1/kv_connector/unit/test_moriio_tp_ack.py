@@ -446,7 +446,7 @@ def test_read_completion_waits_for_every_posted_read():
         "req": ("127.0.0.1", "7000", "tx-pending")
     }
     worker._recving_transfers_start = {"req": float("inf")}
-    worker._recving_local_blocks = {"req": [1, 2]}
+    worker._recving_local_blocks = {"req": {(0, 1), (0, 2)}}
     worker._invalid_block_ids = set()
 
     assert worker._pop_done_transfers() == set()
@@ -456,12 +456,16 @@ def test_read_completion_waits_for_every_posted_read():
 
 @pytest.mark.parametrize(
     ("has_mamba", "expected_invalid"),
-    [(False, {1, 2}), (True, set())],
+    [(False, {(0, 1), (1, 2)}), (True, set())],
 )
-def test_failed_read_reports_blocks_only_without_hma(has_mamba, expected_invalid):
+def test_failed_read_reports_grouped_blocks_only_without_mamba(
+    has_mamba, expected_invalid
+):
+    # Under large_page, load errors carry (group_id, block_id) pairs; hybrid
+    # (mamba) failures fail the step at the read barrier instead.
     worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
     worker._has_mamba = has_mamba
-    worker._recving_local_blocks = {"req": [1, 2]}
+    worker._recving_local_blocks = {"req": {(0, 1), (1, 2)}}
     worker._invalid_block_ids = set()
 
     worker._record_failed_recv("req")
@@ -609,7 +613,7 @@ def _worker_with_failed_and_pending_read(has_mamba, pending_b, monkeypatch):
         "b": ("127.0.0.1", "7000", "tx-b"),
     }
     worker._recving_transfers_start = {}
-    worker._recving_local_blocks = {"a": [1, 2], "b": [3, 4]}
+    worker._recving_local_blocks = {"a": {(0, 1), (1, 2)}, "b": {(0, 3), (0, 4)}}
     worker._invalid_block_ids = set()
     return worker
 
@@ -624,7 +628,7 @@ def test_step_barrier_failure_still_awaits_other_requests(monkeypatch, fake_cloc
     assert late_b.polls >= 5
     assert fake_clock.sleeps >= 4
     assert worker._pop_done_transfers() == {"tx-b"}
-    assert worker.get_block_ids_with_load_errors() == {1, 2}
+    assert worker.get_block_ids_with_load_errors() == {(0, 1), (1, 2)}
 
 
 def test_hybrid_step_barrier_failure_does_not_wait(monkeypatch, fake_clock):

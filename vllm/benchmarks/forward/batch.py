@@ -14,7 +14,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
 )
 
 
@@ -55,8 +54,6 @@ def _num_blocks(
 ) -> tuple[int, int]:
     """Return (leading null blocks, live blocks) for one request."""
     block_size = kv_block_size(spec, dcp_size)
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        spec = spec.first_spec
     if isinstance(spec, (CircularBufferSpec, MambaSpec)):
         return 0, 1
     total = -(-kv_len // block_size)

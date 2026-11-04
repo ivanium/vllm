@@ -119,7 +119,6 @@ def test_hisparse_host_residency_reported_as_hisparse_metrics():
         make_hisparse_kv_cache_config(2, 2),
         max_model_len=128,
         enable_caching=True,
-        hash_block_size=16,
         metrics_collector=collector,
     )
     coordinator = get_hisparse_coordinator(manager)
@@ -131,14 +130,14 @@ def test_hisparse_host_residency_reported_as_hisparse_metrics():
     request = create_requests(1, num_tokens=16)[0]
     for pool, birth in ((device, 1), (host, 2)):
         with patch("time.monotonic_ns", return_value=birth * 10**9):
-            block = pool.get_new_blocks(1)[0]
+            block = pool.get_new_blocks(1, 0)[0]
             assert block.block_id == 1
-            pool.cache_full_blocks(request, [block], 0, 1, 16, 0)
+            pool.cache_full_blocks(request, [block], 0, 1, 0)
     with patch("time.monotonic_ns", return_value=4_000_000_000):
         host.free_blocks([host.blocks[1]])
-        host.evict_blocks({1})
+        host.evict_blocks([(0, 1)])
     with patch("time.monotonic_ns", return_value=6_000_000_000):
-        device.evict_blocks({1})
+        device.evict_blocks([(0, 1)])
 
     assert collector.drain_events() == [KVCacheEvictionEvent(5.0, 5.0, ())]
     stats = scheduler.get_kv_connector_stats()
@@ -187,7 +186,7 @@ def test_full_graph_step_prepares_host_mirror_outside_model():
     connector = object.__new__(HiSparseConnector)
     connector.connector_worker = worker
     connector._get_connector_metadata = MagicMock(
-        return_value=HiSparseConnectorMetadata(None, (), (), {}, True, {})
+        return_value=HiSparseConnectorMetadata(None, (), {}, True, {})
     )
     req_id_per_token = torch.tensor([0, 1], dtype=torch.int32)
     attn_metadata = SimpleNamespace(
@@ -314,7 +313,6 @@ def test_draft_layer_rows_mirrored_after_drafter(monkeypatch, cg_mode):
                 ]
             ),
             (),
-            (),
             {
                 "req": (
                     SparseKVRowMirror(
@@ -429,14 +427,13 @@ def test_zero_token_step_holds_tp_ranks_after_host_write_wait(
         "_release_completed_dma_descriptors",
         "_set_row_mirrors",
         "_clear_forward_mirror_state",
-        "_copy_host_blocks",
         "_restore_pages",
         "_submit_transfers",
     ):
         setattr(worker, name, MagicMock())
 
     worker.start_step(
-        HiSparseConnectorMetadata(None, (), (), {}, True, {}),
+        HiSparseConnectorMetadata(None, (), {}, True, {}),
         None,
         [],
         num_tokens=num_tokens,

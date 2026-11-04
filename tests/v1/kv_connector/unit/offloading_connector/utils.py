@@ -32,16 +32,14 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     init_none_hash,
-    resolve_kv_cache_block_sizes,
+    resolve_scheduler_block_size,
 )
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheTensor,
 )
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
@@ -250,30 +248,37 @@ class RequestRunner:
                 )
             ]
 
-        # Groups overlay one allocation, sized by the largest group.
-        block_stride = max(
-            group.kv_cache_spec.page_size_bytes * len(group.layer_names)
-            for group in kv_cache_groups
+        # Large-page geometry: the pool is num_gpu_blocks pages, and block b
+        # of group g is at b * block_bytes (block ids collide across groups;
+        # only the group tag makes them unique). Callers may preset
+        # blocks_per_page / kernel_rows_per_block / row_bytes on a group.
+        for group in kv_cache_groups:
+            if group.row_bytes == 0:
+                group.row_bytes = group.kv_cache_spec.page_size_bytes * len(
+                    group.layer_names
+                )
+        large_page_bytes = max(
+            g.blocks_per_page * g.kernel_rows_per_block * g.row_bytes
+            for g in kv_cache_groups
         )
-        kv_cache_tensors = [
-            KVCacheTensor(
-                size=block_stride * num_gpu_blocks,
-                layers=list(group.layer_names),
-                layer_stride=group.kv_cache_spec.page_size_bytes * num_gpu_blocks,
-                block_stride=group.kv_cache_spec.page_size_bytes,
+        for group in kv_cache_groups:
+            group.num_blocks = (
+                num_gpu_blocks
+                * large_page_bytes
+                // (group.kernel_rows_per_block * group.row_bytes)
             )
-            for group in kv_cache_groups
-        ]
 
         kv_cache_config = KVCacheConfig(
-            num_blocks=num_gpu_blocks,
-            kv_cache_tensors=kv_cache_tensors,
+            num_pages=num_gpu_blocks,
+            kv_cache_tensors=[],
             kv_cache_groups=kv_cache_groups,
+            large_page_bytes=large_page_bytes,
+            block_size=block_size,
         )
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         self.num_kv_groups = len(kv_cache_config.kv_cache_groups)
 
-        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        scheduler_block_size = resolve_scheduler_block_size(
             kv_cache_config, vllm_config
         )
 
@@ -284,7 +289,6 @@ class RequestRunner:
             log_stats=True,
             structured_output_manager=StructuredOutputManager(vllm_config),
             block_size=scheduler_block_size,
-            hash_block_size=hash_block_size,
         )
 
         self.worker_connector = OffloadingConnector(
@@ -292,20 +296,19 @@ class RequestRunner:
         )
 
         # register worker kv_caches to enable OffloadingWorker creations
+        backing = torch.empty(num_gpu_blocks * large_page_bytes, dtype=torch.int8)
         kv_caches: dict[str, torch.Tensor] = {}
         for group in kv_cache_groups:
-            spec = group.kv_cache_spec
-            assert isinstance(spec, AttentionSpec)
-            for layer_name in group.layer_names:
-                # Shape follows FlashAttention layout:
-                # Shape: (num_blocks, 2, block_size, num_kv_heads, head_size)
-                kv_caches[layer_name] = torch.empty(
-                    num_gpu_blocks,
-                    2,
-                    spec.block_size,
-                    spec.num_kv_heads,
-                    spec.head_size,
-                    dtype=spec.dtype,
+            num_rows = num_gpu_blocks * large_page_bytes // group.row_bytes
+            layer_row_bytes = group.row_bytes // len(group.layer_names)
+            for layer_idx, layer_name in enumerate(group.layer_names):
+                # Per-layer strided row view over the shared backing
+                # allocation, as built by the large-page worker binding.
+                kv_caches[layer_name] = torch.as_strided(
+                    backing,
+                    (num_rows, layer_row_bytes),
+                    (group.row_bytes, 1),
+                    storage_offset=layer_idx * layer_row_bytes,
                 )
 
         with set_current_vllm_config(vllm_config):
@@ -350,8 +353,8 @@ class RequestRunner:
         self.flushed_gpu_blocks: set[GPUBlock] = set()
         self.kv_connector_stats: list[Any] = []
 
-        # block_id -> GPUBlock
-        self.gpu_blocks: dict[int, GPUBlock] = {}
+        # (group_idx, block_id) -> GPUBlock; block ids are group-local
+        self.gpu_blocks: dict[tuple[int, int], GPUBlock] = {}
 
         init_none_hash(sha256)
         self._block_hasher = get_request_block_hasher(block_size, sha256)
@@ -394,17 +397,29 @@ class RequestRunner:
 
         self.scheduler.add_request(req)
 
+    def _gpu_blocks_of(self, gpu_spec: GPULoadStoreSpec) -> list[GPUBlock]:
+        """Map a GPU spec's group-local block ids to GPUBlocks."""
+        gpu_blocks: list[GPUBlock] = []
+        group_configs = self.connector_scheduler.config.kv_group_configs
+        offset = 0
+        for group_config, group_size in zip(group_configs, gpu_spec.group_sizes):
+            for block_id in gpu_spec.block_ids[offset : offset + group_size]:
+                gpu_blocks.append(
+                    self.gpu_blocks[(group_config.group_idx, block_id.item())]
+                )
+            offset += group_size
+        assert offset == len(gpu_spec.block_ids)
+        return gpu_blocks
+
     def _parse_transfers(self):
         for src_spec, dst_spec in self.offloading_spec.get_flushed_transfers():
             if isinstance(src_spec, GPULoadStoreSpec):
                 # store flush
-                for block_id in src_spec.block_ids:
-                    self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
+                self.flushed_gpu_blocks.update(self._gpu_blocks_of(src_spec))
             else:
                 # load flush
                 assert isinstance(dst_spec, GPULoadStoreSpec)
-                for block_id in dst_spec.block_ids:
-                    self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
+                self.flushed_gpu_blocks.update(self._gpu_blocks_of(dst_spec))
 
         blocks_per_chunk = self.blocks_per_chunk
 
@@ -423,9 +438,7 @@ class RequestRunner:
             assert isinstance(gpu_spec, GPULoadStoreSpec)
             assert len(gpu_spec.group_sizes) == self.num_kv_groups
 
-            gpu_blocks: list[GPUBlock] = []
-            for block_id in gpu_spec.block_ids:
-                gpu_blocks.append(self.gpu_blocks[block_id.item()])
+            gpu_blocks = self._gpu_blocks_of(gpu_spec)
 
             # list of (offload_key, sub_block_offset)
             offload_addresses: list[Any] = []
@@ -475,7 +488,8 @@ class RequestRunner:
         ):
             for blocks in manager.req_to_blocks.values():
                 for block_idx, block in enumerate(blocks):
-                    self.gpu_blocks[block.block_id] = GPUBlock(group_idx, block_idx)
+                    key = (group_idx, block.block_id)
+                    self.gpu_blocks[key] = GPUBlock(group_idx, block_idx)
 
     def _run(
         self,

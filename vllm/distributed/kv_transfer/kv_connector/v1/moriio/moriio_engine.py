@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import (
     make_zmq_path,
     make_zmq_socket,
+    zmq_socket_ctx,
 )
 
 if TYPE_CHECKING:
@@ -38,7 +39,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     get_port_offset,
     get_role,
     pod_index,
-    zmq_ctx,
 )
 
 if TYPE_CHECKING:
@@ -395,7 +395,7 @@ class MoRIIOWriter:
             )
             if is_mamba:
                 plans = self._prepare_mamba_transfer_plans(
-                    task, request_info, target, remote_moriio_meta
+                    task, request_info, remote_moriio_meta, target
                 )
             else:
                 plans = [
@@ -440,7 +440,6 @@ class MoRIIOWriter:
         layer_cache = self.worker.kv_caches[task.layer_name]
         if remote_engine_id is None:
             remote_engine_id = task.dst_engine_id
-        self.worker._check_peer_block_size(task.layer_name, remote_moriio_meta)
         target_rank = -1 if target is None else target.tp_rank
         key = (task.layer_name, *_get_write_geometry_key(layer_cache), target_rank)
         offsets = request_info.transfer_offsets.get(key)
@@ -501,8 +500,8 @@ class MoRIIOWriter:
         self,
         task: WriteTask,
         request_info: RemoteAllocInfo,
+        remote_moriio_meta: MoRIIOAgentMetadata,
         target: "WriteTarget | None" = None,
-        remote_moriio_meta: MoRIIOAgentMetadata | None = None,
     ) -> list[LayerTransferPlan]:
         """Plan both registered regions as one scheduled layer write."""
         assert request_info.block_ids is not None
@@ -516,15 +515,12 @@ class MoRIIOWriter:
             raise MoRIIOError(
                 "Hybrid WRITE requires one running-state slot per Mamba group"
             )
-        if (
-            target is None
-            or target.local_slices == target.remote_slices == 1
-            or remote_moriio_meta is None
-        ):
+        if target is None or target.local_slices == target.remote_slices == 1:
             local, remote, sizes, n_conv = self.worker._compute_mamba_transfer_offsets(
                 task.layer_name,
                 local_slots,
                 remote_slots,
+                remote_moriio_meta,
                 remote_tp_size=task.remote_tp_size,
             )
         else:
@@ -988,7 +984,7 @@ class MoRIIOWrapper:
             path = make_zmq_path("tcp", host, self.notify_port)
             logger.info("Node starting to listen notify from path = %s", path)
 
-            with zmq_ctx(zmq.ROUTER, path) as sock:
+            with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
                 while True:
                     try:
                         identity, msg = sock.recv_multipart()

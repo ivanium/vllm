@@ -24,7 +24,6 @@ from vllm.distributed.kv_events import (
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
     HiSparseConnector,
     HiSparseConnectorScheduler,
-    HiSparseConnectorWorkerMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
@@ -51,7 +50,6 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     make_block_hash_with_group_id,
 )
-from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
 from vllm.v1.kv_cache_interface import (
@@ -125,7 +123,7 @@ def make_request(
 def make_kv_cache_manager(kv_cache_config: KVCacheConfig, **kwargs) -> KVCacheManager:
     """Build a ``KVCacheManager``, deriving ``scheduler_block_size`` from the
     config (LCM of group block sizes) unless explicitly provided. This mirrors
-    ``resolve_kv_cache_block_sizes`` for the non-context-parallel case used by
+    ``resolve_scheduler_block_size`` for the non-context-parallel case used by
     these tests, so callers don't have to pass it at every site."""
     kwargs.setdefault(
         "scheduler_block_size",
@@ -144,7 +142,7 @@ def make_kv_cache_manager(kv_cache_config: KVCacheConfig, **kwargs) -> KVCacheMa
 
 def make_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -157,6 +155,7 @@ def make_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
                 ),
             )
         ],
+        block_size=block_size,
     )
 
 
@@ -169,6 +168,7 @@ def make_hisparse_kv_cache_config(
     *,
     transfer_device_cache: bool = False,
     num_resident_groups: int = 1,
+    resident_blocks_per_page: int = 1,
 ) -> KVCacheConfig:
     source_spec = FullAttentionSpec(
         block_size=HISPARSE_BLOCK_SIZE,
@@ -198,6 +198,10 @@ def make_hisparse_kv_cache_config(
                 page_size=HISPARSE_BLOCK_SIZE * 4,
             ),
             enable_kv_transfer=transfer_device_cache,
+            num_blocks=num_blocks * resident_blocks_per_page,
+            blocks_per_page=resident_blocks_per_page,
+            # A page of resident_blocks_per_page bytes holds that many blocks.
+            row_bytes=1,
         )
     )
     groups.append(
@@ -219,10 +223,12 @@ def make_hisparse_kv_cache_config(
             for group in groups[2:4]
         )
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         hisparse_host_num_blocks=host_num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=groups,
+        large_page_bytes=resident_blocks_per_page,
+        block_size=HISPARSE_BLOCK_SIZE,
     )
 
 
@@ -242,7 +248,6 @@ def make_hisparse_kv_cache_manager(
         max_model_len=max_model_len,
         max_in_flight_tokens=max_in_flight_tokens,
         enable_caching=enable_caching,
-        hash_block_size=HISPARSE_BLOCK_SIZE,
         num_prefill_lookahead=num_prefill_lookahead,
     )
 
@@ -338,7 +343,6 @@ def test_hisparse_async_speculation_mirrors_uncertain_position_range():
     connector.connector_scheduler = scheduler
     connector.update_state_after_alloc(request, None, 0)
     scheduler_output = SimpleNamespace(
-        kv_cache_block_copies=None,
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
             new_block_ids=[],
@@ -378,7 +382,7 @@ def test_hisparse_reports_when_context_is_fully_resident():
     coordinator.take_residency_updates([request.request_id])
     core_row = manager.get_block_ids(request.request_id)[2]
     pool = manager.block_pool
-    pool.get_new_blocks(pool.get_num_free_blocks())
+    pool.get_new_blocks(pool.get_num_free_blocks(), 0)
 
     assert not coordinator.all_context_pages_resident(scheduled)
     # The block-table row stays append-only; the worker learns of the lost
@@ -408,12 +412,48 @@ def test_hisparse_residency_update_sends_only_changed_pages():
     num_never_used = pool.get_num_free_blocks()
     # Pages unpin as their host copies complete, so page 0 is reused first.
     _publish_hisparse_pages(manager)
-    pool.get_new_blocks(num_never_used + 1)
+    pool.get_new_blocks(num_never_used + 1, 0)
 
     update = coordinator.take_residency_updates([request.request_id])
 
     assert update[request.request_id].pages == [0]
     assert update[request.request_id].block_ids == ([0],)
+
+
+def test_hisparse_page_takeover_drops_resident_slots():
+    """When the pool hands a resident group's page to another group, readers
+    of its unpinned blocks learn the loss through a residency update."""
+    manager = make_hisparse_kv_cache_manager(32, 16, resident_blocks_per_page=4)
+    coordinator = get_hisparse_coordinator(manager)
+    # Hold the low pages so the resident group's block ids collide with no
+    # page id the drain below hands out.
+    manager.block_pool.get_new_blocks(7, 0)
+    tokens = list(range(6 * HISPARSE_BLOCK_SIZE))
+    request = make_request("request", tokens, HISPARSE_BLOCK_SIZE, sha256)
+    assert _allocate_scheduled(manager, request, num_new_tokens=len(tokens))
+    for hot_manager in coordinator.hot_managers:
+        hot_manager.require_hot(request.request_id)
+    assert _allocate_scheduled(manager, request, num_new_tokens=len(tokens))
+    _publish_hisparse_pages(manager)
+    coordinator.take_residency_updates([request.request_id])
+
+    resident_ids = _resident_block_ids(manager, request.request_id)
+    num_pages = manager.kv_cache_config.num_pages
+    # The whole first resident page unpins once its host copies complete.
+    assert len(resident_ids) == 6 and min(resident_ids) >= num_pages
+    unpinned_pages = {block_id // 4 for block_id in resident_ids[:4]}
+    assert len(unpinned_pages) == 1
+    # Reuse that page for another group: every fresh page is taken first, so
+    # draining the pool hands the released page out last.
+    pool = manager.block_pool
+    pool.get_new_blocks(pool.get_num_free_blocks(), 0)
+
+    update = coordinator.take_residency_updates([request.request_id])
+
+    assert update[request.request_id].pages == [0, 1, 2, 3]
+    assert update[request.request_id].block_ids == ([0, 0, 0, 0],)
+    # The active tail is pinned and survives the takeover.
+    assert _resident_block_ids(manager, request.request_id)[4:] == resident_ids[4:]
 
 
 def test_hisparse_readmitted_request_resends_its_full_residency():
@@ -455,7 +495,7 @@ def test_hisparse_host_prefix_can_be_completed_by_indexer_offload():
     _, indexer_blocks, _, _ = manager.get_blocks(original.request_id).blocks
     evicted_indexer_id = indexer_blocks[2].block_id
     manager.free(original)
-    manager.block_pool.evict_blocks({evicted_indexer_id})
+    manager.block_pool.evict_blocks([(1, evicted_indexer_id)])
 
     resumed = make_request("resumed", tokens, HISPARSE_BLOCK_SIZE, sha256)
     blocks, num_local, _ = manager.get_computed_blocks(resumed)
@@ -503,7 +543,7 @@ def test_hisparse_indexer_offload_is_capped_by_missing_host_prefix():
     evicted_host_id = host_blocks[0].block_id
     manager.free(original)
     get_hisparse_coordinator(manager).host_manager.block_pool.evict_blocks(
-        {evicted_host_id}
+        [(0, evicted_host_id)]
     )
 
     resumed = make_request("resumed", tokens, HISPARSE_BLOCK_SIZE, sha256)
@@ -532,7 +572,7 @@ def test_connector_completes_partial_prefix_without_importing_missing_host_kv(
     missing_indexer = indexer[1].block_id
     missing_host = host[0].block_id
     manager.free(original)
-    manager.block_pool.evict_blocks({missing_indexer})
+    manager.block_pool.evict_blocks([(1, missing_indexer)])
 
     defer = True
 
@@ -592,7 +632,7 @@ def test_connector_completes_partial_prefix_without_importing_missing_host_kv(
 
     # A surviving indexer offload must not make absent host KV look computed.
     get_hisparse_coordinator(manager).host_manager.block_pool.evict_blocks(
-        {missing_host}
+        [(0, missing_host)]
     )
     retry = make_request("retry", tokens, HISPARSE_BLOCK_SIZE, sha256)
     _, local, _, _ = Scheduler._get_local_prefix_cache_hit(scheduler, retry)
@@ -709,7 +749,7 @@ def test_hisparse_keeps_resident_pages_until_hot_buffer_is_allocated(enable_cach
     _publish_hisparse_pages(manager)
     first.num_computed_tokens = 128
     pool = manager.block_pool
-    held = pool.get_new_blocks(pool.get_num_free_blocks() - 3)
+    held = pool.get_new_blocks(pool.get_num_free_blocks() - 3, 0)
 
     assert _allocate_scheduled(manager, first, num_new_tokens=1) is not None
     second = make_request("second", [1000] * 16, HISPARSE_BLOCK_SIZE, sha256)
@@ -725,7 +765,7 @@ def test_hisparse_keeps_resident_pages_until_hot_buffer_is_allocated(enable_cach
     assert _allocate_scheduled(manager, first, num_new_tokens=1) is not None
     assert all(m.has_hot("first") for m in coordinator.hot_managers)
     coordinator.take_residency_updates(["first"])
-    pool.get_new_blocks(pool.get_num_free_blocks())
+    pool.get_new_blocks(pool.get_num_free_blocks(), 0)
     assert not coordinator.all_context_pages_resident(scheduled)
     assert "first" in coordinator.take_residency_updates(["first"])
 
@@ -843,44 +883,6 @@ def test_hisparse_deferred_free_retains_host_blocks_until_fence():
     manager.block_pool.free_blocks(reversed(blocks))
     assert host_pool.get_num_free_blocks() == host_free
     assert manager.block_pool.get_num_free_blocks() == device_free
-
-
-def test_hisparse_host_cow_copy_is_drained_without_a_gpu_pool():
-    """Host-only copy-on-write work must reach the worker copy queue."""
-    manager = make_hisparse_kv_cache_manager(16, 16)
-    source_manager = manager.coordinator.single_type_managers[0]
-    source_block = source_manager.block_pool.get_new_blocks(1)[0]
-    source_manager.req_to_blocks["cow"] = [source_block]
-    source_manager._partial_hit_reqs["cow"] = (0, source_block)
-
-    new_blocks = source_manager.allocate_new_blocks(
-        "cow", HISPARSE_BLOCK_SIZE, HISPARSE_BLOCK_SIZE
-    )
-    new_block_ids = manager.take_new_block_ids()
-    coordinator = get_hisparse_coordinator(manager)
-    assert manager.take_kv_cache_block_copies() == ([], [])
-    connector = HiSparseConnectorScheduler(async_speculative=False)
-    connector.bind_coordinator(coordinator)
-    output = SchedulerOutput.make_empty()
-    copies = connector.build_connector_meta(output).host_block_copies
-    assert output.has_sync_kv_loads
-
-    assert new_blocks and new_block_ids == []
-    assert len(copies) == 1
-    assert copies[0].src_block_id == source_block.block_id
-    assert copies[0].dst_block_id == new_blocks[0].block_id
-    source_manager.free("cow")
-    assert source_block.ref_cnt > 0 and new_blocks[0].ref_cnt > 0
-    assert coordinator.has_pending_work()
-    connector.update_connector_output(
-        KVConnectorOutput(
-            kv_connector_worker_meta=HiSparseConnectorWorkerMetadata(
-                {}, {}, completed_host_copy_dst_ids=(copies[0].dst_block_id,)
-            )
-        )
-    )
-    assert source_block.ref_cnt == new_blocks[0].ref_cnt == 0
-    assert not coordinator.has_pending_work()
 
 
 def test_hisparse_inflight_host_import_reserves_remaining_gpu_pages():
@@ -1011,23 +1013,21 @@ def test_hisparse_admitted_async_loads_can_finish_with_nothing_running(tmp_path)
     [
         (False, HISPARSE_BLOCK_SIZE, 1, True),
         (True, HISPARSE_BLOCK_SIZE, 1, False),
-        (False, HISPARSE_BLOCK_SIZE - 1, 1, False),
-        (False, HISPARSE_BLOCK_SIZE - 1, 2, True),
     ],
 )
-def test_hisparse_import_capacity_includes_hits_and_cow(
+def test_hisparse_import_capacity_includes_hits(
     evictable, local_tokens, free_blocks, admitted
 ):
-    """Touching an evictable hit and copying a partial hit consume capacity."""
+    """Touching an evictable hit consumes capacity."""
     manager = make_hisparse_kv_cache_manager(32, free_blocks + 2 - int(evictable))
     coordinator = get_hisparse_coordinator(manager)
     host_pool = coordinator.get_host_block_pool()
     assert host_pool is not None
-    hit = host_pool.get_new_blocks(1)[0]
+    hit = host_pool.get_new_blocks(1, 0)[0]
     if evictable:
         host_pool.free_blocks([hit])
     assert host_pool.get_num_free_blocks() == free_blocks
-    # None (deny this step) replaces the former num_gpu_blocks + 1 sentinel.
+    # None (deny this step) replaces the former num_pages + 1 sentinel.
     required = coordinator.host_manager.get_num_blocks_to_allocate(
         "waiting", 32, [hit], 32, local_tokens, 32
     )
@@ -1184,7 +1184,6 @@ def test_hisparse_events_report_host_and_device_placement():
         make_hisparse_kv_cache_config(32, 16),
         max_model_len=128,
         enable_caching=True,
-        hash_block_size=HISPARSE_BLOCK_SIZE,
         enable_kv_cache_events=True,
     )
     request = make_request("request", list(range(64)), HISPARSE_BLOCK_SIZE, sha256)
@@ -1201,7 +1200,7 @@ def test_hisparse_events_report_host_and_device_placement():
 
     host_block = manager.get_blocks(request.request_id).blocks[0][0]
     get_hisparse_coordinator(manager).host_manager.block_pool.evict_blocks(
-        {host_block.block_id}
+        [(0, host_block.block_id)]
     )
     [removed] = manager.take_events()
     assert isinstance(removed, BlockRemoved)
@@ -1213,7 +1212,7 @@ def test_mamba_boundary_handoffs_do_not_pin_obsolete_blocks():
     """Draining unused connector offers must not retain old recurrent states."""
     manager = make_kv_cache_manager(
         KVCacheConfig(
-            num_blocks=16,
+            num_pages=16,
             kv_cache_tensors=[],
             kv_cache_groups=[
                 KVCacheGroupSpec(
@@ -1226,10 +1225,10 @@ def test_mamba_boundary_handoffs_do_not_pin_obsolete_blocks():
                     ),
                 )
             ],
+            block_size=16,
         ),
         max_model_len=128,
         enable_caching=True,
-        hash_block_size=16,
     )
     request = make_request("request", list(range(64)), 16, sha256)
     old_blocks = []
@@ -1298,7 +1297,7 @@ def test_hisparse_prefix_hit_under_pressure_adopts_surviving_copies(
     copy_ids = [block.block_id for block in manager.get_blocks("original").blocks[2]]
     manager.free(original)
     pool = manager.block_pool
-    pool.get_new_blocks(pool.get_num_free_blocks() - free_blocks)
+    pool.get_new_blocks(pool.get_num_free_blocks() - free_blocks, 0)
 
     resumed = make_request("resumed", tokens, HISPARSE_BLOCK_SIZE, sha256)
     computed, num_computed, _ = manager.get_computed_blocks(resumed)
@@ -1359,8 +1358,8 @@ def test_hisparse_finished_request_leaves_free_copies():
     coordinator = get_hisparse_coordinator(manager)
     assert coordinator.copies
     pool = manager.block_pool
-    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
-    pool.get_new_blocks(pool.get_num_free_blocks())
+    assert pool.get_num_free_blocks() == pool.num_pages - 1
+    pool.get_new_blocks(pool.get_num_free_blocks(), 0)
     assert not coordinator.copies
     assert not coordinator.spills_to_send
 
@@ -1484,7 +1483,7 @@ def test_hisparse_terminal_prefix_waits_for_all_workers_and_preserves_identity()
     )
     assert _allocate_scheduled(manager, replacement, 17) is not None
     new_blocks = list(manager.get_blocks(replacement.request_id).blocks[0])
-    pressure = host_pool.get_new_blocks(host_pool.get_num_free_blocks())
+    pressure = host_pool.get_new_blocks(host_pool.get_num_free_blocks(), 0)
     assert not {block.block_id for block in old_blocks[:2]} & {
         block.block_id for block in pressure + new_blocks
     }
@@ -1532,7 +1531,7 @@ def test_hisparse_reused_copy_is_not_adopted():
     manager.free(original)
     pool = manager.block_pool
     pool.touch(indexer_blocks)
-    reused = pool.get_new_blocks(pool.get_num_free_blocks())
+    reused = pool.get_new_blocks(pool.get_num_free_blocks(), 0)
     pool.free_blocks(reused)
     pool.free_blocks(indexer_blocks)
 
@@ -1628,7 +1627,7 @@ def make_kv_cache_config_hybrid_model(
         )
 
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -1649,6 +1648,7 @@ def make_kv_cache_config_hybrid_model(
                 second_spec,
             ),
         ],
+        block_size=block_size,
     )
 
 
@@ -1672,7 +1672,7 @@ def make_kv_cache_config_three_types(
         )
 
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -1699,93 +1699,8 @@ def make_kv_cache_config_three_types(
                 third_spec,
             ),
         ],
+        block_size=block_size,
     )
-
-
-@pytest.mark.parametrize("draft_sharded", [True, False])
-def test_prefix_cache_hit_uses_per_group_dcp_geometry(draft_sharded):
-    """Prefix lookup must use each group's DCP size, not the process-wide one.
-
-    Target MLA is sharded; draft MLA can opt out and Mamba stays replicated.
-    Hits must align to the target block in either case.
-    """
-    block_size = 16
-    dcp = 8
-    sharded_block = block_size * dcp
-    kv_cache_config = KVCacheConfig(
-        num_blocks=64,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["target_mla"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["draft_mla"],
-                MLAAttentionSpec(
-                    dcp_sharded=draft_sharded,
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["mamba"],
-                MambaSpec(
-                    block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
-                    mamba_cache_mode="align",
-                ),
-            ),
-        ],
-    )
-    manager = KVCacheManager(
-        kv_cache_config,
-        max_model_len=8192,
-        enable_caching=True,
-        hash_block_size=block_size,
-        scheduler_block_size=sharded_block,
-        dcp_world_size=dcp,
-    )
-    target_mgr, draft_mgr, mamba_mgr = manager.coordinator.single_type_managers
-    assert target_mgr.dcp_world_size == dcp
-    assert draft_mgr.dcp_world_size == (dcp if draft_sharded else 1)
-    assert mamba_mgr.dcp_world_size == 1
-    assert target_mgr.block_size == sharded_block
-    assert draft_mgr.block_size == (sharded_block if draft_sharded else block_size)
-    assert mamba_mgr.block_size == block_size
-
-    hash_fn = sha256
-    common_token_ids = [i for i in range(2) for _ in range(sharded_block)]
-    req0 = make_request("0", common_token_ids + [99] * 7, block_size, hash_fn)
-    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
-    assert num_computed_tokens == 0
-    # Align-mode Mamba keeps a state only where a chunk ends, so end the first
-    # chunk on the shared prefix.
-    for num_new_tokens in (len(common_token_ids), 7):
-        blocks = manager.allocate_slots(req0, num_new_tokens, 0, computed_blocks)
-        assert blocks is not None
-        req0.num_computed_tokens += num_new_tokens
-        computed_blocks = None
-
-    req1 = make_request("1", common_token_ids + [100] * 5, block_size, hash_fn)
-    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
-    assert num_computed_tokens == 2 * sharded_block
-    assert [len(group) for group in computed_blocks.blocks] == [
-        2,
-        2 if draft_sharded else 16,
-        16,
-    ]
-
-    manager.free(req0)
-    manager.free(req1)
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -1795,7 +1710,6 @@ def test_prefill(hash_fn):
         make_kv_cache_config(block_size, 11),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     # Complete 3 blocks (48 tokens)
@@ -1917,7 +1831,6 @@ def test_prefill_hybrid_model():
         make_kv_cache_config_hybrid_model(block_size, 21, 2),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     hash_fn = sha256
@@ -2086,7 +1999,6 @@ def test_prefill_hybrid_model_eagle():
         kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
         use_eagle=True,
     )
 
@@ -2336,9 +2248,10 @@ def _make_hybrid_kv_cache_config(
     ]
 
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=kv_cache_groups,
+        block_size=block_size,
     )
 
 
@@ -2417,7 +2330,6 @@ def test_prefill_hybrid_model_combinations(spec_types: list[str]):
         kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     hash_fn = sha256
@@ -2493,7 +2405,6 @@ def test_prefill_hybrid_model_combinations_eagle(
         kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
         use_eagle=True,
     )
 
@@ -2565,7 +2476,6 @@ def test_prefill_hybrid_model_mamba_align():
         kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     hash_fn = sha256
@@ -2598,7 +2508,6 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         _make_hybrid_kv_cache_config(block_size, 30, ["full", "mamba"]),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
     hash_fn = sha256
 
@@ -2639,9 +2548,6 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         max_num_scheduled_tokens=3 * block_size,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle_block_drop=False,
-        hash_block_size=block_size,
-        mamba_partial_cache_hit=False,
-        mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
     )
     req_2.shared_prefix_boundary = shared_prefix_boundary
@@ -2676,7 +2582,6 @@ def test_hybrid_model_mamba_align_with_dynamic_draft_tokens():
         kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
         scheduler_block_size=block_size,
     )
 
@@ -2723,7 +2628,6 @@ def test_prefill_plp():
         make_kv_cache_config(block_size, 11),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
     # the default hash function is sha256
     hash_fn = sha256
@@ -2830,7 +2734,6 @@ def test_decode():
         make_kv_cache_config(block_size, 11),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     # Complete 3 blocks (48 tokens)
@@ -2893,7 +2796,6 @@ def test_evict():
         make_kv_cache_config(block_size, 11),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     last_token_id = 5 * 16 + 7
@@ -2955,7 +2857,6 @@ def test_hash_block_correct_reuse():
         make_kv_cache_config(16, 2),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     # Allocate 1 block and cache it.
@@ -2995,7 +2896,6 @@ def test_computed_blocks_not_evicted():
         make_kv_cache_config(block_size, 3),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     # Allocate a block and cache it.
@@ -3052,7 +2952,6 @@ def test_basic_prefix_caching_disabled():
         make_kv_cache_config(block_size, 5),
         max_model_len=8192,
         enable_caching=False,
-        hash_block_size=block_size,
     )
 
     req1 = make_request(
@@ -3098,9 +2997,9 @@ def test_cache_blocks(hash_fn):
     """
     block_size = 4
     block_pool = BlockPool(
-        num_gpu_blocks=5,
+        num_pages=5,
         enable_caching=True,
-        hash_block_size=block_size,
+        block_size=block_size,
     )
     # Req:
     #  Block 0: [0, 1, 2, 3]
@@ -3117,7 +3016,6 @@ def test_cache_blocks(hash_fn):
         blocks=blocks,
         num_cached_blocks=0,
         num_full_blocks=2,
-        block_size=block_size,
         kv_cache_group_id=0,
     )
 
@@ -3132,7 +3030,6 @@ def test_cache_blocks(hash_fn):
         blocks=blocks,
         num_cached_blocks=2,
         num_full_blocks=3,
-        block_size=block_size,
         kv_cache_group_id=0,
     )
     assert len(block_pool.cached_block_hash_to_block) == 3
@@ -3142,9 +3039,7 @@ def test_cache_blocks(hash_fn):
 def test_cache_blocks_multi_group():
     """This tests that blocks are cached correctly for different kv cache groups."""
     block_size = 4
-    block_pool = BlockPool(
-        num_gpu_blocks=10, enable_caching=True, hash_block_size=block_size
-    )
+    block_pool = BlockPool(num_pages=10, enable_caching=True, block_size=block_size)
 
     # Req:
     #  Block 0/4: [0, 1, 2, 3]
@@ -3160,7 +3055,6 @@ def test_cache_blocks_multi_group():
         blocks=blocks,
         num_cached_blocks=0,
         num_full_blocks=2,
-        block_size=block_size,
         kv_cache_group_id=0,
     )
     assert len(block_pool.cached_block_hash_to_block) == 2
@@ -3174,7 +3068,6 @@ def test_cache_blocks_multi_group():
         blocks=blocks,
         num_cached_blocks=0,
         num_full_blocks=3,
-        block_size=block_size,
         kv_cache_group_id=1,
     )
     assert len(block_pool.cached_block_hash_to_block) == 5
@@ -3229,7 +3122,6 @@ def test_mm_prefix_caching():
         make_kv_cache_config(block_size, 11),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     # Common prompt tokens (T is text tokens and P is image placeholder tokens)
@@ -3336,7 +3228,6 @@ def test_cache_key_salting():
         make_kv_cache_config(block_size, 11),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     # 3 complete blocks and an incomplete block with 11 tokens.
@@ -3425,7 +3316,6 @@ def test_prefill_not_enough_free_blocks_with_computed_blocks():
         make_kv_cache_config(block_size, 11),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
     # Complete 3 blocks (48 tokens)
     # | Common-0 | Common-1 | Common-2 | ... |
@@ -3498,7 +3388,6 @@ def test_reset_prefix_cache():
         make_kv_cache_config(block_size, 11),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     full_block_token_ids = [i for i in range(3) for _ in range(16)]
@@ -3539,7 +3428,6 @@ def test_prefix_cache_stats_disabled():
         make_kv_cache_config(block_size, 11),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
         log_stats=False,  # Disable logging stats
     )
     assert manager.prefix_cache_stats is None
@@ -3559,7 +3447,7 @@ def test_prefix_cache_stats_disabled():
 
 
 def test_maybe_evict_cached_block():
-    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
+    pool = BlockPool(num_pages=4, enable_caching=True, block_size=16)
     block_hash0 = make_block_hash_with_group_id(BlockHash(b"10"), 1000)
     block_hash1 = make_block_hash_with_group_id(BlockHash(b"20"), 2000)
     block_hash2 = make_block_hash_with_group_id(BlockHash(b"30"), 3000)
@@ -3620,7 +3508,6 @@ def test_kv_cache_events(blocks_to_cache: int):
         max_model_len=8192,
         enable_caching=True,
         enable_kv_cache_events=True,
-        hash_block_size=block_size,
     )
 
     num_tokens = block_size * blocks_to_cache
@@ -3676,9 +3563,9 @@ def test_null_parent_block_hash():
     kv_cache_group_id = 0
 
     pool = BlockPool(
-        num_gpu_blocks=8,
+        num_pages=8,
         enable_caching=True,
-        hash_block_size=block_size,
+        block_size=block_size,
         enable_kv_cache_events=True,
     )
 
@@ -3693,7 +3580,7 @@ def test_null_parent_block_hash():
     # Physical parent is `null_block` (no hash), while the logical parent hash
     # still exists in `request.block_hashes[num_cached_blocks - 1]`.
     assert pool.null_block.block_hash is None
-    new_blocks = pool.get_new_blocks(num_full_blocks - 1)
+    new_blocks = pool.get_new_blocks(num_full_blocks - 1, 0)
     blocks = [
         new_blocks[: num_cached_blocks - 1],
         pool.null_block,  # physical parent
@@ -3705,7 +3592,6 @@ def test_null_parent_block_hash():
         blocks=blocks,
         num_cached_blocks=num_cached_blocks,
         num_full_blocks=num_full_blocks,
-        block_size=block_size,
         kv_cache_group_id=kv_cache_group_id,
     )
 
@@ -3748,7 +3634,6 @@ def test_kv_cache_events_with_lora(blocks_to_cache: int):
         max_model_len=8192,
         enable_caching=True,
         enable_kv_cache_events=True,
-        hash_block_size=block_size,
     )
 
     # Test with LoRA request
@@ -3806,7 +3691,6 @@ def test_block_stored_event_group_idx(group_id: int):
         max_model_len=8192,
         enable_caching=True,
         enable_kv_cache_events=True,
-        hash_block_size=block_size,
     )
     pool = manager.block_pool
 
@@ -3817,13 +3701,12 @@ def test_block_stored_event_group_idx(group_id: int):
         hash_fn=sha256,
     )
 
-    blocks = pool.get_new_blocks(2)
+    blocks = pool.get_new_blocks(2, 0)
     pool.cache_full_blocks(
         request=req,
         blocks=blocks,
         num_cached_blocks=0,
         num_full_blocks=2,
-        block_size=block_size,
         kv_cache_group_id=group_id,
     )
 
@@ -3857,7 +3740,6 @@ def test_block_stored_event_session_id():
         max_model_len=8192,
         enable_caching=True,
         enable_kv_cache_events=True,
-        hash_block_size=block_size,
     )
     req = make_request(
         "req_session_id",
@@ -3882,7 +3764,6 @@ def test_session_id_does_not_affect_prefix_cache_identity():
         make_kv_cache_config(block_size, num_blocks=8),
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
     )
     first_req = make_request(
         "req_session_a",
@@ -3927,7 +3808,7 @@ def test_block_stored_event_group_idx_multiple_groups():
 
     manager = make_kv_cache_manager(
         KVCacheConfig(
-            num_blocks=5,
+            num_pages=5,
             kv_cache_tensors=[],
             kv_cache_groups=[
                 KVCacheGroupSpec(
@@ -3950,11 +3831,11 @@ def test_block_stored_event_group_idx_multiple_groups():
                     ),
                 ),
             ],
+            block_size=block_size,
         ),
         max_model_len=8192,
         enable_caching=True,
         enable_kv_cache_events=True,
-        hash_block_size=block_size,
     )
     pool = manager.block_pool
 
@@ -3966,24 +3847,22 @@ def test_block_stored_event_group_idx_multiple_groups():
     )
 
     # Cache blocks for group 0 (full-attention)
-    blocks_grp0 = pool.get_new_blocks(2)
+    blocks_grp0 = pool.get_new_blocks(2, 0)
     pool.cache_full_blocks(
         request=req,
         blocks=blocks_grp0,
         num_cached_blocks=0,
         num_full_blocks=2,
-        block_size=block_size,
         kv_cache_group_id=0,
     )
 
     # Cache blocks for group 1 (sliding-window)
-    blocks_grp1 = pool.get_new_blocks(2)
+    blocks_grp1 = pool.get_new_blocks(2, 0)
     pool.cache_full_blocks(
         request=req,
         blocks=blocks_grp1,
         num_cached_blocks=0,
         num_full_blocks=2,
-        block_size=block_size,
         kv_cache_group_id=1,
     )
 
@@ -4007,7 +3886,6 @@ def test_block_stored_event_group_idx_out_of_bounds(monkeypatch):
         max_model_len=8192,
         enable_caching=True,
         enable_kv_cache_events=True,
-        hash_block_size=block_size,
     )
     event = BlockStored(
         block_hashes=[1],
@@ -4046,9 +3924,9 @@ def test_block_removed_event_group_idx(group_id: int):
     # null block + 4 usable; allocate all 4, cache 2, free all, re-allocate
     # all 4 so the 2 cached blocks are forced through _maybe_evict_cached_block.
     pool = BlockPool(
-        num_gpu_blocks=5,
+        num_pages=5,
         enable_caching=True,
-        hash_block_size=block_size,
+        block_size=block_size,
         enable_kv_cache_events=True,
     )
 
@@ -4060,13 +3938,12 @@ def test_block_removed_event_group_idx(group_id: int):
     )
 
     # Allocate all usable blocks and cache the first two for the target group.
-    all_blocks = pool.get_new_blocks(4)
+    all_blocks = pool.get_new_blocks(4, 0)
     pool.cache_full_blocks(
         request=req,
         blocks=all_blocks,
         num_cached_blocks=0,
         num_full_blocks=2,
-        block_size=block_size,
         kv_cache_group_id=group_id,
     )
 
@@ -4077,7 +3954,7 @@ def test_block_removed_event_group_idx(group_id: int):
     pool.free_blocks(all_blocks)
 
     # Re-allocate all blocks; the two with hashes trigger BlockRemoved events.
-    pool.get_new_blocks(4)
+    pool.get_new_blocks(4, 0)
 
     events = pool.take_events()
     removed_events = [e for e in events if isinstance(e, BlockRemoved)]
@@ -4097,9 +3974,9 @@ def test_emit_cached_block_events():
     num_tokens = block_size * 4  # 4 full blocks; reuse the first 3
 
     pool = BlockPool(
-        num_gpu_blocks=8,
+        num_pages=8,
         enable_caching=True,
-        hash_block_size=block_size,
+        block_size=block_size,
         enable_kv_cache_events=True,
     )
 
@@ -4119,7 +3996,6 @@ def test_emit_cached_block_events():
     pool.emit_cached_block_events(
         request=req,
         num_cached_blocks=num_cached_blocks,
-        block_size=block_size,
         kv_cache_group_id=kv_cache_group_id,
     )
 
@@ -4153,9 +4029,9 @@ def test_emit_cached_block_events_disabled():
     """No events are emitted when enable_kv_cache_events is False."""
     block_size = 4
     pool = BlockPool(
-        num_gpu_blocks=8,
+        num_pages=8,
         enable_caching=True,
-        hash_block_size=block_size,
+        block_size=block_size,
         enable_kv_cache_events=False,
     )
     req = make_request(
@@ -4168,7 +4044,6 @@ def test_emit_cached_block_events_disabled():
     pool.emit_cached_block_events(
         request=req,
         num_cached_blocks=3,
-        block_size=block_size,
         kv_cache_group_id=0,
     )
 
@@ -4179,9 +4054,9 @@ def test_emit_cached_block_events_zero_cached():
     """No events are emitted when num_cached_blocks == 0."""
     block_size = 4
     pool = BlockPool(
-        num_gpu_blocks=8,
+        num_pages=8,
         enable_caching=True,
-        hash_block_size=block_size,
+        block_size=block_size,
         enable_kv_cache_events=True,
     )
     req = make_request(
@@ -4194,7 +4069,6 @@ def test_emit_cached_block_events_zero_cached():
     pool.emit_cached_block_events(
         request=req,
         num_cached_blocks=0,
-        block_size=block_size,
         kv_cache_group_id=0,
     )
 
@@ -4210,7 +4084,6 @@ def test_eagle_enabled_removes_last_block():
         max_model_len=8192,
         enable_caching=True,
         use_eagle=True,
-        hash_block_size=block_size,
     )
 
     # Request with 3 full blocks (48 tokens)
@@ -4243,7 +4116,6 @@ def test_eagle_with_partial_blocks():
         max_model_len=8192,
         enable_caching=True,
         use_eagle=True,
-        hash_block_size=block_size,
     )
     # 2 full blocks + 5 tokens (non-divisible length)
     token_ids = [0] * (2 * block_size + 5)
@@ -4276,14 +4148,14 @@ def test_eagle_with_sliding_window():
     )
     manager = make_kv_cache_manager(
         KVCacheConfig(
-            num_blocks=10,
+            num_pages=10,
             kv_cache_tensors=[],
             kv_cache_groups=[KVCacheGroupSpec(["layer"], sliding_window_spec)],
+            block_size=block_size,
         ),
         max_model_len=8192,
         enable_caching=True,
         use_eagle=True,
-        hash_block_size=block_size,
     )
 
     # 2 full blocks + 5 tokens (non-divisible length)
@@ -4330,426 +4202,17 @@ def test_eagle_with_sliding_window():
     assert num_tokens == 0
 
 
-def test_eagle_swa_alignment_caches_extra_block():
-    """Regression: SWA + EAGLE with `sliding_window <= alignment_tokens`.
-
-    When the cache-hit alignment (lcm of per-group block sizes) is larger than
-    the SWA window, the SWA mask only kept the last block of each aligned
-    segment. EAGLE/MTP lookup needs ``tail + 1`` contiguous cached blocks and
-    that +1 block lives at the next segment's first position, which was left
-    uncached. The fix caches that extra block when ``use_eagle=True``.
-    """
-    block_size = 8
-    # Full group uses 4 * block_size, so lcm/alignment is 4 * block_size.
-    # SWA group has sliding_window = block_size (i.e., tail = 1 block).
-    # Without the fix, the second cached block needed for the EAGLE 2-block
-    # match never exists -> EAGLE cache hit fails entirely.
-    kv_cache_config = KVCacheConfig(
-        num_blocks=100,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["full"],
-                FullAttentionSpec(
-                    block_size=4 * block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["swa_mtp"],
-                SlidingWindowSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                    sliding_window=block_size,
-                ),
-                is_eagle_group=True,
-            ),
-        ],
-    )
-    manager = make_kv_cache_manager(
-        kv_cache_config=kv_cache_config,
-        max_model_len=8192,
-        enable_caching=True,
-        hash_block_size=block_size,
-        use_eagle=True,
-    )
-
-    # Prime the cache with a long prompt (16 swa blocks = 4 aligned segments).
-    token_ids = [i for i in range(16) for _ in range(block_size)]
-    req0 = make_request("0", token_ids, block_size, sha256)
-    computed_blocks, _, _ = manager.get_computed_blocks(req0)
-    blocks = manager.allocate_slots(
-        req0,
-        len(token_ids),
-        len(computed_blocks.blocks[0]) * block_size,
-        computed_blocks,
-    )
-    assert blocks is not None
-    manager.free(req0)
-
-    # Second request with identical prompt should find an EAGLE cache hit.
-    # Without the fix, ``num_computed_tokens`` is 0; with the fix, it lands at
-    # an alignment boundary (multiple of 32 tokens, minus the EAGLE drop).
-    req1 = make_request("1", token_ids, block_size, sha256)
-    _, num_computed_tokens, _ = manager.get_computed_blocks(req1)
-    assert num_computed_tokens > 0, (
-        "EAGLE + SWA with sliding_window <= alignment failed to find any "
-        "cache hit; the +1 block past each segment boundary must be cached."
-    )
-    # Each aligned segment contributes 4 * block_size = 32 tokens; EAGLE drops
-    # the last block (block_size tokens) from the hit.
-    assert num_computed_tokens % (4 * block_size) == 0
-
-
-def test_eagle_swa_boundary_caches_post_boundary_block():
-    """EAGLE + SWA must cache the first block after an alignment boundary.
-
-    A 40-token computed prefix with 8-token SWA blocks and 32-token hybrid
-    alignment needs SWA blocks 3 and 4 cached to reuse a 32-token prefix:
-    block 3 is the segment tail, and block 4 is the EAGLE lookahead block
-    that gets dropped after lookup.
-    """
-    block_size = 8
-    kv_cache_config = KVCacheConfig(
-        num_blocks=100,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["full"],
-                FullAttentionSpec(
-                    block_size=4 * block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["swa_mtp"],
-                SlidingWindowSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                    sliding_window=block_size,
-                ),
-                is_eagle_group=True,
-            ),
-        ],
-    )
-    manager = make_kv_cache_manager(
-        kv_cache_config=kv_cache_config,
-        max_model_len=8192,
-        enable_caching=True,
-        hash_block_size=block_size,
-        use_eagle=True,
-    )
-
-    token_ids = [i for i in range(5) for _ in range(block_size)]
-    req0 = make_request("0", token_ids, block_size, sha256)
-    computed_blocks, _, _ = manager.get_computed_blocks(req0)
-    blocks = manager.allocate_slots(
-        req0,
-        len(token_ids),
-        len(computed_blocks.blocks[0]) * block_size,
-        computed_blocks,
-    )
-    assert blocks is not None
-
-    pool = manager.block_pool
-    assert pool.get_cached_block(req0.block_hashes[3], kv_cache_group_ids=[1])
-    assert pool.get_cached_block(req0.block_hashes[4], kv_cache_group_ids=[1])
-    manager.free(req0)
-
-    req1 = make_request("1", token_ids + [999], block_size, sha256)
-    _, num_computed_tokens, _ = manager.get_computed_blocks(req1)
-    assert num_computed_tokens == 4 * block_size
-
-
-def test_eagle_grouped_swa_siblings_use_same_cache_mask():
-    """Grouped SWA siblings must cache the EAGLE lookahead block together."""
-    block_size = 8
-    swa_spec = SlidingWindowSpec(
-        block_size=block_size,
-        num_kv_heads=1,
-        head_size=1,
-        dtype=torch.float32,
-        sliding_window=block_size,
-    )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=100,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["full"],
-                FullAttentionSpec(
-                    block_size=4 * block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                ),
-            ),
-            KVCacheGroupSpec(["swa_main"], swa_spec),
-            KVCacheGroupSpec(["swa_mtp"], swa_spec, is_eagle_group=True),
-        ],
-    )
-    manager = make_kv_cache_manager(
-        kv_cache_config=kv_cache_config,
-        max_model_len=8192,
-        enable_caching=True,
-        hash_block_size=block_size,
-        use_eagle=True,
-    )
-
-    token_ids = [i for i in range(9) for _ in range(block_size)]
-    req0 = make_request("0", token_ids, block_size, sha256)
-    computed_blocks, _, _ = manager.get_computed_blocks(req0)
-    blocks = manager.allocate_slots(
-        req0,
-        len(token_ids),
-        len(computed_blocks.blocks[0]) * block_size,
-        computed_blocks,
-    )
-    assert blocks is not None
-
-    pool = manager.block_pool
-    assert pool.get_cached_block(req0.block_hashes[4], kv_cache_group_ids=[1, 2])
-    assert pool.get_cached_block(req0.block_hashes[8], kv_cache_group_ids=[1, 2])
-    manager.free(req0)
-
-    req1 = make_request("1", token_ids + [999], block_size, sha256)
-    _, num_computed_tokens, _ = manager.get_computed_blocks(req1)
-    assert num_computed_tokens == 8 * block_size
-
-
-def test_different_block_size():
-    block_size = 16
-    # full attention and sliding window attention layers have the same page size:
-    # (32 tokens/block * float16 token, vs. 16 tokens/block * float32 token)
-    kv_cache_config = KVCacheConfig(
-        num_blocks=100,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer1"],
-                FullAttentionSpec(
-                    block_size=block_size * 2,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["layer2"],
-                SlidingWindowSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                    sliding_window=2 * block_size,
-                ),
-            ),
-        ],
-    )
-    manager = make_kv_cache_manager(
-        kv_cache_config=kv_cache_config,
-        max_model_len=8192,
-        enable_caching=True,
-        hash_block_size=block_size,
-    )
-
-    # 10 blocks of 16 tokens each. Token ids are not strictly aligned for each block.
-    common_token_ids = [i for i in range(10) for _ in range(block_size)]
-
-    req0 = make_request("0", common_token_ids, block_size, sha256)
-    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
-    assert not computed_blocks.blocks[0]
-    assert not computed_blocks.blocks[1]
-    assert num_computed_tokens == 0
-    blocks = manager.allocate_slots(
-        req0, 7 * block_size, len(computed_blocks.blocks[0]) * 16, computed_blocks
-    )
-    assert blocks.get_block_ids() == ([1, 2, 3, 4], [5, 6, 7, 8, 9, 10, 11])
-    req1 = make_request("1", common_token_ids[: 7 * block_size + 1], block_size, sha256)
-    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
-    assert len(computed_blocks.blocks[0]) == 3
-    assert len(computed_blocks.blocks[1]) == 6
-    assert num_computed_tokens == 6 * 16
-
-    req2 = make_request("2", common_token_ids[: 6 * block_size + 1], block_size, sha256)
-    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req2)
-    assert len(computed_blocks.blocks[0]) == 3
-    assert len(computed_blocks.blocks[1]) == 6
-    assert num_computed_tokens == 6 * 16
-
-    # Evict some blocks to make sliding window cache hit length 5*16
-    # But should return 4 * 16 because full attention cache hit length must be
-    # a multiple of 32
-    manager.block_pool.cached_block_hash_to_block.pop(
-        make_block_hash_with_group_id(req1.block_hashes[6], 1), 11
-    )
-    manager.block_pool.cached_block_hash_to_block.pop(
-        make_block_hash_with_group_id(req1.block_hashes[5], 1), 10
-    )
-    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
-    assert len(computed_blocks.blocks[0]) == 2
-    assert len(computed_blocks.blocks[1]) == 4
-    assert num_computed_tokens == 4 * 16
-
-
-def test_hybrid_cache_blocks_swa_tail_window_only():
-    """Within each lcm-aligned segment, SWA's ``find_longest_cache_hit`` only
-    returns the trailing ``ceil((sliding_window - 1) / block_size)`` blocks
-    (its right-to-left scan stops once a contiguous match is found). Blocks
-    earlier in the segment can never serve a hit, so
-    ``HybridKVCacheCoordinator.cache_blocks`` should skip them rather than
-    polluting the prefix-cache hash map."""
-    block_size = 8
-    # Full attn block_size=32, SWA block_size=8, sw=8 -> lcm=32.
-    # tail = ceil(7/8) = 1; per_segment = 32/8 = 4.
-    # Per-segment template = [F, F, F, T]; only the last SWA block in each
-    # 32-token segment ends up in the prefix-cache hash map.
-    kv_cache_config = KVCacheConfig(
-        num_blocks=100,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer1"],
-                FullAttentionSpec(
-                    block_size=4 * block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["layer2"],
-                SlidingWindowSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                    sliding_window=block_size,
-                ),
-            ),
-        ],
-    )
-    manager = make_kv_cache_manager(
-        kv_cache_config=kv_cache_config,
-        max_model_len=8192,
-        enable_caching=True,
-        hash_block_size=block_size,
-    )
-
-    # 8 hash-blocks of 8 tokens (64 tokens, two lcm-aligned segments).
-    token_ids = [i for i in range(8) for _ in range(block_size)]
-    req = make_request("0", token_ids, block_size, sha256)
-    computed_blocks, _, _ = manager.get_computed_blocks(req)
-    blocks = manager.allocate_slots(
-        req,
-        8 * block_size,
-        len(computed_blocks.blocks[0]) * block_size,
-        computed_blocks,
-    )
-    assert blocks is not None
-    assert len(req.block_hashes) == 8
-
-    pool = manager.block_pool
-    # SWA group_id=1: only hash 3 and hash 7 (the last block of each
-    # 32-token segment) should be cached. Hashes 0,1,2,4,5,6 cannot serve
-    # a hit at any lcm-aligned length, so they must NOT be cached.
-    expected_cached = {3, 7}
-    for i in range(8):
-        cached = pool.get_cached_block(req.block_hashes[i], kv_cache_group_ids=[1])
-        if i in expected_cached:
-            assert cached is not None, f"SWA hash {i} should be cached"
-        else:
-            assert cached is None, (
-                f"SWA hash {i} cannot serve any lcm-aligned hit; should not be cached"
-            )
-
-
-def test_hybrid_cache_blocks_clamped_to_lcm():
-    """HybridKVCacheCoordinator.cache_blocks() clamps to scheduler_block_size.
-    Chunks past the last lcm-aligned boundary can never participate in a
-    cache hit (find_longest_cache_hit always returns lcm-aligned hits), so
-    caching them only pollutes the prefix-cache hash map and keeps blocks
-    on the LRU list that could otherwise return to the free pool."""
-    block_size = 16
-    # Full attn block_size=32, SWA block_size=16 -> lcm=32.
-    kv_cache_config = KVCacheConfig(
-        num_blocks=100,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer1"],
-                FullAttentionSpec(
-                    block_size=block_size * 2,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["layer2"],
-                SlidingWindowSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                    sliding_window=2 * block_size,
-                ),
-            ),
-        ],
-    )
-    manager = make_kv_cache_manager(
-        kv_cache_config=kv_cache_config,
-        max_model_len=8192,
-        enable_caching=True,
-        hash_block_size=block_size,
-    )
-
-    # 7 hash-blocks of 16 tokens (112 tokens). With lcm=32 the clamp truncates
-    # to 96 tokens — SWA caches 6 hashes, full-attn caches 3.
-    token_ids = [i for i in range(7) for _ in range(block_size)]
-    req = make_request("0", token_ids, block_size, sha256)
-    computed_blocks, _, _ = manager.get_computed_blocks(req)
-    blocks = manager.allocate_slots(
-        req,
-        7 * block_size,
-        len(computed_blocks.blocks[0]) * block_size,
-        computed_blocks,
-    )
-    assert blocks is not None
-    assert len(req.block_hashes) == 7
-
-    pool = manager.block_pool
-    # SWA group_id=1: hashes 0..5 cached (6 blocks * 16 tokens = 96), hash 6
-    # spans tokens [96, 112) past the lcm boundary and must NOT be cached.
-    for i in range(6):
-        assert (
-            pool.get_cached_block(req.block_hashes[i], kv_cache_group_ids=[1])
-            is not None
-        ), f"SWA hash {i} should be cached"
-    assert pool.get_cached_block(req.block_hashes[6], kv_cache_group_ids=[1]) is None, (
-        "SWA hash 6 spans tokens past the lcm boundary; should not be cached"
-    )
-
-
 def test_hybrid_local_kv_retention_interval_aligns_in_manager():
     """Verify fixed intervals retain sparse tails plus the latest replay tail."""
     block_size = 8
     kv_cache_config = KVCacheConfig(
-        num_blocks=100,
+        num_pages=100,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["layer1"],
                 FullAttentionSpec(
-                    block_size=4 * block_size,
+                    block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float16,
@@ -4766,19 +4229,20 @@ def test_hybrid_local_kv_retention_interval_aligns_in_manager():
                 ),
             ),
         ],
+        block_size=block_size,
     )
     manager = make_kv_cache_manager(
         kv_cache_config=kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
         retention_interval=64,
     )
 
     # The SWA manager uses the configured 64-token interval (a multiple of the
-    # 32-token lcm_block_size) as its retention segment. For this 128-token
-    # prompt, the retained SWA tails are the 64-token interval boundary, the
-    # 96-token replay boundary, and the 128-token interval boundary.
+    # 8-token scheduler_block_size) as its retention segment. For this
+    # 128-token prompt, the retained SWA tails end at the 64- and 128-token
+    # interval boundaries (blocks 7 and 15) and at the 120-token replay
+    # boundary (block 14).
     token_ids = [i for i in range(16) for _ in range(block_size)]
     req = make_request("0", token_ids, block_size, sha256)
     computed_blocks, _, _ = manager.get_computed_blocks(req)
@@ -4791,7 +4255,7 @@ def test_hybrid_local_kv_retention_interval_aligns_in_manager():
     assert blocks is not None
 
     pool = manager.block_pool
-    expected_swa_cached = {7, 11, 15}
+    expected_swa_cached = {7, 14, 15}
     for i in range(16):
         cached = pool.get_cached_block(req.block_hashes[i], kv_cache_group_ids=[1])
         if i in expected_swa_cached:
@@ -4803,9 +4267,9 @@ def test_hybrid_local_kv_retention_interval_aligns_in_manager():
 @pytest.mark.parametrize(
     "interval, expected_match",
     [
-        # scheduler_block_size is 32 (= lcm(4*8, 8)); 33 is not a multiple of it.
+        # scheduler_block_size is 8; 33 is not a multiple of it.
         (33, "multiple of scheduler_block_size"),
-        # A negative multiple (-32 % 32 == 0) must still be rejected explicitly,
+        # A negative multiple (-32 % 8 == 0) must still be rejected explicitly,
         # otherwise it would pass the modulo check and silently degrade to dense.
         (-32, "non-negative"),
     ],
@@ -4815,13 +4279,13 @@ def test_hybrid_local_kv_retention_interval_rejects_invalid(interval, expected_m
     scheduler_block_size errors out at construction time."""
     block_size = 8
     kv_cache_config = KVCacheConfig(
-        num_blocks=100,
+        num_pages=100,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["layer1"],
                 FullAttentionSpec(
-                    block_size=4 * block_size,
+                    block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float16,
@@ -4838,13 +4302,13 @@ def test_hybrid_local_kv_retention_interval_rejects_invalid(interval, expected_m
                 ),
             ),
         ],
+        block_size=block_size,
     )
     with pytest.raises(ValueError, match=expected_match):
         make_kv_cache_manager(
             kv_cache_config=kv_cache_config,
             max_model_len=8192,
             enable_caching=True,
-            hash_block_size=block_size,
             retention_interval=interval,
         )
 
@@ -4855,7 +4319,6 @@ def test_zero_retention_is_ignored_for_full_attention():
         kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=16,
         retention_interval=0,
     )
     assert manager.coordinator.retention_interval == 0
@@ -4868,22 +4331,24 @@ def test_positive_retention_rejects_full_attention():
             kv_cache_config,
             max_model_len=8192,
             enable_caching=True,
-            hash_block_size=16,
             retention_interval=16,
         )
 
 
 def test_hybrid_local_kv_retention_interval_survives_recycling():
     """Verify retained local checkpoints are reused after block recycling."""
-    hash_block_size = 4
+    block_size = 4
     kv_cache_config = KVCacheConfig(
-        num_blocks=800,
+        # Large enough that recycling never reaches a cached block: the point
+        # is that retained checkpoints survive the second fill's scratch reuse,
+        # not capacity pressure.
+        num_pages=6400,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["full"],
                 MLAAttentionSpec(
-                    block_size=64 * hash_block_size,
+                    block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.uint8,
@@ -4893,7 +4358,7 @@ def test_hybrid_local_kv_retention_interval_survives_recycling():
             KVCacheGroupSpec(
                 ["swa"],
                 SlidingWindowSpec(
-                    block_size=16 * hash_block_size,
+                    block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
@@ -4903,7 +4368,7 @@ def test_hybrid_local_kv_retention_interval_survives_recycling():
             KVCacheGroupSpec(
                 ["c128"],
                 SlidingWindowSpec(
-                    block_size=2 * hash_block_size,
+                    block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
@@ -4913,7 +4378,7 @@ def test_hybrid_local_kv_retention_interval_survives_recycling():
             KVCacheGroupSpec(
                 ["c4"],
                 SlidingWindowSpec(
-                    block_size=hash_block_size,
+                    block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
@@ -4921,20 +4386,18 @@ def test_hybrid_local_kv_retention_interval_survives_recycling():
                 ),
             ),
         ],
+        block_size=block_size,
     )
     manager = make_kv_cache_manager(
         kv_cache_config=kv_cache_config,
         max_model_len=4096,
         enable_caching=True,
-        hash_block_size=hash_block_size,
         retention_interval=1024,
     )
 
     def fill_request(request_id: str, token_offset: int) -> list[int]:
-        token_ids = [
-            token_offset + i for i in range(1024) for _ in range(hash_block_size)
-        ]
-        fill_req = make_request(request_id, token_ids, hash_block_size, sha256)
+        token_ids = [token_offset + i for i in range(1024) for _ in range(block_size)]
+        fill_req = make_request(request_id, token_ids, block_size, sha256)
         while fill_req.num_computed_tokens < len(token_ids):
             num_new_tokens = min(512, len(token_ids) - fill_req.num_computed_tokens)
             blocks = manager.allocate_slots(fill_req, num_new_tokens)
@@ -4944,29 +4407,29 @@ def test_hybrid_local_kv_retention_interval_survives_recycling():
         return token_ids
 
     token_ids = fill_request("fill_0", 0)
-    replay_req = make_request("replay", token_ids[:1800], hash_block_size, sha256)
+    replay_req = make_request("replay", token_ids[:1800], block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay_req)
     assert num_computed_tokens == 1024
-    assert [len(blocks) for blocks in computed_blocks.blocks] == [4, 16, 128, 256]
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [256, 256, 256, 256]
 
     fill_request("fill_1", 100_000)
-    replay_req = make_request("replay_again", token_ids[:1800], hash_block_size, sha256)
+    replay_req = make_request("replay_again", token_ids[:1800], block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay_req)
     assert num_computed_tokens == 1024
-    assert [len(blocks) for blocks in computed_blocks.blocks] == [4, 16, 128, 256]
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [256, 256, 256, 256]
 
 
 def test_hybrid_local_kv_retention_latest_only_reuses_replay_boundary():
     """Verify latest-only retention reuses only the replayable prompt boundary."""
     block_size = 8
     kv_cache_config = KVCacheConfig(
-        num_blocks=100,
+        num_pages=100,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["layer1"],
                 FullAttentionSpec(
-                    block_size=4 * block_size,
+                    block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float16,
@@ -4983,12 +4446,12 @@ def test_hybrid_local_kv_retention_latest_only_reuses_replay_boundary():
                 ),
             ),
         ],
+        block_size=block_size,
     )
     manager = make_kv_cache_manager(
         kv_cache_config=kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
         retention_interval=0,
     )
 
@@ -5004,7 +4467,9 @@ def test_hybrid_local_kv_retention_latest_only_reuses_replay_boundary():
     assert blocks is not None
 
     pool = manager.block_pool
-    expected_swa_cached = {11}
+    # Retention 0 keeps only the replay-boundary tail: the block ending at
+    # the 120-token boundary (block 14 of 8 tokens).
+    expected_swa_cached = {14}
     for i in range(16):
         cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
         if i in expected_swa_cached:
@@ -5013,18 +4478,18 @@ def test_hybrid_local_kv_retention_latest_only_reuses_replay_boundary():
             assert cached is None, f"SWA hash {i} should not be cached"
 
     manager.free(req0)
-    retained_swa_block = pool.get_cached_block(req0.block_hashes[11], [1])
+    retained_swa_block = pool.get_cached_block(req0.block_hashes[14], [1])
     assert retained_swa_block is not None
     assert retained_swa_block[0].ref_cnt == 0
 
     req1 = make_request("1", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
     # Full prompt hits intentionally recompute the final block for logits, so
-    # the longest usable hit is the previous LCM boundary: 96 tokens.
-    assert num_computed_tokens == 12 * block_size
-    assert len(computed_blocks.blocks[1]) == 12
+    # the longest usable hit is the retained replay boundary: 120 tokens.
+    assert num_computed_tokens == 15 * block_size
+    assert len(computed_blocks.blocks[1]) == 15
 
-    shorter_req = make_request("2", token_ids[: 12 * block_size], block_size, sha256)
+    shorter_req = make_request("2", token_ids[: 14 * block_size], block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(shorter_req)
     assert num_computed_tokens == 0
     assert len(computed_blocks.blocks[1]) == 0
@@ -5039,13 +4504,13 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     """
     block_size = 8
     kv_cache_config = KVCacheConfig(
-        num_blocks=100,
+        num_pages=100,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["full"],
                 FullAttentionSpec(
-                    block_size=4 * block_size,
+                    block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float16,
@@ -5063,20 +4528,20 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
                 is_eagle_group=True,
             ),
         ],
+        block_size=block_size,
     )
     manager = make_kv_cache_manager(
         kv_cache_config=kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
         retention_interval=0,
         use_eagle=True,
     )
 
-    # 127 tokens: eagle proves a boundary only if an aligned unit exists past
-    # it, so the replay boundary rewinds one unit to
-    # floor(127 / 32) * 32 - 32 = 64. The SWA tail plus its proof block then
-    # ends at 72, two 8-token blocks wide: hashes 7 and 8.
+    # 127 tokens: eagle proves a boundary only if an aligned block exists past
+    # it, so the replay boundaries rewind to 112 and 120. The SWA tail plus its
+    # proof block then covers hashes 13 and 14 below 112+8=120 and 14 and 15
+    # below 120+8=128.
     token_ids = [i for i in range(15) for _ in range(block_size)] + [15] * 7
     req0 = make_request("0", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
@@ -5090,7 +4555,7 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     assert blocks is not None
 
     pool = manager.block_pool
-    expected_swa_cached = {7, 8}
+    expected_swa_cached = {13, 14, 15}
     for i in range(15):
         cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
         if i in expected_swa_cached:
@@ -5102,8 +4567,8 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
 
     req1 = make_request("1", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
-    assert num_computed_tokens == 8 * block_size
-    assert [len(blocks) for blocks in computed_blocks.blocks] == [2, 8]
+    assert num_computed_tokens == 14 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [14, 14]
 
 
 def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
@@ -5115,7 +4580,7 @@ def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
     block_size = 32
     num_spec = 3
     kv_cache_config = KVCacheConfig(
-        num_blocks=100,
+        num_pages=100,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -5138,12 +4603,12 @@ def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
                 ),
             ),
         ],
+        block_size=block_size,
     )
     manager = make_kv_cache_manager(
         kv_cache_config=kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
         retention_interval=0,
         use_eagle=True,
     )
@@ -5277,7 +4742,7 @@ def test_can_fit_full_sequence_swa_cap_admits_long_prompt():
     num_blocks = 64 + 13 + 1
 
     config = KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -5300,6 +4765,7 @@ def test_can_fit_full_sequence_swa_cap_admits_long_prompt():
                 ),
             ),
         ],
+        block_size=block_size,
     )
 
     manager = make_kv_cache_manager(
@@ -5308,7 +4774,6 @@ def test_can_fit_full_sequence_swa_cap_admits_long_prompt():
         # Single (sync) batch in flight, so in-flight tokens == batched tokens.
         max_in_flight_tokens=max_num_batched_tokens,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     # A prompt that is shorter than max_model_len but longer than SW + chunk:
@@ -5330,7 +4795,7 @@ def test_full_sequence_admission_reserves_device_blocks_for_immediate_chunk(
     """Reservations constrain the current allocation, not the entire prompt."""
     block_size = 16
     config = KVCacheConfig(
-        num_blocks=11,  # Ten usable blocks after the null block.
+        num_pages=11,  # Ten usable blocks after the null block.
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -5343,10 +4808,9 @@ def test_full_sequence_admission_reserves_device_blocks_for_immediate_chunk(
                 ),
             )
         ],
+        block_size=block_size,
     )
-    manager = make_kv_cache_manager(
-        config, max_model_len=128, enable_caching=True, hash_block_size=block_size
-    )
+    manager = make_kv_cache_manager(config, max_model_len=128, enable_caching=True)
     request = make_request("chunk", list(range(128)), block_size, sha256)
 
     blocks = manager.allocate_slots(
@@ -5370,7 +4834,7 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
     num_blocks = 5
 
     config = KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -5393,6 +4857,7 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
                 ),
             ),
         ],
+        block_size=block_size,
     )
 
     manager = make_kv_cache_manager(
@@ -5401,7 +4866,6 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
         # Single (sync) batch in flight, so in-flight tokens == batched tokens.
         max_in_flight_tokens=max_num_batched_tokens,
         enable_caching=True,
-        hash_block_size=block_size,
     )
 
     # 16 blocks of full attention demand alone exceeds the 5-block pool.
@@ -5450,7 +4914,6 @@ def test_cache_hit_local_and_external():
         kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
         use_eagle=True,
     )
 
@@ -5552,7 +5015,6 @@ def _make_two_phase_manager(num_groups: int) -> KVCacheManager:
         kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
         use_eagle=True,
     )
 
@@ -5611,19 +5073,18 @@ def test_cache_hit_local_and_external_two_groups_preempt_and_reallocate():
 
 
 def test_swa_free_split_keeps_cached_tail_ahead_of_scratch():
-    """Dense retention: freeing an SWA request must place its
-    uncached scratch blocks at the front of the free queue (recycled first)
-    and keep its cached checkpoint blocks at the back (retained for prefix
-    hits). This split is always-on, independent of the retention interval."""
+    """Freeing an SWA request must place its uncached scratch blocks at the
+    front of the free queue (recycled first) and keep its cached checkpoint
+    blocks at the back (retained for prefix hits)."""
     block_size = 8
     kv_cache_config = KVCacheConfig(
-        num_blocks=100,
+        num_pages=100,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["layer1"],
                 FullAttentionSpec(
-                    block_size=4 * block_size,
+                    block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float16,
@@ -5640,12 +5101,15 @@ def test_swa_free_split_keeps_cached_tail_ahead_of_scratch():
                 ),
             ),
         ],
+        block_size=block_size,
     )
     manager = make_kv_cache_manager(
         kv_cache_config=kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
+        # Sparse retention gives the 16-block SWA prompt a mix of retained
+        # checkpoint tails and uncached scratch blocks.
+        retention_interval=4 * block_size,
     )
 
     token_ids = [i for i in range(16) for _ in range(block_size)]
@@ -5672,7 +5136,7 @@ def test_swa_free_split_keeps_cached_tail_ahead_of_scratch():
         else:
             cached_ids.add(block.block_id)
             cached_hash_indices.append(i)
-    # The dense default mask caches only the per-segment tails, so a 16-block
+    # The sparse mask caches only the per-segment tails, so a 16-block
     # SWA prompt must produce a mix of retained and scratch blocks.
     assert cached_ids, "expected some retained (cached) SWA tail blocks"
     assert uncached_ids, "expected some scratch (uncached) SWA blocks"
@@ -5698,7 +5162,7 @@ def test_swa_free_split_keeps_cached_tail_ahead_of_scratch():
 def _make_pure_swa_manager(block_size, sliding_window, num_blocks=100, **kwargs):
     """Single sliding-window group (UnitaryKVCacheCoordinator)."""
     kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -5712,12 +5176,12 @@ def _make_pure_swa_manager(block_size, sliding_window, num_blocks=100, **kwargs)
                 ),
             ),
         ],
+        block_size=block_size,
     )
     return make_kv_cache_manager(
         kv_cache_config=kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
-        hash_block_size=block_size,
         **kwargs,
     )
 
@@ -5919,7 +5383,6 @@ def test_mamba_shared_prefix_reuse_under_zero_retention():
             _make_hybrid_kv_cache_config(block_size, 200, ["full", "mamba"]),
             max_model_len=8192,
             enable_caching=True,
-            hash_block_size=block_size,
             retention_interval=retention,
         )
         shared = [7 for _ in range(2 * block_size)]  # 2-block shared prefix
@@ -6197,7 +5660,7 @@ def _make_dcp_kv_cache_config(
     """A planner-shaped DCP config: the sharded groups' specs hold the
     per-rank block size (B // dcp), replicated groups hold B."""
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -6230,8 +5693,52 @@ def _make_dcp_kv_cache_config(
                 ),
             ),
         ],
-        hash_block_size=block_size,
+        block_size=block_size,
     )
+
+
+@pytest.mark.parametrize("draft_sharded", [True, False])
+def test_prefix_cache_hit_uses_per_group_dcp_geometry(draft_sharded):
+    """Prefix lookup resolves each group's token-space block size from its
+    per-rank spec: DCP-sharded groups scale by the world size, replicated
+    draft and Mamba groups do not."""
+    block_size = 128
+    dcp = 8
+    manager = make_kv_cache_manager(
+        _make_dcp_kv_cache_config(block_size, 64, dcp, draft_sharded),
+        max_model_len=8192,
+        enable_caching=True,
+        scheduler_block_size=block_size,
+        dcp_world_size=dcp,
+    )
+    target_mgr, draft_mgr, mamba_mgr = manager.coordinator.single_type_managers
+    assert target_mgr.dcp_world_size == dcp
+    assert draft_mgr.dcp_world_size == (dcp if draft_sharded else 1)
+    assert mamba_mgr.dcp_world_size == 1
+    # Every prefix-cacheable group pages at the token-space block size B.
+    assert target_mgr.block_size == block_size
+    assert draft_mgr.block_size == block_size
+    assert mamba_mgr.block_size == block_size
+
+    common_token_ids = [i for i in range(2) for _ in range(block_size)]
+    req0 = make_request("0", common_token_ids + [99] * 7, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    # Align-mode Mamba keeps a state only where a chunk ends, so end the first
+    # chunk on the shared prefix.
+    for num_new_tokens in (len(common_token_ids), 7):
+        blocks = manager.allocate_slots(req0, num_new_tokens, 0, computed_blocks)
+        assert blocks is not None
+        req0.num_computed_tokens += num_new_tokens
+        computed_blocks = None
+
+    req1 = make_request("1", common_token_ids + [100] * 5, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 2 * block_size
+    assert [len(group) for group in computed_blocks.blocks] == [2, 2, 2]
+
+    manager.free(req0)
+    manager.free(req1)
 
 
 def test_get_block_ids_for_computed_tokens_clips_in_token_space_under_dcp():
@@ -6242,7 +5749,7 @@ def test_get_block_ids_for_computed_tokens_clips_in_token_space_under_dcp():
     block_size = 16
     dcp = 2
     kv_cache_config = KVCacheConfig(
-        num_blocks=100,
+        num_pages=100,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -6256,13 +5763,12 @@ def test_get_block_ids_for_computed_tokens_clips_in_token_space_under_dcp():
                 ),
             )
         ],
-        hash_block_size=block_size,
+        block_size=block_size,
     )
     manager = make_kv_cache_manager(
         kv_cache_config,
         max_model_len=4096,
         enable_caching=True,
-        hash_block_size=block_size,
         scheduler_block_size=block_size,
         dcp_world_size=dcp,
     )
@@ -6283,7 +5789,7 @@ def test_prefix_hit_events_use_token_space_block_size_under_dcp():
     block_size = 16
     dcp = 2
     kv_cache_config = KVCacheConfig(
-        num_blocks=100,
+        num_pages=100,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -6297,14 +5803,13 @@ def test_prefix_hit_events_use_token_space_block_size_under_dcp():
                 ),
             )
         ],
-        hash_block_size=block_size,
+        block_size=block_size,
     )
     manager = make_kv_cache_manager(
         kv_cache_config,
         max_model_len=4096,
         enable_caching=True,
         enable_kv_cache_events=True,
-        hash_block_size=block_size,
         scheduler_block_size=block_size,
         dcp_world_size=dcp,
     )
@@ -6345,7 +5850,6 @@ def test_swa_shared_prefix_reuse_under_zero_retention(use_eagle):
             max_model_len=8192,
             enable_caching=True,
             use_eagle=use_eagle,
-            hash_block_size=block_size,
             retention_interval=retention,
         )
         shared = [7 for _ in range(4 * block_size)]  # 4-block shared prefix
@@ -6395,7 +5899,7 @@ def test_device_eviction_keeps_host_prefix():
     assert device_block.block_id == host_block.block_id
     manager.free(request)
     assert host_block.block_hash is not None and device_block.block_hash is not None
-    manager.evict_blocks({device_block.block_id})
+    manager.evict_blocks({(1, device_block.block_id)})
     assert device_block.block_hash is None, (
         "Device eviction left the indexer prefix cached"
     )

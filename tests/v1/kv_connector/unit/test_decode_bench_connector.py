@@ -50,6 +50,42 @@ from .utils import (
 )
 
 
+def _large_page_group(
+    layer_names: list[str],
+    spec: FullAttentionSpec | SlidingWindowSpec | CircularBufferSpec | MambaSpec,
+    num_pages: int,
+    blocks_per_page: int = 1,
+    kernel_rows_per_block: int = 1,
+    row_bytes: int = 64,
+) -> KVCacheGroupSpec:
+    """A large-page group holding ``num_pages * blocks_per_page`` blocks.
+
+    With the defaults the group's kernel rows are the manager block ids.
+    """
+    return KVCacheGroupSpec(
+        layer_names,
+        spec,
+        num_blocks=num_pages * blocks_per_page,
+        blocks_per_page=blocks_per_page,
+        kernel_rows_per_block=kernel_rows_per_block,
+        row_bytes=row_bytes,
+    )
+
+
+def _large_page_config(
+    groups: list[KVCacheGroupSpec],
+    num_pages: int,
+    large_page_bytes: int = 64,
+) -> KVCacheConfig:
+    return KVCacheConfig(
+        num_pages=num_pages,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        large_page_bytes=large_page_bytes,
+        block_size=groups[0].kv_cache_spec.block_size,
+    )
+
+
 class DecodeBenchTestRunner:
     """Test runner for DecodeBenchConnector."""
 
@@ -73,8 +109,32 @@ class DecodeBenchTestRunner:
         )
 
         self.vllm_config = vllm_config
+
+        # Create dummy KV caches for testing
+        # Shape: [num_rows, 2, num_heads, block_size, head_dim]
+        # Using simplified shape for testing
+        num_heads = 4
+        head_dim = 64
+        row_bytes = 2 * num_heads * block_size * head_dim * torch.float32.itemsize
+        kv_cache_config = _large_page_config(
+            [
+                _large_page_group(
+                    ["layer"],
+                    FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                    num_pages=num_gpu_blocks,
+                    row_bytes=row_bytes,
+                )
+            ],
+            num_pages=num_gpu_blocks,
+            large_page_bytes=row_bytes,
+        )
         self.scheduler: Scheduler = create_scheduler(
-            vllm_config, num_blocks=num_gpu_blocks
+            vllm_config, num_blocks=num_gpu_blocks, kv_cache_config=kv_cache_config
         )
 
         # Create worker-side connector
@@ -84,11 +144,6 @@ class DecodeBenchTestRunner:
             self.scheduler.kv_cache_config,
         )
 
-        # Create dummy KV caches for testing
-        # Shape: [num_blocks, 2, num_heads, block_size, head_dim]
-        # Using simplified shape for testing
-        num_heads = 4
-        head_dim = 64
         layer_names = self.scheduler.kv_cache_config.kv_cache_groups[0].layer_names
         self.kv_caches = {
             layer_name: torch.zeros(num_gpu_blocks, 2, num_heads, block_size, head_dim)
@@ -254,13 +309,12 @@ def test_decode_bench_connector_fills_each_hma_group():
         head_size=1,
         dtype=torch.float32,
     )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_gpu_blocks,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(["group_0_layer"], kv_cache_spec),
-            KVCacheGroupSpec(["group_1_layer"], kv_cache_spec),
+    kv_cache_config = _large_page_config(
+        [
+            _large_page_group(["group_0_layer"], kv_cache_spec, num_gpu_blocks),
+            _large_page_group(["group_1_layer"], kv_cache_spec, num_gpu_blocks),
         ],
+        num_pages=num_gpu_blocks,
     )
     connector = DecodeBenchConnector(
         vllm_config,
@@ -289,6 +343,76 @@ def test_decode_bench_connector_fills_each_hma_group():
     assert torch.allclose(group_1_cache[5], torch.tensor(0.015))
 
 
+def test_decode_bench_connector_fills_kernel_rows_of_each_group():
+    """The fill follows the group's kernel rows, not the manager block id.
+
+    Both groups have 2 rows per block, so block b is rows 2b and 2b + 1:
+    group 0 blocks 1 and 2 are rows 2-5, group 1 blocks 1 and 3 are rows 2-3
+    and 6-7. Block ids collide across groups; each group's fill must land on
+    its own rows.
+    """
+    num_pages = 4
+    large_page_bytes = 2048
+    vllm_config = create_vllm_config(
+        block_size=16,
+        max_num_batched_tokens=1000,
+        kv_connector="DecodeBenchConnector",
+    )
+    kv_cache_config = _large_page_config(
+        [
+            _large_page_group(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+                num_pages=num_pages,
+                blocks_per_page=2,
+                kernel_rows_per_block=2,
+                row_bytes=512,
+            ),
+            _large_page_group(
+                ["window"],
+                SlidingWindowSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=32,
+                ),
+                num_pages=num_pages,
+                kernel_rows_per_block=2,
+                row_bytes=768,
+            ),
+        ],
+        num_pages=num_pages,
+        large_page_bytes=large_page_bytes,
+    )
+    connector = DecodeBenchConnector(
+        vllm_config,
+        KVConnectorRole.WORKER,
+        kv_cache_config,
+    )
+    # Strided views over a shared backing, one per group; the row stride in
+    # bytes is the group's row_bytes.
+    full_view = torch.zeros(16 * 128).as_strided((16, 4), (128, 1))
+    window_view = torch.zeros(11 * 192).as_strided((11, 4), (192, 1))
+    connector.register_kv_caches({"full": full_view, "window": window_view})
+    connector.bind_connector_metadata(
+        DecodeBenchConnectorMetadata(reqs_to_fill={"request": (([1, 2], [1, 3]), 48)})
+    )
+
+    connector.start_load_kv(
+        ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
+    )
+
+    full_expected = torch.zeros_like(full_view)
+    full_expected[[2, 3, 4, 5]] = 0.015
+    torch.testing.assert_close(full_view, full_expected)
+    window_expected = torch.zeros_like(window_view)
+    window_expected[[2, 3, 6, 7]] = 0.015
+    torch.testing.assert_close(window_view, window_expected)
+
+
 def test_decode_bench_connector_zero_fills_circular_buffer_groups():
     """Circular buffers are zeroed to preserve packed non-floating metadata."""
     num_gpu_blocks = 8
@@ -297,11 +421,9 @@ def test_decode_bench_connector_zero_fills_circular_buffer_groups():
         max_num_batched_tokens=1000,
         kv_connector="DecodeBenchConnector",
     )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_gpu_blocks,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
+    kv_cache_config = _large_page_config(
+        [
+            _large_page_group(
                 ["circular_layer"],
                 CircularBufferSpec(
                     block_size=2,
@@ -310,8 +432,10 @@ def test_decode_bench_connector_zero_fills_circular_buffer_groups():
                     head_size_v=0,
                     dtype=torch.bfloat16,
                 ),
+                num_pages=num_gpu_blocks,
             ),
         ],
+        num_pages=num_gpu_blocks,
     )
     connector = DecodeBenchConnector(
         vllm_config,
@@ -341,7 +465,7 @@ def test_decode_bench_connector_selects_external_blocks_per_group():
         kv_connector="DecodeBenchConnector",
     )
     kv_cache_groups = [
-        KVCacheGroupSpec(
+        _large_page_group(
             ["full_attention"],
             FullAttentionSpec(
                 block_size=16,
@@ -349,8 +473,9 @@ def test_decode_bench_connector_selects_external_blocks_per_group():
                 head_size=1,
                 dtype=torch.float32,
             ),
+            num_pages=8,
         ),
-        KVCacheGroupSpec(
+        _large_page_group(
             ["compressor_ring"],
             CircularBufferSpec(
                 block_size=32,
@@ -358,16 +483,13 @@ def test_decode_bench_connector_selects_external_blocks_per_group():
                 head_size=1,
                 dtype=torch.float32,
             ),
+            num_pages=8,
         ),
     ]
     connector = DecodeBenchConnector(
         vllm_config,
         KVConnectorRole.SCHEDULER,
-        KVCacheConfig(
-            num_blocks=8,
-            kv_cache_tensors=[],
-            kv_cache_groups=kv_cache_groups,
-        ),
+        _large_page_config(kv_cache_groups, num_pages=8),
     )
     num_local_tokens = 32
     num_external_tokens = 17
@@ -421,10 +543,9 @@ def test_decode_bench_connector_selects_unaligned_external_block():
     connector = DecodeBenchConnector(
         vllm_config,
         KVConnectorRole.SCHEDULER,
-        KVCacheConfig(
-            num_blocks=4,
-            kv_cache_tensors=[],
-            kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+        _large_page_config(
+            [_large_page_group(["layer"], kv_cache_spec, num_pages=4)],
+            num_pages=4,
         ),
     )
     num_local_tokens = 23
@@ -464,10 +585,9 @@ def test_decode_bench_connector_skips_null_padding():
     connector = DecodeBenchConnector(
         vllm_config,
         KVConnectorRole.SCHEDULER,
-        KVCacheConfig(
-            num_blocks=8,
-            kv_cache_tensors=[],
-            kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+        _large_page_config(
+            [_large_page_group(["layer"], kv_cache_spec, num_pages=8)],
+            num_pages=8,
         ),
     )
     num_external_tokens = 4 * block_size
@@ -525,13 +645,12 @@ def test_decode_bench_connector_uses_per_group_dcp_block_sizes():
     connector = DecodeBenchConnector(
         vllm_config,
         KVConnectorRole.SCHEDULER,
-        KVCacheConfig(
-            num_blocks=8,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(["full_attention"], full_attention),
-                KVCacheGroupSpec(["sliding_window"], sliding_window),
+        _large_page_config(
+            [
+                _large_page_group(["full_attention"], full_attention, num_pages=8),
+                _large_page_group(["sliding_window"], sliding_window, num_pages=8),
             ],
+            num_pages=8,
         ),
     )
     num_external_tokens = block_size * dcp_world_size + 1
@@ -808,10 +927,17 @@ def _fill_single_block(cache_dtype, spec_dtype, kv_quant_mode, cache, fill_std=0
     connector = DecodeBenchConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        KVCacheConfig(
-            num_blocks=cache.shape[0],
-            kv_cache_tensors=[],
-            kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+        _large_page_config(
+            [
+                _large_page_group(
+                    ["layer"],
+                    kv_cache_spec,
+                    num_pages=cache.shape[0],
+                    row_bytes=16 * 8 * cache.element_size(),
+                )
+            ],
+            num_pages=cache.shape[0],
+            large_page_bytes=16 * 8 * cache.element_size(),
         ),
     )
     connector.register_kv_caches({"layer": cache})
@@ -872,17 +998,17 @@ def test_decode_bench_connector_startup_fill_fills_registered_caches(fill_std):
         kv_connector="DecodeBenchConnector",
         kv_connector_extra_config={"startup_fill": True, "fill_std": fill_std},
     )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=4,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
+    kv_cache_config = _large_page_config(
+        [
+            _large_page_group(
                 ["attention", "transposed"],
                 FullAttentionSpec(
                     block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
                 ),
+                num_pages=4,
             ),
         ],
+        num_pages=4,
     )
     connector = DecodeBenchConnector(
         vllm_config, KVConnectorRole.WORKER, kv_cache_config
@@ -918,10 +1044,9 @@ def test_decode_bench_connector_startup_fill_encodes_fp8_caches(fill_std):
     connector = DecodeBenchConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        KVCacheConfig(
-            num_blocks=4,
-            kv_cache_tensors=[],
-            kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+        _large_page_config(
+            [_large_page_group(["layer"], kv_cache_spec, num_pages=4)],
+            num_pages=4,
         ),
     )
     cache = torch.zeros(4, 16, 8, dtype=torch.uint8)
@@ -945,25 +1070,26 @@ def test_decode_bench_connector_startup_fill_keeps_zeroed_groups_per_request():
         kv_connector_extra_config={"startup_fill": True},
     )
     # Mamba layers make the engine zero newly allocated attention blocks.
-    kv_cache_config = KVCacheConfig(
-        num_blocks=4,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
+    kv_cache_config = _large_page_config(
+        [
+            _large_page_group(
                 ["attention"],
                 FullAttentionSpec(
                     block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
                 ),
+                num_pages=4,
             ),
-            KVCacheGroupSpec(
+            _large_page_group(
                 ["mamba"],
                 MambaSpec(
                     block_size=16,
                     shapes=((4,), (4,)),
                     dtypes=(torch.float32, torch.float32),
                 ),
+                num_pages=4,
             ),
         ],
+        num_pages=4,
     )
     assert kv_cache_config.needs_kv_cache_zeroing
     scheduler_connector = DecodeBenchConnector(
@@ -1047,23 +1173,24 @@ def test_decode_bench_connector_startup_fill_keeps_circular_buffer_zero_fill():
         kv_connector="DecodeBenchConnector",
         kv_connector_extra_config={"startup_fill": True},
     )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=8,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
+    kv_cache_config = _large_page_config(
+        [
+            _large_page_group(
                 ["full_attention"],
                 FullAttentionSpec(
                     block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
                 ),
+                num_pages=8,
             ),
-            KVCacheGroupSpec(
+            _large_page_group(
                 ["compressor_ring"],
                 CircularBufferSpec(
                     block_size=32, num_kv_heads=1, head_size=1, dtype=torch.float32
                 ),
+                num_pages=8,
             ),
         ],
+        num_pages=8,
     )
     scheduler_connector = DecodeBenchConnector(
         vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config

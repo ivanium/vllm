@@ -168,3 +168,50 @@ def test_bf16_triton_sparse_mla_masked_chunks(device_str, dtype):
     # lse/max_logits are large-negative finite rather than the reference's
     # +inf/-inf placeholders, so only the output is compared here.
     assert torch.allclose(out[2], torch.zeros_like(out[2]))
+
+
+@pytest.mark.parametrize("device_str", ["xpu"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="XPU is required",
+)
+def test_bf16_triton_sparse_mla_strided_kv_rows(device_str, dtype):
+    """KV as a strided row view, as produced by ``flat_kv_row_view`` when a
+    large-page group row leaves other layers' rows between this layer's blocks.
+
+    The kernel must honor the runtime row stride in the ``indices * stride``
+    product; a dense-layout assumption reads the gap rows instead.
+    """
+    device = torch.device(device_str)
+    s_q = 2
+    s_kv = 256
+    h_q = 64
+    h_kv = 1
+    d_qk = 576
+    d_v = 512
+    topk = 128
+    row_gap = 3  # every live row is followed by 2 gap rows
+
+    torch.random.manual_seed(1234)
+
+    q = torch.randn((s_q, h_q, d_qk), dtype=dtype, device=device)
+    backing = torch.randn((s_kv * row_gap, h_kv, d_qk), dtype=dtype, device=device)
+    kv = backing[::row_gap]
+    assert kv.stride(0) == row_gap * d_qk
+    indices = torch.full((s_q, h_kv, topk), -1, dtype=torch.int32, device=device)
+    for t in range(s_q):
+        n = max(1, t * 64)
+        indices[t, 0, :n] = torch.randperm(s_kv, device=device)[:n].to(torch.int32)
+
+    sm_scale = d_qk**-0.5
+
+    out, max_logits, lse = triton_bf16_mla_sparse_interface(
+        q, kv, indices, sm_scale, d_v
+    )
+    ref_out, _, ref_max_logits, ref_lse = reference_mla_sparse_prefill(
+        q, kv, indices, sm_scale, d_v
+    )
+    assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(max_logits, ref_max_logits, atol=1e-3, rtol=1e-3)
+    assert torch.allclose(lse, ref_lse, atol=1e-3, rtol=1e-3)

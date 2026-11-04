@@ -153,9 +153,10 @@ def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
     model_state = MagicMock()
     model_state.prepare_attn.return_value = {}
     kv_cache_config = KVCacheConfig(
-        num_blocks=0,
+        num_pages=0,
         kv_cache_tensors=[],
         kv_cache_groups=[],
+        block_size=16,
     )
 
     gpu_cudagraph_utils.prepare_inputs_to_capture(
@@ -199,7 +200,7 @@ def test_dcp_full_capture_has_kv_context(
     model_state = MagicMock()
     model_state.max_model_len = 1024
     kv_cache_config = KVCacheConfig(
-        num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[]
+        num_pages=8, kv_cache_tensors=[], kv_cache_groups=[], block_size=16
     )
 
     gpu_cudagraph_utils.prepare_inputs_to_capture(
@@ -239,7 +240,7 @@ def test_capture_query_length_covers_replay_batches(
     )
     model_state = MagicMock()
     kv_cache_config = KVCacheConfig(
-        num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]
+        num_pages=0, kv_cache_tensors=[], kv_cache_groups=[], block_size=16
     )
 
     gpu_cudagraph_utils.prepare_inputs_to_capture(
@@ -291,7 +292,7 @@ def test_speculator_capture_preserves_decode_query_bounds(
     )
     model_state = MagicMock()
     kv_cache_config = KVCacheConfig(
-        num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]
+        num_pages=0, kv_cache_tensors=[], kv_cache_groups=[], block_size=16
     )
 
     def capture(self, create_forward_fn, progress_bar_desc):

@@ -254,7 +254,7 @@ void mla_decode_kvcache_cpu_impl(
     const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
     const int* __restrict__ seq_lens,      // [num_seqs]
     const int max_num_blocks_per_seq, const int o_stride, const int q_stride,
-    const int kv_stride, const int num_seqs) {
+    const int64_t kv_stride, const int num_seqs) {
   using qk_load_vec_type = typename KernelVecType<scalar_t>::qk_load_vec_type;
   using qk_vec_type = typename KernelVecType<scalar_t>::qk_vec_type;
   constexpr int QK_NUM_ELEM = qk_vec_type::VEC_ELEM_NUM;
@@ -374,7 +374,9 @@ void mla_decode_kvcache(torch::Tensor& out, torch::Tensor& query,
   const int max_num_blocks_per_seq = block_tables.size(1);
   const int o_stride = out.stride(0);
   const int q_stride = query.stride(0);
-  const int kv_stride = kv_cache.stride(0);
+  // One group row (a kernel block across all layers of the group) can exceed
+  // 2^31 elements times the block index, so the row stride must stay int64.
+  const int64_t kv_stride = kv_cache.stride(0);
 
   VLLM_DISPATCH_FLOATING_TYPES(
       query.scalar_type(), "mla_decode_kvcache_cpu_impl", [&] {

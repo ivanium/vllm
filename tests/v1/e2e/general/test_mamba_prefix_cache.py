@@ -58,9 +58,8 @@ async_scheduling_mode = False
 num_accepted_tokens = 1
 prompt_token_ids: list[int] = []
 MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
-# Must be a value no platform rewrites, since the step actions below encode
-# where block boundaries fall. XPU rounds GDN block sizes up to a multiple of 64
-# (XPUPlatform.update_block_size_for_backend), so use one.
+# Must be a block size the planner keeps as-is (a multiple of 64), since the
+# step actions below encode where block boundaries fall.
 BLOCK_SIZE = 576
 # The step actions also encode the split at the prompt's last block boundary,
 # which a GDN prefill backend with internal checkpoints (FlashInfer) skips; see

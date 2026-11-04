@@ -39,10 +39,16 @@ def test_mixed_warmup_disables_watermarking():
         max_num_reqs=2,
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
+                SimpleNamespace(
+                    kv_cache_spec=SimpleNamespace(block_size=16),
+                    blocks_per_page=1,
+                    kernel_rows_per_block=1,
+                    row_bytes=0,
+                    block_bytes=0,
+                )
             ],
-            num_blocks=128,
-            allocator="uniform_page",
+            num_pages=128,
+            large_page_bytes=1,
         ),
         vllm_config=SimpleNamespace(num_lookahead_tokens=0),
         max_model_len=128,

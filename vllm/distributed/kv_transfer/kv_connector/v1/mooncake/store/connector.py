@@ -135,7 +135,11 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def _validate_kv_cache_config(
         vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
     ) -> None:
-        from vllm.v1.kv_cache_interface import CrossAttentionSpec, MambaSpec
+        from vllm.v1.kv_cache_interface import (
+            CrossAttentionSpec,
+            KVCacheGroupRole,
+            MambaSpec,
+        )
 
         unsupported: list[str] = []
         store_group_ids = kv_cache_config.prefix_cacheable_group_ids
@@ -144,7 +148,15 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 "MooncakeStore requires at least one prefix-cacheable KV cache group"
             )
         for group_id in store_group_ids:
-            spec = kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+            group = kv_cache_config.kv_cache_groups[group_id]
+            spec = group.kv_cache_spec
+            if group.role in (
+                KVCacheGroupRole.HISPARSE_SOURCE,
+                KVCacheGroupRole.HISPARSE_INDEXER,
+            ):
+                # HiSparse groups are prefix-cacheable but have no single-type
+                # store semantics; the hit coordinator cannot serve them.
+                unsupported.append(f"group {group_id}: HiSparse ({group.role.value})")
             if isinstance(spec, CrossAttentionSpec):
                 unsupported.append(f"group {group_id}: CrossAttentionSpec")
             if isinstance(spec, MambaSpec) and spec.mamba_cache_mode != "align":
@@ -273,17 +285,6 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         # so a finishing request never has to defer freeing them.
         return False, None
 
-    def register_finished_partial_tail(
-        self,
-        request: Request,
-        block_ids: tuple[list[int], ...],
-        partial_tail_offloads: list[tuple[int, int, int]],
-    ) -> bool:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.register_finished_partial_tail(
-            request, block_ids, partial_tail_offloads
-        )
-
     def reset_cache(self) -> bool | None:
         """Reset the external Mooncake store on prefix-cache reset.
 
@@ -384,7 +385,7 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(metadata, MooncakeStoreConnectorMetadata)
         return self.connector_worker.get_transfer_results(finished_req_ids, metadata)
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
         assert self.connector_worker is not None
         return self.connector_worker.get_block_ids_with_load_errors()
 

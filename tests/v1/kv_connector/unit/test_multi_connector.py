@@ -154,26 +154,6 @@ KVConnectorFactory.register_connector(
 )
 
 
-def test_register_finished_partial_tail_notifies_every_connector():
-    connector = object.__new__(MultiConnector)
-    first = MagicMock(spec_set=KVConnectorBase_V1)
-    second = MagicMock(spec_set=KVConnectorBase_V1)
-    first.register_finished_partial_tail.return_value = True
-    second.register_finished_partial_tail.return_value = False
-    connector._connectors = [first, second]
-    request = MagicMock()
-    block_ids = ([1], [2])
-    offloads = [(1, 2, 12)]
-
-    assert connector.register_finished_partial_tail(request, block_ids, offloads)
-    first.register_finished_partial_tail.assert_called_once_with(
-        request, block_ids, offloads
-    )
-    second.register_finished_partial_tail.assert_called_once_with(
-        request, block_ids, offloads
-    )
-
-
 @pytest.fixture
 def mc() -> MultiConnector:
     """MultiConnector using two mocked connectors."""
@@ -191,7 +171,10 @@ def mc() -> MultiConnector:
     )
 
     kv_cache_config = KVCacheConfig(
-        num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]
+        num_pages=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[],
+        block_size=16,
     )
 
     mc = MultiConnector(
@@ -245,6 +228,15 @@ def test_multi_connector_rejects_multiple_mem_pool_contexts(mc: MultiConnector):
         match="Multiple connectors provide a KV cache memory pool",
     ):
         mc.get_mem_pool_context()
+
+
+def test_load_error_block_ids_keep_their_group_tags(mc: MultiConnector):
+    """Under large_page children report (group_id, block_id) pairs; the
+    union must forward them unchanged."""
+    mc._connectors[0].get_block_ids_with_load_errors.return_value = {(0, 3)}
+    mc._connectors[1].get_block_ids_with_load_errors.return_value = {(1, 3)}
+
+    assert mc.get_block_ids_with_load_errors() == {(0, 3), (1, 3)}
 
 
 def test_cache_hit_sources_delegate_to_selected_connector(mc: MultiConnector):
@@ -1179,9 +1171,10 @@ def _make_multi_connector(connector_names: list[str]) -> MultiConnector:
         kv_connector_extra_config={"connectors": connectors},
     )
     kv_cache_config = KVCacheConfig(
-        num_blocks=0,
+        num_pages=0,
         kv_cache_tensors=[],
         kv_cache_groups=[],
+        block_size=16,
     )
     return MultiConnector(
         vllm_config=vllm_config,

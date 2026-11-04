@@ -32,7 +32,8 @@ pytestmark = pytest.mark.cpu_test
 
 # Mirrors the deployment where the poisoning was observed (Qwen3.6-27B): mamba
 # block 1600, MTP with 3 draft tokens, prompts shorter than 2 mamba blocks.
-ATTN_BLOCK_SIZE = 16
+# Under large pages every group shares the global block size B, which is also
+# the hash granularity.
 MAMBA_BLOCK_SIZE = 1600
 NUM_SPEC = 3
 PROMPT_LEN = 2002
@@ -74,7 +75,7 @@ def test_mamba_prefill_checkpoint_valid(
             query_start=query_start,
             query_end=query_end,
             checkpoint_position=checkpoint_position,
-            hash_block_size=hash_size,
+            block_size=hash_size,
             mamba_block_size=block_size,
             checkpoint_alignment=alignment,
         )
@@ -86,13 +87,13 @@ def _make_hybrid_kv_cache_manager(
     num_prefill_checkpoint_blocks: int = 0,
 ) -> KVCacheManager:
     config = KVCacheConfig(
-        num_blocks=10000,
+        num_pages=10000,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["full_layer"],
                 FullAttentionSpec(
-                    block_size=ATTN_BLOCK_SIZE,
+                    block_size=MAMBA_BLOCK_SIZE,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
@@ -113,12 +114,12 @@ def _make_hybrid_kv_cache_manager(
                 ),
             ),
         ],
+        block_size=MAMBA_BLOCK_SIZE,
     )
     return KVCacheManager(
         config,
         max_model_len=262144,
         scheduler_block_size=MAMBA_BLOCK_SIZE,
-        hash_block_size=ATTN_BLOCK_SIZE,
         enable_caching=True,
         use_eagle=True,
     )
@@ -129,7 +130,6 @@ def _split(
     num_new_tokens: int,
     use_eagle: bool = True,
     use_eagle_block_drop: bool | None = None,
-    partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
     max_num_scheduled_tokens: int = 16384,
 ) -> int:
@@ -139,13 +139,10 @@ def _split(
     stub = SimpleNamespace(
         block_size=MAMBA_BLOCK_SIZE,
         cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
+        kv_cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
         use_eagle_block_drop=use_eagle_block_drop,
         max_num_scheduled_tokens=max_num_scheduled_tokens,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
-        # `prefix_match_unit` finer than the block size (#46384).
-        mamba_partial_cache_hit=partial_hit,
-        mamba_shared_prefix_checkpoint=False,
-        hash_block_size=ATTN_BLOCK_SIZE,
         mamba_has_prefill_checkpoint_blocks=(num_prefill_checkpoint_blocks > 0),
         mamba_prefill_checkpoint_alignment=(
             16 if num_prefill_checkpoint_blocks > 0 else None
@@ -168,7 +165,7 @@ def _split(
 def test_internal_checkpoint_split(
     prompt_len: int, num_new_tokens: int, use_eagle: bool, expected: int
 ) -> None:
-    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=MAMBA_BLOCK_SIZE)
     assert (
         _split(
             request,
@@ -183,7 +180,7 @@ def test_internal_checkpoint_split(
 def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
     prompt_len = 3602
     resume_at = 1984
-    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=MAMBA_BLOCK_SIZE)
     request.num_computed_tokens = resume_at
 
     # Without an internal checkpoint export, the forward must stop at the
@@ -193,20 +190,19 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
             request,
             prompt_len - resume_at,
             use_eagle=False,
-            partial_hit=True,
         )
         == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE
     )
 
-    # A hash-aligned resume inside a physical Mamba block cannot use the fixed
-    # internal-checkpoint column: it aliases the initial-state column. Enabling
-    # checkpoints must therefore preserve the normal aligned split.
+    # A resume inside a physical Mamba block (e.g. from unaligned external
+    # tokens of a KV connector) cannot use the fixed internal-checkpoint
+    # column: it aliases the initial-state column. Enabling checkpoints must
+    # therefore preserve the normal aligned split.
     assert (
         _split(
             request,
             prompt_len - resume_at,
             use_eagle=False,
-            partial_hit=True,
             num_prefill_checkpoint_blocks=1,
         )
         == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE
@@ -214,7 +210,7 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
 
 
 def test_disabling_eagle_block_drop_keeps_the_trailing_cache_boundary() -> None:
-    (request,) = create_requests(1, num_tokens=3602, block_size=ATTN_BLOCK_SIZE)
+    (request,) = create_requests(1, num_tokens=3602, block_size=MAMBA_BLOCK_SIZE)
 
     with_drop = _split(request, request.num_tokens, use_eagle_block_drop=True)
     without_drop = _split(request, request.num_tokens, use_eagle_block_drop=False)
@@ -263,7 +259,7 @@ def _count_cached_boundary_states(
     """Assert every hash-cached mamba slot holds the state its hash claims.
 
     Covers both full-block snapshots (`(p + 1) * block_size`) and the
-    partial-tail entries align mode registers at an exact token count.
+    checkpoint entries align mode registers at an exact token count.
 
     Returns the number of cached slots checked.
     """
@@ -283,7 +279,7 @@ def _count_cached_boundary_states(
 
 def _prefill(prompt_len: int, budgets: list[int]) -> int:
     manager = _make_hybrid_kv_cache_manager()
-    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=MAMBA_BLOCK_SIZE)
     state_at = _run_chunked_prefill(manager, request, budgets)
     assert request.num_computed_tokens == prompt_len, "prefill did not complete"
     return _count_cached_boundary_states(manager, request, state_at)
@@ -338,32 +334,22 @@ def test_poisoning_is_block_size_independent(
     assert _prefill(prompt_len, budgets=budgets) > 0
 
 
-@pytest.mark.parametrize("partial_hit", [False, True])
 @pytest.mark.parametrize("resume_at", [331, 1599, 1601, 2531, 3011])
 @pytest.mark.parametrize(
     ("num_prefill_checkpoint_blocks", "use_eagle"),
     [(0, True), (1, False)],
 )
 def test_unaligned_resume_never_runs_past_its_block(
-    partial_hit: bool,
     resume_at: int,
     num_prefill_checkpoint_blocks: int,
     use_eagle: bool,
 ) -> None:
     """A prefill resuming mid-block must re-align before crossing a boundary.
 
-    Reachable with a finer `prefix_match_unit` (its partial-tail stop ends a
-    chunk off-grid by design) and with unaligned external tokens from a KV
-    connector.
+    Reachable with unaligned external tokens from a KV connector.
     """
     prompt_len = 3602
-    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
-    # Under eagle the partial-tail stop sits one hash unit below the prompt's
-    # last hash boundary: eagle matches a unit past its candidate and drops it,
-    # so nothing proves that last boundary.
-    tail_stop = prompt_len // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
-    if use_eagle:
-        tail_stop -= ATTN_BLOCK_SIZE
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=MAMBA_BLOCK_SIZE)
 
     pos, ends = resume_at, []
     while pos < prompt_len:
@@ -372,7 +358,6 @@ def test_unaligned_resume_never_runs_past_its_block(
             request,
             prompt_len - pos,
             use_eagle=use_eagle,
-            partial_hit=partial_hit,
             num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
         )
         assert num_new > 0, f"no progress at {pos}"
@@ -387,8 +372,6 @@ def test_unaligned_resume_never_runs_past_its_block(
         ends.append(pos)
 
     for end in ends[:-1]:
-        aligned = end % MAMBA_BLOCK_SIZE == 0
-        assert aligned or (partial_hit and end == tail_stop), (
-            f"intermediate chunk end {end} is neither block-aligned nor the "
-            f"partial-tail stop ({tail_stop})"
+        assert end % MAMBA_BLOCK_SIZE == 0, (
+            f"intermediate chunk end {end} is not block-aligned"
         )

@@ -17,12 +17,55 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 
+from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.metadata import (
+    LoadStoreOp,
+)
+from vllm.v1.kv_cache_interface import KVCacheConfig
+
 logger = init_logger(__name__)
 
+# Version of the builtin multiprocess wire protocol. Carried in the
+# REGISTER_KV_CACHE payload so a mismatched server rejects the registration
+# instead of misreading the per-group geometry dict. Released lmcache
+# versions (<= 0.5.5) predate this protocol; consuming it requires the
+# lmcache server co-released with this vLLM.
+BUILTIN_MP_PROTOCOL_VERSION = 1
 
-def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
-    logger.info("KV caches keys are %s", list(kv_caches.keys()))
-    return [CudaIPCWrapper(tensor) for tensor in kv_caches.values()]
+
+def wrap_kv_caches(
+    kv_caches: dict[str, torch.Tensor],
+    kv_cache_config: KVCacheConfig,
+) -> tuple[KVCache, dict[str, Any]]:
+    """Wrap the transferable layer views and describe the group geometry.
+
+    The views are strided rows into one shared backing allocation per group,
+    so the per-group geometry travels with the registration for the server
+    to expand manager block ids into kernel rows.
+
+    Returns:
+        The IPC-wrapped layer views ordered by transfer group, and the
+        geometry payload of the REGISTER_KV_CACHE request.
+
+    """
+    groups = kv_cache_config.transfer_groups
+    layer_names = [
+        name for group in groups for name in group.layer_names if name in kv_caches
+    ]
+    logger.info("KV caches keys are %s", layer_names)
+    geometry: dict[str, Any] = {
+        "groups": [
+            {
+                "layer_names": [
+                    name for name in group.layer_names if name in kv_caches
+                ],
+                "block_size": group.kv_cache_spec.block_size,
+                "kernel_rows_per_block": group.kernel_rows_per_block,
+                "row_bytes": group.row_bytes,
+            }
+            for group in groups
+        ],
+    }
+    return [CudaIPCWrapper(kv_caches[name]) for name in layer_names], geometry
 
 
 def striding_block_hashes(
@@ -111,27 +154,6 @@ class ParallelStrategy:
     """The pipeline parallel size."""
 
 
-@dataclass
-class LoadStoreOp:
-    block_ids: list[int]
-    """Block ids for the load/store operation"""
-
-    token_ids: list[int] | None = None
-    """Token IDs for the load/store operation (token mode)"""
-
-    block_hashes: list[bytes] | None = None
-    """Block hashes for the load/store operation (hash mode)"""
-
-    start: int = 0
-    """Start token index (token mode only)"""
-
-    end: int = 0
-    """End token index (token mode only)"""
-
-    def __len__(self) -> int:
-        return len(self.block_ids)
-
-
 StoreResult = bool
 RetrieveResult = list[bool]
 LookupResult = int
@@ -193,6 +215,7 @@ class LMCacheMPSchedulerAdapter:
         request_id: str,
         block_hashes: list[bytes] | None = None,
         token_ids: list[int] | None = None,
+        cache_salt: str = "",
     ) -> None:
         """Submit a new lookup request to LMCache if there is no ongoing request.
 
@@ -207,6 +230,9 @@ class LMCacheMPSchedulerAdapter:
                 from the same request
             block_hashes: Block hashes to lookup from LMCache (hash mode)
             token_ids: Token IDs to lookup from LMCache (token mode)
+            cache_salt: Per-request isolation salt. Accepted for parity with
+                the external adapter interface; the builtin protocol does not
+                salt keys.
 
         Returns:
             None
@@ -411,21 +437,34 @@ class LMCacheMPWorkerAdapter:
             == 0
         )
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        kv_cache_config: KVCacheConfig,
+    ):
         """Register the kv caches with LMCache server.
 
         Args:
             kv_caches: A dict of kv caches to register. The keys are the
                 layer names and the values are the corresponding tensors.
+            kv_cache_config: The large-page KV cache config; the per-group
+                geometry is sent with the registration so the server can
+                expand manager block ids into kernel rows.
 
         """
         # Register kv cache and send the request
         self.kv_caches = kv_caches
         logger.info("Registering kv caches")
+        wrapped_caches, geometry = wrap_kv_caches(kv_caches, kv_cache_config)
         future = send_lmcache_request(
             self.mq_client,
             RequestType.REGISTER_KV_CACHE,
-            [self.instance_id, wrap_kv_caches(kv_caches)],
+            [
+                self.instance_id,
+                wrapped_caches,
+                geometry,
+                BUILTIN_MP_PROTOCOL_VERSION,
+            ],
         )
         future.result()
 
@@ -503,6 +542,7 @@ class LMCacheMPWorkerAdapter:
         request_ids: list[str],
         ops: list[LoadStoreOp],
         event: torch.cuda.Event,
+        cache_salts: list[str] | None = None,
     ):
         """Submit a batched store request to LMCache.
 
@@ -512,28 +552,12 @@ class LMCacheMPWorkerAdapter:
                 the same length as request_ids
             event: The CUDA event that is recorded after the current
                 model inference step
+            cache_salts: Per-request isolation salts. Accepted for parity with
+                the external adapter interface; the builtin protocol does not
+                salt keys.
 
         """
-        all_keys: list[IPCCacheEngineKey] = []
-        block_ids: list[int] = []
-        for request_id, op in zip(request_ids, ops, strict=False):
-            if op.block_hashes is not None:
-                chunk_hashes = list(
-                    striding_block_hashes(op.block_hashes, self.blocks_in_chunk)
-                )
-                keys = [
-                    self._create_hash_key(ch, request_id=request_id)
-                    for ch in chunk_hashes
-                ]
-                all_keys.extend(keys)
-            else:
-                assert op.token_ids is not None
-                all_keys.append(
-                    self._create_key(
-                        op.token_ids, op.start, op.end, request_id=request_id
-                    )
-                )
-            block_ids.extend(op.block_ids)
+        all_keys, block_ids = self._merge_batched_ops(request_ids, ops)
         future = send_lmcache_request(
             self.mq_client,
             RequestType.STORE,
@@ -552,6 +576,7 @@ class LMCacheMPWorkerAdapter:
         request_ids: list[str],
         ops: list[LoadStoreOp],
         event: torch.cuda.Event,
+        cache_salts: list[str] | None = None,
     ):
         """Submit a batched retrieve request to LMCache.
 
@@ -561,28 +586,12 @@ class LMCacheMPWorkerAdapter:
                 the same length as request_ids
             event: The CUDA event that is recorded after the current
                 model inference step
+            cache_salts: Per-request isolation salts. Accepted for parity with
+                the external adapter interface; the builtin protocol does not
+                salt keys.
 
         """
-        all_keys: list[IPCCacheEngineKey] = []
-        block_ids: list[int] = []
-        for request_id, op in zip(request_ids, ops, strict=False):
-            if op.block_hashes is not None:
-                chunk_hashes = list(
-                    striding_block_hashes(op.block_hashes, self.blocks_in_chunk)
-                )
-                keys = [
-                    self._create_hash_key(ch, request_id=request_id)
-                    for ch in chunk_hashes
-                ]
-                all_keys.extend(keys)
-            else:
-                assert op.token_ids is not None
-                all_keys.append(
-                    self._create_key(
-                        op.token_ids, op.start, op.end, request_id=request_id
-                    )
-                )
-            block_ids.extend(op.block_ids)
+        all_keys, block_ids = self._merge_batched_ops(request_ids, ops)
         future = send_lmcache_request(
             self.mq_client,
             RequestType.RETRIEVE,
@@ -594,6 +603,40 @@ class LMCacheMPWorkerAdapter:
             ],
         ).to_cuda_future()
         self.retrieve_futures[request_ids[0]] = (future, list(request_ids[1:]))
+
+    def _merge_batched_ops(
+        self,
+        request_ids: list[str],
+        ops: list[LoadStoreOp],
+    ) -> tuple[list[IPCCacheEngineKey], list[list[int]]]:
+        """Merge batched ops into keys and per-group manager block ids.
+
+        The block ids stay grouped: the server expands each group's manager
+        block ids into kernel rows with the registered group geometry.
+        """
+        all_keys: list[IPCCacheEngineKey] = []
+        block_ids: list[list[int]] = []
+        for request_id, op in zip(request_ids, ops, strict=False):
+            if op.block_hashes is not None:
+                chunk_hashes = list(
+                    striding_block_hashes(op.block_hashes, self.blocks_in_chunk)
+                )
+                all_keys.extend(
+                    self._create_hash_key(ch, request_id=request_id)
+                    for ch in chunk_hashes
+                )
+            else:
+                assert op.token_ids is not None
+                all_keys.append(
+                    self._create_key(
+                        op.token_ids, op.start, op.end, request_id=request_id
+                    )
+                )
+            if not block_ids:
+                block_ids = [[] for _ in op.block_ids]
+            for group_ids, op_ids in zip(block_ids, op.block_ids, strict=True):
+                group_ids.extend(op_ids)
+        return all_keys, block_ids
 
     @_lmcache_nvtx_annotate
     def get_finished(
@@ -681,6 +724,14 @@ class LMCacheMPWorkerAdapter:
 
         """
         return self.blocks_in_chunk
+
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
+        """Get the set of (group_id, block_id) pairs that failed to load.
+
+        The builtin multiprocess protocol has no load-error reporting
+        channel, so this is always empty.
+        """
+        return set()
 
     def shutdown(self):
         """Shutdown the LMCache MP worker adapter."""

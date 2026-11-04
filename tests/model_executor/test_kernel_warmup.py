@@ -14,15 +14,15 @@ pytestmark = pytest.mark.cpu_test
 
 def test_kernel_warmup_warms_each_v1_kv_block_zeroer():
     """The V1 runner keeps one zeroer per KV cache group in
-    ``_kv_block_zeroers``; warmup must reach every one of them."""
+    ``kv_block_zeroers``; warmup must reach every one of them."""
     warmed: list[int] = []
     zeroer = SimpleNamespace(warmup=lambda num_blocks: warmed.append(num_blocks))
     worker = SimpleNamespace(
         use_v2_model_runner=False,
         get_model=torch.nn.Module,
         model_runner=SimpleNamespace(
-            _kv_block_zeroers=[zeroer, None, zeroer],
-            kv_cache_config=SimpleNamespace(num_blocks=8),
+            kv_block_zeroers={0: zeroer, 2: zeroer},
+            kv_cache_config=SimpleNamespace(num_pages=8),
             device=torch.device("cpu"),
             get_model=torch.nn.Module,
             is_pooling_model=False,

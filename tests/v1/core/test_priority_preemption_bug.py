@@ -67,9 +67,10 @@ def build_scheduler():
         block_size=BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32
     )
     kv_cache_config = KVCacheConfig(
-        num_blocks=NUM_BLOCKS,
+        num_pages=NUM_BLOCKS,
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+        block_size=BLOCK_SIZE,
     )
     cache_config.num_gpu_blocks = NUM_BLOCKS
     register_all_kvcache_specs(vllm_config)

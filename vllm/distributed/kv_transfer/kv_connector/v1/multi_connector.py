@@ -392,8 +392,8 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                         self._extra_async_saves[req_id] = extra_pending - 1
         return results
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
-        agg_block_ids: set[int] = set()
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
+        agg_block_ids: set[tuple[int, int]] = set()
         for c in self._connectors:
             agg_block_ids |= c.get_block_ids_with_load_errors()
         return agg_block_ids
@@ -596,18 +596,6 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             request,
             lambda c: c.request_finished(request, blocks),
         )
-
-    def register_finished_partial_tail(
-        self,
-        request: "Request",
-        block_ids: tuple[list[int], ...],
-        partial_tail_offloads: list[tuple[int, int, int]],
-    ) -> bool:
-        accepted = [
-            c.register_finished_partial_tail(request, block_ids, partial_tail_offloads)
-            for c in self._connectors
-        ]
-        return any(accepted)
 
     def request_finished_all_groups(
         self,
