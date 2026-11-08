@@ -16,15 +16,8 @@ from vllm.distributed.kv_events import BlockStored, KVEventBatch
 from vllm.platforms import current_platform
 
 # The offloaded block size must stay a whole number of GPU blocks.
-CPU_BLOCK_SIZES: int
-if current_platform.is_xpu():
-    CPU_BLOCK_SIZES = 64
-elif current_platform.is_rocm():
-    # ROCM_AITER_UNIFIED_ATTN prefers 64-token GPU blocks, so 192 covers both that
-    # and the 16-token default.
-    CPU_BLOCK_SIZES = 192
-else:
-    CPU_BLOCK_SIZES = 48
+# Off XPU, three blocks at the 64-token default block size.
+CPU_BLOCK_SIZES = 64 if current_platform.is_xpu() else 192
 
 _ATTN_BACKENDS: list[str] = []
 if current_platform.is_cuda():

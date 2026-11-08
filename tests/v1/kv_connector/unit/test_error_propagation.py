@@ -71,7 +71,7 @@ def test_error_propagation_sync_load(fail_scheduler: Scheduler):
     assert fail_scheduler.connector.get_num_new_matched_tokens.call_count == 1
 
     req_block_ids = scheduler_output.scheduled_new_reqs[0].block_ids[0]
-    invalid_block_ids = {req_block_ids[invalid_block_idx]}
+    invalid_block_ids = {(0, req_block_ids[invalid_block_idx])}
     model_runner_output = create_model_runner_output(
         [request],
         invalid_block_ids=invalid_block_ids,
@@ -126,7 +126,7 @@ def test_error_propagation_async_load(fail_scheduler: Scheduler):
     assert request.num_computed_tokens == num_external_computed_tokens
 
     (req_block_ids,) = fail_scheduler.kv_cache_manager.get_block_ids(request.request_id)
-    invalid_block_ids = {req_block_ids[invalid_block_idx]}
+    invalid_block_ids = {(0, req_block_ids[invalid_block_idx])}
     model_runner_output = create_model_runner_output(
         reqs=[],
         finished_recving=set(),

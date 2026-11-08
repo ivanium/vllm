@@ -772,7 +772,8 @@ def test_turboquant_boundary_selection_is_not_cached_from_ordinary_run(
     assert ordinary_backend is AttentionBackendEnum.ROCM_ATTN.get_class()
     assert quantized_backend is AttentionBackendEnum.TURBOQUANT.get_class()
     assert get_supported_kv_cache_layouts([boundary_backend, quantized_backend]) == [
-        KVCacheLayout.LBNHC
+        KVCacheLayout.LBNHC,
+        KVCacheLayout.BLNHC,
     ]
 
 

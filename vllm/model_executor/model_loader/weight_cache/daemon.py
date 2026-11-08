@@ -258,7 +258,6 @@ class WeightCacheDaemon:
         ):
             return
         try:
-            current_platform.update_block_size_for_backend(vllm_config)
             runner = build_warmup_runner(
                 vllm_config,
                 self.local_rank,

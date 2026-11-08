@@ -235,11 +235,11 @@ class RocmAttentionBackend(AttentionBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        # The native HIP kernels hardcode group-contiguous block addressing, so
-        # they need the K and V groups to span all blocks (H outermost within the layer)
-        # The Triton fallbacks are stride-aware, so block-interior LBHNC is also
-        # supported, just without the native kernels.
-        return (KVCacheLayout.LHBNC, KVCacheLayout.LBHNC)
+        # The native HIP kernels and the Triton fallbacks take the block stride
+        # from the caches and see each K/V head slot as its own view, so the
+        # slots may also sit apart in a head-major (BHLNC) row. LHBNC is stored
+        # as LBHNC under large pages.
+        return (KVCacheLayout.LHBNC, KVCacheLayout.LBHNC, KVCacheLayout.BHLNC)
 
     @staticmethod
     def get_builder_cls() -> type["RocmAttentionMetadataBuilder"]:
@@ -490,7 +490,8 @@ class RocmAttentionImpl(AttentionImpl):
         )
 
         if block_size in (16, 32) and has_native_layout:
-            # Normal 16, 32 with contiguous blocks: use vLLM native HIP C++ logic.
+            # Normal 16, 32 with dense head interiors: use vLLM native HIP C++
+            # logic, which takes the block stride from the caches.
             PagedAttention.write_to_paged_cache(
                 key,
                 value,
@@ -503,10 +504,8 @@ class RocmAttentionImpl(AttentionImpl):
                 interleaved_v,
             )
         else:
-            # Non-standard blocks and hybrid attention/Mamba layouts need the
-            # stride-aware Triton writer. The native reshape_and_cache kernel
-            # assumes contiguous block storage and writes to the wrong hybrid
-            # cache blocks.
+            # Non-standard blocks and padded or misaligned head interiors need
+            # the stride-aware Triton writer.
             triton_reshape_and_cache_flash(
                 key,
                 value,

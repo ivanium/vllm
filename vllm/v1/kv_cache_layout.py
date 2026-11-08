@@ -37,6 +37,16 @@ class KVCacheLayout(Enum):
         return tuple(i - 1 for i in self.value if i != _DIM_L)
 
     @property
+    def row_layout(self) -> "KVCacheLayout":
+        """How the large-page pool stores this layout.
+
+        A pool row holds one block of every layer of a group, so B is outermost
+        and only the order of L, H, N and C inside the block is kept. Layouts
+        with the same row layout share one physical memory layout.
+        """
+        return KVCacheLayout((_DIM_B, *(dim for dim in self.value if dim != _DIM_B)))
+
+    @property
     def is_layer_compact(self) -> bool:
         """True when the layer is compact; i.e. the L dimension is outermost."""
         return self.value[_DIM_L] == 0

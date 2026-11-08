@@ -79,8 +79,11 @@ def _reference_shard(
     return scores, written
 
 
+# 1: dense pages; 3: each page is the last layer's slice of a large-page row
+# that holds three layers, so pages sit a row apart.
+@pytest.mark.parametrize("layers_per_row", [1, 3])
 @torch.inference_mode()
-def test_indexer_context_scores_matches_reference():
+def test_indexer_context_scores_matches_reference(layers_per_row):
     rank = 1
     torch.manual_seed(0)
     world_size = 2
@@ -90,7 +93,10 @@ def test_indexer_context_scores_matches_reference():
     blocks = (max_seq_len + BLOCK - 1) // BLOCK
     pages = batch * blocks
     table = torch.arange(pages, device=DEVICE, dtype=torch.int32).reshape(batch, blocks)
-    cache = torch.randn(pages, BLOCK, HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    rows = torch.randn(
+        pages, layers_per_row * BLOCK, HEAD_DIM, device=DEVICE, dtype=torch.bfloat16
+    )
+    cache = rows[:, -BLOCK:]
     idx_q = torch.randn(
         batch * query_len, heads, HEAD_DIM, device=DEVICE, dtype=torch.bfloat16
     )

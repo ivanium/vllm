@@ -92,7 +92,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVQuantMode,
     is_quantized_kv_cache,
-    iter_layer_specs,
 )
 from vllm.v1.utils import CpuGpuBuffer
 
@@ -1152,35 +1151,34 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if vllm_config.parallel_config.decode_context_parallel_size > 1:
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
-        kv_specs = iter_layer_specs(kv_cache_spec)
         num_qo_heads = vllm_config.model_config.get_num_attention_heads(
             vllm_config.parallel_config
         )
         is_xqa_arch = current_platform.is_device_capability(
             90
         ) or current_platform.is_device_capability_family(120)
-        has_uniform_batch_support: bool = len(kv_specs) > 0
-        for spec in kv_specs:
-            if not isinstance(spec, AttentionSpec):
-                # FlashInfer only applies to attention, so we don't consider other types
-                # of KV spec (e.g. Mamba) here. This is mostly for type checking.
-                continue
-            if not can_use_trtllm_attention(
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=spec.num_kv_heads,
-                is_prefill=False,
-            ) or (
-                is_xqa_arch
-                and (
-                    (
-                        spec.kv_quant_mode.is_nvfp4
-                        and not current_platform.is_device_capability_family(120)
-                    )
-                    or not _is_xqa_head_dim_supported(spec.head_size)
+        # FlashInfer only applies to attention, so other KV specs (e.g. Mamba)
+        # do not restrict it.
+        has_uniform_batch_support = not (
+            isinstance(kv_cache_spec, AttentionSpec)
+            and (
+                not can_use_trtllm_attention(
+                    num_qo_heads=num_qo_heads,
+                    num_kv_heads=kv_cache_spec.num_kv_heads,
+                    is_prefill=False,
                 )
-            ):
-                has_uniform_batch_support = False
-                break
+                or (
+                    is_xqa_arch
+                    and (
+                        (
+                            kv_cache_spec.kv_quant_mode.is_nvfp4
+                            and not current_platform.is_device_capability_family(120)
+                        )
+                        or not _is_xqa_head_dim_supported(kv_cache_spec.head_size)
+                    )
+                )
+            )
+        )
 
         use_non_causal = vllm_config.attention_config.use_non_causal
         if has_uniform_batch_support and (not use_non_causal or is_xqa_arch):

@@ -43,7 +43,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
-from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import (
     empty_exponential_noise_like,
@@ -1739,12 +1739,6 @@ class SpecDecodeBaseProposer:
                 attn_backend = all_attn_layers[layer_name].get_attn_backend()
                 backend_key = attn_backend.full_cls_name()
                 if backend_key not in attention_groups:
-                    layer_kv_cache_spec = kv_cache_spec
-                    if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                        layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
-                            layer_name
-                        ]
-
                     kernel_block_size = (
                         kernel_block_sizes[self.kv_cache_gid]
                         if kernel_block_sizes is not None
@@ -1754,7 +1748,7 @@ class SpecDecodeBaseProposer:
                     attn_group = AttentionGroup(
                         backend=attn_backend,
                         layer_names=[layer_name],
-                        kv_cache_spec=layer_kv_cache_spec,
+                        kv_cache_spec=kv_cache_spec,
                         kv_cache_group_id=self.kv_cache_gid,
                     )
                     attn_group.create_metadata_builders(

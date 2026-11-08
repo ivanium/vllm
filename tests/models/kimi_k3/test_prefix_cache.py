@@ -93,17 +93,14 @@ NIXL_OFFLOAD = {
 
 @dataclass(frozen=True)
 class Mode:
-    # A finer prefix_match_unit enables partial hits inside a Mamba block.
-    prefix_match_unit: int | None
     spec: bool
 
     @property
     def name(self) -> str:
-        name = "block" if self.prefix_match_unit is None else "partial"
-        return f"{name}-dspark" if self.spec else name
+        return "block-dspark" if self.spec else "block"
 
 
-MODES = [Mode(unit, spec) for spec in (False, True) for unit in (None, 128)]
+MODES = [Mode(spec) for spec in (False, True)]
 
 
 @dataclass(frozen=True)
@@ -131,8 +128,6 @@ class Instance:
         if not self.prefix_caching:
             return args + ["--no-enable-prefix-caching"]
         args.append("--enable-prefix-caching")
-        if mode.prefix_match_unit is not None:
-            args += ["--prefix-match-unit", str(mode.prefix_match_unit)]
         return args
 
 
@@ -332,7 +327,7 @@ def _run_conversation(
     # Under P/D the prefiller computes the prompt, so hits are read from it.
     compute_url, decode_url = servers[0].url_root, servers[-1].url_root
     block_size = _block_size(compute_url)
-    hit_unit = mode.prefix_match_unit or block_size
+    hit_unit = block_size
     rng = random.Random(0)
 
     def new_tokens(n: int) -> list[int]:
@@ -379,7 +374,7 @@ def _check_resend_reuses_prompt_checkpoint(
     deployment: Deployment, prompt_len: int
 ) -> None:
     """Resends reuse the Mamba checkpoint and its companion EAGLE attention proof."""
-    mode = Mode(128, True)
+    mode = Mode(True)
     salt = str(uuid4())
     rng = random.Random(0)
     prompt = [rng.randint(1000, 150000) for _ in range(prompt_len)]

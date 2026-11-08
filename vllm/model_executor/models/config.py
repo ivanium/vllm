@@ -586,9 +586,8 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Perform early validation and setup for hybrid attention/mamba models.
 
-        Block size alignment with mamba page sizes is handled later by
-        Platform.update_block_size_for_backend(), which runs after model
-        layers are constructed and the attention backend is known.
+        The block size is chosen later by the KV cache planner, after model
+        layers are constructed and the attention backends are known.
 
         Args:
             vllm_config: vLLM Config

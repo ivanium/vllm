@@ -56,9 +56,25 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionLayer, AttentionType, MultipleOf
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    flat_kv_row_view,
+    slots_to_flat_rows,
+)
 
 _MIN_WORK_PER_SPLIT = 512
 _SPLIT_OCCUPANCY_MULTIPLIER = 2
+
+
+def _flat_cache_view(kv_cache: torch.Tensor) -> torch.Tensor:
+    """Flat [rows, 1, head_dim] view of a paged cache for the AMX kernels.
+
+    Token offset is ``block_idx * block_stride_rows + offset_in_block``; the
+    gap rows between this layer's blocks belong to other layers of the KV
+    cache group and are never indexed (``req_to_token`` only holds rows of
+    this layer).
+    """
+    rows, _ = flat_kv_row_view(kv_cache, kv_cache.shape[1])
+    return rows.unsqueeze(1)
 
 
 def _block_quant_to_tensor_quant(
@@ -109,15 +125,21 @@ def _compute_num_kv_splits(max_seq_len: int, num_threads: int) -> int:
     return min(ideal_splits, max_splits)
 
 
-def _expand_block_table(block_table: torch.Tensor, block_size: int) -> torch.Tensor:
+def _expand_block_table(
+    block_table: torch.Tensor, block_size: int, block_stride_rows: int
+) -> torch.Tensor:
     """Adapter: vLLM's block-table paging -> the flat per-(request, position)
     physical row index the decode/extend kernels expect. Called once per step
     from ``AMXMLAMetadataBuilder.build``, not per layer.
+
+    ``block_stride_rows`` is the physical row stride between consecutive
+    blocks of this cache (``kv_cache.stride(0) // head_dim``); it exceeds
+    ``block_size`` when other layers of the KV cache group sit in the gaps.
+    Row ids are int64 so the kernels' row * head_dim addressing never
+    overflows 32 bits.
     """
-    offsets = torch.arange(
-        block_size, device=block_table.device, dtype=block_table.dtype
-    )
-    flat = block_table.unsqueeze(-1) * block_size + offsets
+    offsets = torch.arange(block_size, device=block_table.device, dtype=torch.int64)
+    flat = block_table.to(torch.int64).unsqueeze(-1) * block_stride_rows + offsets
     return flat.reshape(block_table.size(0), -1).contiguous()
 
 
@@ -153,17 +175,33 @@ class AMXMLABackend(MLACommonBackend):
 
 
 class AMXMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.layer_names = layer_names
+        self._block_stride_rows: int | None = None
+
+    def _get_block_stride_rows(self) -> int:
+        # The bound cache never restrides, so read the group-row stride once
+        # from any layer of this group (kv caches are bound before build()).
+        if self._block_stride_rows is None:
+            ctx = self.compilation_config.static_forward_context
+            kv_cache = ctx[self.layer_names[0]].kv_cache
+            assert isinstance(kv_cache, torch.Tensor)
+            _, self._block_stride_rows = flat_kv_row_view(kv_cache, kv_cache.shape[1])
+        return self._block_stride_rows
+
     def build(self, common_prefix_len, common_attn_metadata, fast_build: bool = False):
         attn_metadata = super().build(
             common_prefix_len, common_attn_metadata, fast_build
         )
         block_size = self.kv_cache_spec.block_size
+        block_stride_rows = self._get_block_stride_rows()
         if attn_metadata.decode is not None:
             # Built once per step and reused by every layer, instead of
             # recomputing the same tensor arithmetic in every forward_mqa call.
             decode = attn_metadata.decode
             decode.req_to_token = _expand_block_table(  # type: ignore[attr-defined]
-                decode.block_table, block_size
+                decode.block_table, block_size, block_stride_rows
             )
             decode.seq_lens_i64 = decode.seq_lens.to(torch.int64)  # type: ignore[attr-defined]
             decode.req_pool_indices = torch.arange(  # type: ignore[attr-defined]
@@ -185,8 +223,8 @@ class AMXMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
                 num_decodes : num_decodes + num_prefills
             ].to(torch.int64)
             prefill.req_to_token = _expand_block_table(  # type: ignore[attr-defined]
-                prefill.block_table, block_size
-            ).to(torch.int64)
+                prefill.block_table, block_size, block_stride_rows
+            )
             prefill.req_pool_indices = torch.arange(  # type: ignore[attr-defined]
                 prefill.block_table.size(0),
                 dtype=torch.int64,
@@ -319,8 +357,15 @@ class AMXMLAImpl(MLACommonImpl[MLACommonMetadata]):
             "AMXMLAImpl only supports an unquantized (bf16) KV cache; fp8 "
             "KV cache for CPU MLA is not yet implemented."
         )
+        # The cache op addresses dense rows (slot * row stride), so remap the
+        # kernel-block-granular slot ids to physical flat rows and hand it a
+        # dense [1, num_rows, head_dim] alias of the strided layer view.
+        block_size = kv_cache.shape[1]
+        flat, block_stride_rows = flat_kv_row_view(kv_cache, block_size)
+        slots = slot_mapping.flatten().to(torch.int64)
+        rows = slots_to_flat_rows(slots, block_size, block_stride_rows)
         ops.amx_mla_concat_and_cache(
-            kv_c_normed, k_pe.squeeze(1), kv_cache, slot_mapping.flatten()
+            kv_c_normed, k_pe.squeeze(1), flat.unsqueeze(0), rows
         )
 
     def forward_mqa(
@@ -340,7 +385,7 @@ class AMXMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert attn_metadata.decode is not None
 
         num_tokens = q.shape[0]
-        kv_cache_flat = kv_c_and_k_pe_cache.view(-1, 1, self.head_size)
+        kv_cache_flat = _flat_cache_view(kv_c_and_k_pe_cache)
         v_buffer = kv_cache_flat[..., : self.kv_lora_rank]
 
         seq_lens = attn_metadata.decode.seq_lens_i64  # type: ignore[attr-defined]
@@ -422,7 +467,7 @@ class AMXMLAImpl(MLACommonImpl[MLACommonMetadata]):
         )
         mqa_q = torch.cat([ql_nope, q_pe], dim=-1)
 
-        kv_cache_flat = kv_c_and_k_pe_cache.view(-1, 1, self.head_size)
+        kv_cache_flat = _flat_cache_view(kv_c_and_k_pe_cache)
         v_buffer = kv_cache_flat[..., : self.kv_lora_rank]
 
         req_to_token = prefill.req_to_token  # type: ignore[attr-defined]

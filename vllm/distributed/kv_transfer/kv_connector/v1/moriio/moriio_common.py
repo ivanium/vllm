@@ -1,18 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import contextlib
 import math
 import os
 import threading
 import time
-from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
 import regex as re
 import torch
-import zmq
 
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
@@ -27,8 +24,8 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import (
     get_ip,
     get_open_port,
-    make_zmq_socket,
 )
+from vllm.v1.kv_cache_interface import GroupGeometry
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_tp_mapping import (
@@ -39,6 +36,20 @@ from dataclasses import field
 from enum import Enum
 
 logger = init_logger(__name__)
+
+# MoRIIO Connector Version
+#
+# Increment this version whenever there is an incompatible change to:
+#   - MoRIIOAgentMetadata schema
+#   - kv_transfer_params schema or semantics
+#   - the MoRIIO transfer protocol or wire format
+#   - KV cache memory layout or block organization
+#
+# Version History:
+#   1: Large-page pool: MoRIIOAgentMetadata carries per-transfer-group pool
+#      geometry (group_num_blocks, group_geometries) instead of the uniform
+#      num_blocks / block_len pair.
+MORIIO_CONNECTOR_VERSION: int = 1
 
 
 Transfer = tuple[int, float]
@@ -133,12 +144,18 @@ class MoRIIOAgentMetadata(
     # required for @cached_property.d
     dict=True,
 ):
+    # Schema version; the handshake rejects peers running a different one.
+    version: int
     engine_id: str
     agent_metadata: bytes
     kv_caches_base_addr: list[int]
-    num_blocks: int
-    block_len: int
     attn_backend_name: str
+    # Per-transfer-group pool geometry (positional over
+    # KVCacheConfig.transfer_groups). A peer expands this engine's manager
+    # block ids to kernel rows with it (block b is rows b * R .. b * R + R - 1):
+    # the manager block count and the geometry of a group's views.
+    group_num_blocks: list[int]
+    group_geometries: list[GroupGeometry]
     # Per-layer HeadLayout / MambaStateLayout wire forms, so a producer with a
     # different TP size can address head and state slices of these caches.
     kv_head_layouts: dict[str, list[int]] = {}
@@ -655,20 +672,3 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             self.reqs_to_save[request_id] = _req
         else:
             self.reqs_to_recv[request_id] = _req
-
-
-@contextlib.contextmanager
-def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
-    """Context manager for a ZMQ socket."""
-    if socket_type not in (zmq.ROUTER, zmq.REQ, zmq.DEALER):
-        raise ValueError(f"Unexpected socket type: {socket_type}")
-
-    ctx: zmq.Context | None = None
-    try:
-        ctx = zmq.Context()  # type: ignore[attr-defined]
-        yield make_zmq_socket(
-            ctx=ctx, path=addr, socket_type=socket_type, bind=socket_type == zmq.ROUTER
-        )
-    finally:
-        if ctx is not None:
-            ctx.destroy(linger=0)

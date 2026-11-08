@@ -551,10 +551,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         if any(ref.mapping is None for ref in all_refs):
             raise RuntimeError(
                 "canonical_layout was requested but the KV cache layout "
-                "could not be certified for canonical offload (offload "
-                "workers must be exactly the TP group, and packed / "
-                "cross-layer KV layouts are not supported). Remove "
-                "canonical_layout from kv_connector_extra_config."
+                "could not be certified for canonical offload: the offload "
+                "workers must be exactly the TP group (no pipeline or "
+                "context parallelism). Remove canonical_layout from "
+                "kv_connector_extra_config."
             )
         self.all_layers_portable = all(
             ref.mapping is not None and ref.mapping.parallelism_agnostic

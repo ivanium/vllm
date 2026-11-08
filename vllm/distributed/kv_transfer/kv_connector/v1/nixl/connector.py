@@ -264,7 +264,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
             results.finished_sending.clear()
         return results
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
         """Get block IDs that failed to load via NIXL."""
         assert self.connector_worker is not None
         return self.connector_worker.get_block_ids_with_load_errors()

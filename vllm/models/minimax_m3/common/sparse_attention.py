@@ -50,6 +50,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.mla.sparse_utils import slots_to_flat_rows
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
@@ -70,23 +71,49 @@ def _minimax_m3_aiter_sparse_pa_requested() -> bool:
 def minimax_m3_rebase_slots_to_page16(
     slot_mapping: torch.Tensor,
     block_size: int,
+    pages_per_block: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Rebase a token slot mapping onto AITER's page-16 page numbering.
 
     AITER's KV writer derives the destination page from ``slot // 16`` and
-    assumes pages are numbered consecutively. When the resolved layout stores
-    both K/V sides inside a block, a block spans twice as many pages, so only
-    the block component of the slot doubles -- the offset within the page must
-    not move. Clamping before the division leaves padding slots at their
-    negative sentinel, which is what tells the writer to skip them.
+    assumes pages are numbered consecutively, so only the block component of
+    each slot rescales, from one dense block (``block_size`` tokens) to the
+    ``pages_per_block * 16`` tokens a block row spans physically; the offset
+    within the block must not move. ``pages_per_block`` defaults to the dense
+    packed width (both K/V sides share a block); a strided window into a
+    shared large-page buffer spans the whole group row instead -- see
+    ``minimax_m3_page16_pages_per_block``. Clamping before the division leaves
+    padding slots at their negative sentinel, which is what tells the writer
+    to skip them.
     """
+    if pages_per_block is None:
+        pages_per_block = 2 * (block_size // 16)
     if out is None:
         out = torch.empty_like(slot_mapping)
     torch.clamp(slot_mapping, min=0, out=out)
     return (
-        out.div_(block_size, rounding_mode="floor").mul_(block_size).add_(slot_mapping)
+        out.div_(block_size, rounding_mode="floor")
+        .mul_(pages_per_block * 16 - block_size)
+        .add_(slot_mapping)
     )
+
+
+def minimax_m3_page16_pages_per_block(kv_cache: torch.Tensor) -> int:
+    """Physical page-16 pages one block of a bound ``[B, 2, N, C]`` view spans.
+
+    A dense block row holds exactly its sides' pages. A strided window into
+    the shared large-page buffer spans the whole group row, and a block's
+    page-16 ids advance by that full row.
+    """
+    assert kv_cache.dim() == 4
+    block_row = kv_cache.stride(0)
+    page_row = 16 * kv_cache.shape[3]
+    assert block_row % page_row == 0
+    pages_per_block = block_row // page_row
+    pages_in_side = kv_cache.shape[2] // 16
+    assert pages_per_block % pages_in_side == 0
+    return pages_per_block
 
 
 def minimax_m3_dense_equivalent_index_slots(
@@ -97,12 +124,11 @@ def minimax_m3_dense_equivalent_index_slots(
     qknorm-rope-insert kernel assumes (``index_cache + slot * kHeadDim``).
 
     The index cache view is ``[blocks, page, kHeadDim]``. A strided window
-    into the shared pool (large_page) starts block ``b`` at
-    ``b * stride(0)`` elements rather than ``b * page * kHeadDim``, so each
-    slot's block component rescales to the dense-equivalent slot
-    ``(sm // page) * (stride(0) // kHeadDim) + sm % page``. Dense views
-    (uniform_page) return the mapping unchanged. Negative padding sentinels
-    are kept.
+    into the shared pool starts block ``b`` at ``b * stride(0)`` elements
+    rather than ``b * page * kHeadDim``, so each slot's block component
+    rescales to the dense-equivalent slot
+    ``(sm // page) * (stride(0) // kHeadDim) + sm % page``. Dense views return
+    the mapping unchanged. Negative padding sentinels are kept.
     """
     page, head_dim = index_cache.shape[1], index_cache.shape[2]
     if index_cache.stride(0) == page * head_dim:
@@ -112,7 +138,7 @@ def minimax_m3_dense_equivalent_index_slots(
     assert index_cache.stride(0) % head_dim == 0
     pages_per_block = index_cache.stride(0) // head_dim
     clamped = slot_mapping.clamp_min(0)
-    remapped = clamped // page * pages_per_block + clamped % page
+    remapped = slots_to_flat_rows(clamped, page, pages_per_block)
     return torch.where(slot_mapping < 0, slot_mapping, remapped)
 
 
@@ -259,9 +285,9 @@ class MiniMaxM3SparseMetadata(AttentionMetadata):
     prefill: MiniMaxM3SparsePrefillMetadata | None = None
     decode: MiniMaxM3SparseDecodeMetadata | None = None
 
-    # ``slot_mapping`` rebased onto the page-16 numbering AITER's KV writer
-    # uses when both K/V sides share a block. Only set for the AITER sparse PA
-    # path; see ``MiniMaxM3SparseMetadataBuilder.build``.
+    # ``slot_mapping`` rebased onto the physical page-16 numbering AITER's KV
+    # writer uses. Only set for the AITER sparse PA path; see
+    # ``MiniMaxM3SparseMetadataBuilder.build``.
     page16_slot_mapping: torch.Tensor | None = None
 
 
@@ -301,6 +327,20 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
                 dtype=torch.int64,
                 device=device,
             )
+
+    def _aiter_sparse_pa_pages_per_block16(self) -> int:
+        """Physical page-16 pages one main-cache block row spans.
+
+        Read off a bound layer's cache view. Before the caches are bound
+        (memory profiling) the dense packed width stands in; the metadata
+        built then is never consumed.
+        """
+        layers = self.vllm_config.compilation_config.static_forward_context
+        layer = layers.get(self.layer_names[0]) if self.layer_names else None
+        kv_cache = getattr(layer, "kv_cache", None)
+        if kv_cache is None or kv_cache.numel() == 0:
+            return 2 * (self.kv_cache_spec.block_size // 16)
+        return minimax_m3_page16_pages_per_block(kv_cache)
 
     def build(
         self,
@@ -393,6 +433,7 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
             page16_slot_mapping = minimax_m3_rebase_slots_to_page16(
                 slot_mapping,
                 self.kv_cache_spec.block_size,
+                pages_per_block=self._aiter_sparse_pa_pages_per_block16(),
                 out=self.page16_slot_mapping_buffer[: slot_mapping.shape[0]],
             )
 

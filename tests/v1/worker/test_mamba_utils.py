@@ -20,7 +20,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -389,7 +388,8 @@ def _make_dual_layer_state(
 
 
 def _make_kv_cache_config(cfg: _TestConfig, layer_names: list[str]) -> KVCacheConfig:
-    """Create a KVCacheConfig with mamba groups."""
+    """Create a large-page KVCacheConfig with mamba groups, one manager block
+    per page."""
     mamba_spec = MambaSpec(
         block_size=cfg.block_size,
         shapes=(
@@ -402,11 +402,17 @@ def _make_kv_cache_config(cfg: _TestConfig, layer_names: list[str]) -> KVCacheCo
     group = KVCacheGroupSpec(
         layer_names=layer_names,
         kv_cache_spec=mamba_spec,
+        num_blocks=cfg.num_blocks,
+        blocks_per_page=1,
+        kernel_rows_per_block=1,
+        row_bytes=1024,
     )
     return KVCacheConfig(
-        num_blocks=cfg.num_blocks,
+        num_pages=cfg.num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[group],
+        large_page_bytes=1024,
+        block_size=cfg.block_size,
     )
 
 
@@ -497,12 +503,28 @@ def test_mamba_groups_support_different_state_specs():
         num_speculative_blocks=3,
     )
     kv_cache_config = KVCacheConfig(
-        num_blocks=8,
+        num_pages=8,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(["gdn.0", "gdn.1"], gdn_spec),
-            KVCacheGroupSpec(["ple.0"], short_conv_spec),
+            KVCacheGroupSpec(
+                ["gdn.0", "gdn.1"],
+                gdn_spec,
+                num_blocks=8,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=1024,
+            ),
+            KVCacheGroupSpec(
+                ["ple.0"],
+                short_conv_spec,
+                num_blocks=8,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=1024,
+            ),
         ],
+        large_page_bytes=1024,
+        block_size=16,
     )
 
     mamba_groups = get_mamba_groups(kv_cache_config)
@@ -550,90 +572,6 @@ def test_mamba_groups_support_different_state_specs():
     )
     assert ctx.is_initialized
     assert ctx.state_group_indices.tolist() == [0, 0, 0, 0, 1]
-    assert ctx.state_conv_widths.tolist() == [4, 0, 4, 0, 12]
-
-
-def test_mamba_groups_support_mixed_specs_in_uniform_group():
-    gdn_spec = MambaSpec(
-        block_size=16,
-        shapes=((4, 4), (2, 4, 4)),
-        dtypes=(torch.float16, torch.float32),
-        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
-        mamba_cache_mode="align",
-        num_speculative_blocks=3,
-    )
-    short_conv_spec = MambaSpec(
-        block_size=16,
-        shapes=((12, 8),),
-        dtypes=(torch.float16,),
-        mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
-        mamba_cache_mode="align",
-        num_speculative_blocks=3,
-    )
-    layer_specs = {
-        "gdn.0": gdn_spec,
-        "gdn.1": gdn_spec,
-        "ple.0": short_conv_spec,
-    }
-    kv_cache_config = KVCacheConfig(
-        num_blocks=8,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                list(layer_specs),
-                UniformTypeKVCacheSpecs(
-                    block_size=16,
-                    kv_cache_specs=layer_specs,
-                ),
-            )
-        ],
-    )
-
-    assert kv_cache_config.has_mamba_layers
-    assert get_mamba_groups(kv_cache_config) == {
-        gdn_spec: [0],
-        short_conv_spec: [0],
-    }
-
-    # The group is listed once per spec, so its id must not be repeated.
-    model_state = object.__new__(MambaHybridModelState)
-    model_state._mamba_group_ids = []
-    model_state._mamba_spec = None
-    group_ids, representative_spec = model_state._get_mamba_group_info(kv_cache_config)
-    assert group_ids == [0]
-    assert representative_spec is gdn_spec
-
-    cfg = _TestConfig()
-    copy_bufs = _make_copy_bufs(cfg, kv_cache_config, torch.device("cpu"))
-    assert copy_bufs.mamba_group_ids == [0]
-    assert copy_bufs.src_ptrs.cpu.numel() == cfg.max_num_reqs * 5
-
-    ctx = _make_gpu_ctx(cfg, kv_cache_config, torch.device("cpu"))
-    assert ctx.mamba_group_ids == [0]
-    assert ctx.num_states == 5
-
-    forward_context = {
-        "gdn.0": MagicMock(
-            kv_cache=(
-                torch.empty(8, 4, 4, dtype=torch.float16),
-                torch.empty(8, 2, 4, 4, dtype=torch.float32),
-            )
-        ),
-        "gdn.1": MagicMock(
-            kv_cache=(
-                torch.empty(8, 4, 4, dtype=torch.float16),
-                torch.empty(8, 2, 4, 4, dtype=torch.float32),
-            )
-        ),
-        "ple.0": MagicMock(kv_cache=(torch.empty(8, 12, 8, dtype=torch.float16),)),
-    }
-    ctx.initialize_from_forward_context(
-        kv_cache_config,
-        forward_context,
-        _COPY_FUNCS,
-        [torch.zeros(4, 8, dtype=torch.int32)],
-    )
-    assert ctx.state_group_indices.tolist() == [0, 0, 0, 0, 0]
     assert ctx.state_conv_widths.tolist() == [4, 0, 4, 0, 12]
 
 

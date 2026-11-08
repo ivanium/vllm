@@ -50,7 +50,7 @@ class UMBPStoreConnectorWorker:
         self._pending_stores: list[_StoreBatch] = []
         self._worker_meta = UMBPConnectorWorkerMetadata()
         self._finished_recving: set[str] = set()
-        self._load_error_block_ids: set[int] = set()
+        self._load_error_block_ids: set[tuple[int, int]] = set()
         self._report_load_completions = False
         self._active_store_event = -1
 
@@ -228,7 +228,7 @@ class UMBPStoreConnectorWorker:
         self._worker_meta = UMBPConnectorWorkerMetadata()
         return result
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
+    def get_block_ids_with_load_errors(self) -> set[tuple[int, int]]:
         failed = self._load_error_block_ids
         self._load_error_block_ids = set()
         return failed

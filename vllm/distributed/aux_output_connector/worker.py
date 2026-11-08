@@ -32,7 +32,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
 )
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import resolve_scheduler_block_size
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -114,19 +114,18 @@ class AuxOutputWorkerConnector:
 
         shape_per_token = self._capturer.shape_per_token
         dtype: np.dtype[Any] = np.dtype(self._capturer.output_dtype_name)
-        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        scheduler_block_size = resolve_scheduler_block_size(
             kv_cache_config, vllm_config
         )
-        hashes_per_kv_block = scheduler_block_size // hash_block_size
-        block_nbytes = hash_block_size * int(np.prod(shape_per_token)) * dtype.itemsize
+        block_size = kv_cache_config.block_size
+        hashes_per_kv_block = scheduler_block_size // block_size
+        block_nbytes = block_size * int(np.prod(shape_per_token)) * dtype.itemsize
         max_bytes = vllm_config.aux_output_config.max_bytes
         if max_bytes is None:
             # A large page holds several blocks of its group, so the KV cache
             # holds up to the largest group's block count.
-            num_kv_blocks = (
-                max(group.num_blocks for group in kv_cache_config.kv_cache_groups)
-                if kv_cache_config.allocator == "large_page"
-                else kv_cache_config.num_blocks
+            num_kv_blocks = max(
+                group.num_blocks for group in kv_cache_config.kv_cache_groups
             )
             max_bytes = num_kv_blocks * hashes_per_kv_block * block_nbytes
         self._store = BackgroundBlockObjectStore(
@@ -136,7 +135,7 @@ class AuxOutputWorkerConnector:
         self._buffer = RoutedExpertsBuffer(
             dtype,
             shape_per_token,
-            hash_block_size,
+            block_size,
             vllm_config.scheduler_config.max_num_seqs,
             max_num_batched_tokens,
             vllm_config.max_concurrent_batches,

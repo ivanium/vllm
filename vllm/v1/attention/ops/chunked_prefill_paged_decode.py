@@ -27,13 +27,27 @@ def has_native_kv_cache_layout(
 ) -> bool:
     """Return whether KV cache blocks can use the native ROCm pairing.
 
-    The native reshape_and_cache writer assumes packed blocks. If cache update
-    needs reshape_and_cache_flash for a stride-padded hybrid layout, decode
-    should use the matching Triton path too.
+    The native reshape_and_cache writer and custom paged-attention kernels
+    take the block and head strides from the caches (64-bit), so a block may
+    be a row of several layers, but they hard-code a dense head interior and
+    load it in 16-byte vectors. Otherwise cache update uses
+    reshape_and_cache_flash and decode the matching Triton path.
     """
+
+    def dense_aligned_heads(cache: torch.Tensor) -> bool:
+        inner = range(2, cache.dim())
+        return (
+            all(cache.stride(d - 1) == cache.shape[d:].numel() for d in inner)
+            and cache.stride(-1) == 1
+            and cache.data_ptr() % 16 == 0
+            and cache.stride(0) * cache.element_size() % 16 == 0
+            and cache.stride(1) * cache.element_size() % 16 == 0
+        )
+
     return (
-        key_cache.stride(0) == key_cache.shape[1:].numel()
-        and value_cache.stride(0) == value_cache.shape[1:].numel()
+        key_cache.stride()[:2] == value_cache.stride()[:2]
+        and dense_aligned_heads(key_cache)
+        and dense_aligned_heads(value_cache)
     )
 
 
@@ -400,9 +414,9 @@ def chunked_prefill_paged_decode(
         sinks,
     )
     has_native_layout = has_native_kv_cache_layout(key_cache, value_cache)
-    # Force Triton for non-standard blocks like Qwen3's 544 and for
-    # stride-padded hybrid layouts. The latter use reshape_and_cache_flash
-    # during cache update, so keep decode on the matching stride-aware path.
+    # Force Triton for non-standard blocks like Qwen3's 544 and for padded or
+    # misaligned head interiors. The latter use reshape_and_cache_flash during
+    # cache update, so keep decode on the matching stride-aware path.
     is_pow2 = block_size > 0 and (block_size & (block_size - 1) == 0)
     if not is_pow2 or not has_native_layout:
         use_custom = False

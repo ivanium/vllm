@@ -13,7 +13,6 @@ Supported model types:
     temporal = (num_v_heads, v_dim, k_dim)
 """
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -217,19 +216,3 @@ def derive_mamba_conv_split(
         conv_dtype_size=conv_dtype_size,
         ssm_sizes=(conv_state_bytes, ssm_state_bytes),
     )
-
-
-def compute_physical_blocks_per_logical(
-    ssm_sizes: tuple[int, ...], block_len: int
-) -> int:
-    """Derive _physical_blocks_per_logical_kv_block from remote metadata.
-
-    The remote engine's ratio is not sent directly in the handshake, so we
-    reconstruct it: total mamba state per logical block / block_len.
-
-    Args:
-        ssm_sizes: (conv_state_bytes, ssm_state_bytes) from NixlAgentMetadata.
-        block_len: the engine's block_len in bytes (from block_lens[0]).
-
-    """
-    return math.ceil((ssm_sizes[0] + ssm_sizes[1]) / block_len)

@@ -150,7 +150,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
-    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -227,12 +226,8 @@ from .utils import (
     add_kv_sharing_layers_to_kv_cache_groups,
     allocate_kv_cache,
     bind_kv_cache,
-    build_large_page_zeroers,
-    copy_kv_cache_blocks_inplace,
+    build_kv_block_zeroers,
     customize_attention_spec,
-    dispatch_large_page_cow,
-    dispatch_large_page_zeroing,
-    map_kv_caches_to_kernel_blocks,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
@@ -882,6 +877,9 @@ class GPUModelRunner(
         # KVCacheConfig of the scheduler.
         self.runner_only_attn_layers: set[str] = set()
 
+        # Built by _init_kv_zero_meta when the KV cache needs zeroing.
+        self.kv_block_zeroers: dict[int, KVBlockZeroer] = {}
+
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self._draft_probs: torch.Tensor | None = None
@@ -1122,36 +1120,23 @@ class GPUModelRunner(
             )
 
     def _init_kv_zero_meta(self) -> None:
-        """One-time precomputation for _zero_block_ids.
+        """One-time precomputation for KV block zeroing.
 
         Called from gpu_worker.py outside the CuMem pool context.
         """
-        kv_cache_config = self.kv_cache_config
-        if kv_cache_config.allocator == "large_page":
-            self._kv_block_zeroers: list[KVBlockZeroer | None] = (
-                build_large_page_zeroers(
-                    kv_cache_config,
-                    self.attn_groups,
-                    self.device,
-                    self._kernel_block_sizes,
-                    self.compilation_config.static_forward_context,
-                    runner_only_attn_layers=self.runner_only_attn_layers,
-                )
-            )
-            return
-        self._kv_block_zeroer = KVBlockZeroer(
+        self.kv_block_zeroers = build_kv_block_zeroers(
+            self.kv_cache_config,
+            self.attn_groups,
             self.device,
-            attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
-            kernel_block_sizes=self._kernel_block_sizes,
+            self._kernel_block_sizes,
+            self.compilation_config.static_forward_context,
             runner_only_attn_layers=self.runner_only_attn_layers,
-            static_forward_context=self.compilation_config.static_forward_context,
-            num_blocks=self.kv_cache_config.num_blocks,
         )
 
-    def _zero_block_ids(self, block_ids: list[int]) -> None:
-        """Zero the KV cache memory for the given block IDs."""
-        if hasattr(self, "_kv_block_zeroer"):
-            self._kv_block_zeroer.zero_block_ids(block_ids)
+    # Note: used for model runner override.
+    def _zero_block_ids(self, block_ids: list[list[int]]) -> None:
+        for group_id, zeroer in self.kv_block_zeroers.items():
+            zeroer.zero_block_ids(block_ids[group_id])
 
     # Note: used for model runner override.
     def _sync_device(self) -> None:
@@ -1210,28 +1195,7 @@ class GPUModelRunner(
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            if self.kv_cache_config.allocator == "large_page":
-                dispatch_large_page_zeroing(
-                    self._kv_block_zeroers,
-                    cast(list[tuple[int, int]], scheduler_output.new_block_ids_to_zero),
-                )
-            else:
-                self._zero_block_ids(
-                    cast(list[int], scheduler_output.new_block_ids_to_zero)
-                )
-        if scheduler_output.kv_cache_block_copies:
-            if self.kv_cache_config.allocator == "large_page":
-                dispatch_large_page_cow(
-                    self.kv_cache_config,
-                    self.kv_caches_by_layer,
-                    scheduler_output.kv_cache_block_copies,
-                )
-            else:
-                copy_kv_cache_blocks_inplace(
-                    self.kv_caches,
-                    self.kv_cache_config.num_blocks,
-                    scheduler_output.kv_cache_block_copies,
-                )
+            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Free the cached encoder outputs.
         self._process_encoder_cache_scheduler_output(scheduler_output)
@@ -2479,8 +2443,6 @@ class GPUModelRunner(
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
             cache_key = (kv_cache_spec, type(builder))
 
             extra_attn_metadata_args = {}
@@ -6224,7 +6186,7 @@ class GPUModelRunner(
         )
 
         self.initialize_kv_cache(minimal_config, is_profiling=True)
-        self.cache_config.num_gpu_blocks = minimal_config.num_blocks
+        self.cache_config.num_gpu_blocks = minimal_config.num_pages
 
         logger.debug("Initialized minimal KV cache for CUDA graph profiling")
 
@@ -6260,9 +6222,6 @@ class GPUModelRunner(
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
             self.kv_caches.clear()
-        if hasattr(self, "kv_caches_by_layer"):
-            self.kv_caches_by_layer.clear()
-            del self.kv_caches_by_layer
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
@@ -6733,8 +6692,6 @@ class GPUModelRunner(
 
                 full_cls_name = attn_backend.full_cls_name()
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
                 # Non-Attention layer types (e.g. Mamba1, ShortConv) do not
                 # expose ``num_heads``; fall back to 0 so they cluster as
                 # before. Such layers never coexist with Attention in a
@@ -6968,23 +6925,15 @@ class GPUModelRunner(
     def _attn_group_iterator(self) -> Iterator[AttentionGroup]:
         return itertools.chain.from_iterable(self.attn_groups)
 
-    def _kv_cache_spec_attn_group_iterator(self) -> Iterator[AttentionGroup]:
-        if not self.kv_cache_config.kv_cache_groups:
-            return
-        for attn_groups in self.attn_groups:
-            yield from attn_groups
-
     def initialize_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
-        kernel_block_sizes: list[int],
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> dict[str, torch.Tensor]:
         """Initialize the memory buffer for KV cache.
 
         Args:
             kv_cache_config: The KV cache config
-            kernel_block_sizes: The kernel block sizes for each KV cache group.
             kv_cache_allocation_context: Context manager the allocation runs
                 inside, e.g. to place the KV cache in a specific memory pool.
 
@@ -6999,7 +6948,6 @@ class GPUModelRunner(
                 kv_cache_config,
                 self.device,
                 self.cache_config.get_resolved_kv_cache_layout(),
-                kernel_block_sizes,
             )
 
         # Set up cross-layer KV cache sharing
@@ -7010,16 +6958,12 @@ class GPUModelRunner(
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
         )
-        attn_groups = [g for groups in self.attn_groups for g in groups]
-        if self.speculative_config:
-            attn_groups += getattr(self.drafter, "draft_attn_groups", [])
         bind_kv_cache(
             kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_caches,
             num_attn_module,
             kv_cache_groups=kv_cache_config.kv_cache_groups,
-            layer_kv_caches=map_kv_caches_to_kernel_blocks(kv_caches, attn_groups),
         )
         return kv_caches
 
@@ -7078,16 +7022,9 @@ class GPUModelRunner(
             self.kv_cache_config,
             use_replayssm=self.vllm_config.cache_config.use_replayssm,
         )
-        # The kernel block size for all KV cache groups. For example, if
-        # kv_cache_manager uses block_size 256 for a given group, but the attention
-        # backends for that group only supports block_size 64, we will return
-        # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
-        # tokens each.
-        # Block-outermost packed groups are not split; their attention groups
-        # map kernel blocks themselves.
-        kernel_block_sizes = prepare_kernel_block_sizes(
-            kv_cache_config, self.attn_groups
-        )
+        # The kernel block size of each KV cache group: block_size tokens =
+        # kernel_rows_per_block kernel rows of kernel_block_size tokens.
+        kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config)
         self._kernel_block_sizes = kernel_block_sizes
 
         # create metadata builders
@@ -7099,12 +7036,8 @@ class GPUModelRunner(
         with self.jit_warmup_registry.activate():  # type: ignore[attr-defined]
             kv_caches = self.initialize_kv_cache_tensors(
                 kv_cache_config,
-                kernel_block_sizes,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
-        if kv_cache_config.allocator == "large_page":
-            # Per-group CoW copies address each group's own layer views.
-            self.kv_caches_by_layer = kv_caches
 
         if (
             self.speculative_config

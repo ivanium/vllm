@@ -147,3 +147,83 @@ def test_flydsl_decode_matches_reference(
     assert cosine > 0.995
     assert error.mean() < 0.05
     assert error.max() < 0.8
+
+
+def _strided_block_view(kv_cache: torch.Tensor, gap_bytes: int) -> torch.Tensor:
+    """Re-home the blocks of a dense cache at a padded stride, mimicking the
+    per-layer view of a large-page cache whose stride(0) spans the whole
+    layer group (other layers' blocks sit in the gaps).
+    """
+    assert kv_cache.dtype == torch.uint8
+    num_blocks = kv_cache.shape[0]
+    block_bytes = kv_cache.stride(0)
+    stride_bytes = block_bytes + gap_bytes
+    backing = torch.zeros(
+        num_blocks * stride_bytes, dtype=torch.uint8, device=kv_cache.device
+    )
+    backing.view(num_blocks, stride_bytes)[:, :block_bytes] = kv_cache.view(
+        num_blocks, block_bytes
+    )
+    view = backing.as_strided(kv_cache.shape, (stride_bytes, *kv_cache.stride()[1:]))
+    assert view.stride(0) == stride_bytes
+    return view
+
+
+def test_flydsl_decode_strided_cache_view():
+    """The kernel must take the cache block stride from the tensor.
+
+    A large-page layer view has stride(0) wider than one block; a kernel
+    using the baked dense-layout stride reads gap bytes for every block
+    past block 0 and fails this check.
+    """
+    if not ultraquant_flydsl_decode_eligible(
+        head_size=256,
+        num_kv_groups=8,
+        has_sinks=False,
+        sliding_window=None,
+        flydsl_loaded=is_ultraquant_flydsl_available(),
+    ):
+        pytest.skip("UltraQuant D=256 FlyDSL kernel is unavailable")
+
+    set_random_seed(0x57A1D)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch_size, num_kv_heads, head_size = 4, 1, 256
+    block_size, seq_len = 32, 1024
+    scale = head_size**-0.5
+
+    key = torch.randn(
+        batch_size, seq_len, num_kv_heads, head_size, dtype=dtype, device=device
+    )
+    value = torch.randn_like(key)
+    query = torch.randn(batch_size, 8, head_size, dtype=dtype, device=device)
+    kv_cache, block_table = _build_paged_cache(key, value, block_size)
+    kv_cache = _strided_block_view(kv_cache, gap_bytes=kv_cache.stride(0) + 64)
+    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+    hadamard = hadamard_matrix(head_size, device)
+
+    actual = flydsl_ultraquant_decode_attention(
+        query=query,
+        kv_cache=kv_cache,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        scale=scale,
+        PiT=hadamard,
+        max_seq_len=seq_len,
+    )
+    expected = reference_ultraquant_attention(
+        query=query,
+        key=key,
+        value=value,
+        scale=scale,
+    )
+
+    actual_f32 = actual.float()
+    expected_f32 = expected.float()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual_f32.flatten(), expected_f32.flatten(), dim=0
+    )
+    error = (actual_f32 - expected_f32).abs()
+    assert cosine > 0.995
+    assert error.mean() < 0.05
+    assert error.max() < 0.8

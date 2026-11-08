@@ -125,7 +125,7 @@ def _store_quantized_value(
 def _tq_fused_store_fp8(
     Key_ptr,  # [NH, D] float16/bfloat16 — raw keys
     Value_ptr,  # [NH, D] float16/bfloat16 — raw values
-    KV_cache_ptr,  # [total_bytes] uint8 (flattened view)
+    KV_cache_ptr,  # uint8 layer cache base; blocks are stride_cache_block apart
     KV_cache_u16_ptr,  # uint16-aliased view of the same storage (Opt#3)
     Slot_mapping_ptr,  # [N] int32 — per-token slot indices
     # Cache strides (stride_cache_block = bytes per block = bs*H*slot_aligned)
@@ -230,7 +230,7 @@ def _tq_fused_store_mse(
     Midpoints_ptr,  # [n_centroids-1] float32
     Centroids_ptr,  # [n_centroids] float32 — used only when NORM_CORRECTION=1
     # Cache and indexing
-    KV_cache_ptr,  # [total_bytes] uint8 (flattened view)
+    KV_cache_ptr,  # uint8 layer cache base; blocks are stride_cache_block apart
     KV_cache_u16_ptr,  # uint16-aliased view of the same storage (Opt#3)
     Slot_mapping_ptr,  # [N] int32 — per-token slot indices
     # Cache strides (stride_cache_block = bs*H*slot_aligned, unchanged)
@@ -454,8 +454,8 @@ def triton_turboquant_store(
         _tq_fused_store_fp8[grid](
             k_flat,
             v_flat,
-            kv_cache.view(-1),
-            kv_cache_u16.view(-1),
+            kv_cache,
+            kv_cache_u16,
             slot_mapping,
             stride_cache_block=stride_block,
             D=D,
@@ -498,8 +498,8 @@ def triton_turboquant_store(
         v_flat,
         midpoints,
         centroids_ptr,
-        kv_cache.view(-1),
-        kv_cache_u16.view(-1),
+        kv_cache,
+        kv_cache_u16,
         slot_mapping,
         stride_cache_block=stride_block,
         D=D,

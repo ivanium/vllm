@@ -221,9 +221,9 @@ class KVConnectorOutput:
     kv_connector_worker_meta: KVConnectorWorkerMetadata | None = None
     # IDs of externally computed KV blocks that failed to load.
     # Requests referencing these blocks should be rescheduled to recompute them
-    # Under the large-page allocator block ids are unique only within a group,
-    # so each entry is a (group_id, block_id) pair.
-    invalid_block_ids: set[int] | set[tuple[int, int]] = field(default_factory=set)
+    # Block ids are unique only within a group, so each entry is a
+    # (group_id, block_id) pair.
+    invalid_block_ids: set[tuple[int, int]] = field(default_factory=set)
     # Receive failures keyed by request identity. This remains unambiguous for
     # hybrid/multi-pool cache layouts where numeric block IDs overlap.
     failed_recving: set[str] = field(default_factory=set)

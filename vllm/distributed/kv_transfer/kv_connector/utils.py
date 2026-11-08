@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV cache helper for store."""
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -20,7 +20,9 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+)
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 if TYPE_CHECKING:
@@ -103,9 +105,7 @@ class KVOutputAggregator:
         aggregated_kv_connector_stats = None
         aggregated_kv_connector_worker_meta = None
         combined_kv_cache_events = None
-        # Any: uniform_page workers report bare ids, large_page workers report
-        # (group_id, block_id) pairs; the aggregator only unions and forwards.
-        invalid_block_ids: set[Any] = set()
+        invalid_block_ids: set[tuple[int, int]] = set()
         for model_runner_output in outputs:
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
@@ -243,54 +243,13 @@ def copy_kv_blocks(
         copy_fn(src_tensor, dst_tensor, src_indices, dst_indices)
 
 
-def kv_postprocess_blksize_on_receive(cache, indices, block_size_ratio):
-    """Transforms the layout of received KV cache blocks to the local block_size.
-    (Only works for local blocksize > remote blocksize)
-
-    Example:
-    local blocksize = 16 tokens, remote blocksize = 4 tokens
-    local block[0] = remote block[0, 1, 2, 3]
-    remote is |h0-b0|h1-b0|h2-b0|h3-b0|h0-b1|h1-b1|h2-b1|h3-b1|...
-    local is  |h0-b0..................|h1-b0..................|...
-    permute is to:
-    1. view => view remote as n_blocks * remote_shape(H,remoteN,D)
-    2. permute => (H, nblocks, remoteN, D)
-    3. flatten => (H, localN, D)
-
+def kv_postprocess_layout_on_receive(cache, indices):
+    """Transforms received KV cache blocks from the remote LBHNC layout to the
+    local LBNHC layout.
     """
     blocks_to_update = cache.index_select(0, indices)
-    n_kv_heads, block_size, head_size = blocks_to_update.shape[1:]
-    remote_block_size = block_size // block_size_ratio
-    n_blocks = block_size_ratio
-
-    permuted_blocks = (
-        blocks_to_update.reshape(-1, n_blocks, n_kv_heads, remote_block_size, head_size)
-        .permute(0, 2, 1, 3, 4)
-        .flatten(2, 3)
-    )
-    cache.index_copy_(0, indices, permuted_blocks)
-
-
-def kv_postprocess_blksize_and_layout_on_receive(cache, indices, block_size_ratio):
-    """Transforms the layout of received KV cache to the local block_size and LBHNC.
-    (Only works for local blocksize >= remote blocksize)
-
-    prefill is LBHNC, smaller block_size
-    decode(local) is LBNHC, larger block_size
-    """
-    blocks_to_update = cache.index_select(0, indices)
-
-    n_kv_heads, block_size, head_size = blocks_to_update.shape[1:]
-    remote_block_size = block_size // block_size_ratio
-    n_blocks = block_size_ratio
-
     # View the received bytes in memory order as the remote head-major blocks.
-    permuted_blocks = (
-        blocks_to_update.transpose(1, 2)
-        .reshape(-1, n_blocks, n_kv_heads, remote_block_size, head_size)
-        .permute(0, 2, 1, 3, 4)
-        .flatten(2, 3)
-    )
+    permuted_blocks = blocks_to_update.transpose(1, 2).reshape(blocks_to_update.shape)
     cache.index_copy_(0, indices, permuted_blocks)
 
 
@@ -354,35 +313,6 @@ def get_current_attn_backends(
         ]
 
 
-def get_current_attn_backends_and_specs(
-    vllm_config: VllmConfig,
-    kv_cache_config: KVCacheConfig,
-    fallback: list[type[AttentionBackend]],
-) -> tuple[list[type[AttentionBackend]], list[AttentionSpec | None]]:
-    """Distinct (backend, spec) pairs of the transfer layers, else ``fallback``.
-
-    Compressed caches are skipped: their kernel pages never split transferred
-    blocks.
-    """
-    pairs: dict[tuple[type[AttentionBackend], AttentionSpec | None], None] = {}
-    layer_type = cast(type[Any], AttentionLayerBase)
-    for group in kv_cache_config.transfer_groups:
-        specs = getattr(group.kv_cache_spec, "kv_cache_specs", {})
-        layers = get_layers_from_vllm_config(vllm_config, layer_type, group.layer_names)
-        for name, layer in layers.items():
-            spec = specs.get(name, group.kv_cache_spec)
-            if isinstance(spec, AttentionSpec) and spec.tokens_per_state > 1:
-                layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
-                assert layout.is_block_outermost, "Compressed caches must be packed"
-                continue
-            if not isinstance(spec, AttentionSpec):
-                spec = None
-            pairs[layer.get_attn_backend(), spec] = None
-    if not pairs:
-        return fallback, [None] * len(fallback)
-    return [backend for backend, _ in pairs], [spec for _, spec in pairs]
-
-
 def get_current_attn_backend(
     vllm_config: VllmConfig, layer_names: list[str] | None = None
 ) -> type[AttentionBackend]:
@@ -408,9 +338,6 @@ class EngineTransferInfo:
     remote_block_size: int
     """Tokens per block."""
 
-    remote_physical_blocks_per_logical: int
-    """Physical blocks per logical block."""
-
     remote_pp_rank: int = 0
     """Remote producer PP rank for this engine."""
 
@@ -427,13 +354,32 @@ class EngineTransferInfo:
 # ---- Transfer topology ----
 
 
+def tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
+    """The tensor parallel ratio between local and remote TP.
+
+    Positive when local_tp >= remote_tp (local workers read from the
+    same remote worker in groups of size ``tp_ratio``). Negative when
+    remote_tp > local_tp (ratio is flipped).
+    """
+    if local_tp_size >= remote_tp_size:
+        assert local_tp_size % remote_tp_size == 0, (
+            f"Local tensor parallel size {local_tp_size} is not divisible "
+            f"by remote tensor parallel size {remote_tp_size}."
+        )
+        return local_tp_size // remote_tp_size
+    assert remote_tp_size % local_tp_size == 0, (
+        f"Remote tensor parallel size {remote_tp_size} is not divisible "
+        f"by local tensor parallel size {local_tp_size}."
+    )
+    return -(remote_tp_size // local_tp_size)
+
+
 @dataclass
 class TransferTopology:
     """Single source of truth for local TP identity and per-engine remote info."""
 
     tp_rank: int
     tp_size: int
-    block_size: int
     engine_id: EngineId
     is_mla: bool
     is_mamba: bool
@@ -495,31 +441,8 @@ class TransferTopology:
     # ============================================================
 
     def tp_ratio(self, remote_tp_size: int) -> int:
-        """Calculate the tensor parallel ratio between local and remote TP.
-
-        Positive when local_tp >= remote_tp (local workers read from the
-        same remote worker in groups of size ``tp_ratio``).  Negative when
-        remote_tp > local_tp (ratio is flipped).
-        """
-        if self.tp_size >= remote_tp_size:
-            assert self.tp_size % remote_tp_size == 0, (
-                f"Local tensor parallel size {self.tp_size} is not divisible "
-                f"by remote tensor parallel size {remote_tp_size}."
-            )
-            return self.tp_size // remote_tp_size
-        assert remote_tp_size % self.tp_size == 0, (
-            f"Remote tensor parallel size {remote_tp_size} is not divisible "
-            f"by local tensor parallel size {self.tp_size}."
-        )
-        return -(remote_tp_size // self.tp_size)
-
-    def block_size_ratio(self, remote_block_size: int) -> int:
-        """Calculate the block size ratio between local and remote."""
-        assert self.block_size % remote_block_size == 0, (
-            f"Local block size {self.block_size} is not divisible "
-            f"by remote block size {remote_block_size} or vice versa."
-        )
-        return self.block_size // remote_block_size
+        """The tensor parallel ratio between local and remote TP sizes."""
+        return tp_ratio(self.tp_size, remote_tp_size)
 
     def is_kv_replicated(
         self, remote_engine_id: EngineId, remote_pp_rank: int = 0
@@ -637,3 +560,68 @@ class TransferTopology:
             f"local_rank={self.tp_rank}, "
             f"remote_block_len={info.remote_block_len})"
         )
+
+
+# ---- Large-page pool ----
+
+
+def group_pool_storage(
+    kv_caches: Mapping[str, torch.Tensor],
+    kv_cache_config: KVCacheConfig,
+    group_id: int,
+) -> torch.UntypedStorage | None:
+    """The large-page pool under a KV cache group's layer views on this rank.
+
+    Every local layer view of the group must stride its kernel rows at the
+    group's row bytes over one backing storage, so block ``b`` of the group
+    starts ``b * block_bytes`` past the storage's ``data_ptr()``.
+
+    Returns:
+        The backing storage, or None when this rank holds no layer of the
+        group (pipeline parallelism).
+
+    Raises:
+        ValueError: if a view strides differently or the views do not share
+            one backing storage.
+
+    """
+    group = kv_cache_config.kv_cache_groups[group_id]
+    views = [kv_caches[name] for name in group.layer_names if name in kv_caches]
+    if not views:
+        return None
+    row_bytes = kv_cache_config.group_geometry(group_id).row_bytes
+    view_row_bytes = {view.stride(0) * view.element_size() for view in views}
+    if view_row_bytes != {row_bytes}:
+        raise ValueError(
+            f"KV cache group {group_id} layer views stride rows at "
+            f"{sorted(view_row_bytes)} bytes, not the group's {row_bytes}"
+        )
+    if len({view.untyped_storage().data_ptr() for view in views}) != 1:
+        raise ValueError(
+            f"KV cache group {group_id} layer views must share one backing allocation"
+        )
+    return views[0].untyped_storage()
+
+
+def group_slot_mapping(
+    block_size: int,
+    block_ids: list[int],
+    num_tokens: int,
+) -> torch.Tensor:
+    """Slots of the first ``num_tokens`` tokens in a group's kernel views.
+
+    Token t lives in manager block ``b = block_ids[t // block_size]`` at
+    slot ``b * block_size + t % block_size`` of any layer view of the group.
+
+    Args:
+        block_size: tokens per manager block of the group.
+        block_ids: manager block ids of the group, in token order.
+        num_tokens: number of tokens to map.
+
+    Returns:
+        A long tensor of ``num_tokens`` slot indices.
+
+    """
+    block_ids_tensor = torch.tensor(block_ids, dtype=torch.long)
+    slots = block_ids_tensor.reshape(-1, 1) * block_size + torch.arange(block_size)
+    return slots.flatten()[:num_tokens]

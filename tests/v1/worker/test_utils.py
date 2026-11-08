@@ -27,14 +27,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker import (
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot
-from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-from vllm.v1.hisparse.runtime import HiSparseCacheHandle
+from vllm.v1.hisparse.runtime import HiSparseCacheHandle, PagedCacheView
 from vllm.v1.hisparse.types import SparseKVPageTransfer, SparseKVRowMirror
 from vllm.v1.worker.utils import (
     bind_kv_cache,
     bind_kv_cache_to_layers,
-    copy_kv_cache_blocks_inplace,
-    copy_kv_cache_blocks_large_page,
     request_memory,
 )
 
@@ -54,7 +51,6 @@ def _make_hisparse_worker() -> HiSparseConnectorWorker:
     worker._next_host_write_event = 0
     worker.dma_stream = None
     worker.shared_host_region = None
-    worker._completed_host_copy_dst_ids = []
     worker._metrics_calls = 0
     worker._metrics_event = MagicMock()
     worker._metrics_pending = False
@@ -433,75 +429,9 @@ def test_hisparse_registration_chunks_end_between_host_blocks():
     )
 
 
-def test_copy_cpu_kv_cache_logical_blocks_ignores_storage_padding():
-    backing = torch.full((10, 2, 3), -1, dtype=torch.float32)
-    cache = backing[1:9]
-    cache[2:4] = 7
-    cache[6:8] = 11
-
-    copy_kv_cache_blocks_inplace(
-        [cache],
-        num_blocks=4,
-        kv_cache_block_copies=[
-            KVCacheBlockCopy(1, 0),
-            KVCacheBlockCopy(3, 2),
-        ],
-    )
-
-    torch.testing.assert_close(cache[0:2], torch.full_like(cache[0:2], 7))
-    torch.testing.assert_close(cache[4:6], torch.full_like(cache[4:6], 11))
-    assert (backing[0] == -1).all()
-    assert (backing[9] == -1).all()
-
-
-def test_copy_kv_cache_blocks_large_page():
-    """Under the large-page allocator a CoW copy moves kernel rows on the
-    group's views: manager block b occupies rows b * R_g + j, j < R_g."""
-    from vllm.v1.kv_cache_interface import (
-        FullAttentionSpec,
-        KVCacheConfig,
-        KVCacheGroupSpec,
-    )
-
-    cfg = KVCacheConfig(
-        num_blocks=4,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                layer_names=["a.0", "a.1"],
-                kv_cache_spec=FullAttentionSpec(
-                    block_size=8, num_kv_heads=1, head_size=8, dtype=torch.float16
-                ),
-                num_blocks=5,
-                slots_per_large_page=1,
-                kernel_rows_per_block=2,
-                # Does not divide the page, so some block ids straddle a page end.
-                row_bytes=1536,
-            )
-        ],
-        allocator="large_page",
-        large_page_bytes=4096,
-    )
-    num_rows = 4 * 4096 // 1536
-    base = torch.arange(num_rows * 4, dtype=torch.float32).reshape(num_rows, 4)
-    views = [base.clone(), base.clone() * 100]  # two layers of the group
-    copies = [KVCacheBlockCopy(2, 4, group_id=0), KVCacheBlockCopy(1, 3, group_id=0)]
-    copy_kv_cache_blocks_large_page(
-        views, cfg.kv_cache_groups[0].kernel_rows_per_block, copies
-    )
-
-    for layer, view in enumerate(views):
-        expected = base.clone() * (100 if layer else 1)
-        for src, dst in ((2, 4), (1, 3)):
-            expected[2 * dst : 2 * dst + 2] = base[2 * src : 2 * src + 2] * (
-                100 if layer else 1
-            )
-        assert torch.equal(view, expected), f"layer {layer}"
-
-
 def test_bind_kv_cache_keeps_scheduler_block_views_for_runner():
-    """Block copies index scheduler blocks, so the runner keeps the unmapped
-    views while a packed layer is bound with kernel blocks."""
+    """The runner's caches stay addressed by manager block ids while a layer
+    can be bound with its kernel-row view."""
 
     class _Layer:
         def bind_kv_cache(self, kv_cache):
@@ -509,11 +439,10 @@ def test_bind_kv_cache_keeps_scheduler_block_views_for_runner():
 
     num_blocks, row = 4, 64
     storage = torch.zeros(num_blocks * row)
-    # Two layers packed into one block row: an 8x4 page, then a 4x2 page
-    # split into two 2-row kernel blocks.
+    # Two layers of one packed group: an 8x4 page, then a 4x2 page.
     mla = storage.as_strided((num_blocks, 8, 4), (row, 4, 1))
     indexer = storage.as_strided((num_blocks, 1, 4, 2), (row, 8, 2, 1), 40)
-    # The indexer in 2-row kernel blocks: block b's kernel block j is b * 16 + j.
+    # The indexer viewed at kernel-row granularity.
     mapped = indexer.as_strided((50, 1, 2, 2), (4, 8, 2, 1))
     kv_caches = {"layers.0.attn": mla, "layers.1.indexer": indexer}
     ctx = {name: _Layer() for name in kv_caches}
@@ -526,45 +455,9 @@ def test_bind_kv_cache_keeps_scheduler_block_views_for_runner():
         layer_kv_caches={**kv_caches, "layers.1.indexer": mapped},
     )
 
+    assert ctx["layers.0.attn"].kv_cache is mla
     assert ctx["layers.1.indexer"].kv_cache is mapped
     assert runner_kv_caches == [mla, indexer]
-    copies = [KVCacheBlockCopy(1, 3)]
-    with pytest.raises(AssertionError, match="not divisible"):
-        copy_kv_cache_blocks_inplace([mapped], num_blocks, copies)
-    storage[row : 2 * row] = 7
-    copy_kv_cache_blocks_inplace(runner_kv_caches, num_blocks, copies)
-    assert (mla[3] == 7).all() and (indexer[3] == 7).all()
-
-
-@pytest.mark.parametrize("shared,rank", [(False, 0), (True, 0), (True, 1)])
-@pytest.mark.parametrize("has_copies", [False, True])
-def test_hisparse_host_copy_waits_for_writes_on_writer_only(
-    monkeypatch, shared, rank, has_copies
-):
-    """Host CoW must read completed writes; shared non-writers only barrier."""
-    worker = _make_hisparse_worker()
-    cache = torch.zeros((2, 1, 1))
-    worker.host_caches = [cache]
-    worker.host_num_blocks = 2
-    worker.shared_host_region = object() if shared else None
-    event = MagicMock()
-    event.synchronize.side_effect = lambda: cache[0].fill_(7)
-    barrier = MagicMock()
-    monkeypatch.setattr(
-        hisparse_worker_module, "get_tensor_model_parallel_rank", lambda: rank
-    )
-    monkeypatch.setattr(
-        hisparse_worker_module, "get_tp_group", lambda: SimpleNamespace(barrier=barrier)
-    )
-    copies = [KVCacheBlockCopy(0, 1)] if has_copies else []
-
-    worker._copy_host_blocks(copies, event)
-
-    writes = has_copies and (not shared or rank == 0)
-    assert cache[1].item() == (7 if writes else 0)
-    assert event.synchronize.call_count == int(writes)
-    assert barrier.call_count == int(shared and has_copies)
-    assert worker._completed_host_copy_dst_ids == ([1] if has_copies else [])
 
 
 def test_hisparse_worker_updates_request_state_mapping_in_place(monkeypatch):
@@ -1136,7 +1029,6 @@ def test_hisparse_step_waits_for_previous_host_write(monkeypatch, is_host_writer
 
     worker.start_step(
         SimpleNamespace(
-            host_block_copies=[],
             command=None,
             source_block_ids=[],
             row_mirrors={},
@@ -1148,7 +1040,6 @@ def test_hisparse_step_waits_for_previous_host_write(monkeypatch, is_host_writer
     )
     worker.start_step(
         SimpleNamespace(
-            host_block_copies=[],
             command=None,
             source_block_ids=[],
             row_mirrors={},
@@ -1164,34 +1055,6 @@ def test_hisparse_step_waits_for_previous_host_write(monkeypatch, is_host_writer
         call(host_write_events[0]),
     ]
     assert worker.host_write_event is host_write_events[1]
-
-
-@pytest.mark.parametrize("tp_rank, expected_copies", [(0, 1), (1, 0)])
-def test_hisparse_shared_host_block_copy_has_one_writer(
-    monkeypatch, tp_rank, expected_copies
-):
-    worker = _make_hisparse_worker()
-    worker.shared_host_region = object()
-    worker.host_caches = (torch.empty(4, 1),)
-    worker.host_num_blocks = 4
-    previous_event = MagicMock()
-    copies = (KVCacheBlockCopy(0, 1),)
-    copy_blocks = MagicMock()
-    tp_group = MagicMock()
-    monkeypatch.setattr(
-        hisparse_worker_module, "get_tensor_model_parallel_rank", lambda: tp_rank
-    )
-    monkeypatch.setattr(hisparse_worker_module, "get_tp_group", lambda: tp_group)
-    monkeypatch.setattr(
-        hisparse_worker_module, "copy_kv_cache_blocks_inplace", copy_blocks
-    )
-
-    worker._copy_host_blocks(copies, previous_event)
-
-    assert copy_blocks.call_count == expected_copies
-    tp_group.barrier.assert_called_once_with()
-    assert worker.take_completed_host_copies() == [1]
-    assert worker.take_completed_host_copies() == []
 
 
 def test_hisparse_empty_step_does_not_replay_stale_host_mirror(monkeypatch):
@@ -1222,7 +1085,6 @@ def test_hisparse_empty_step_does_not_replay_stale_host_mirror(monkeypatch):
 
     worker.start_step(
         SimpleNamespace(
-            host_block_copies=[],
             command=None,
             source_block_ids=[],
             row_mirrors={},
@@ -1239,6 +1101,7 @@ def test_hisparse_empty_step_does_not_replay_stale_host_mirror(monkeypatch):
     torch.testing.assert_close(handle.mirror_slot_mapping, torch.tensor([4, 5]))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_hisparse_cache_handles_join_index_groups_during_construction(monkeypatch):
     """Followers must not allocate duplicate runtime state before profiling."""
     config = SimpleNamespace(
@@ -1531,3 +1394,23 @@ def test_request_memory_charges_external_weights():
         request_memory(
             _memory_snapshot(total_gib=100, free_gib=10), cache_config, 70 * GiB_bytes
         )
+
+
+def test_hisparse_attention_rows_address_a_strided_large_page_view():
+    """A large-page layer view has other groups' rows between its blocks and
+    does not run to the end of the backing tensor; the flat attention rows
+    still name the same bytes as the paged view."""
+    raw = torch.arange(84, dtype=torch.float32).view(torch.int8)
+    view = PagedCacheView.bind(
+        raw,
+        dtype=torch.float32,
+        row_width=4,
+        byte_offset=32,
+        block_stride=96,
+        num_blocks=3,
+        block_size=2,
+    )
+
+    assert view.attention_block_stride == 6
+    flat_rows = view.attention_cache.reshape(-1, 4)
+    assert torch.equal(flat_rows[[0, 1, 6, 7, 12, 13]], view.cache.reshape(-1, 4))

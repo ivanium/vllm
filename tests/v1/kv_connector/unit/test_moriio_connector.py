@@ -22,6 +22,7 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+    MORIIO_CONNECTOR_VERSION,
     ROLE,
     MoRIIOAgentMetadata,
     MoRIIOConnectorMetadata,
@@ -29,7 +30,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOMode,
     resolve_host_ip,
     set_role,
-    zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
     KVConnectorRole,
@@ -41,6 +41,7 @@ from vllm.platforms import current_platform
 from vllm.utils.network_utils import (
     get_ip,
     make_zmq_path,
+    zmq_socket_ctx,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -49,7 +50,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
     SlidingWindowSpec,
-    compute_layer_kv_cache_shape_bytes,
 )
 
 from .utils import create_request, create_scheduler
@@ -63,26 +63,70 @@ def _find_free_port() -> int:
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
     layer_names = ["layer0", "layer1", "layer2"]
-    num_blocks = 2
     spec = FullAttentionSpec(
         block_size=16,
         num_kv_heads=4,
         head_size=64,
         dtype=torch.float16,
     )
-    page = spec.page_size_bytes
+    # Large-page layout: one row per block (R=1), one block per page; a row
+    # packs every layer of the group.
+    row = len(layer_names) * spec.page_size_bytes
+    num_pages = 2
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_pages,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=len(layer_names) * num_blocks * page,
-                layers=layer_names,
-                layer_stride=num_blocks * page,
-                block_stride=page,
+                size=num_pages * row,
+                layers=[name],
+                layer_stride=row,
+                block_stride=row,
+                offset=i * spec.page_size_bytes,
+            )
+            for i, name in enumerate(layer_names)
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=layer_names,
+                kv_cache_spec=spec,
+                num_blocks=num_pages,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=row,
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)],
+        large_page_bytes=row,
+        block_size=spec.block_size,
     )
+
+
+def _large_page_kv_caches(config: KVCacheConfig) -> dict[str, torch.Tensor]:
+    """Pool-backed [K, H, N, C] uint8 views matching a large-page config."""
+    num_pages = config.num_pages
+    pool = torch.zeros(num_pages * config.large_page_bytes, dtype=torch.uint8)
+    caches = {}
+    for group in config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        row = group.row_bytes
+        num_rows = num_pages * config.large_page_bytes // row
+        for i, name in enumerate(group.layer_names):
+            caches[name] = torch.as_strided(
+                pool,
+                (
+                    num_rows,
+                    spec.num_heads,
+                    spec.num_states,
+                    spec.state_content_size_bytes,
+                ),
+                (
+                    row,
+                    spec.num_states * spec.state_content_size_bytes,
+                    spec.state_content_size_bytes,
+                    1,
+                ),
+                storage_offset=i * spec.page_size_bytes,
+            )
+    return caches
 
 
 aiter_available = importlib.util.find_spec("aiter") is not None
@@ -595,27 +639,17 @@ def test_send_transfer_release_sends_structured_release_message():
     not aiter_available, reason="Requires aiter package for ROCm FlashAttention backend"
 )
 def test_register_kv_caches(mock_parallel_groups):
-    """Test that MoRIIOConnector.register_kv_caches correctly registers kv caches."""
+    """MoRIIOConnector.register_kv_caches registers the shared large-page pool
+    as one memory region and records each layer view's offset inside it."""
     ROLE = "kv_consumer"
     IP = get_ip()
     vllm_config = create_vllm_config(role=ROLE)
     DEFAULT_PORT = 6301
     TP_RANK = 0
     DP_RANK = 0
-    # Create test kv cache tensors using KVCacheSpec layout
-    shape = compute_layer_kv_cache_shape_bytes(
-        FullAttentionSpec(
-            block_size=16, num_kv_heads=4, head_size=64, dtype=torch.float16
-        ),
-        2,
-    )
-    shared_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
-    unique_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
-    kv_caches = {
-        "layer0": shared_tensor,
-        "layer1": unique_tensor,
-        "layer2": shared_tensor,
-    }
+    config = _make_test_kv_cache_config()
+    kv_caches = _large_page_kv_caches(config)
+    page = config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
 
     with (
         patch(
@@ -639,7 +673,7 @@ def test_register_kv_caches(mock_parallel_groups):
             connector = MoRIIOConnector(
                 vllm_config,
                 KVConnectorRole.WORKER,
-                _make_test_kv_cache_config(),
+                config,
             )
             connector.connector_worker = FakeMoRIIOConnectorWorker(
                 vllm_config, connector.engine_id, hand_shake_latency=0
@@ -652,42 +686,23 @@ def test_register_kv_caches(mock_parallel_groups):
         # Execute register_kv_caches
         connector.register_kv_caches(kv_caches)
 
-        # Verify that the MemoryDesc stored in layer_name_to_local_kv_cache_metadata
-        assert (
-            shared_tensor.data_ptr()
-            == MemoryDesc.unpack(
-                connector.connector_worker.layer_name_to_local_kv_cache_metadata[
-                    "layer0"
-                ][0]
-            ).data
-        )
-        assert (
-            unique_tensor.data_ptr()
-            == MemoryDesc.unpack(
-                connector.connector_worker.layer_name_to_local_kv_cache_metadata[
-                    "layer1"
-                ][0]
-            ).data
-        )
-        assert (
-            shared_tensor.data_ptr()
-            == MemoryDesc.unpack(
-                connector.connector_worker.layer_name_to_local_kv_cache_metadata[
-                    "layer2"
-                ][0]
-            ).data
-        )
+        worker = connector.connector_worker
+        assert worker is not None
+        # Every attention layer registers the one shared pool MR; the layer's
+        # position inside it is tracked in kv_layer_mr_offset.
+        mem_descs = {
+            name: MemoryDesc.unpack(
+                worker.layer_name_to_local_kv_cache_metadata[name][0]
+            )
+            for name in kv_caches
+        }
+        assert len({desc.data for desc in mem_descs.values()}) == 1
+        offsets = [worker.kv_layer_mr_offset[name] for name in sorted(kv_caches)]
+        assert [b - a for a, b in zip(offsets, offsets[1:])] == [page, page]
 
         # Verify engine keys
         expected_engine_key = f"{ROLE[3:]}:{IP}:{DEFAULT_PORT}:tp{TP_RANK}:dp{DP_RANK}"
-        assert (
-            MemoryDesc.unpack(
-                connector.connector_worker.layer_name_to_local_kv_cache_metadata[
-                    "layer0"
-                ][0]
-            ).engine_key
-            == expected_engine_key
-        )
+        assert mem_descs["layer0"].engine_key == expected_engine_key
 
 
 @pytest.mark.skipif(
@@ -697,20 +712,8 @@ def test_moriio_handshake_returns_metadata(mock_parallel_groups):
     """MoRIIO handshake socket returns valid agent metadata over ZMQ."""
     ROLE = "kv_consumer"
     vllm_config = create_vllm_config(role=ROLE)
-    # Create test kv cache tensors using KVCacheSpec layout
-    shape = compute_layer_kv_cache_shape_bytes(
-        FullAttentionSpec(
-            block_size=16, num_kv_heads=4, head_size=64, dtype=torch.float16
-        ),
-        2,
-    )
-    shared_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
-    unique_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
-    kv_caches = {
-        "layer0": shared_tensor,
-        "layer1": unique_tensor,
-        "layer2": shared_tensor,
-    }
+    config = _make_test_kv_cache_config()
+    kv_caches = _large_page_kv_caches(config)
 
     with (
         patch(
@@ -733,7 +736,7 @@ def test_moriio_handshake_returns_metadata(mock_parallel_groups):
             connector = MoRIIOConnector(
                 vllm_config,
                 KVConnectorRole.WORKER,
-                _make_test_kv_cache_config(),
+                config,
             )
 
         # Execute register_kv_caches
@@ -741,7 +744,7 @@ def test_moriio_handshake_returns_metadata(mock_parallel_groups):
 
         # Connect to handshake socket and request metadata
         path = make_zmq_path("tcp", "127.0.0.1", handshake_port)
-        with zmq_ctx(zmq.DEALER, path) as sock:
+        with zmq_socket_ctx(path, zmq.DEALER, bind=False) as sock:
             sock.send(MoRIIOConstants.GET_META_MSG)
             received_frame = sock.recv_multipart()
 
@@ -754,6 +757,10 @@ def test_moriio_handshake_returns_metadata(mock_parallel_groups):
             assert isinstance(metadata, MoRIIOAgentMetadata), (
                 "Decoded metadata is not MoRIIOAgentMetadata"
             )
+            assert metadata.version == MORIIO_CONNECTOR_VERSION
+            # One transfer group: one block (row) per page, two pages.
+            assert metadata.group_num_blocks == [2]
+            assert [g.kernel_rows_per_block for g in metadata.group_geometries] == [1]
 
 
 def test_resolve_host_ip_prefers_extra_config():
@@ -977,22 +984,40 @@ def _make_hybrid_kv_cache_config() -> KVCacheConfig:
         dtype=torch.float16,
         sliding_window=32,
     )
-    num_blocks = 2
+    num_pages = 2
+    # Same page for both groups: one block (one row) per page.
     page = full_spec.page_size_bytes
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_pages,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=2 * num_blocks * page,
-                layers=["full0", "sw0"],
-                layer_stride=num_blocks * page,
+                size=num_pages * page,
+                layers=[name],
+                layer_stride=page,
                 block_stride=page,
             )
+            for name in ("full0", "sw0")
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=["full0"], kv_cache_spec=full_spec),
-            KVCacheGroupSpec(layer_names=["sw0"], kv_cache_spec=sw_spec),
+            KVCacheGroupSpec(
+                layer_names=["full0"],
+                kv_cache_spec=full_spec,
+                num_blocks=num_pages,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=page,
+            ),
+            KVCacheGroupSpec(
+                layer_names=["sw0"],
+                kv_cache_spec=sw_spec,
+                num_blocks=num_pages,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=page,
+            ),
         ],
+        large_page_bytes=page,
+        block_size=full_spec.block_size,
     )
 
 
@@ -1007,21 +1032,30 @@ def _make_sliding_window_only_kv_cache_config() -> KVCacheConfig:
         dtype=torch.float16,
         sliding_window=32,
     )
-    num_blocks = 2
+    num_pages = 2
     page = sw_spec.page_size_bytes
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_pages,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=num_blocks * page,
+                size=num_pages * page,
                 layers=["sw0"],
-                layer_stride=num_blocks * page,
+                layer_stride=page,
                 block_stride=page,
             )
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=["sw0"], kv_cache_spec=sw_spec),
+            KVCacheGroupSpec(
+                layer_names=["sw0"],
+                kv_cache_spec=sw_spec,
+                num_blocks=num_pages,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=page,
+            )
         ],
+        large_page_bytes=page,
+        block_size=sw_spec.block_size,
     )
 
 
@@ -1093,22 +1127,39 @@ def test_non_sliding_window_hybrid_is_rejected():
         dtype=torch.float16,
         attention_chunk_size=32,
     )
-    num_blocks = 2
+    num_pages = 2
     page = full_spec.page_size_bytes
     config = KVCacheConfig(
-        num_blocks=num_blocks,
+        num_pages=num_pages,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=2 * num_blocks * page,
-                layers=["full0", "local0"],
-                layer_stride=num_blocks * page,
+                size=num_pages * page,
+                layers=[name],
+                layer_stride=page,
                 block_stride=page,
             )
+            for name in ("full0", "local0")
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=["full0"], kv_cache_spec=full_spec),
-            KVCacheGroupSpec(layer_names=["local0"], kv_cache_spec=local_spec),
+            KVCacheGroupSpec(
+                layer_names=["full0"],
+                kv_cache_spec=full_spec,
+                num_blocks=num_pages,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=page,
+            ),
+            KVCacheGroupSpec(
+                layer_names=["local0"],
+                kv_cache_spec=local_spec,
+                num_blocks=num_pages,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=page,
+            ),
         ],
+        large_page_bytes=page,
+        block_size=full_spec.block_size,
     )
     with pytest.raises(NotImplementedError, match="sliding-window hybrid"):
         _read_scheduler(config)

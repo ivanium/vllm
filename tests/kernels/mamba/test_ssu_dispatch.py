@@ -298,6 +298,7 @@ def _kv_cache_config_with_ssu(
         num_blocks=1,
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["l0"], kv_cache_spec=spec)],
+        block_size=16,
     )
 
 

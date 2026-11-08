@@ -414,8 +414,8 @@ def test_manager_counts_load_blocks_completed() -> None:
     sched = fixture.scheduler
 
     request = make_request(num_blocks=2)
-    gpu_blocks = fixture.gpu_block_pool.get_new_blocks(2)
-    cpu_blocks = sched.cpu_block_pool.get_new_blocks(2)
+    gpu_blocks = fixture.gpu_block_pool.get_new_blocks(2, 0)
+    cpu_blocks = sched.cpu_block_pool.get_new_blocks(2, 0)
     sched._reqs_to_load[request.request_id] = LoadRequestState(
         request=request,
         transfer_meta=TransferMeta(
@@ -444,8 +444,8 @@ def test_manager_abandoned_load_counts_as_completed_after_reset() -> None:
     sched = fixture.scheduler
 
     request = make_request(num_blocks=2)
-    gpu_blocks = fixture.gpu_block_pool.get_new_blocks(2)
-    cpu_blocks = sched.cpu_block_pool.get_new_blocks(2)
+    gpu_blocks = fixture.gpu_block_pool.get_new_blocks(2, 0)
+    cpu_blocks = sched.cpu_block_pool.get_new_blocks(2, 0)
     sched._reqs_to_load[request.request_id] = LoadRequestState(
         request=request,
         transfer_meta=TransferMeta(

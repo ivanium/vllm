@@ -90,7 +90,7 @@ def test_invalid_blocks_evicted_prevents_cache_pollution(
     # get allocated block IDs
     req_block_ids = scheduler_output.scheduled_new_reqs[0].block_ids[0]
     invalid_block_id = req_block_ids[invalid_block_idx]
-    invalid_block_ids = {invalid_block_id}
+    invalid_block_ids = {(0, invalid_block_id)}
 
     # get the block object to verify eviction later
     block = fail_scheduler.kv_cache_manager.block_pool.blocks[invalid_block_id]

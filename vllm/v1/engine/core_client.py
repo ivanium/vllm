@@ -868,14 +868,12 @@ class MPClient(EngineCoreClient):
 
         # Setup KV cache config with initialization state from
         # engine core process. Sum num_gpu_blocks from all engines in DP case.
-        # Under the large-page allocator num_gpu_blocks is the number of large
-        # pages N, so the sum is in pages (unchanged in meaning).
+        # num_gpu_blocks is the number of large pages N, so the sum is in pages.
         num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks or 0
         num_gpu_blocks += response.num_gpu_blocks
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
 
-        # Sync block_size: may be enlarged by _align_hybrid_block_size in the
-        # worker for hybrid Mamba models.
+        # Sync block_size: the KV cache planner resolves it in the engine core.
         cache_config = vllm_config.cache_config
         cache_config.block_size = response.block_size
         cache_config.mamba_block_size = response.mamba_block_size

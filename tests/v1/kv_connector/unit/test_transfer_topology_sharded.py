@@ -24,7 +24,6 @@ def _make_topology(
     return TransferTopology(
         tp_rank=tp_rank,
         tp_size=tp_size,
-        block_size=16,
         engine_id="local-engine",
         is_mla=False,
         is_mamba=False,
@@ -39,7 +38,6 @@ def test_legacy_register_remote_engine_uses_pp_rank_zero() -> None:
         remote_tp_size=2,
         remote_block_len=1024,
         remote_block_size=16,
-        remote_physical_blocks_per_logical=1,
     )
 
     registered = topology.register_remote_engine("remote-engine", info)
@@ -58,7 +56,6 @@ def test_register_remote_engine_stores_pp_ranks_separately() -> None:
         remote_tp_size=2,
         remote_block_len=1024,
         remote_block_size=16,
-        remote_physical_blocks_per_logical=1,
         remote_pp_rank=0,
         start_layer=0,
         end_layer=16,
@@ -67,7 +64,6 @@ def test_register_remote_engine_stores_pp_ranks_separately() -> None:
         remote_tp_size=1,
         remote_block_len=512,
         remote_block_size=8,
-        remote_physical_blocks_per_logical=2,
         remote_pp_rank=1,
         start_layer=16,
         end_layer=32,
@@ -95,7 +91,6 @@ def test_helpers_use_requested_pp_rank() -> None:
             remote_tp_size=1,
             remote_block_len=1024,
             remote_block_size=16,
-            remote_physical_blocks_per_logical=1,
             remote_pp_rank=0,
             start_layer=0,
             end_layer=8,
@@ -107,7 +102,6 @@ def test_helpers_use_requested_pp_rank() -> None:
             remote_tp_size=4,
             remote_block_len=1024,
             remote_block_size=16,
-            remote_physical_blocks_per_logical=1,
             remote_pp_rank=1,
             start_layer=8,
             end_layer=16,
@@ -128,7 +122,6 @@ def test_engine_info_fields_have_backward_compatible_defaults() -> None:
         remote_tp_size=2,
         remote_block_len=1024,
         remote_block_size=16,
-        remote_physical_blocks_per_logical=1,
     )
 
     registered = topology.register_remote_engine("remote-engine", info)

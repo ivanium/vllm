@@ -395,9 +395,10 @@ def test_dsv4_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
 @pytest.mark.cpu_test
 def test_k3_dspark_mla_kv_cache_spec_groups_with_target_mla():
     """The draft's MLA layers must share a KV cache group with the target's."""
+    from vllm.config import ModelConfig, VllmConfig
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
     from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
-    from vllm.v1.core.kv_cache_planning import _get_kv_cache_groups_uniform_page_size
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 
     vllm_config = SimpleNamespace(
         model_config=None, cache_config=SimpleNamespace(block_size=64)
@@ -421,6 +422,8 @@ def test_k3_dspark_mla_kv_cache_spec_groups_with_target_mla():
     kv_cache_spec = {f"model.layers.{i}.attn": target_spec for i in range(24)}
     kv_cache_spec |= {f"draft.layers.{i}.attn": draft_spec for i in range(5)}
 
-    groups = _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+    groups = get_kv_cache_groups(
+        VllmConfig(model_config=ModelConfig(max_model_len=1024)), kv_cache_spec
+    )
     assert len(groups) == 1
     assert len(groups[0].layer_names) == 29

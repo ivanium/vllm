@@ -111,14 +111,19 @@ class CPUModelRunner(GPUModelRunner):
     def _sync_device(self) -> None:
         pass
 
-    def _zero_block_ids(self, block_ids: list[int]) -> None:
+    def _zero_block_ids(self, block_ids: list[list[int]]) -> None:
         # Zero full-attention blocks to prevent stale data corruption on partial writes.
         # Encoder-only (runner-only) layers are not FullAttentionSpec, so the
         # spec filter below already excludes them; no runner-only skip needed.
         seen_ptrs: set[int] = set()
-        for group in self.kv_cache_config.kv_cache_groups:
-            if not isinstance(group.kv_cache_spec, FullAttentionSpec):
+        for group_id, group_block_ids in enumerate(block_ids):
+            group = self.kv_cache_config.kv_cache_groups[group_id]
+            if not group_block_ids or not isinstance(
+                group.kv_cache_spec, FullAttentionSpec
+            ):
                 continue
+            geometry = self.kv_cache_config.group_geometry(group_id)
+            rows = torch.from_numpy(geometry.rows(group_block_ids))
             for layer_name in group.layer_names:
                 ctx = self.compilation_config.static_forward_context.get(layer_name)
                 if ctx is None:
@@ -129,8 +134,7 @@ class CPUModelRunner(GPUModelRunner):
                 if kv.data_ptr() in seen_ptrs:
                     continue
                 seen_ptrs.add(kv.data_ptr())
-                for block_id in block_ids:
-                    kv[block_id].zero_()
+                kv[rows] = 0
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         """CPU-safe version: direct tolist() without CUDA events."""

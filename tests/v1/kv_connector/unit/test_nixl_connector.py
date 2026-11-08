@@ -70,6 +70,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CircularBufferSpec,
     FullAttentionSpec,
+    GroupGeometry,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
@@ -83,6 +84,8 @@ from vllm.v1.request import RequestStatus
 from .test_nixl_desc_geometry import (
     _large_page_remote_meta,
     _make_large_page_worker,
+    fill_lp_geometry,
+    make_lp_kv_cache_config,
 )
 from .utils import (
     create_model_runner_output,
@@ -90,7 +93,6 @@ from .utils import (
     create_scheduler,
     create_vllm_config,
     expand_strided_descs,
-    make_kv_cache_config,
     maybe_update_block_size,
 )
 
@@ -453,7 +455,10 @@ def test_kv_transfer_handshake(dist_init):
             )
         ]
         kv_cache_config = KVCacheConfig(
-            num_blocks=2, kv_cache_tensors=[], kv_cache_groups=kv_cache_groups
+            num_pages=2,
+            kv_cache_tensors=[],
+            kv_cache_groups=kv_cache_groups,
+            block_size=block_size,
         )
         prefill_connector = NixlConnector(
             vllm_config, KVConnectorRole.WORKER, kv_cache_config
@@ -462,13 +467,13 @@ def test_kv_transfer_handshake(dist_init):
             AttentionSpec, kv_cache_config.kv_cache_groups[0].kv_cache_spec
         )
         raw = torch.zeros(
-            kv_cache_spec.page_size_bytes * kv_cache_config.num_blocks * 3,
+            kv_cache_spec.page_size_bytes * kv_cache_config.num_pages * 3,
             dtype=torch.int8,
         )
         caches = dense_kv_cache_views(
             raw,
             kv_cache_spec,
-            kv_cache_config.num_blocks,
+            kv_cache_config.num_pages,
             num_layers=3,
             layout=KVCacheLayout.BLHNC,
         )
@@ -543,6 +548,17 @@ def test_kv_transfer_handshake(dist_init):
         scheduler_connector.shutdown()
 
 
+def lp_peer_geometry(worker, num_regions: int) -> dict[str, Any]:
+    """Mandatory large-page region/geometry fields for a peer's metadata."""
+    return {
+        "region_num_blocks": [1] * num_regions,
+        "region_group_ids": [0] * num_regions,
+        "region_mem_types": ["VRAM"] * num_regions,
+        "group_geometries": worker.kv_cache_config.transfer_group_geometries,
+        "group_layer_names": [list(names) for names in worker._group_layer_names],
+    }
+
+
 class FakeNixlConnectorWorker(NixlConnectorWorker):
     REMOTE_ENGINE_ID = "remote_engine"
 
@@ -555,21 +571,20 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         **kwargs,
     ):
         if kv_cache_config is None:
-            kv_cache_config = make_kv_cache_config(
+            kv_cache_config = make_lp_kv_cache_config(
                 block_size=args[0].cache_config.block_size
             )
         super().__init__(*args, kv_cache_config=kv_cache_config, **kwargs)
         self._hand_shake_latency = hand_shake_latency
         self.kv_cache_layout = kv_cache_layout
         # Mock register_kv_caches attributes needed for tests that do not call it.
-        self.src_xfer_handles_by_block_size = {self.block_size: 1}
+        self.src_xfer_handle = 1
         self.src_blocks_data = np.empty((0, 5), dtype=np.uint64)
         rep_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         test_shape = compute_layer_kv_cache_shape_bytes(rep_spec, 1)
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.world_size,
-            block_size=self.block_size,
             engine_id=self.engine_id,
             is_mla=self.use_mla,
             is_mamba=False,
@@ -596,16 +611,15 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         time.sleep(self._hand_shake_latency)
         # These should've been done in register_kv_caches(), called by
         # gpu_model_runner. Here we just hardcode some dummy values.
+        transfer_groups = self.kv_cache_config.transfer_groups
         slot_size_bytes = 4096
         self.slot_size_per_layer = [slot_size_bytes]
         self.block_len_per_layer = [slot_size_bytes * self.block_size]
-        self.num_blocks = self.kv_cache_config.num_blocks
-        self.num_regions = 1
+        self.num_regions = len(transfer_groups)
         self.block_stride_per_layer = list(self.block_len_per_layer)
-        self.region_num_blocks = [self.num_blocks]
-        self.region_group_ids = [0]
-        self.region_mem_types = [self.nixl_memory_type]
-        self.dst_num_blocks[self.engine_id] = self.num_blocks
+        self.region_num_blocks = [group.num_blocks for group in transfer_groups]
+        self.region_group_ids = list(range(self.num_regions))
+        self.region_mem_types = [self.nixl_memory_type] * self.num_regions
         self.dst_region_num_blocks[self.engine_id] = self.region_num_blocks
         self.dst_region_group_ids[self.engine_id] = self.region_group_ids
         self.dst_region_mem_types[self.engine_id] = self.region_mem_types
@@ -637,17 +651,17 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                     agent_metadata=FakeNixlWrapper.AGENT_METADATA,
                     kv_caches_base_addr=[0],
                     device_id=remote_tp_rank,
-                    num_blocks=self.num_blocks,
                     block_lens=remote_block_lens,
                     block_strides=remote_block_lens,
                     kv_cache_layout="LBHNC",
                     block_size=self.block_size,
                     ssm_sizes=(0, 0),
                     attn_backend_name=self.backend_name,
-                    physical_blocks_per_logical_kv_block=1,
                     region_num_blocks=self.region_num_blocks,
                     region_group_ids=self.region_group_ids,
                     region_mem_types=self.region_mem_types,
+                    group_geometries=self.kv_cache_config.transfer_group_geometries,
+                    group_layer_names=[list(g) for g in self._group_layer_names],
                 ),
                 remote_tp_rank=remote_tp_rank,
                 remote_tp_size=remote_tp_size,
@@ -706,7 +720,7 @@ class TestNixlHandshake:
             connector = NixlConnector(
                 vllm_config,
                 KVConnectorRole.WORKER,
-                make_kv_cache_config(block_size=block_size),
+                make_lp_kv_cache_config(block_size=block_size),
             )
 
         worker = connector.connector_worker
@@ -766,7 +780,7 @@ class TestNixlHandshake:
         request_id = "req_id"
 
         # Test worker role in decode server.
-        kv_cache_config = make_kv_cache_config(block_size=block_size, num_blocks=10)
+        kv_cache_config = make_lp_kv_cache_config(block_size=block_size, num_blocks=10)
         connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
         connector.connector_worker = FakeNixlConnectorWorker(
             vllm_config,
@@ -860,7 +874,7 @@ class TestNixlHandshake:
         connector = NixlConnector(
             vllm_config,
             KVConnectorRole.WORKER,
-            make_kv_cache_config(block_size=block_size),
+            make_lp_kv_cache_config(block_size=block_size),
         )
         connector.connector_worker = FakeNixlConnectorWorker(
             vllm_config, connector.engine_id
@@ -923,7 +937,7 @@ class TestNixlHandshake:
         # num_blocks=1 keeps the fake handshake's region_num_blocks consistent
         # with the minimal single-block registration below (num_descs == 1);
         # _fa_desc_replicated cross-checks the two.
-        kv_cache_config = make_kv_cache_config(block_size=block_size, num_blocks=1)
+        kv_cache_config = make_lp_kv_cache_config(block_size=block_size, num_blocks=1)
         connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
         connector.connector_worker = FakeNixlConnectorWorker(
             vllm_config,
@@ -936,11 +950,9 @@ class TestNixlHandshake:
         # Minimal local registration params used by add_remote_agent
         worker.slot_size_per_layer = [4096]
         worker.block_len_per_layer = [4096 * worker.block_size]
-        worker.num_blocks = 1
-        worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
         block_len = worker.block_len_per_layer[0]
         worker.src_blocks_data = np.array(
-            [(0, block_len, worker.tp_rank, block_len, worker.num_blocks)],
+            [(0, block_len, worker.tp_rank, block_len, 1)],
             dtype=np.uint64,
         )
         worker.num_descs = int(worker.src_blocks_data[:, 4].sum())
@@ -953,10 +965,9 @@ class TestNixlHandshake:
             remote_info = worker.transfer_topo.get_engine_info(remote_engine_id)
             assert remote_info.remote_tp_size == remote_tp_size
             assert -tp_ratio == worker.transfer_topo.tp_ratio(remote_tp_size)
-            # ensure src_xfer_handles_by_tp_ratio is populated with tpratio chunks
-            split_key = (-tp_ratio, worker.block_size)
-            assert split_key in worker.src_xfer_handles_by_tp_ratio
-            assert len(worker.src_xfer_handles_by_tp_ratio[split_key]) == tp_ratio
+            # Split handles are registered per remote tp ratio.
+            assert -tp_ratio in worker.src_xfer_handles_by_tp_ratio
+            assert len(worker.src_xfer_handles_by_tp_ratio[-tp_ratio]) == tp_ratio
             assert remote_engine_id in worker.dst_xfer_side_handles
             assert set(worker.dst_xfer_side_handles[remote_engine_id].keys()) == set(
                 range(tp_ratio)
@@ -1001,12 +1012,12 @@ class TestNixlHandshake:
         conn_p0 = NixlConnector(
             vllm_config,
             KVConnectorRole.WORKER,
-            make_kv_cache_config(block_size=block_size),
+            make_lp_kv_cache_config(block_size=block_size),
         )
         conn_p1 = NixlConnector(
             vllm_config,
             KVConnectorRole.WORKER,
-            make_kv_cache_config(block_size=block_size),
+            make_lp_kv_cache_config(block_size=block_size),
         )
         conn_p0.connector_worker = FakeNixlConnectorWorker(
             vllm_config, conn_p0.engine_id, hand_shake_latency=0
@@ -1107,14 +1118,14 @@ class TestNixlHandshake:
         connector = NixlConnector(
             vllm_config,
             KVConnectorRole.WORKER,
-            make_kv_cache_config(block_size=block_size),
+            make_lp_kv_cache_config(block_size=block_size),
         )
         connector.connector_worker = FakeNixlConnectorWorker(
             vllm_config, connector.engine_id
         )
         # Register (mocked) local xfer handler
         # worker = connector.connector_worker
-        # worker.src_xfer_handles_by_block_size = {worker.block_size: 1}
+        # worker.src_xfer_handle = 1
         metadata = NixlConnectorMetadata()
         total_reqs = 5
         for i in range(total_reqs):
@@ -1187,7 +1198,7 @@ class TestNixlHandshake:
             connector = NixlConnector(
                 vllm_config,
                 KVConnectorRole.WORKER,
-                make_kv_cache_config(block_size=block_size),
+                make_lp_kv_cache_config(block_size=block_size),
             )
             connector.connector_worker = FakeNixlConnectorWorker(
                 vllm_config,
@@ -1200,8 +1211,6 @@ class TestNixlHandshake:
             # Minimal local registration params used by add_remote_agent
             worker.slot_size_per_layer = [4096]
             worker.block_len_per_layer = [4096 * worker.block_size]
-            worker.num_blocks = 1
-            worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
 
             # Metadata with different kv_cache_layout than local worker
             mismatched_layout = (
@@ -1212,14 +1221,13 @@ class TestNixlHandshake:
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
                 kv_caches_base_addr=[0],
                 device_id=0,
-                num_blocks=1,
                 block_lens=worker.block_len_per_layer,
                 block_strides=worker.block_len_per_layer,
                 kv_cache_layout=mismatched_layout,
                 block_size=worker.block_size,
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
-                physical_blocks_per_logical_kv_block=1,
+                **lp_peer_geometry(worker, 1),
             )
 
             with pytest.raises(RuntimeError):
@@ -1252,7 +1260,7 @@ class TestNixlHandshake:
             connector = NixlConnector(
                 vllm_config,
                 KVConnectorRole.WORKER,
-                make_kv_cache_config(block_size=block_size),
+                make_lp_kv_cache_config(block_size=block_size),
             )
             connector.connector_worker = FakeNixlConnectorWorker(
                 vllm_config,
@@ -1265,8 +1273,6 @@ class TestNixlHandshake:
             # Minimal local registration params used by add_remote_agent
             worker.slot_size_per_layer = [2048]
             worker.block_len_per_layer = [2048 * worker.block_size]
-            worker.num_blocks = 1
-            worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
 
             # Metadata with different kv_cache_layout than local worker
             # prefill TP=1, decode TP=2, remote block_lens is double to local
@@ -1276,14 +1282,13 @@ class TestNixlHandshake:
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
                 kv_caches_base_addr=[0],
                 device_id=0,
-                num_blocks=1,
                 block_lens=remote_block_lens,
                 block_strides=remote_block_lens,
                 kv_cache_layout="LBHNC",
                 block_size=worker.block_size,
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
-                physical_blocks_per_logical_kv_block=1,
+                **lp_peer_geometry(worker, 1),
             )
 
             # We don't check layout for homogeneous TP and MLA for now, as the
@@ -1307,14 +1312,12 @@ class TestNixlHandshake:
         local_block_len = remote_block_len // 2
         worker.block_len_per_layer = [local_block_len]
         worker._region_is_mla = [False]
-        worker.num_blocks = 1
         worker.num_regions = 1
         worker._has_mamba = True
         worker._mamba_ssm_size = (128, 256)
         worker.transfer_topo = TransferTopology(
             tp_rank=1,
             tp_size=2,
-            block_size=worker.block_size,
             engine_id=worker.engine_id,
             is_mla=False,
             is_mamba=True,
@@ -1331,18 +1334,16 @@ class TestNixlHandshake:
             agent_metadata=FakeNixlWrapper.AGENT_METADATA,
             kv_caches_base_addr=[0x1000],
             device_id=0,
-            num_blocks=1,
             block_lens=[remote_block_len],
             block_strides=[remote_block_len],
             kv_cache_layout="HND",
             block_size=worker.block_size,
             ssm_sizes=(0, 0),
             attn_backend_name=worker.backend_name,
-            physical_blocks_per_logical_kv_block=1,
-            region_num_blocks=None,
+            region_num_blocks=[1],
         )
 
-        assert worker._build_fa_remote(plan, meta, block_size_ratio=1).tolist() == [
+        assert worker._build_fa_remote(plan, meta).tolist() == [
             [0x1000 + local_block_len, local_block_len, 0, remote_block_len, 1]
         ]
 
@@ -1364,7 +1365,7 @@ class TestNixlHandshake:
             connector = NixlConnector(
                 vllm_config,
                 KVConnectorRole.WORKER,
-                make_kv_cache_config(block_size=block_size),
+                make_lp_kv_cache_config(block_size=block_size),
             )
             connector.connector_worker = FakeNixlConnectorWorker(
                 vllm_config, connector.engine_id, hand_shake_latency=0
@@ -1377,12 +1378,10 @@ class TestNixlHandshake:
             worker.slot_size_per_layer = [4096, 512]
             worker.block_len_per_layer = [fa_len, idx_len]
             worker._region_is_mla = [False, True]
-            worker.num_blocks = 1
-            worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
             worker.src_blocks_data = np.array(
                 [
-                    (0, fa_len, worker.tp_rank, fa_len, worker.num_blocks),
-                    (0, idx_len, worker.tp_rank, idx_len, worker.num_blocks),
+                    (0, fa_len, worker.tp_rank, fa_len, 1),
+                    (0, idx_len, worker.tp_rank, idx_len, 1),
                 ],
                 dtype=np.uint64,
             )
@@ -1396,14 +1395,13 @@ class TestNixlHandshake:
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
                 kv_caches_base_addr=[0, 0],
                 device_id=0,
-                num_blocks=1,
                 block_lens=[fa_len * tp_ratio, idx_len],
                 block_strides=[fa_len * tp_ratio, idx_len],
                 kv_cache_layout=worker.kv_cache_layout,
                 block_size=worker.block_size,
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
-                physical_blocks_per_logical_kv_block=1,
+                **lp_peer_geometry(worker, 2),
             )
             worker.add_remote_agent(meta, remote_tp_size=1)
             assert (
@@ -1415,14 +1413,11 @@ class TestNixlHandshake:
             )
             worker2.block_len_per_layer = [fa_len, idx_len]
             worker2._region_is_mla = [False, True]
-            worker2.num_blocks = 1
-            worker2.dst_num_blocks[worker2.engine_id] = worker2.num_blocks
             bad_meta = NixlAgentMetadata(
                 engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
                 kv_caches_base_addr=[0, 0],
                 device_id=0,
-                num_blocks=1,
                 # WRONG: MLA region scaled by tp_ratio (it should be replicated).
                 block_lens=[fa_len * tp_ratio, idx_len * tp_ratio],
                 block_strides=[fa_len * tp_ratio, idx_len * tp_ratio],
@@ -1430,7 +1425,7 @@ class TestNixlHandshake:
                 block_size=worker2.block_size,
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker2.backend_name,
-                physical_blocks_per_logical_kv_block=1,
+                **lp_peer_geometry(worker2, 2),
             )
             with pytest.raises(AssertionError):
                 worker2.add_remote_agent(bad_meta, remote_tp_size=1)
@@ -1485,7 +1480,6 @@ class TestNixlHandshake:
         worker.transfer_topo = TransferTopology(
             tp_rank=tp_rank,
             tp_size=tp_size,
-            block_size=worker.block_size,
             engine_id=worker.engine_id,
             is_mla=True,
             is_mamba=False,
@@ -1504,8 +1498,6 @@ class TestNixlHandshake:
             "model.layers.0.self_attn",
             "draft_model.model.layers.0.self_attn",
         ]
-        worker.num_blocks = 1
-        worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
         worker.src_blocks_data = np.array(
             [(0, mla_len, worker.tp_rank), (0, draft_len, worker.tp_rank)],
             dtype=np.uint64,
@@ -1520,14 +1512,13 @@ class TestNixlHandshake:
             agent_metadata=FakeNixlWrapper.AGENT_METADATA,
             kv_caches_base_addr=[0x10000, 0x20000],
             device_id=0,
-            num_blocks=1,
             block_lens=[mla_len, remote_draft_len],
             block_strides=[mla_len, remote_draft_len],
             kv_cache_layout=worker.kv_cache_layout,
             block_size=worker.block_size,
             ssm_sizes=(0, 0),
             attn_backend_name=worker.backend_name,
-            physical_blocks_per_logical_kv_block=1,
+            **lp_peer_geometry(worker, 2),
         )
         return worker, meta, mla_len, draft_len
 
@@ -1593,7 +1584,7 @@ class TestNixlHandshake:
         worker.add_remote_agent(meta, remote_tp_size=remote_tp_size)
 
         plan = worker.tp_mappings[FakeNixlConnectorWorker.REMOTE_ENGINE_ID]
-        remote = worker._build_fa_remote(plan, meta, block_size_ratio=1)
+        remote = worker._build_fa_remote(plan, meta)
         assert expand_strided_descs(remote).tolist() == [
             [0x10000, mla_len, 0],
             [0x20000 + draft_slice * draft_len, draft_len, 0],
@@ -1621,17 +1612,15 @@ class TestNixlHandshake:
 
         worker.kv_cache_layout = "BLHNC"
         worker.block_stride_per_layer = [local_page, local_page]
-        worker.num_blocks = num_blocks
-        worker.dst_num_blocks[worker.engine_id] = num_blocks
         meta.kv_cache_layout = "BLHNC"
-        meta.num_blocks = num_blocks
+        meta.region_num_blocks = [num_blocks, num_blocks]
         meta.kv_caches_base_addr = [remote_page_base, remote_page_base + mla_len]
         meta.block_strides = [remote_page, remote_page]
         worker.add_remote_agent(meta, remote_tp_size=1)
 
         plan = worker.tp_mappings[FakeNixlConnectorWorker.REMOTE_ENGINE_ID]
         pages = [remote_page_base + b * remote_page for b in range(num_blocks)]
-        remote = worker._build_fa_remote(plan, meta, block_size_ratio=1)
+        remote = worker._build_fa_remote(plan, meta)
         assert expand_strided_descs(remote).tolist() == [
             *([page, mla_len, 0] for page in pages),
             *([page + mla_len + tp_rank * draft_len, draft_len, 0] for page in pages),
@@ -1696,7 +1685,7 @@ class TestNixlHandshake:
             connector = NixlConnector(
                 vllm_config,
                 KVConnectorRole.WORKER,
-                make_kv_cache_config(block_size=block_size),
+                make_lp_kv_cache_config(block_size=block_size),
             )
             connector.connector_worker = FakeNixlConnectorWorker(
                 vllm_config, connector.engine_id, hand_shake_latency=0
@@ -1709,8 +1698,6 @@ class TestNixlHandshake:
 
             worker.slot_size_per_layer = [4096]
             worker.block_len_per_layer = [4096 * worker.block_size]
-            worker.num_blocks = 1
-            worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
 
             # Remote P with TP=8 also has 1 head/rank -> identical
             # block_len despite tp_ratio == 2.
@@ -1719,14 +1706,13 @@ class TestNixlHandshake:
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
                 kv_caches_base_addr=[0],
                 device_id=0,
-                num_blocks=1,
                 block_lens=list(worker.block_len_per_layer),
                 block_strides=list(worker.block_len_per_layer),
                 kv_cache_layout="LBHNC",
                 block_size=worker.block_size,
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
-                physical_blocks_per_logical_kv_block=1,
+                **lp_peer_geometry(worker, 1),
             )
 
             # Must validate cleanly (used to raise AssertionError).
@@ -1753,7 +1739,7 @@ class TestNixlHandshake:
             connector = NixlConnector(
                 vllm_config,
                 KVConnectorRole.WORKER,
-                make_kv_cache_config(block_size=block_size),
+                make_lp_kv_cache_config(block_size=block_size),
             )
             connector.connector_worker = FakeNixlConnectorWorker(
                 vllm_config, connector.engine_id, hand_shake_latency=0
@@ -1767,8 +1753,6 @@ class TestNixlHandshake:
             slot_size = 4096
             worker.slot_size_per_layer = [slot_size]
             worker.block_len_per_layer = [slot_size * worker.block_size]
-            worker.num_blocks = 1
-            worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
 
             # Remote P_TP=2 has 16 heads/rank -> head_ratio = 16/8 = 2.
             # Correct remote block_len = local * 2.  Send local * 1
@@ -1778,14 +1762,13 @@ class TestNixlHandshake:
                 agent_metadata=FakeNixlWrapper.AGENT_METADATA,
                 kv_caches_base_addr=[0],
                 device_id=0,
-                num_blocks=1,
                 block_lens=list(worker.block_len_per_layer),
                 block_strides=list(worker.block_len_per_layer),
                 kv_cache_layout="LBHNC",
                 block_size=worker.block_size,
                 ssm_sizes=(0, 0),
                 attn_backend_name=worker.backend_name,
-                physical_blocks_per_logical_kv_block=1,
+                **lp_peer_geometry(worker, 1),
             )
 
             with pytest.raises(AssertionError):
@@ -1822,8 +1805,9 @@ class TestNixlHandshake:
         block_size = maybe_update_block_size(16)
         vllm_config = create_vllm_config(block_size=block_size)
         kv_cache_config = KVCacheConfig(
-            num_blocks=1,
+            num_pages=1,
             kv_cache_tensors=[],
+            block_size=block_size,
             kv_cache_groups=[
                 KVCacheGroupSpec(
                     ["layer0"],
@@ -1857,21 +1841,18 @@ class TestNixlHandshake:
             // worker.transfer_topo.local_physical_heads
         )
         worker.block_len_per_layer = [local_len]
-        worker.num_blocks = 1
-        worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
         meta = NixlAgentMetadata(
             engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
             agent_metadata=FakeNixlWrapper.AGENT_METADATA,
             kv_caches_base_addr=[0],
             device_id=0,
-            num_blocks=1,
             block_lens=[remote_len],
             block_strides=[remote_len],
             kv_cache_layout=worker.kv_cache_layout,
             block_size=worker.block_size,
             ssm_sizes=(0, 0),
             attn_backend_name=worker.backend_name,
-            physical_blocks_per_logical_kv_block=1,
+            **lp_peer_geometry(worker, 1),
         )
 
         if rejected:
@@ -1885,22 +1866,24 @@ class TestNixlHandshake:
         rows per block are what expand its manager block ids to kernel-block
         desc ids."""
         worker = _make_large_page_worker()
-        meta = _large_page_remote_meta(worker, group_kernel_rows_per_block=[4, 1])
+        local_geometries = worker.kv_cache_config.transfer_group_geometries
+        peer_geometries = [
+            GroupGeometry(4, local_geometries[0].row_bytes),
+            GroupGeometry(1, local_geometries[1].row_bytes),
+        ]
+        meta = _large_page_remote_meta(worker, group_geometries=peer_geometries)
         worker.add_remote_agent(meta, remote_tp_size=1)
 
-        assert worker._dst_kernel_rows_per_block[meta.engine_id] == [4, 1]
+        assert worker._dst_group_geometries[meta.engine_id] == peer_geometries
         # Group 0, block 3 with the peer's R=4: rows 12 to 15.
-        assert worker._remote_logical_to_kernel_block_ids(
-            ([3], []), 1, meta.engine_id
-        ) == [[12, 13, 14, 15], []]
+        expanded = worker._remote_logical_to_kernel_block_ids(([3], []), meta.engine_id)
+        assert expanded == [[12, 13, 14, 15], []]
         # Group 1, block 5 with R=1: row 5.
-        assert worker._remote_logical_to_kernel_block_ids(
-            ([], [5]), 1, meta.engine_id
-        ) == [[], [5]]
+        expanded = worker._remote_logical_to_kernel_block_ids(([], [5]), meta.engine_id)
+        assert expanded == [[], [5]]
 
     def test_handshake_large_page_rejects_unequal_block_size(self):
-        """large_page pairing requires the same global block size B; the
-        block-size-ratio path is uniform_page-only."""
+        """P/D pairing requires the same global block size B."""
         worker = _make_large_page_worker()
         meta = _large_page_remote_meta(worker, block_size=32)
         with pytest.raises(RuntimeError, match="equal P/D block sizes"):
@@ -1921,16 +1904,6 @@ class TestNixlHandshake:
         )
         worker.add_remote_agent(pp_gap, remote_tp_size=1)
 
-    def test_compat_hash_includes_kv_cache_allocator(self):
-        """The allocator is a compatibility-hash factor: uniform_page and
-        large_page deployments can never complete a handshake."""
-        uniform_config = create_vllm_config(block_size=16)
-        large_config = create_vllm_config(block_size=16)
-        large_config.cache_config.kv_cache_allocator = "large_page"
-        assert compute_nixl_compatibility_hash(
-            uniform_config, "FLASH_ATTN"
-        ) != compute_nixl_compatibility_hash(large_config, "FLASH_ATTN")
-
 
 # NOTE: resource cleanup in mp backend is a bit finicky, so the order in which
 # we put here is important. First run ray, it will clean up the resources, then
@@ -1948,7 +1921,7 @@ def test_kv_connector_stats(default_vllm_config, dist_init):
     connector = NixlConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config, connector.engine_id, hand_shake_latency=0
@@ -2029,7 +2002,7 @@ def test_reqs_to_send_deadline_rebased_to_worker_clock(default_vllm_config, dist
     connector = NixlConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config, connector.engine_id, hand_shake_latency=0
@@ -2223,7 +2196,7 @@ def test_notification_after_expiry_is_counted(default_vllm_config, dist_init):
     connector = NixlConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config, connector.engine_id, hand_shake_latency=0
@@ -2523,9 +2496,9 @@ def test_mixed_memory_local_descriptors_split_by_memory_type():
     worker._skip_dram_xfer = False
     worker.region_mem_types = ["DRAM", "VRAM"]
     worker.region_num_blocks = [2, 2]
-    worker._desc_is_dram_by_block_size = {}
-    worker._desc_pos_by_block_size = {}
-    worker._dram_src_handles_by_block_size = {}
+    worker._desc_is_dram = None
+    worker._desc_pos = None
+    worker._dram_src_handle = None
     worker.nixl_memory_type = "VRAM"
     # One dense run of two 10-byte blocks per region: (addr, len, dev, stride, count).
     worker._build_fa_local = MagicMock(  # type: ignore[method-assign]
@@ -2534,17 +2507,17 @@ def test_mixed_memory_local_descriptors_split_by_memory_type():
     worker.nixl_wrapper = MagicMock()
     worker.nixl_wrapper.prep_xfer_dlist.side_effect = [11, 22]
 
-    handle, blocks = worker.register_local_xfer_handler(worker.block_size)
+    handle, blocks = worker.register_local_xfer_handler()
 
     assert handle == 22
-    assert worker._dram_src_handles_by_block_size[worker.block_size] == 11
+    assert worker._dram_src_handle == 11
     # Must stay an array: P_TP > D_TP splits call .tolist() on it.
     assert isinstance(blocks, np.ndarray)
     # DRAM runs are re-homed to device 0; the per-descriptor maps consumed by
     # the mixed READ path still cover every block.
     assert blocks[:, 2].tolist() == [0, 3]
-    assert worker._desc_is_dram_by_block_size[16].tolist() == [True, True, False, False]
-    assert worker._desc_pos_by_block_size[16].tolist() == [0, 1, 0, 1]
+    assert worker._desc_is_dram.tolist() == [True, True, False, False]
+    assert worker._desc_pos.tolist() == [0, 1, 0, 1]
     dlist_calls = worker.nixl_wrapper.prep_xfer_dlist.call_args_list
     assert [call.kwargs["mem_type"] for call in dlist_calls] == ["DRAM", "VRAM"]
     assert [call.args[1].tolist() for call in dlist_calls] == [
@@ -2557,12 +2530,11 @@ def test_mixed_memory_local_descriptors_split_by_memory_type():
 def recv_worker():
     """Receive lifecycle state without distributed or device initialization."""
     worker = object.__new__(NixlConnectorWorker)
+    worker.kv_cache_config = make_lp_kv_cache_config(block_size=16)
     worker.transfer_topo = MagicMock()
-    worker.transfer_topo.block_size_ratio.return_value = 1
     worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-        remote_block_size=16, remote_physical_blocks_per_logical=1
+        remote_block_size=16
     )
-    worker._physical_blocks_per_logical_kv_block = 1
     worker._recving_metadata = {"request": MagicMock(local_block_ids=([1, 2, 3],))}
     worker._recving_transfers = defaultdict(list)
     worker._failed_recv_reqs = queue.Queue()
@@ -2595,15 +2567,14 @@ def recv_worker():
 
 def test_mixed_memory_read_notifies_after_both_transfers_finish(recv_worker):
     worker = recv_worker
-    worker._desc_is_dram_by_block_size = {16: np.array([True, True, False, False])}
-    worker._desc_pos_by_block_size = {16: np.array([0, 1, 0, 1])}
-    worker._dram_src_handles_by_block_size = {16: 10}
+    worker._desc_is_dram = np.array([True, True, False, False])
+    worker._desc_pos = np.array([0, 1, 0, 1])
+    worker._dram_src_handle = 10
     worker.nixl_wrapper.make_prepped_xfer.side_effect = [101, 102]
     worker.nixl_wrapper.check_xfer_state.return_value = "DONE"
 
     worker._read_blocks_mixed(
         request_id="request",
-        local_block_size_key=16,
         local_device_handle=20,
         local_dram_handle=10,
         remote_xfer_side_handle=30,
@@ -2647,15 +2618,14 @@ def test_hisparse_dram_rank0_only_read_keeps_device_part(recv_worker):
     worker = recv_worker
     worker.tp_rank = 1
     worker._skip_dram_xfer = True
-    worker._desc_is_dram_by_block_size = {16: np.array([True, True, False, False])}
-    worker._desc_pos_by_block_size = {16: np.array([0, 1, 0, 1])}
-    worker._dram_src_handles_by_block_size = {16: None}
+    worker._desc_is_dram = np.array([True, True, False, False])
+    worker._desc_pos = np.array([0, 1, 0, 1])
+    worker._dram_src_handle = None
     worker.nixl_wrapper.make_prepped_xfer.side_effect = [102]
     worker.nixl_wrapper.check_xfer_state.return_value = "DONE"
 
     worker._read_blocks_mixed(
         request_id="request",
-        local_block_size_key=16,
         local_device_handle=20,
         local_dram_handle=None,
         remote_xfer_side_handle=30,
@@ -2681,12 +2651,11 @@ def test_hisparse_dram_rank0_only_dram_only_read_completes(recv_worker):
     worker = recv_worker
     worker.tp_rank = 1
     worker._skip_dram_xfer = True
-    worker._desc_is_dram_by_block_size = {16: np.array([True, True, False, False])}
-    worker._desc_pos_by_block_size = {16: np.array([0, 1, 0, 1])}
+    worker._desc_is_dram = np.array([True, True, False, False])
+    worker._desc_pos = np.array([0, 1, 0, 1])
 
     worker._read_blocks_mixed(
         request_id="request",
-        local_block_size_key=16,
         local_device_handle=20,
         local_dram_handle=None,
         remote_xfer_side_handle=30,
@@ -2729,7 +2698,13 @@ def element_byte_addrs(view: torch.Tensor) -> list[int]:
         "TRITON_ATTN",
     ],
 )
-@pytest.mark.parametrize("layout", [layout.name for layout in KVCacheLayout])
+@pytest.mark.parametrize(
+    "layout",
+    # large_page registers per-layer kernel-row regions, which requires each
+    # layer's page to be contiguous within a block row; head-interleaved
+    # layouts (BHLNC, LHBNC) cannot be expressed.
+    ["LBHNC", "LBNHC", "BLHNC", "BLNHC"],
+)
 @pytest.mark.parametrize("separate_kv_head_groups", [False, True])
 def test_register_kv_caches(
     default_vllm_config,
@@ -2789,14 +2764,17 @@ def test_register_kv_caches(
             if separate_kv_head_groups
             else None,
         )
-        kv_cache_config = KVCacheConfig(
-            num_blocks=num_blocks,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["layer0", "layer1", "layer2", "layer3"], kv_cache_spec
-                )
-            ],
+        kv_cache_config = fill_lp_geometry(
+            KVCacheConfig(
+                num_pages=num_blocks,
+                kv_cache_tensors=[],
+                kv_cache_groups=[
+                    KVCacheGroupSpec(
+                        ["layer0", "layer1", "layer2", "layer3"], kv_cache_spec
+                    )
+                ],
+                block_size=block_size,
+            )
         )
         # Create connector
         connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
@@ -2818,26 +2796,26 @@ def test_register_kv_caches(
         mock_thread.return_value.is_alive.return_value = False
 
         raw0 = torch.zeros(
-            kv_cache_spec.page_size_bytes * kv_cache_config.num_blocks * 2,
+            kv_cache_spec.page_size_bytes * kv_cache_config.num_pages * 2,
             dtype=torch.int8,
             device=current_platform.device_type,
         )
         raw1 = torch.zeros(
-            kv_cache_spec.page_size_bytes * kv_cache_config.num_blocks,
+            kv_cache_spec.page_size_bytes * kv_cache_config.num_pages,
             dtype=torch.int8,
             device=current_platform.device_type,
         )
         tensor0, tensor1 = dense_kv_cache_views(
             raw0,
             kv_cache_spec,
-            kv_cache_config.num_blocks,
+            kv_cache_config.num_pages,
             num_layers=2,
             layout=KVCacheLayout[layout],
         )
         (tensor2,) = dense_kv_cache_views(
             raw1,
             kv_cache_spec,
-            kv_cache_config.num_blocks,
+            kv_cache_config.num_pages,
             num_layers=1,
             layout=KVCacheLayout[layout],
         )
@@ -2963,12 +2941,13 @@ def test_register_packed_dsv4_mla_cache_as_single_region(
             for group_idx, (_, num_layers) in enumerate(groups)
         ]
         kv_cache_config = KVCacheConfig(
-            num_blocks=num_blocks,
+            num_pages=num_blocks,
             kv_cache_tensors=[],
             kv_cache_groups=[
                 KVCacheGroupSpec(layer_names, spec)
                 for layer_names, spec in zip(group_layers, specs)
             ],
+            block_size=specs[0].block_size,
         )
         vllm_config = create_vllm_config(attention_backend="TRITON_ATTN")
         vllm_config.cache_config.block_size = 256
@@ -3005,22 +2984,22 @@ def test_register_packed_dsv4_mla_cache_as_single_region(
             kv_caches.update(zip(layer_names, views))
         connector.register_kv_caches(kv_caches)
 
-        # MLA pages transfer as whole rows; a ring page past the row start keeps
-        # its own region.
+        # MLA pages transfer as whole rows, one region per group (regions
+        # never merge across groups); ring layers keep per-layer regions.
+        num_mla_groups = sum(not isinstance(spec, CircularBufferSpec) for spec in specs)
         ring_pages = [
             (cache.data_ptr(), spec.page_size_bytes)
             for layer_names, spec in zip(group_layers, specs)
             if isinstance(spec, CircularBufferSpec)
             for cache in (kv_caches[name] for name in layer_names)
-            if cache.data_ptr() != raw.data_ptr()
         ]
         _agent, block_runs = wrapper.prep_xfer_dlist.call_args[0]
         assert connector.connector_worker.kv_caches_base_addr[
             connector.connector_worker.engine_id
-        ][0] == [raw.data_ptr()] + [addr for addr, _ in ring_pages]
+        ][0] == [raw.data_ptr()] * num_mla_groups + [addr for addr, _ in ring_pages]
         assert block_runs.tolist() == [
             [raw.data_ptr(), packed_block_len, 0, packed_block_len, num_blocks]
-        ] + [
+        ] * num_mla_groups + [
             [addr, page_size, 0, packed_block_len, num_blocks]
             for addr, page_size in ring_pages
         ]
@@ -3087,7 +3066,7 @@ def test_kv_buffer_to_nixl_memory_types(
         connector = NixlConnector(
             vllm_config,
             KVConnectorRole.WORKER,
-            make_kv_cache_config(block_size=block_size),
+            make_lp_kv_cache_config(block_size=block_size),
         )
 
         # Verify get_reg_descs was called with the correct memory_type
@@ -3107,12 +3086,12 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
     scheduler = NixlConnectorScheduler(
         vllm_config,
         vllm_config.kv_transfer_config.engine_id,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
     worker = NixlConnectorWorker(
         vllm_config,
         vllm_config.kv_transfer_config.engine_id,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
     nixl_wrapper = worker.nixl_wrapper
 
@@ -3126,14 +3105,14 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
     ):
         worker._recving_transfers = {"req1": [123]}
         # Mock register_kv_cache which registers local handle
-        worker.src_xfer_handles_by_block_size = {worker.block_size: 455}
+        worker.src_xfer_handle = 455
         # P TP = 2 * D TP case, we should register 2 local handles
-        worker.src_xfer_handles_by_tp_ratio = {(-2, block_size): [456, 457]}
+        worker.src_xfer_handles_by_tp_ratio = {-2: [456, 457]}
         worker.dst_xfer_side_handles = {"engine1": {0: 789}}
         worker._remote_agents = {"engine1": {(0, 0): "agent1"}}
         # _cleanup_remote_engine (called by shutdown) also clears these:
         worker.kv_caches_base_addr["engine1"] = {0: [0xABC]}
-        worker.dst_num_blocks["engine1"] = 50
+        worker.dst_region_num_blocks["engine1"] = [50]
         worker.tp_mappings["engine1"] = MagicMock()
         worker._engine_last_active["engine1"] = time.perf_counter()
         worker._registered_descs = ["desc1", "desc2"]
@@ -3181,9 +3160,10 @@ def test_sleep_unregisters_and_restores_kv_caches(dist_init):
         block_size=block_size, num_kv_heads=4, head_size=16, dtype=torch.float16
     )
     kv_cache_config = KVCacheConfig(
-        num_blocks=2,
+        num_pages=2,
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
+        block_size=block_size,
     )
     raw = torch.zeros(spec.page_size_bytes * 2, dtype=torch.int8)
     (cache,) = dense_kv_cache_views(
@@ -3219,7 +3199,9 @@ def test_registration_generation_bumps_on_changed_payload(
     registration changed."""
     vllm_config = create_vllm_config()
     scheduler = NixlConnectorScheduler(
-        vllm_config, vllm_config.kv_transfer_config.engine_id, make_kv_cache_config(16)
+        vllm_config,
+        vllm_config.kv_transfer_config.engine_id,
+        make_lp_kv_cache_config(block_size=16),
     )
     scheduler._nixl_handshake_listener_t = MagicMock()  # already serving
     generations: list[int] = []
@@ -3251,14 +3233,14 @@ def _setup_worker_with_remote_engine(
     worker = NixlConnectorWorker(
         vllm_config,
         vllm_config.kv_transfer_config.engine_id,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
 
     engine_id = "remote-engine-1"
     worker._remote_agents[engine_id] = {(0, 0): "agent_0", (0, 1): "agent_1"}
     worker.dst_xfer_side_handles[engine_id] = {0: 100, 1: 200}
     worker.kv_caches_base_addr[engine_id] = {0: [0xABC]}
-    worker.dst_num_blocks[engine_id] = 50
+    worker.dst_region_num_blocks[engine_id] = [50]
     worker.tp_mappings[engine_id] = MagicMock()
     worker._engine_last_active[engine_id] = time.perf_counter()
 
@@ -3288,7 +3270,7 @@ def test_engine_ttl_eviction(default_vllm_config, dist_init):
         assert engine_id not in worker._remote_agents
         assert engine_id not in worker.dst_xfer_side_handles
         assert engine_id not in worker.kv_caches_base_addr
-        assert engine_id not in worker.dst_num_blocks
+        assert engine_id not in worker.dst_region_num_blocks
         assert engine_id not in worker.tp_mappings
         assert engine_id not in worker._engine_last_active
         worker.transfer_topo.unregister_remote_engine.assert_called_with(engine_id)
@@ -3541,7 +3523,7 @@ class TestPeerReplacement:
         assert result.finished_recving == {"old-req"}
         assert result.failed_recving == ({"old-req"} if failed else set())
         assert self.worker.get_block_ids_with_load_errors() == (
-            {1} if failed else set()
+            {(0, 1)} if failed else set()
         )
         assert self.transport.release_xfer_handle.call_count == (2 if failed else 1)
         self.transport.remove_remote_agent.assert_called_once_with("old")
@@ -3611,7 +3593,7 @@ class TestPeerReplacement:
 
         result = self.worker.get_transfer_results()
         assert result.finished_recving == result.failed_recving == {"old-req"}
-        assert self.worker.get_block_ids_with_load_errors() == {1}
+        assert self.worker.get_block_ids_with_load_errors() == {(0, 1)}
         assert ("old" not in self.worker._remote_agents) is (missing is True)
         assert self.transport.release_dlist_handle.call_count == (missing is True)
 
@@ -3793,7 +3775,6 @@ def test_transfer_topology_unregister():
     topo = TransferTopology(
         tp_rank=0,
         tp_size=1,
-        block_size=16,
         engine_id="local",
         is_mla=False,
         is_mamba=False,
@@ -3805,7 +3786,6 @@ def test_transfer_topology_unregister():
         remote_tp_size=1,
         remote_block_size=16,
         remote_block_len=64,
-        remote_physical_blocks_per_logical=1,
     )
     topo.register_remote_engine("remote-1", info)
     assert topo.get_engine_info("remote-1") is info
@@ -3835,7 +3815,7 @@ def test_aborted_request_removed_from_worker_in_batch(default_vllm_config, dist_
     connector = NixlConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config, connector.engine_id, hand_shake_latency=0
@@ -3975,7 +3955,7 @@ def test_empty_recv_is_reported_only_when_awaited(
     connector = NixlConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config,
@@ -4011,17 +3991,15 @@ def test_empty_recv_is_reported_only_when_awaited(
     assert (request_id in done_recving) is awaiting_kvs
 
 
-@pytest.mark.parametrize("is_hma", [False, True])
 @pytest.mark.parametrize(
     "local_block_ids,awaiting_kvs",
     [((), False), (([],), False), (([],), True), (([1, 2, 3],), True)],
 )
 def test_handshake_failure_reports_only_awaited_recvs(
-    recv_worker, is_hma, local_block_ids, awaiting_kvs
+    recv_worker, local_block_ids, awaiting_kvs
 ):
     """A failed cleanup handshake must not complete an already-aborted request."""
     worker = recv_worker
-    worker._is_hma_required = is_hma
     worker._recving_metadata.clear()
     worker._remote_agents = {}
     worker._handshake_lock = contextlib.nullcontext()
@@ -4050,7 +4028,7 @@ def test_handshake_failure_reports_only_awaited_recvs(
     expected = {"request"} if awaiting_kvs else set()
     assert results.finished_recving == results.failed_recving == expected
     assert worker.get_block_ids_with_load_errors() == (
-        set(local_block_ids[0]) if awaiting_kvs and not is_hma else set()
+        {(0, block_id) for block_id in local_block_ids[0]} if awaiting_kvs else set()
     )
     assert not worker._recving_metadata
     assert not worker._recv_failures
@@ -4099,7 +4077,7 @@ def test_transfer_failure_logging(
     connector = NixlConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=block_size, swa_enabled=enable_hma),
+        make_lp_kv_cache_config(block_size=block_size, swa_enabled=enable_hma),
     )
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config,
@@ -4230,7 +4208,7 @@ def test_handshake_failure_returns_finished(default_vllm_config, dist_init):
     connector = NixlConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config, connector.engine_id, hand_shake_latency=0.1
@@ -4266,7 +4244,7 @@ def test_handshake_failure_returns_finished(default_vllm_config, dist_init):
     assert connector.get_block_ids_with_load_errors() == set()
     _, done_recving = connector.get_finished(finished_req_ids=set())
     assert request_id in done_recving
-    assert connector.get_block_ids_with_load_errors() == {1, 2, 3}
+    assert connector.get_block_ids_with_load_errors() == {(0, 1), (0, 2), (0, 3)}
 
     # Handshake failures are recorded as transport failures, separately
     # from KV expiry.
@@ -4289,7 +4267,7 @@ def test_transfer_setup_failure_returns_finished(
     connector = NixlConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config, connector.engine_id, hand_shake_latency=0
@@ -4330,7 +4308,7 @@ def test_transfer_setup_failure_returns_finished(
     assert request_id in results.finished_recving
     assert results.failed_recving == {request_id}
     invalid_blocks = connector.get_block_ids_with_load_errors()
-    assert invalid_blocks == (set() if is_hma else {7, 8, 9})
+    assert invalid_blocks == {(0, 7), (0, 8), (0, 9)}
 
 
 class _ScriptedXferWrapper(FakeNixlWrapper):
@@ -4360,7 +4338,7 @@ def _make_split_read_connector(vllm_config, request_id, states):
     connector = NixlConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=vllm_config.cache_config.block_size),
+        make_lp_kv_cache_config(block_size=vllm_config.cache_config.block_size),
     )
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config, connector.engine_id, hand_shake_latency=0
@@ -4421,7 +4399,7 @@ def test_split_read_failure_defers_report_until_last_handle(
     # Poll 3: sibling terminal -> reported exactly once, blocks invalidated.
     _, done_recving = connector.get_finished(finished_req_ids=set())
     assert done_recving == {request_id}
-    assert connector.get_block_ids_with_load_errors() == {7, 8, 9}
+    assert connector.get_block_ids_with_load_errors() == {(0, 7), (0, 8), (0, 9)}
     assert request_id not in worker._recving_metadata
     assert wrapper.released == [err_handle, live_handle]
 
@@ -4486,7 +4464,7 @@ def test_failed_request_skips_kv_postprocessing(
     connector = NixlConnector(
         vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config,
@@ -4552,7 +4530,7 @@ def test_failed_request_skips_kv_postprocessing(
 
     # Blocks should have been marked as invalid.
     invalid_blocks = connector.get_block_ids_with_load_errors()
-    assert invalid_blocks == {1, 2, 3}
+    assert invalid_blocks == {(0, 1), (0, 2), (0, 3)}
 
 
 @pytest.mark.parametrize("sibling_state", ["ERR", "DONE"])
@@ -4571,7 +4549,7 @@ def test_recv_failure_waits_for_sibling_transfer(recv_worker, sibling_state):
 
     results = worker.get_transfer_results()
     assert results.finished_recving == results.failed_recving == {"request"}
-    assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
+    assert worker.get_block_ids_with_load_errors() == {(0, 1), (0, 2), (0, 3)}
     worker.nixl_wrapper.send_notif.assert_not_called()
 
     results = worker.get_transfer_results()
@@ -4596,7 +4574,7 @@ def test_recv_failure_waits_for_unpollable_handle_to_be_released(recv_worker):
 
     results = worker.get_transfer_results()
     assert results.finished_recving == results.failed_recving == {"request"}
-    assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
+    assert worker.get_block_ids_with_load_errors() == {(0, 1), (0, 2), (0, 3)}
     assert worker.nixl_wrapper.release_xfer_handle.call_count == 2
 
 
@@ -4750,7 +4728,7 @@ def test_scheduler_advertises_transfer_topology(
     config.parallel_config.prefill_context_parallel_size = pcp_size
     config.parallel_config.decode_context_parallel_size = dcp_size
     cls = NixlPullConnectorScheduler if mode == "pull" else NixlPushConnectorScheduler
-    scheduler = cls(config, "prefiller", make_kv_cache_config(block_size=16))
+    scheduler = cls(config, "prefiller", make_lp_kv_cache_config(block_size=16))
     request = create_request(request_id=1, num_tokens=32, do_remote_decode=True)
     request.status = RequestStatus.FINISHED_LENGTH_CAPPED
     try:
@@ -4817,7 +4795,7 @@ def test_compatibility_hash_validation(
             "enforce_handshake_compat": enforce_handshake_compat
         },
     )
-    kv_cache_config = make_kv_cache_config(block_size=block_size, num_blocks=2)
+    kv_cache_config = make_lp_kv_cache_config(block_size=block_size, num_blocks=2)
     decode_connector = NixlConnector(
         local_vllm_config, KVConnectorRole.WORKER, kv_cache_config
     )
@@ -4825,9 +4803,7 @@ def test_compatibility_hash_validation(
     kv_cache_spec = cast(
         AttentionSpec, kv_cache_config.kv_cache_groups[0].kv_cache_spec
     )
-    shape = compute_layer_kv_cache_shape_bytes(
-        kv_cache_spec, kv_cache_config.num_blocks
-    )
+    shape = compute_layer_kv_cache_shape_bytes(kv_cache_spec, kv_cache_config.num_pages)
     shared_tensor = torch.zeros(*shape, dtype=torch.int8).view(kv_cache_spec.dtype)
     unique_tensor = torch.zeros(*shape, dtype=torch.int8).view(kv_cache_spec.dtype)
     # Build kv_caches from the actual layer names in kv_cache_config so that
@@ -4873,14 +4849,12 @@ def test_compatibility_hash_validation(
         agent_metadata=FakeNixlWrapper.AGENT_METADATA,
         kv_caches_base_addr=[0],
         device_id=0,
-        num_blocks=1,
         block_lens=prefill_block_lens,
         block_strides=prefill_block_lens,
         kv_cache_layout="LBHNC",
         block_size=prefill_block_size,
         ssm_sizes=(0, 0),
         attn_backend_name=decode_worker.backend_name,
-        physical_blocks_per_logical_kv_block=1,
     )
     handshake_payload = NixlHandshakePayload(
         compatibility_hash=remote_hash,
@@ -4895,10 +4869,10 @@ def test_compatibility_hash_validation(
     ]
 
     # Mock add_remote_agent to avoid actual NIXL operations
-    # Patch zmq_ctx to return our mock socket
+    # Patch zmq_socket_ctx to return our mock socket
     with (
         patch.object(decode_worker, "add_remote_agent", return_value="fake_agent"),
-        patch.object(nixl.base_worker, "zmq_ctx") as mock_zmq_ctx,
+        patch.object(nixl.base_worker, "zmq_socket_ctx") as mock_zmq_ctx,
     ):
         mock_zmq_ctx.return_value.__enter__.return_value = mock_socket
 
@@ -4950,7 +4924,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
     decode_connector = NixlConnector(
         local_vllm_config,
         KVConnectorRole.WORKER,
-        make_kv_cache_config(block_size=block_size),
+        make_lp_kv_cache_config(block_size=block_size),
     )
     decode_worker = decode_connector.connector_worker
 
@@ -4960,7 +4934,6 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
     decode_worker.transfer_topo = TransferTopology(
         tp_rank=decode_worker.tp_rank,
         tp_size=decode_worker.world_size,
-        block_size=decode_worker.block_size,
         engine_id=decode_worker.engine_id,
         is_mla=decode_worker.use_mla,
         is_mamba=False,
@@ -5001,7 +4974,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
     ]
     with (
         patch.object(decode_worker, "add_remote_agent", return_value="fake_agent"),
-        patch.object(nixl.base_worker, "zmq_ctx") as mock_zmq_ctx,
+        patch.object(nixl.base_worker, "zmq_socket_ctx") as mock_zmq_ctx,
     ):
         mock_zmq_ctx.return_value.__enter__.return_value = mock_socket
 
@@ -5041,7 +5014,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
         connector = NixlConnector(
             vllm_config,
             KVConnectorRole.WORKER,
-            make_kv_cache_config(block_size=block_size),
+            make_lp_kv_cache_config(block_size=block_size),
         )
         connector.connector_worker = FakeNixlConnectorWorker(
             vllm_config, connector.engine_id, hand_shake_latency=0
@@ -5063,7 +5036,6 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
             remote_tp_size=prefill_tp_size,
             remote_block_size=worker.block_size,
             remote_block_len=worker.block_size * 4096,
-            remote_physical_blocks_per_logical=1,
             local_block_len=worker.block_size * 4096,
         )
         worker._remote_agents[remote_engine_id] = {
@@ -5156,7 +5128,7 @@ def test_kv_both_deprecation_warning(default_vllm_config, dist_init):
         NixlConnector(
             vllm_config,
             KVConnectorRole.WORKER,
-            make_kv_cache_config(block_size=block_size),
+            make_lp_kv_cache_config(block_size=block_size),
         )
 
     mock_logger.warning_once.assert_called_once()
@@ -5180,7 +5152,7 @@ def test_explicit_kv_role_no_deprecation_warning(default_vllm_config, dist_init)
             NixlConnector(
                 vllm_config,
                 KVConnectorRole.WORKER,
-                make_kv_cache_config(block_size=block_size),
+                make_lp_kv_cache_config(block_size=block_size),
             )
 
         (

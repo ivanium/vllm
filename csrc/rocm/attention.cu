@@ -370,8 +370,8 @@ __launch_bounds__(NUM_THREADS, 4) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes, // [num_heads]
     const int q_stride,
-    const int kv_block_stride,
-    const int kv_head_stride,
+    const int64_t kv_block_stride,
+    const int64_t kv_head_stride,
     float* __restrict__ exp_sums,           // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,         // [num_seqs, num_heads, max_num_partitions]
     scalar_t* __restrict__ out,             // [num_seqs, num_heads, max_num_partitions, head_size]
@@ -1045,8 +1045,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes, // [num_heads]
     const int q_stride,
-    const int kv_block_stride,
-    const int kv_head_stride,
+    const int64_t kv_block_stride,
+    const int64_t kv_head_stride,
     float* __restrict__ exp_sums,           // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,         // [num_seqs, num_heads, max_num_partitions]
     scalar_t* __restrict__ out,             // [num_seqs, num_heads, max_num_partitions, head_size]
@@ -1905,7 +1905,7 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const int* __restrict__ query_start_loc_ptr,   // [num_seqs]
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
-    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const int q_stride, const int64_t kv_block_stride, const int64_t kv_head_stride,
     float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,  // [num_seqs, num_heads,
                                      // max_num_partitions]
@@ -2360,7 +2360,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
     const int* __restrict__ query_start_loc_ptr,  // [num_seqs]
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
-    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const int q_stride, const int64_t kv_block_stride,
+    const int64_t kv_head_stride,
     float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,  // [num_seqs, num_heads,
                                      // max_num_partitions]
@@ -2686,7 +2687,7 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const int* __restrict__ query_start_loc_ptr,   // [num_seqs]
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
-    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const int q_stride, const int64_t kv_block_stride, const int64_t kv_head_stride,
     float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,  // [num_seqs, num_heads,
                                      // max_num_partitions]
@@ -3106,7 +3107,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
     const int* __restrict__ query_start_loc_ptr,  // [num_seqs]
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
-    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    const int q_stride, const int64_t kv_block_stride,
+    const int64_t kv_head_stride,
     float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,  // [num_seqs, num_heads,
                                      // max_num_partitions]
@@ -3337,8 +3339,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
     const int q_stride,
-    const int kv_block_stride,
-    const int kv_head_stride,
+    const int64_t kv_block_stride,
+    const int64_t kv_head_stride,
     float* __restrict__ exp_sums,             // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,           // [num_seqs, num_heads, max_num_partitions]
     scalar_t* __restrict__ out,               // [num_seqs, num_heads, max_num_partitions, head_size]
@@ -3365,8 +3367,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
     const int q_stride,
-    const int kv_block_stride,
-    const int kv_head_stride,
+    const int64_t kv_block_stride,
+    const int64_t kv_head_stride,
     float* __restrict__ exp_sums,            // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits,          // [num_seqs, num_heads, max_num_partitions]
     scalar_t* __restrict__ out,              // [num_seqs, num_heads, max_num_partitions, head_size]
@@ -3440,8 +3442,13 @@ void paged_attention_custom_launcher(
   int head_size = query.size(2);
   int max_num_blocks_per_seq = block_tables.size(1);
   int q_stride = query.stride(0);
-  int kv_block_stride = key_cache.stride(0);
-  int kv_head_stride = key_cache.stride(1);
+  // K and V share the block (row) and head strides; a block row may hold
+  // several layers, so these exceed the dense page.
+  int64_t kv_block_stride = key_cache.stride(0);
+  int64_t kv_head_stride = key_cache.stride(1);
+  TORCH_CHECK(value_cache.stride(0) == kv_block_stride &&
+                  value_cache.stride(1) == kv_head_stride,
+              "K and V caches must share block and head strides");
 
   // NOTE: query start location is optional for V0 decode should not be used.
   // If batch contains mix of prefills and decode, prefills should be skipped.
@@ -3596,8 +3603,13 @@ void paged_attention_custom_launcher_navi(
   int head_size = query.size(2);
   int max_num_blocks_per_seq = block_tables.size(1);
   int q_stride = query.stride(0);
-  int kv_block_stride = key_cache.stride(0);
-  int kv_head_stride = key_cache.stride(1);
+  // K and V share the block (row) and head strides; a block row may hold
+  // several layers, so these exceed the dense page.
+  int64_t kv_block_stride = key_cache.stride(0);
+  int64_t kv_head_stride = key_cache.stride(1);
+  TORCH_CHECK(value_cache.stride(0) == kv_block_stride &&
+                  value_cache.stride(1) == kv_head_stride,
+              "K and V caches must share block and head strides");
 
   // NOTE: query start location is optional for V0 decode should not be used.
   // If batch contains mix of prefills and decode, prefills should be skipped.

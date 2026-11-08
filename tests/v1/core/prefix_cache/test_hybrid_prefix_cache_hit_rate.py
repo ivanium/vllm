@@ -39,9 +39,8 @@ def _user_turns(conversation: int) -> list[str]:
 async def _scheduler_block_size(client: httpx.AsyncClient) -> int:
     """Return the coarsest boundary an expected cache hit can land on.
 
-    Mirrors ``scheduler_block_size`` in ``resolve_kv_cache_block_sizes``, which
-    the engine keeps internal: the LCM of the resolved group block sizes. A
-    finer ``prefix_match_unit`` only adds hits, so this stays conservative.
+    Mirrors ``resolve_scheduler_block_size``, which the engine keeps
+    internal: the LCM of the resolved group block sizes.
     """
     response = await client.get("/metrics")
     response.raise_for_status()

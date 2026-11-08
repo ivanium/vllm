@@ -12,6 +12,7 @@ from vllm.config import (
     DeviceConfig,
     VllmConfig,
 )
+from vllm.v1.core.kv_cache_planning import _is_uniform_type
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
     CrossAttentionManager,
@@ -30,14 +31,11 @@ from vllm.v1.kv_cache_interface import (
     HiddenStateCacheSpec,
     KVCacheGroupRole,
     KVCacheSpec,
-    KVCacheSpecKind,
     MambaSpec,
     MLAAttentionSpec,
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-    get_kv_cache_spec_kind,
 )
 from vllm.v1.kv_cache_spec_registry import (
     _REGISTRY_KVCACHESPEC_LIST,
@@ -159,9 +157,7 @@ def make_spec(spec_cls: type[KVCacheSpec]) -> KVCacheSpec:
 
 
 def are_uniform_specs(*specs: KVCacheSpec) -> bool:
-    return UniformTypeKVCacheSpecs.is_uniform_type(
-        {f"layer_{i}": spec for i, spec in enumerate(specs)}
-    )
+    return _is_uniform_type({f"layer_{i}": spec for i, spec in enumerate(specs)})
 
 
 class TestKVCacheSpecRegistry:
@@ -237,7 +233,7 @@ class TestKVCacheSpecRegistry:
             KVCacheSpecRegistry.check_kv_cache_spec_registry({"layer_0": spec})
 
         with pytest.raises(AssertionError, match="Unsupported KV cache spec type"):
-            UniformTypeKVCacheSpecs.is_uniform_type({"layer_0": spec})
+            _is_uniform_type({"layer_0": spec})
 
     def test_unregistered_subclass_inherits_parent_manager(self):
         """An unregistered subclass of a registered spec resolves via MRO
@@ -322,111 +318,3 @@ class TestKVCacheSpecRegistry:
         )
 
         assert are_uniform_specs(custom_spec, make_spec(FullAttentionSpec))
-
-
-class TestGetKVCacheSpecKind:
-    """get_kv_cache_spec_kind() for merged UniformTypeKVCacheSpecs groups."""
-
-    @pytest.mark.parametrize(
-        "spec_cls,expected_kind",
-        [
-            (FullAttentionSpec, KVCacheSpecKind.FULL_ATTENTION),
-            (MLAAttentionSpec, KVCacheSpecKind.MLA_ATTENTION),
-            (SlidingWindowSpec, KVCacheSpecKind.SLIDING_WINDOW),
-        ],
-    )
-    def test_homogeneous_group_keeps_member_kind(self, spec_cls, expected_kind):
-        """A group whose members all share one kind reports that kind."""
-        spec = make_spec(spec_cls)
-        group = UniformTypeKVCacheSpecs(
-            block_size=64, kv_cache_specs={"layer_0": spec, "layer_1": spec}
-        )
-
-        assert get_kv_cache_spec_kind(group) == expected_kind
-
-    @pytest.mark.parametrize("other_cls", [MLAAttentionSpec, SinkFullAttentionSpec])
-    def test_mixed_kinds_sharing_full_attention_base(self, other_cls):
-        """Members with differing kinds but a single registered
-        uniform_type_base_spec of FullAttentionSpec report FULL_ATTENTION.
-
-        This is the shape produced by a model that pairs a main K/V cache with a
-        differently shaped auxiliary cache (e.g. a K-only index cache). The two
-        merge into one group precisely because they share a base spec, so
-        falling back to UNKNOWN would discard what the merge established.
-        """
-        group = UniformTypeKVCacheSpecs(
-            block_size=64,
-            kv_cache_specs={
-                "layer_0": make_spec(FullAttentionSpec),
-                "layer_1": make_spec(other_cls),
-            },
-        )
-
-        # Precondition: the members really do differ in kind but share a base.
-        assert (
-            len({get_kv_cache_spec_kind(s) for s in group.kv_cache_specs.values()}) == 2
-        )
-        assert {
-            KVCacheSpecRegistry.get_uniform_type_base_spec(s)
-            for s in group.kv_cache_specs.values()
-        } == {FullAttentionSpec}
-
-        assert get_kv_cache_spec_kind(group) == KVCacheSpecKind.FULL_ATTENTION
-
-    def test_mixed_base_specs_report_unknown(self):
-        """Members resolving to different base specs remain UNKNOWN."""
-        group = UniformTypeKVCacheSpecs(
-            block_size=64,
-            kv_cache_specs={
-                "layer_0": make_spec(FullAttentionSpec),
-                "layer_1": make_spec(SlidingWindowSpec),
-            },
-        )
-
-        assert (
-            len(
-                {
-                    KVCacheSpecRegistry.get_uniform_type_base_spec(s)
-                    for s in group.kv_cache_specs.values()
-                }
-            )
-            == 2
-        )
-        assert get_kv_cache_spec_kind(group) == KVCacheSpecKind.UNKNOWN
-
-    def test_uniform_non_full_attention_base_reports_unknown(self):
-        """The FULL_ATTENTION result is gated on the shared base spec being
-        FullAttentionSpec; a uniform base of any other type stays UNKNOWN.
-        """
-
-        # SlidingWindowMLASpec subclasses SlidingWindowSpec but carries a
-        # distinct kind, so declaring SlidingWindowSpec as the base gives a
-        # group with differing kinds yet a single, non-full-attention base.
-        @register_kv_cache_spec(
-            manager_class=SlidingWindowManager,
-            uniform_type_base_spec=SlidingWindowSpec,
-        )
-        @dataclass(frozen=True, kw_only=True)
-        class _SlidingBasedMLASpec(SlidingWindowMLASpec):
-            custom_param: int = 16
-
-        custom_spec = _SlidingBasedMLASpec(**spec_args_map[SlidingWindowMLASpec])
-        group = UniformTypeKVCacheSpecs(
-            block_size=64,
-            kv_cache_specs={
-                "layer_0": custom_spec,
-                "layer_1": make_spec(SlidingWindowSpec),
-            },
-        )
-
-        # Two differing kinds, but a single shared base that is not
-        # FullAttentionSpec -- so the group must not be upgraded.
-        assert (
-            len({get_kv_cache_spec_kind(s) for s in group.kv_cache_specs.values()}) == 2
-        )
-        assert {
-            KVCacheSpecRegistry.get_uniform_type_base_spec(s)
-            for s in group.kv_cache_specs.values()
-        } == {SlidingWindowSpec}
-
-        assert get_kv_cache_spec_kind(group) == KVCacheSpecKind.UNKNOWN

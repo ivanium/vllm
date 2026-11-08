@@ -98,7 +98,7 @@ def _initialize_kv_cache(runner: GPUModelRunner) -> None:
     )
     tensor_size = attn_spec.page_size_bytes * NUM_BLOCKS
     kv_cache_config = KVCacheConfig(
-        num_blocks=NUM_BLOCKS,
+        num_pages=NUM_BLOCKS,
         kv_cache_tensors=[
             KVCacheTensor(
                 size=tensor_size,
@@ -108,8 +108,17 @@ def _initialize_kv_cache(runner: GPUModelRunner) -> None:
             ),
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=attn_spec)
+            KVCacheGroupSpec(
+                layer_names=["layer.0"],
+                kv_cache_spec=attn_spec,
+                num_blocks=NUM_BLOCKS,
+                blocks_per_page=1,
+                kernel_rows_per_block=1,
+                row_bytes=attn_spec.page_size_bytes,
+            )
         ],
+        large_page_bytes=attn_spec.page_size_bytes,
+        block_size=BLOCK_SIZE,
     )
     runner.kv_cache_config = kv_cache_config
     runner.input_batch = InputBatch(

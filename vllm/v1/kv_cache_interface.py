@@ -5,15 +5,15 @@ from __future__ import annotations
 
 import copy
 import math
-from collections import Counter
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
 from math import prod
-from typing import TYPE_CHECKING, Literal, Self, TypeVar
+from typing import TYPE_CHECKING, Self, TypeVar
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -205,7 +205,7 @@ class KVCacheSpec:
         default=(), kw_only=True, compare=False
     )
     """Kernel block sizes (tokens) the layer's attention backend supports, set
-    on the worker. The large-page planner picks the global block size from them.
+    on the worker. The planner picks the global block size from them.
     Empty: no constraint."""
 
     def __post_init__(self):
@@ -337,18 +337,6 @@ class KVCacheSpec:
         return True
 
 
-def group_kernel_blocks(cache: torch.Tensor, num_blocks: int) -> torch.Tensor:
-    """View a kernel-block-granular layer cache with manager blocks as dim 0.
-
-    Kernel block splitting subdivides each manager block into uniformly strided
-    kernel blocks, so grouping is a pure view: ``(num_blocks * ratio, ...)``
-    """
-    if cache.shape[0] == num_blocks:
-        return cache
-    assert cache.shape[0] % num_blocks == 0
-    return cache.unflatten(0, (num_blocks, -1))
-
-
 def compute_layer_kv_cache_shape_bytes(
     spec: KVCacheSpec,
     num_blocks: int,
@@ -359,9 +347,9 @@ def compute_layer_kv_cache_shape_bytes(
     assert spec.block_size % bs == 0, (
         f"Kernel block size {bs} must divide KV cache block size {spec.block_size}."
     )
-    blocks_per_page = spec.block_size // bs
+    kernel_rows_per_block = spec.block_size // bs
     return (
-        num_blocks * blocks_per_page,
+        num_blocks * kernel_rows_per_block,
         spec.num_heads,
         spec.get_num_kernel_states(bs),
         spec.state_content_size_bytes,
@@ -1160,16 +1148,16 @@ class MambaSpec(KVCacheSpec):
 
 def get_mamba_prefill_checkpoint_position(
     num_tokens: int,
-    hash_block_size: int,
+    block_size: int,
     drop_eagle_block: bool,
 ) -> int:
     """Return the reusable Mamba checkpoint boundary for a prefill."""
     # Without EAGLE, leave one token to recompute on resend.
     # EAGLE's block drop already leaves tokens to recompute.
     proof_limit = num_tokens if drop_eagle_block else num_tokens - 1
-    checkpoint_position = proof_limit // hash_block_size * hash_block_size
+    checkpoint_position = proof_limit // block_size * block_size
     if drop_eagle_block:
-        checkpoint_position -= hash_block_size
+        checkpoint_position -= block_size
     return max(checkpoint_position, 0)
 
 
@@ -1177,7 +1165,7 @@ def is_mamba_prefill_checkpoint_valid(
     query_start: int,
     query_end: int,
     checkpoint_position: int,
-    hash_block_size: int,
+    block_size: int,
     mamba_block_size: int,
     checkpoint_alignment: int | None,
 ) -> bool:
@@ -1189,9 +1177,9 @@ def is_mamba_prefill_checkpoint_valid(
     initial_state_col = (query_start - 1) // mamba_block_size
     checkpoint_col = cdiv(query_end, mamba_block_size) - 2
     return (
-        query_start % hash_block_size == 0
+        query_start % block_size == 0
         and checkpoint_col > initial_state_col
-        and query_start + hash_block_size <= checkpoint_position
+        and query_start + block_size <= checkpoint_position
         and query_start < checkpoint_position < query_end
         and (checkpoint_position - query_start) % checkpoint_alignment == 0
     )
@@ -1274,155 +1262,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         return merged_spec
 
 
-@dataclass(frozen=True)
-class UniformTypeKVCacheSpecs(KVCacheSpec):
-    """A KV cache spec for multiple layers with the same type of attention. Here,
-    same types means always need the same number of token slots. For example,
-    sliding window attentions with different window sizes are not the same type
-    and should not be merged into one UniformTypeKVCacheSpecs.
-    """
-
-    kv_cache_specs: dict[str, KVCacheSpec]
-
-    def __post_init__(self):
-        super().__post_init__()
-        if self.kv_cache_specs:
-            object.__setattr__(self, "dcp_sharded", self.first_spec.dcp_sharded)
-
-    @property
-    def prefix_cacheable(self) -> bool:
-        return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
-
-    @property
-    def prefix_replay_tokens(self) -> int:
-        return max(spec.prefix_replay_tokens for spec in self.kv_cache_specs.values())
-
-    @property
-    def first_spec(self) -> KVCacheSpec:
-        """Return the first spec in the group."""
-        return next(iter(self.kv_cache_specs.values()))
-
-    @property
-    def page_size_bytes(self) -> int:
-        return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
-
-    @property
-    def block_table_token_alignment(self) -> int | None:
-        return self.first_spec.block_table_token_alignment
-
-    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        max_num_pages = max(
-            cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
-            for spec in self.kv_cache_specs.values()
-        )
-        return max_num_pages * self.page_size_bytes
-
-    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
-        # Metadata builders are constructed from the per-layer spec, so the base
-        # cdiv(max_len, block_size) would drop its DCP sharding and size the
-        # block table wider than those builders expect.
-        widths = {
-            spec.max_num_blocks_per_req(vllm_config, max_len)
-            for spec in self.kv_cache_specs.values()
-        }
-        assert len(widths) == 1, (
-            "All layers in the same KV cache group must need the same number "
-            f"of block table entries, got {sorted(widths)}."
-        )
-        return next(iter(widths))
-
-    @classmethod
-    def is_uniform_type(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> bool:
-        """Whether all layers have the same type of KV cache spec.
-
-        Uses the registry to determine grouping base classes, so custom specs
-        that inherit from FullAttentionSpec are treated as full attention.
-        """
-        block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
-        if len(block_sizes) > 1:
-            # Different block sizes, not uniform.
-            return False
-        if len({spec.dcp_sharded for spec in kv_cache_specs.values()}) > 1:
-            return False
-        first_spec = next(iter(kv_cache_specs.values()))
-        return first_spec.is_uniform_with_collection(kv_cache_specs)
-
-    @classmethod
-    def from_specs(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> Self | None:
-        """Return a SameTypeKVCacheSpecs object if all layers have the same type
-        of KV cache spec. Return None if not.
-        """
-        if cls.is_uniform_type(kv_cache_specs):
-            block_size = next(iter(kv_cache_specs.values())).block_size
-            return cls(block_size=block_size, kv_cache_specs=kv_cache_specs)
-        else:
-            return None
-
-    def get_max_layers_per_page_size(self) -> int:
-        """Max number of layers sharing a page size. For a balanced bucket
-        this equals the number of repetitions of the layer pattern."""
-        return Counter(
-            spec.page_size_bytes for spec in self.kv_cache_specs.values()
-        ).most_common(1)[0][1]
-
-    def max_memory_usage_pages(self, vllm_config: VllmConfig) -> int:
-        return max(
-            cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
-            for spec in self.kv_cache_specs.values()
-        )
-
-    @property
-    def uses_slot_mapping(self) -> bool:
-        return self.first_spec.uses_slot_mapping
-
-
-def iter_layer_specs(kv_cache_spec: KVCacheSpec) -> Collection[KVCacheSpec]:
-    """The per-layer specs a KV cache group spec covers.
-
-    ``UniformTypeKVCacheSpecs`` groups keep one spec per layer; every other
-    spec describes its group on its own. Returns the layer specs either way so
-    callers do not have to special-case the wrapper.
-    """
-    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-        return kv_cache_spec.kv_cache_specs.values()
-    return (kv_cache_spec,)
-
-
-def is_full_attention_spec(kv_cache_spec: KVCacheSpec) -> bool:
-    """Whether a KV cache group spec is (or wraps) full attention.
-
-    ``UniformTypeKVCacheSpecs`` is not itself a ``FullAttentionSpec``, so a bare
-    isinstance check misses groups that carry the wrapper -- DeepSeek-V4's MLA
-    layers, or any model taking the ``UniformTypeKVCacheSpecs.from_specs`` path.
-
-    Every layer must be full attention: a group holding a recycling
-    (sliding-window) layer has no stable slot layout, so callers that key data
-    by slot cannot use it.
-    """
-    layer_specs = iter_layer_specs(kv_cache_spec)
-    return len(layer_specs) > 0 and all(
-        isinstance(spec, FullAttentionSpec) for spec in layer_specs
-    )
-
-
 def get_kv_cache_spec_kind(kv_cache_spec: KVCacheSpec) -> KVCacheSpecKind:
-    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-        inner_kinds = {
-            get_kv_cache_spec_kind(spec)
-            for spec in kv_cache_spec.kv_cache_specs.values()
-        }
-        if len(inner_kinds) == 1:
-            return next(iter(inner_kinds))
-        # A group is only formed when all members share one registered
-        # uniform_type_base_spec, so UNKNOWN would discard what the merge
-        # already established.
-        base_specs = {
-            KVCacheSpecRegistry.get_uniform_type_base_spec(spec)
-            for spec in kv_cache_spec.kv_cache_specs.values()
-        }
-        if len(base_specs) == 1 and next(iter(base_specs)) is FullAttentionSpec:
-            return KVCacheSpecKind.FULL_ATTENTION
-        return KVCacheSpecKind.UNKNOWN
     # Keep subclass checks before base classes so specialized specs keep their
     # more precise kind.
     if isinstance(kv_cache_spec, SlidingWindowMLASpec):
@@ -1447,12 +1287,6 @@ def get_kv_cache_spec_kind(kv_cache_spec: KVCacheSpec) -> KVCacheSpecKind:
 
 
 def get_kv_cache_spec_sliding_window(kv_cache_spec: KVCacheSpec) -> int | None:
-    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-        inner_windows = {
-            get_kv_cache_spec_sliding_window(spec)
-            for spec in kv_cache_spec.kv_cache_specs.values()
-        }
-        return next(iter(inner_windows)) if len(inner_windows) == 1 else None
     if isinstance(kv_cache_spec, SlidingWindowSpec):
         return kv_cache_spec.sliding_window
     return None
@@ -1510,25 +1344,40 @@ class KVCacheGroupSpec:
     # source group after a connector load.
     enable_kv_transfer: bool = True
     role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT
-    # Large-page allocator only (see `KVCacheConfig.allocator`).
     # Size of this group's block id space: the page count * large_page_bytes
     # // block_bytes (see large_page_block_range).
     num_blocks: int = 0
     # Fewest blocks of this group that one large page holds (n_g).
-    slots_per_large_page: int = 1
+    blocks_per_page: int = 1
     # Kernel blocks per manager block (R_g).
     kernel_rows_per_block: int = 1
     # Bytes of one kernel block of all layers of this group (row_g), the same on
     # every rank.
     row_bytes: int = 0
     # Per-layer specs at the group's final block size, with each layer's own
-    # block_stride_alignment. Kept for large-page placement; never merged.
+    # block_stride_alignment. Kept for placement; never merged.
     layer_kv_cache_specs: dict[str, KVCacheSpec] | None = None
 
     @property
     def block_bytes(self) -> int:
         """Bytes one block of this group spans in each of its layer views."""
         return self.kernel_rows_per_block * self.row_bytes
+
+    @property
+    def kernel_block_size(self) -> int:
+        """Tokens per kernel block (one row) of this group."""
+        block_size = self.kv_cache_spec.block_size
+        assert block_size % self.kernel_rows_per_block == 0
+        return block_size // self.kernel_rows_per_block
+
+    def is_head_major(self, kv_cache_layout: str | None) -> bool:
+        """Whether this group's rows are head-major (BHLNC): head ``h`` of
+        every layer is one run, ``[head][layer][N, C]``."""
+        return (
+            kv_cache_layout == KVCacheLayout.BHLNC.name
+            and not self.host_resident
+            and self.kv_cache_spec.has_layer_views
+        )
 
 
 def large_page_block_range(page: int, page_bytes: int, block_bytes: int) -> range:
@@ -1543,6 +1392,12 @@ def large_page_block_range(page: int, page_bytes: int, block_bytes: int) -> rang
     )
 
 
+def large_page_of_block(block_id: int, page_bytes: int, block_bytes: int) -> int:
+    """The large page that holds block ``block_id`` (see
+    ``large_page_block_range``)."""
+    return block_id * block_bytes // page_bytes
+
+
 def min_blocks_per_large_page(page_bytes: int, block_bytes: int) -> int:
     """Fewest blocks ``large_page_block_range`` gives any page.
 
@@ -1555,14 +1410,49 @@ def min_blocks_per_large_page(page_bytes: int, block_bytes: int) -> int:
     return num_blocks
 
 
+def large_pages_needed(num_blocks: int, blocks_per_page: int) -> int:
+    """Pages that ``num_blocks`` blocks of a group take at ``blocks_per_page``
+    blocks per page."""
+    return cdiv(num_blocks, blocks_per_page)
+
+
+@dataclass(frozen=True)
+class GroupGeometry:
+    """Where the blocks of one KV cache group lie in a layer view.
+
+    Block ``b`` is kernel blocks (rows) ``b * R`` to ``b * R + R - 1``, at byte
+    offset ``b * block_bytes``. Peers advertise the same two numbers, so
+    connectors address a remote pool with the peer's geometry.
+    """
+
+    kernel_rows_per_block: int
+    row_bytes: int
+
+    @property
+    def block_bytes(self) -> int:
+        """Bytes one manager block spans in a layer view of the group."""
+        return self.kernel_rows_per_block * self.row_bytes
+
+    def first_rows(self, block_ids: Sequence[int] | np.ndarray) -> np.ndarray:
+        """First kernel block (row) of each manager block."""
+        return np.asarray(block_ids, dtype=np.int64) * self.kernel_rows_per_block
+
+    def rows(self, block_ids: Sequence[int] | np.ndarray) -> np.ndarray:
+        """Every kernel block of each manager block, block by block."""
+        first_rows = self.first_rows(block_ids)
+        if self.kernel_rows_per_block == 1:
+            return first_rows
+        return (first_rows[:, None] + np.arange(self.kernel_rows_per_block)).ravel()
+
+
 @dataclass
 class KVCacheConfig:
     """The KV cache configuration of a model."""
 
-    num_blocks: int
-    """The number of KV cache blocks. Under the large_page allocator, the
-    number of large pages: a page holds at least
-    ``slots_per_large_page`` blocks of its group."""
+    num_pages: int
+    """The number of KV cache large pages (N; page 0 holds every group's null
+    block). A page holds at least ``blocks_per_page`` blocks of its group, so this
+    is not a block or kernel-row count."""
     kv_cache_tensors: list[KVCacheTensor]
     """How should model runner initialize the KV cache tensors for each layer"""
     kv_cache_groups: list[KVCacheGroupSpec]
@@ -1571,16 +1461,15 @@ class KVCacheConfig:
     For models with only one type of attention, there is only one group that
     contains all layers.
     For models with multiple types of attention, there will be multiple groups,
-    see `_get_kv_cache_config_uniform_page_size` for more details.
+    see `get_kv_cache_groups` for more details.
     """
+    block_size: int
+    """The global block size B; prefix caching hashes blocks at this
+    granularity."""
     prefix_cache_retention_interval: int | None = None
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
-    hash_block_size: int | None = None
-    """Tokens per prefix-cache block hash, resolved by the engine core."""
-    cache_hit_alignment_tokens: int | None = None
-    """Token granularity of prefix-cache hits, resolved by the engine core."""
     hisparse_host_num_blocks: int | None = None
     """Capacity of the dedicated HiSparse host-block manager, when enabled."""
 
@@ -1593,14 +1482,16 @@ class KVCacheConfig:
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
 
-    allocator: Literal["uniform_page", "large_page"] = "uniform_page"
-    """Block allocator. ``large_page``: the pool is ``num_blocks`` pages of
-    ``large_page_bytes``; each page belongs to one group at a time and holds
-    at least ``slots_per_large_page`` blocks of it. Block ids are unique within
-    a group."""
-
     large_page_bytes: int = 0
     """Bytes of one large page (S), the same on every rank."""
+
+    def group_geometry(self, group_id: int) -> GroupGeometry:
+        """The pool geometry of a KV cache group on this worker."""
+        group = self.kv_cache_groups[group_id]
+        if group.host_resident:
+            # The private host pool is dense: block b is row b of each layer.
+            return GroupGeometry(1, group.kv_cache_spec.page_size_bytes)
+        return GroupGeometry(group.kernel_rows_per_block, group.row_bytes)
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
@@ -1610,6 +1501,11 @@ class KVCacheConfig:
             for group_id, group in enumerate(self.kv_cache_groups)
             if group.enable_kv_transfer
         )
+
+    @cached_property
+    def transfer_group_geometries(self) -> list[GroupGeometry]:
+        """This worker's pool geometry for each transfer group, in group order."""
+        return [self.group_geometry(group_id) for group_id in self.transfer_group_ids]
 
     @cached_property
     def prefix_cacheable_group_ids(self) -> tuple[int, ...]:
@@ -1663,46 +1559,31 @@ class KVCacheConfig:
             if group.host_resident
         )
 
-    def num_blocks_of(self, tensor: KVCacheTensor) -> int:
-        """Number of blocks addressable by the pool backing ``tensor``."""
-        if not tensor.host_resident:
-            return self.num_blocks
-        assert self.hisparse_host_num_blocks is not None
-        return self.hisparse_host_num_blocks
-
     @property
     def has_mamba_layers(self) -> bool:
         return any(
-            isinstance(spec, MambaSpec)
-            for group in self.kv_cache_groups
-            for spec in iter_layer_specs(group.kv_cache_spec)
+            isinstance(group.kv_cache_spec, MambaSpec) for group in self.kv_cache_groups
         )
 
     @property
     def num_mamba_blocks(self) -> int:
         """Blocks each Mamba group can hold: a page holds at least
-        ``slots_per_large_page`` blocks of its group."""
+        ``blocks_per_page`` blocks of its group."""
         return min(
-            self.num_blocks * group.slots_per_large_page
+            self.num_pages * group.blocks_per_page
             for group in self.kv_cache_groups
-            if any(
-                isinstance(spec, MambaSpec)
-                for spec in iter_layer_specs(group.kv_cache_spec)
-            )
+            if isinstance(group.kv_cache_spec, MambaSpec)
         )
 
     @property
     def has_mixed_precision_kv_cache(self) -> bool:
         """Whether device attention caches use more than one precision."""
-        kv_cache_precisions: set[tuple[torch.dtype, KVQuantMode]] = set()
-        for group in self.kv_cache_groups:
-            if group.host_resident:
-                continue
-            kv_cache_precisions.update(
-                (spec.dtype, spec.kv_quant_mode)
-                for spec in iter_layer_specs(group.kv_cache_spec)
-                if isinstance(spec, AttentionSpec)
-            )
+        kv_cache_precisions = {
+            (group.kv_cache_spec.dtype, group.kv_cache_spec.kv_quant_mode)
+            for group in self.kv_cache_groups
+            if not group.host_resident
+            and isinstance(group.kv_cache_spec, AttentionSpec)
+        }
         return len(kv_cache_precisions) > 1
 
     @property

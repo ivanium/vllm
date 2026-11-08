@@ -50,6 +50,7 @@ def _context_score(
     Scores,
     Q_TOKEN_STRIDE: tl.constexpr,
     Q_HEAD_STRIDE: tl.constexpr,
+    PAGE_STRIDE,
     TABLE_STRIDE,
     SCORE_HEAD_STRIDE,
     SCORE_ROW_STRIDE,
@@ -99,7 +100,7 @@ def _context_score(
         # run against a block table that was never populated, and a masked
         # load still evaluates the address on ROCm.
         page = tl.minimum(tl.maximum(page, 0), NUM_PAGES - 1)
-        k = tl.load(Cache + page * (128 * 128) + pos[:, None] * 128 + d[None, :])
+        k = tl.load(Cache + page * PAGE_STRIDE + pos[:, None] * 128 + d[None, :])
         dot = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * SCALE
         dot = tl.where(block * 128 + pos[:, None] < cutoff[None, :], dot, float("-inf"))
         tl.store(
@@ -132,10 +133,10 @@ def check_context_score_inputs(
     if (
         index_cache.ndim != 3
         or index_cache.shape[1:] != (128, 128)
-        or not index_cache.is_contiguous()
+        or index_cache.stride()[1:] != (128, 1)
         or index_cache.shape[0] < 1
     ):
-        raise ValueError("index cache must be contiguous non-empty [pages,128,128]")
+        raise ValueError("index cache must be non-empty [pages,128,128] dense pages")
     if index_cache.dtype != torch.bfloat16:
         # The score loop applies no per-token scale.
         raise ValueError(
@@ -229,6 +230,7 @@ def indexer_context_scores(
             scores,
             Q_TOKEN_STRIDE=idx_q.stride(0),
             Q_HEAD_STRIDE=idx_q.stride(1),
+            PAGE_STRIDE=index_cache.stride(0),
             TABLE_STRIDE=block_table.stride(0),
             SCORE_HEAD_STRIDE=scores.stride(0),
             SCORE_ROW_STRIDE=scores.stride(1),

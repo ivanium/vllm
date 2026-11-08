@@ -330,22 +330,23 @@ class HpcRopeNorm(CustomOp, HpcModule):
         ``cache`` is a (num_blocks, block_size, num_kv_heads, head_dim) view
         with arbitrary block/token/head strides; ``src`` is the dense
         (num_tokens, num_kv_heads, head_dim) buffer produced by the fused HPC
-        kernel. FP8 payloads are moved as raw bytes because ``index_copy_``
+        kernel. FP8 payloads are moved as raw bytes because ``index_put_``
         has no FP8 kernel.
 
         Padded tokens carry ``PAD_SLOT_ID`` (-1); clamping sends them to the
-        reserved null block instead of tripping ``index_copy_``'s bounds check.
+        reserved null block instead of tripping the bounds check.
         This keeps the op CUDA-graph safe (static shape, no host sync), unlike
         masking the padded rows out.
         """
-        # (num_blocks, block_size, ...) -> (num_slots, num_kv_heads, head_dim).
-        # Valid as a view for any layout whose block stride is a whole number
-        # of token strides, which holds for every layout the backend accepts.
-        flat = cache.flatten(0, 1)
-        if flat.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            flat = flat.view(torch.uint8)
+        if cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            cache = cache.view(torch.uint8)
             src = src.view(torch.uint8)
-        flat.index_copy_(0, slot_mapping.clamp_min(NULL_BLOCK_ID), src)
+        # Index (block, token) separately: flattening them copies whenever the
+        # block stride is not block_size token strides (e.g. a block row that
+        # holds several layers), and the write would land in the copy.
+        slots = slot_mapping.clamp_min(NULL_BLOCK_ID)
+        block_size = cache.shape[1]
+        cache.index_put_((slots // block_size, slots % block_size), src)
 
     def _forward_impl(
         self,

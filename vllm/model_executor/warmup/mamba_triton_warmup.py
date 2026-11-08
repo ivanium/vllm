@@ -14,18 +14,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _has_mamba_style_cache(runner: "GPUModelRunner") -> bool:
-    from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
-
-    for group in runner.kv_cache_config.kv_cache_groups:
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            spec = spec.first_spec
-        if isinstance(spec, MambaSpec):
-            return True
-    return False
-
-
 def _warm_batch_memcpy_kernel(device: torch.device) -> None:
     """Warm the Mamba prefix-cache state copy specialization."""
     from vllm.v1.worker.mamba_utils import batch_memcpy
@@ -48,6 +36,6 @@ def mamba_triton_warmup(runner: "GPUModelRunner") -> None:
     device = runner.device
     if device.type != "cuda":
         return
-    if not _has_mamba_style_cache(runner):
+    if not runner.kv_cache_config.has_mamba_layers:
         return
     _warm_batch_memcpy_kernel(device)

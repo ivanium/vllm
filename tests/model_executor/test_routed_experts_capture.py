@@ -35,7 +35,6 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     MLAAttentionSpec,
-    UniformTypeKVCacheSpecs,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -113,13 +112,7 @@ def _full_attention_kv_group(
         head_size=1,
         dtype=torch.float32,
     )
-    return KVCacheGroupSpec(
-        ["layer"],
-        UniformTypeKVCacheSpecs(
-            block_size=16,
-            kv_cache_specs={"layer": full_attention},
-        ),
-    )
+    return KVCacheGroupSpec(["layer"], full_attention)
 
 
 @pytest.mark.parametrize("eplb_enabled", [False, True])
@@ -723,8 +716,8 @@ def test_aux_output_worker_connector_default_capacity(monkeypatch):
     monkeypatch.setattr(aux_output_worker, "bind_routed_experts_capturer", Mock())
     monkeypatch.setattr(
         aux_output_worker,
-        "resolve_kv_cache_block_sizes",
-        lambda *_: (32, 16),
+        "resolve_scheduler_block_size",
+        lambda *_: 32,
     )
     monkeypatch.setattr(aux_output_worker, "BlockObjectStore", store_constructor)
     monkeypatch.setattr(
@@ -743,8 +736,9 @@ def test_aux_output_worker_connector_default_capacity(monkeypatch):
         vllm_config=config,
         model=Mock(),
         kv_cache_config=SimpleNamespace(
-            num_blocks=10,
+            num_pages=10,
             kv_cache_groups=[_full_attention_kv_group(MLAAttentionSpec)],
+            block_size=16,
         ),
     )
 

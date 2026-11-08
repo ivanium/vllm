@@ -45,7 +45,6 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
-    KVCacheLayout,
     is_quantized_kv_cache,
 )
 
@@ -125,12 +124,6 @@ class FlexAttentionBackend(AttentionBackend):
     @classmethod
     def supports_batch_invariance(cls) -> bool:
         return True
-
-    @classmethod
-    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        # Flex flattens the (B, N) block/token axes into a single token dim, which
-        # only LBNHC's strides allow as a zero-copy view of the layer cache.
-        return (KVCacheLayout.LBNHC,)
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
@@ -374,6 +367,8 @@ class FlexAttentionMetadata:
     # Block info
     total_cache_tokens: int
     block_size: int
+    # K/V token index of kernel block b is b * kv_block_scale * block_size.
+    kv_block_scale: int
     max_possible_sequence_length: int
     num_reqs: int
     physical_to_logical: torch.Tensor
@@ -432,13 +427,14 @@ class FlexAttentionMetadata:
         q_req = request_lookup[q_idx]
 
         # Convert physical KV indices to logical indices
-        physical_kv_block = physical_kv_idx // self.block_size
-        physical_kv_offset = physical_kv_idx % self.block_size
+        block_stride = self.block_size * self.kv_block_scale
+        physical_kv_block = physical_kv_idx // block_stride
+        physical_kv_offset = physical_kv_idx % block_stride
         logical_block_idx = self.physical_to_logical[q_req, physical_kv_block]
         logical_kv_idx = logical_block_idx * self.block_size + physical_kv_offset
 
         # Determine valid kv indices
-        live_block = logical_block_idx >= 0
+        live_block = (logical_block_idx >= 0) & (physical_kv_offset < self.block_size)
         within_upper_bound = logical_kv_idx < self.seq_lens[q_req]
         within_lower_bound = logical_kv_idx >= 0
         is_valid = live_block & within_upper_bound & within_lower_bound
@@ -784,14 +780,21 @@ class FlexAttentionMetadata:
         used_pages_padded = used_pages_padded // page_to_block_ratio
         kv_indices = unique_static_unsorted(
             (used_pages_padded.long()), M=self.num_blocks
+        )
+        kv_indices = torch.where(
+            kv_indices >= 0, kv_indices * self.kv_block_scale, kv_indices
         ).to(torch.int32)
         kv_indices = copy_to_persistent(self.persistent_kv_indices, kv_indices)
 
         kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
         kv_num_blocks = copy_to_persistent(self.persistent_kv_num_blocks, kv_num_blocks)
 
+        last_kv_block = (self.num_blocks - 1) * self.kv_block_scale
         block_mask_kwargs = {
-            "seq_lengths": (self.num_actual_tokens, self.total_cache_tokens),
+            "seq_lengths": (
+                self.num_actual_tokens,
+                (last_kv_block + 1) * self.block_size,
+            ),
             "kv_num_blocks": kv_num_blocks[None, None],
             "kv_indices": kv_indices[None, None],
             "full_kv_num_blocks": None,
@@ -846,7 +849,6 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
 
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
-        self.cache_config = vllm_config.cache_config
 
         self.num_heads_q = self.model_config.get_num_attention_heads(
             self.parallel_config
@@ -1016,21 +1018,34 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
 
         block_size = self.kv_cache_spec.block_size
         max_possible_seq_len = self.model_config.max_model_len
-        num_gpu_blocks = self.cache_config.num_gpu_blocks
-
-        assert num_gpu_blocks is not None, (
-            "FlexAttention requires num_gpu_blocks to be set"
-        )
-        total_cache_tokens = num_gpu_blocks * block_size
+        uses_paged_kv = not isinstance(self.kv_cache_spec, EncoderOnlyAttentionSpec)
+        kv_block_scale = 1
+        if uses_paged_kv:
+            # Block tables hold kernel block ids: rows of the layer views.
+            kv_cache = self.vllm_config.compilation_config.static_forward_context[
+                self.layer_names[0]
+            ].kv_cache
+            num_kernel_blocks = kv_cache.shape[0]
+            # A row holds this block of every layer. If it is a whole number
+            # of blocks of tokens, flex reads the pool in place as a token dim
+            # where block b starts at token b * kv_block_scale * block_size.
+            block_elems = block_size * kv_cache.stride(2)
+            if self.direct_build and kv_cache.stride(0) % block_elems == 0:
+                kv_block_scale = kv_cache.stride(0) // block_elems
+        else:
+            # Encoder-only attention reads no KV cache; its dummy block table
+            # only names block 0.
+            num_kernel_blocks = 1
+        total_cache_tokens = num_kernel_blocks * block_size
 
         inverse_block_table = physical_to_logical_mapping(
-            block_table_tensor, seq_lens, block_size, num_gpu_blocks
+            block_table_tensor, seq_lens, block_size, num_kernel_blocks
         )
         if self.persistent_physical_to_logical is None:
             max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
             self.persistent_physical_to_logical = torch.empty(
                 max_num_seqs,
-                num_gpu_blocks,
+                num_kernel_blocks,
                 dtype=torch.long,
                 device=self.device,
             )
@@ -1076,7 +1091,6 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             copy_to_persistent(self.persistent_rswa_prefix_lens, rswa_prefix_lens)
             rswa_prefix_lens = self.persistent_rswa_prefix_lens
 
-        uses_paged_kv = not isinstance(self.kv_cache_spec, EncoderOnlyAttentionSpec)
         logical_mask_mod = (
             bidirectional_mask_mod
             if uses_paged_kv and not common_attn_metadata.causal
@@ -1104,6 +1118,7 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             block_size=block_size,
+            kv_block_scale=kv_block_scale,
             max_possible_sequence_length=max_possible_seq_len,
             num_reqs=num_reqs,
             physical_to_logical=self.persistent_physical_to_logical,
@@ -1347,9 +1362,23 @@ class FlexAttentionImpl(AttentionImpl):
             hs = self.head_size
             key_cache, value_cache = kv_cache.split(hs, dim=-1)
 
-            # Flatten (num_blocks, block_size) into a single token dim.
-            key_cache = key_cache.view(-1, self.num_kv_heads, self.head_size)
-            value_cache = value_cache.view(-1, self.num_kv_heads, self.head_size)
+            # Flatten (num_blocks, block_size) into a single token dim. Read
+            # in place when the metadata maps block b to token
+            # b * block_stride; the tokens between blocks belong to other
+            # layers and the block mask skips them. Otherwise densify with a
+            # copy.
+            block_size = attn_metadata.block_size
+            block_stride = attn_metadata.kv_block_scale * block_size
+            token_stride = key_cache.stride(1)
+            if key_cache.stride(0) == block_stride * token_stride:
+                num_tokens = (key_cache.shape[0] - 1) * block_stride + block_size
+                size = (num_tokens, self.num_kv_heads, hs)
+                stride = (token_stride, key_cache.stride(2), key_cache.stride(3))
+                key_cache = key_cache.as_strided(size, stride)
+                value_cache = value_cache.as_strided(size, stride)
+            else:
+                key_cache = key_cache.contiguous().view(-1, self.num_kv_heads, hs)
+                value_cache = value_cache.contiguous().view(-1, self.num_kv_heads, hs)
             query, key_tensor, value_tensor = map(
                 lambda x: self.view_as_4d(x).permute(0, 2, 1, 3),
                 (query, key_cache, value_cache),

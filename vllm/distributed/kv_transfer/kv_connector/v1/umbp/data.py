@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from enum import Enum
@@ -25,19 +25,33 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorWorkerMetadata,
 )
 from vllm.v1.kv_cache_interface import (
+    GroupGeometry,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
-    UniformTypeKVCacheSpecs,
 )
 
 
 def _layer_specs(group: KVCacheGroupSpec) -> dict[str, KVCacheSpec]:
-    """Map each layer of a cache group to the spec describing its own pages."""
-    spec = group.kv_cache_spec
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        return {name: spec.kv_cache_specs[name] for name in group.layer_names}
-    return dict.fromkeys(group.layer_names, spec)
+    """Map each layer of a cache group to its spec at the group block size."""
+    if group.layer_kv_cache_specs is not None:
+        return dict(group.layer_kv_cache_specs)
+    return dict.fromkeys(group.layer_names, group.kv_cache_spec)
+
+
+def _head_major_run(config: KVCacheConfig, group: KVCacheGroupSpec) -> int | None:
+    """Bytes of a head-major (BHLNC) group's heads in one kernel row, or None
+    when each layer's page is one contiguous run of the row.
+
+    The planner lays such a group out as one tensor whose layer stride is one
+    head of one layer.
+    """
+    if not group.is_head_major(config.kv_cache_layout):
+        return None
+    tensor = next(
+        t for t in config.kv_cache_tensors if t.layers[0] in group.layer_names
+    )
+    return group.kv_cache_spec.num_heads * len(tensor.layers) * tensor.layer_stride
 
 
 def _spec_fingerprint(spec: KVCacheSpec) -> dict[str, str]:
@@ -151,7 +165,7 @@ class UMBPNamespace:
     ) -> UMBPNamespace:
         """Derive the namespace from a worker's per-layer KV cache config.
 
-        The scheduler's config flattens UniformTypeKVCacheSpecs groups, so the
+        Only workers hold per-layer specs and group geometry, so the
         scheduler adopts the namespace its workers report instead.
         """
         if (configured := cls.configured(vllm_config)) is not None:
@@ -181,6 +195,8 @@ class UMBPNamespace:
                 {
                     "layers": group.layer_names,
                     "block_size": group.kv_cache_spec.block_size,
+                    "kernel_rows_per_block": group.kernel_rows_per_block,
+                    "row_bytes": group.row_bytes,
                     "layer_specs": {
                         name: _spec_fingerprint(spec)
                         for name, spec in _layer_specs(group).items()
@@ -192,7 +208,7 @@ class UMBPNamespace:
             "pp": parallel_config.pipeline_parallel_size,
             "pcp": getattr(parallel_config, "prefill_context_parallel_size", 1),
             "dcp": getattr(parallel_config, "decode_context_parallel_size", 1),
-            "layout_version": 2,
+            "layout_version": 3,
         }
         if speculative is not None:
             # Added only when set, so namespaces without a drafter are unchanged.
@@ -258,7 +274,13 @@ class BlockIdentityCodec:
 
 @dataclass(frozen=True)
 class KVRegion:
-    """One deterministic region in a rank-local KV object."""
+    """One layer's per-block region in a rank-local KV object.
+
+    ``block_bytes`` is the layer's bytes per manager block; a manager block
+    spans ``kernel_rows_per_block`` kernel rows of its group, and
+    ``block_stride`` is the group's ``row_bytes`` (the stride between the
+    layer's consecutive kernel rows).
+    """
 
     layer_name: str
     group_id: int
@@ -272,11 +294,6 @@ class KVRegion:
             raise ValueError("KV region sizes must be positive")
         if self.block_size <= 0:
             raise ValueError("KV region block_size must be positive")
-        if self.block_bytes > self.block_stride:
-            raise ValueError(
-                f"KV region bytes ({self.block_bytes}) exceed its stride "
-                f"({self.block_stride}) for {self.layer_name!r}"
-            )
 
 
 @dataclass(frozen=True)
@@ -302,43 +319,77 @@ class KVLayoutDescriptor:
 class KVLayoutPlanner:
     """Create a deterministic all-layer object layout from KVCacheConfig."""
 
-    def __init__(self, regions: Sequence[KVRegion]) -> None:
+    def __init__(
+        self,
+        regions: Sequence[KVRegion],
+        group_geometry: Mapping[int, GroupGeometry],
+    ) -> None:
         self.regions = tuple(regions)
+        self.group_geometry = dict(group_geometry)
+        for group_id, geometry in self.group_geometry.items():
+            if geometry.kernel_rows_per_block <= 0 or geometry.row_bytes <= 0:
+                raise ValueError(f"cache group {group_id} geometry must be positive")
         self._regions_by_group = {
             group_id: tuple(r for r in self.regions if r.group_id == group_id)
             for group_id in {r.group_id for r in self.regions}
         }
+        for region in self.regions:
+            region_geometry = self.group_geometry.get(region.group_id)
+            if region_geometry is None:
+                raise ValueError(f"no geometry for cache group {region.group_id}")
+            if region.block_stride != region_geometry.row_bytes:
+                raise ValueError(
+                    f"KV region {region.layer_name!r} row stride "
+                    f"{region.block_stride} != group row_bytes "
+                    f"{region_geometry.row_bytes}"
+                )
+            if region.block_bytes % region_geometry.kernel_rows_per_block != 0:
+                raise ValueError(
+                    f"KV region {region.layer_name!r} block bytes "
+                    f"{region.block_bytes} do not divide across "
+                    f"{region_geometry.kernel_rows_per_block} kernel rows"
+                )
         self._base_addresses: dict[str, int] = {}
-        self._physical_strides: dict[str, int] = {}
 
     @classmethod
     def from_kv_cache_config(cls, config: KVCacheConfig) -> KVLayoutPlanner:
-        layer_specs = {
-            layer: (group_id, spec)
-            for group_id, group in enumerate(config.kv_cache_groups)
-            if group.enable_kv_transfer
-            for layer, spec in _layer_specs(group).items()
+        group_geometry = {
+            group_id: config.group_geometry(group_id)
+            for group_id in config.transfer_group_ids
         }
         regions: list[KVRegion] = []
         offset = 0
-        for tensor in config.kv_cache_tensors:
-            for layer_name in tensor.layers:
-                if layer_name not in layer_specs:
-                    continue
-                group_id, spec = layer_specs[layer_name]
-                block_bytes = spec.page_size_bytes
+        for group_id in config.transfer_group_ids:
+            group = config.kv_cache_groups[group_id]
+            if (run := _head_major_run(config, group)) is not None:
+                # A head-major (BHLNC) row holds each head of every layer back
+                # to back, so the group's heads are one region of the object.
+                block_bytes = run * group.kernel_rows_per_block
+                regions.append(
+                    KVRegion(
+                        layer_name=group.layer_names[0],
+                        group_id=group_id,
+                        block_stride=group.row_bytes,
+                        block_bytes=block_bytes,
+                        object_offset=offset,
+                        block_size=group.kv_cache_spec.block_size,
+                    )
+                )
+                offset += block_bytes
+                continue
+            for layer_name, spec in _layer_specs(group).items():
                 regions.append(
                     KVRegion(
                         layer_name=layer_name,
                         group_id=group_id,
-                        block_stride=tensor.block_stride,
-                        block_bytes=block_bytes,
+                        block_stride=group.row_bytes,
+                        block_bytes=spec.page_size_bytes,
                         object_offset=offset,
                         block_size=spec.block_size,
                     )
                 )
-                offset += block_bytes
-        return cls(regions)
+                offset += spec.page_size_bytes
+        return cls(regions, group_geometry=group_geometry)
 
     @property
     def object_size(self) -> int:
@@ -362,28 +413,19 @@ class KVLayoutPlanner:
         if missing:
             raise ValueError(f"missing KV cache layers: {sorted(missing)}")
         addresses: dict[str, int] = {}
-        for layer_name in required:
-            cache = kv_caches[layer_name]
+        for region in self.regions:
+            if region.layer_name in addresses:
+                continue
+            cache = kv_caches[region.layer_name]
             if cache.ndim == 0:
-                raise ValueError(f"KV cache {layer_name!r} must be a tensor")
-            block_stride = cache.stride(0) * cache.element_size()
-            addresses[layer_name] = cache.data_ptr()
-            for region in self.regions:
-                if region.layer_name != layer_name:
-                    continue
-                if (
-                    block_stride > region.block_stride
-                    or region.block_stride % block_stride != 0
-                    or (
-                        region.block_bytes > block_stride
-                        and region.block_bytes % block_stride != 0
-                    )
-                ):
-                    raise ValueError(
-                        f"KV block stride mismatch for {layer_name!r}: "
-                        f"config={region.block_stride}, tensor={block_stride}"
-                    )
-                self._physical_strides[layer_name] = block_stride
+                raise ValueError(f"KV cache {region.layer_name!r} must be a tensor")
+            row_bytes = cache.stride(0) * cache.element_size()
+            if row_bytes != region.block_stride:
+                raise ValueError(
+                    f"KV row stride mismatch for {region.layer_name!r}: "
+                    f"config={region.block_stride}, tensor={row_bytes}"
+                )
+            addresses[region.layer_name] = cache.data_ptr()
         self._base_addresses = addresses
 
     def plan_registered_block(
@@ -419,6 +461,7 @@ class KVLayoutPlanner:
             block_id=block_id,
             ranges=self._ranges_for_block(block_id, base_addresses, group_id),
             request_id=request_id,
+            group_id=group_id,
         )
 
     def materialize(self, plan: BlockTransferPlan) -> BlockTransferPlan:
@@ -455,45 +498,24 @@ class KVLayoutPlanner:
                 raise ValueError(
                     f"missing base address for layer {region.layer_name!r}"
                 ) from exc
-            physical_stride = self._physical_strides.get(
-                region.layer_name, region.block_stride
+            geometry = self.group_geometry[region.group_id]
+            rows = geometry.kernel_rows_per_block
+            row_bytes = geometry.row_bytes
+            part_bytes = region.block_bytes // rows
+            block_address = base_address + block_id * geometry.block_bytes
+            block_offset = (
+                object_offset if group_id is not None else region.object_offset
             )
-            if region.block_bytes <= physical_stride:
+            for row in range(rows):
                 ranges.append(
                     KVRange(
                         layer_name=region.layer_name,
                         group_id=region.group_id,
                         block_id=block_id,
-                        base_address=base_address + block_id * physical_stride,
-                        stride=physical_stride,
-                        length=region.block_bytes,
-                        object_offset=(
-                            object_offset
-                            if group_id is not None
-                            else region.object_offset
-                        ),
-                    )
-                )
-                object_offset += region.block_bytes
-                continue
-            physical_parts = max(1, region.block_bytes // physical_stride)
-            for part in range(physical_parts):
-                part_start = part * physical_stride
-                part_end = min(part_start + physical_stride, region.block_bytes)
-                physical_block_id = block_id * physical_parts + part
-                ranges.append(
-                    KVRange(
-                        layer_name=region.layer_name,
-                        group_id=region.group_id,
-                        block_id=block_id,
-                        base_address=base_address + physical_block_id * physical_stride,
-                        stride=physical_stride,
-                        length=part_end - part_start,
-                        object_offset=(
-                            object_offset + part_start
-                            if group_id is not None
-                            else region.object_offset + part * physical_stride
-                        ),
+                        base_address=block_address + row * row_bytes,
+                        stride=row_bytes,
+                        length=part_bytes,
+                        object_offset=block_offset + row * part_bytes,
                     )
                 )
             object_offset += region.block_bytes
@@ -521,6 +543,12 @@ class BlockTransferPlan:
     ranges: tuple[KVRange, ...] = ()
     request_id: str | None = None
     group_id: int | None = None
+
+    @property
+    def group_block_id(self) -> tuple[int, int]:
+        """The (group_id, block_id) pair; scheduler-built plans set group_id."""
+        assert self.group_id is not None
+        return self.group_id, self.block_id
 
 
 @dataclass
@@ -612,8 +640,10 @@ class TransferJobState:
         self._finish_if_done()
 
     @property
-    def failed_block_ids(self) -> set[int]:
-        return {plan.block_id for plan in self.plans if plan.key in self.failed_keys}
+    def failed_block_ids(self) -> set[tuple[int, int]]:
+        return {
+            plan.group_block_id for plan in self.plans if plan.key in self.failed_keys
+        }
 
     def _finish_if_done(self) -> None:
         keys = set(self.keys)

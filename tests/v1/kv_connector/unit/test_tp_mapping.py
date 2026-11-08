@@ -275,54 +275,6 @@ class TestMambaPlanSplitHandles:
             [3200, 200, 0, 400, 1],
         ]
 
-    def test_hetero_block_size_splits(self):
-        """With a block-size ratio, single-source FA sub-block descs pass
-        through whole; SSM descs are unexpanded and split per source."""
-        plan = TPMapping(
-            source_ranks_per_group=((0,), (0, 1)),
-            all_source_ranks=(0, 1),
-            rank_to_attention_slot={0: 0, 1: 0},
-            rank_offset_factor=0,
-        )
-
-        worker = _make_mock_worker_for_splits((FullAttentionSpec, MambaSpec))
-        # 2 FA blocks x ratio 2 sub-blocks (one run of 2 per block) + 1 SSM desc
-        # (never expanded).
-        src_blocks_data = np.array(
-            [
-                (1000, 100, 0, 100, 2),
-                (2000, 100, 0, 100, 2),
-                (3000, 400, 0, 400, 1),
-            ],
-            dtype=np.uint64,
-        )
-
-        splits = list(worker._build_local_splits_from_plan(plan, src_blocks_data, 4, 2))
-
-        assert len(splits) == 2
-        fa_passthrough = [[1000, 100, 0, 100, 2], [2000, 100, 0, 100, 2]]
-        assert splits[0].tolist() == fa_passthrough + [[3000, 200, 0, 400, 1]]
-        assert splits[1].tolist() == fa_passthrough + [[3200, 200, 0, 400, 1]]
-
-    def test_hetero_block_size_head_sharded_asserts(self):
-        """Head-sharded FA reads (multiple FA sources) are incompatible with
-        a block-size mismatch and must fail loudly."""
-        plan = TPMapping(
-            source_ranks_per_group=((0, 1), (0, 1)),
-            all_source_ranks=(0, 1),
-            rank_to_attention_slot={0: 0, 1: 1},
-            rank_offset_factor=0,
-        )
-
-        worker = _make_mock_worker_for_splits((FullAttentionSpec, MambaSpec))
-        src_blocks_data = np.array(
-            [(1000, 100, 0, 100, 2), (3000, 400, 0, 400, 1)],
-            dtype=np.uint64,
-        )
-
-        with pytest.raises(AssertionError, match="Head-sharded"):
-            list(worker._build_local_splits_from_plan(plan, src_blocks_data, 2, 2))
-
 
 @pytest.mark.parametrize(
     ("total_kv_heads", "local_tp", "remote_tp", "compatible"),

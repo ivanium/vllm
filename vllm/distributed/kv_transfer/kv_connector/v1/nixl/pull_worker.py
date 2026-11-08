@@ -52,11 +52,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         """
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
-                meta.local_block_ids, self._physical_blocks_per_logical_kv_block
+                meta.local_block_ids
             )
             assert meta.remote is not None
             # Remote block IDs are kept logical here; expanded in
-            # _read_blocks_for_req using the remote engine's phys ratio.
+            # _read_blocks_for_req with the remote engine's advertised
+            # geometry.
             remote_engine_id = meta.remote.engine_id
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
@@ -206,7 +207,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 )
             remote_physical_block_ids = self._remote_logical_to_kernel_block_ids(
                 meta.remote.block_ids,
-                remote_info.remote_physical_blocks_per_logical,
                 engine_id,
             )
             remote_by_region = self._block_ids_by_region(
@@ -217,36 +217,21 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
             num_computed_blocks = None
             num_remote_blocks = None
-            if (
-                meta.remote.num_tokens is not None
-                and meta.local_num_computed_blocks
-                and all(group >= 0 for group in local_region_groups)
-                and all(group >= 0 for group in remote_region_groups)
-            ):
+            if meta.remote.num_tokens is not None and meta.local_num_computed_blocks:
                 transfer_groups = self.kv_cache_config.transfer_group_ids
+                geometries = self.kv_cache_config.transfer_group_geometries
                 num_computed_blocks = [
                     meta.local_num_computed_blocks[transfer_groups[group]]
-                    * (
-                        self.kv_cache_config.kv_cache_groups[
-                            transfer_groups[group]
-                        ].kernel_rows_per_block
-                        if self._large_page
-                        else self._physical_blocks_per_logical_kv_block
-                    )
+                    * geometries[group].kernel_rows_per_block
                     for group in local_region_groups
                 ]
                 num_remote_blocks = cdiv(
                     meta.remote.num_tokens, remote_info.remote_block_size
                 )
-            elif any(local_by_region) and (
-                dcp_active
-                or remote_info.remote_physical_blocks_per_logical
-                != self._physical_blocks_per_logical_kv_block
-            ):
+            elif any(local_by_region) and dcp_active:
                 raise NotImplementedError(
-                    "Region-mapped pulls with DCP or different logical block sizes "
-                    "require remote_num_tokens, per-group prefix counts "
-                    "and unshared regions"
+                    "Region-mapped pulls with DCP require remote_num_tokens, "
+                    "per-group prefix counts and unshared regions"
                 )
             read_specs = [
                 ReadSpec(
@@ -271,7 +256,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             remote_logical_block_ids = meta.remote.block_ids
             meta.remote.block_ids = self._remote_logical_to_kernel_block_ids(
                 remote_logical_block_ids,
-                remote_info.remote_physical_blocks_per_logical,
                 engine_id,
             )
             num_groups = len(meta.local_block_ids)
@@ -303,12 +287,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                                 meta.local_num_computed_blocks[g]
                             ),
                         )
-                    local_physical_ids = self._logical_to_kernel_block_ids(
-                        local_ids, self._physical_blocks_per_logical_kv_block
-                    )
+                    local_physical_ids = self._logical_to_kernel_block_ids(local_ids)
                     remote_physical_ids = self._remote_logical_to_kernel_block_ids(
                         remote_ids,
-                        remote_info.remote_physical_blocks_per_logical,
                         engine_id,
                     )
                 else:
@@ -343,23 +324,18 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             if tp_ratio < 0 and (not self.use_mla or len(read_specs) > 1):
                 # Remote tp_size > local tp_size: we must perform multiple
                 # reads. Get the memory chunk onto which we will write to.
-                split_key = (tp_ratio, remote_block_size)
-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][i]
+                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][i]
                 local_dram_handle = (
-                    self._dram_src_handles_by_tp_ratio[split_key][i]
+                    self._dram_src_handles_by_tp_ratio[tp_ratio][i]
                     if self._mixed_mem_types
                     else None
                 )
             else:
                 # Single read from remote, we write to the whole memory region.
-                # Also handle remote block size different from local block size.
-                local_xfer_side_handle = self.src_xfer_handles_by_block_size[
-                    remote_block_size
-                ]
+                assert self.src_xfer_handle is not None
+                local_xfer_side_handle = self.src_xfer_handle
                 local_dram_handle = (
-                    self._dram_src_handles_by_block_size[remote_block_size]
-                    if self._mixed_mem_types
-                    else None
+                    self._dram_src_handle if self._mixed_mem_types else None
                 )
 
             # Destination handle: remote_engine_id -> remote_rank -> handle.
@@ -432,19 +408,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_block_ids = read_spec.remote_block_ids
 
         remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
-        block_size_ratio = self.transfer_topo.block_size_ratio(
-            remote_info.remote_block_size
-        )
-        if block_size_ratio > 1:
-            if read_spec.block_ids_by_region:
-                raise NotImplementedError(
-                    "Region-mapped NIXL transfers require matching physical block sizes"
-                )
-            local_block_ids, remote_block_ids = (
-                self._map_block_ids_for_block_size_ratio(
-                    local_block_ids, remote_block_ids, block_size_ratio
-                )
-            )
         # NOTE(rob): having the staging blocks be on the READER side is
         # not going to work well (since we will have to call rearrange tensors).
         # after we detect the txn is complete (which means we cannot make the
@@ -494,12 +457,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 local_block_ids, remote_block_ids = self._apply_prefix_caching(
                     decode_block_ids=local_block_ids,
                     prefill_block_ids=remote_block_ids,
-                    decode_physical_per_logical=(
-                        self._physical_blocks_per_logical_kv_block
-                    ),
-                    prefill_physical_per_logical=(
-                        remote_info.remote_physical_blocks_per_logical
-                    ),
                 )
 
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
@@ -509,36 +466,20 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Get descs ids.
         remote_block_descs_ids = self._compute_desc_ids(
             block_ids=remote_block_ids,
-            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
-            block_size_ratio=None,
-            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
-            region_num_blocks=(self.dst_region_num_blocks.get(dst_engine_id) or None),
+            region_num_blocks=self.dst_region_num_blocks[dst_engine_id],
             region_group_ids=(
                 list(range(self.num_regions))
                 if read_spec.block_ids_by_region
-                else (self.dst_region_group_ids.get(dst_engine_id) or None)
-            ),
-            uses_region_group_mapping=(
-                self.num_regions > 1
-                if read_spec.block_ids_by_region
-                else self.dst_uses_region_group_mapping[dst_engine_id]
+                else self.dst_region_group_ids[dst_engine_id]
             ),
         )
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
-            dst_num_blocks=self.dst_num_blocks[self.engine_id],
-            block_size_ratio=block_size_ratio,
-            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-            region_num_blocks=(self.dst_region_num_blocks.get(self.engine_id) or None),
+            region_num_blocks=self.dst_region_num_blocks[self.engine_id],
             region_group_ids=(
                 list(range(self.num_regions))
                 if read_spec.block_ids_by_region
-                else (self.region_group_ids or None)
-            ),
-            uses_region_group_mapping=(
-                self.num_regions > 1
-                if read_spec.block_ids_by_region
-                else self._uses_region_group_mapping
+                else self.region_group_ids
             ),
         )
 
@@ -550,7 +491,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             if self._mixed_mem_types:
                 self._read_blocks_mixed(
                     request_id=request_id,
-                    local_block_size_key=remote_info.remote_block_size,
                     local_device_handle=local_xfer_side_handle,
                     local_dram_handle=local_dram_handle,
                     remote_xfer_side_handle=remote_xfer_side_handle,
@@ -594,7 +534,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     def _read_blocks_mixed(
         self,
         request_id: str,
-        local_block_size_key: int,
         local_device_handle: int,
         local_dram_handle: int | None,
         remote_xfer_side_handle: int,
@@ -604,8 +543,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         notif_id: bytes,
     ) -> None:
         """Split a READ across the local DRAM and device descriptor lists."""
-        desc_is_dram = self._desc_is_dram_by_block_size[local_block_size_key]
-        desc_pos = self._desc_pos_by_block_size[local_block_size_key]
+        assert self._desc_is_dram is not None and self._desc_pos is not None
+        desc_is_dram = self._desc_is_dram
+        desc_pos = self._desc_pos
         local_ids = np.asarray(local_block_descs_ids)
         remote_ids = np.asarray(remote_block_descs_ids)
         is_dram = desc_is_dram[local_ids]

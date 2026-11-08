@@ -30,7 +30,6 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     maybe_convert_block_hash,
-    resolve_block_hashes,
     to_event_extra_keys,
 )
 from vllm.v1.kv_cache_interface import (
@@ -168,89 +167,6 @@ class OffloadingEventsTracker:
             _PRIMARY_RESIDENCY
         )
 
-    def record_partial_store(
-        self,
-        req: Request,
-        group_config: "GroupOffloadConfig",
-        boundary_tokens: int,
-        offload_key: OffloadKey,
-    ) -> None:
-        """Snapshot metadata for a newly stored partial recurrent tail."""
-        if group_config.sliding_window_size_in_chunks is not None:
-            return
-        self._record_partial_tail(req, group_config, boundary_tokens, offload_key)
-
-    def record_partial_lookup(
-        self,
-        req: Request,
-        group_config: "GroupOffloadConfig",
-        boundary_tokens: int,
-        offload_key: OffloadKey,
-    ) -> None:
-        """Backfill metadata for a partial recurrent tail lookup hit."""
-        if group_config.sliding_window_size_in_chunks is not None:
-            return
-        if offload_key not in self._pending_event_metadata:
-            self._record_partial_tail(req, group_config, boundary_tokens, offload_key)
-
-    def _record_partial_tail(
-        self,
-        req: Request,
-        group_config: "GroupOffloadConfig",
-        boundary_tokens: int,
-        offload_key: OffloadKey,
-    ) -> None:
-        """Build metadata for the valid prefix of one physical cache block.
-
-        A partial recurrent tail ends on a hash boundary but before its
-        physical cache block is full. The event describes only the valid
-        hashes and tokens, not the unused remainder of that physical block.
-        """
-        if not self.self_describing_enabled:
-            return
-
-        tokens_per_hash = group_config.tokens_per_chunk // group_config.hashes_per_chunk
-        # Subtract one so the boundary token itself cannot select the next
-        # physical block when the boundary lies exactly on a block edge.
-        chunk_start = (
-            (boundary_tokens - 1) // group_config.tokens_per_chunk
-        ) * group_config.tokens_per_chunk
-        first_hash_idx = chunk_start // tokens_per_hash
-        last_hash_idx = boundary_tokens // tokens_per_hash
-        assert chunk_start < boundary_tokens
-        assert boundary_tokens % tokens_per_hash == 0
-        assert last_hash_idx <= len(req.block_hashes)
-
-        # Unlike a complete chunk, a partial tail contains only the hashes
-        # between its physical block start and its valid token boundary.
-        maybe_block_hashes = req.block_hashes[first_hash_idx:last_hash_idx]
-        block_hashes = tuple(
-            block_hash for block_hash in maybe_block_hashes if block_hash is not None
-        )
-        assert block_hashes and len(block_hashes) == len(maybe_block_hashes)
-        parent_block_hash = (
-            req.block_hashes[first_hash_idx - 1] if first_hash_idx > 0 else None
-        )
-        assert first_hash_idx == 0 or parent_block_hash is not None
-
-        lora_id = req.lora_request.adapter_id if req.lora_request is not None else None
-        lora_name = req.lora_request.name if req.lora_request is not None else None
-        meta = _OffloadEventMetadata(
-            block_hashes=block_hashes,
-            parent_block_hash=parent_block_hash,
-            token_ids=tuple(req.all_token_ids[chunk_start:boundary_tokens]),
-            block_size=tokens_per_hash,
-            lora_id=lora_id,
-            lora_name=lora_name,
-            extra_keys=None,
-            group_idx=group_config.group_idx,
-            kv_cache_spec=group_config.kv_event_group_spec,
-            active_residencies={_PRIMARY_RESIDENCY},
-        )
-        if existing := self._pending_event_metadata.get(offload_key):
-            meta.active_residencies.update(existing.active_residencies)
-        self._pending_event_metadata[offload_key] = meta
-
     def take_events(self, events: Iterable[OffloadingEvent]) -> Iterable[KVCacheEvent]:
         """Translate raw OffloadingEvents into self-describing KV events.
 
@@ -296,18 +212,12 @@ class OffloadingEventsTracker:
         hashes_per_chunk = group_config.hashes_per_chunk
         assert hashes_per_chunk > 0
         assert chunk_idx >= 0
-        tokens_per_hash = group_config.tokens_per_chunk // hashes_per_chunk
         # Each chunk's final raw hash is its OffloadKey.
         first_hash_idx = chunk_idx * hashes_per_chunk
         last_hash_idx = first_hash_idx + hashes_per_chunk
         assert first_hash_idx >= 0
         assert last_hash_idx <= len(req.block_hashes)
-        raw_chunk_hashes = req.block_hashes[first_hash_idx:last_hash_idx]
-        chunk_hashes = resolve_block_hashes(
-            raw_chunk_hashes,
-            tokens_per_hash,
-            group_config.tokens_per_block,
-        )
+        chunk_hashes = req.block_hashes[first_hash_idx:last_hash_idx]
         for block_hash in chunk_hashes:
             assert block_hash is not None
         assert len(chunk_hashes) == (

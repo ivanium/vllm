@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    GroupGeometry,
     KVCacheConfig,
     KVCacheGroupSpec,
 )
@@ -38,6 +39,28 @@ from .utils import (
     make_kv_cache_config,
     maybe_update_block_size,
 )
+
+
+def _make_lp_kv_cache_config(
+    block_size: int, swa_enabled: bool = False, sw_size: int = 128
+) -> KVCacheConfig:
+    """make_kv_cache_config with large-page pool geometry attached.
+
+    One block per page and one kernel row per block, so manager block ids
+    double as kernel row ids (the identity mapping).
+    """
+    config = make_kv_cache_config(
+        block_size=block_size, swa_enabled=swa_enabled, sw_size=sw_size
+    )
+    row_bytes = config.kv_cache_groups[0].kv_cache_spec.page_size_bytes * 2
+    for group in config.kv_cache_groups:
+        group.num_blocks = 100
+        group.blocks_per_page = 1
+        group.kernel_rows_per_block = 1
+        group.row_bytes = row_bytes
+    config.num_pages = 100
+    config.large_page_bytes = row_bytes
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +86,7 @@ def test_sw_sizes(swa_enabled, expected_blocks_per_sw):
     )
     # Override so HMA detection works
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
-    kv_cache_config = make_kv_cache_config(
+    kv_cache_config = _make_lp_kv_cache_config(
         block_size=block_size, swa_enabled=swa_enabled, sw_size=2048
     )
 
@@ -96,7 +119,7 @@ def test_is_hma_required(swa_enabled, disable_hma, expected_is_hma):
         block_size=block_size,
     )
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = disable_hma
-    kv_cache_config = make_kv_cache_config(
+    kv_cache_config = _make_lp_kv_cache_config(
         block_size=block_size, swa_enabled=swa_enabled
     )
 
@@ -122,7 +145,7 @@ def test_get_sw_clipped_blocks():
     )
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
     # SW=128 tokens → 128/16 = 8 blocks + 1 = 9 blocks_per_sw
-    kv_cache_config = make_kv_cache_config(
+    kv_cache_config = _make_lp_kv_cache_config(
         block_size=block_size, swa_enabled=True, sw_size=128
     )
 
@@ -157,7 +180,7 @@ def test_get_sw_clipped_blocks_noop_no_hma():
         block_size=block_size,
     )
     # FA only → _is_hma_required = False
-    kv_cache_config = make_kv_cache_config(block_size=block_size, swa_enabled=False)
+    kv_cache_config = _make_lp_kv_cache_config(block_size=block_size, swa_enabled=False)
 
     scheduler = MooncakeConnectorScheduler(
         vllm_config=vllm_config,
@@ -235,7 +258,7 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector", kv_role="kv_producer", block_size=block_size
     )
-    kv_cache_config = make_kv_cache_config(block_size=block_size, swa_enabled=True)
+    kv_cache_config = _make_lp_kv_cache_config(block_size=block_size, swa_enabled=True)
 
     with set_current_vllm_config(vllm_config), patch_worker_dependencies():
         connector = MooncakeConnector(
@@ -268,27 +291,46 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
                     [[30, 31], [40, 41]],
                 )
             },
-            kv_caches_base_addr=[0x2000],
-            block_lens=[block_len],
-            kv_block_lens=[block_len],
+            kv_caches_base_addr=[0x2000, 0x6000],
+            block_lens=[block_len, block_len],
+            kv_block_lens=[block_len, block_len],
+            group_geometries=[GroupGeometry(1, block_len)] * 2,
         )
 
         local_regions = [
             TransferRegion(
-                layer_name="model.layers.0.self_attn",
+                layer_name="layer0",
                 layer_index=0,
                 base_addr=0x1000,
                 block_len=block_len,
                 kv_block_len=block_len,
+                group_index=0,
+            ),
+            TransferRegion(
+                layer_name="layer1",
+                layer_index=1,
+                base_addr=0x5000,
+                block_len=block_len,
+                kv_block_len=block_len,
+                group_index=1,
             ),
         ]
         remote_regions = [
             TransferRegion(
-                layer_name="model.layers.0.self_attn",
+                layer_name="layer0",
                 layer_index=0,
                 base_addr=0x2000,
                 block_len=block_len,
                 kv_block_len=block_len,
+                group_index=0,
+            ),
+            TransferRegion(
+                layer_name="layer1",
+                layer_index=1,
+                base_addr=0x6000,
+                block_len=block_len,
+                kv_block_len=block_len,
+                group_index=1,
             ),
         ]
 
@@ -303,14 +345,19 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
             ready_reqs, xfer_meta, local_regions, remote_regions
         )
 
-        # No errors
+        # After trimming: FA [10..13] -> last 2 -> [12,13]; SW [20..22] ->
+        # last 2 -> [21,22]. The identity mapping keeps kernel row == block.
         assert err_reqs == []
         assert err_msg is None
-        # After trimming: FA [10..13] → last 2 → [12,13]; SW [20..22] → last 2 → [21,22]
-        # Flattened: [12,13,21,22] = 4 blocks → coalesced into some transfers
-        assert len(src_ptrs) > 0
-        assert len(dst_ptrs) == len(src_ptrs)
-        assert len(lengths) == len(src_ptrs)
+        assert src_ptrs == [
+            0x1000 + 12 * block_len,
+            0x5000 + 21 * block_len,
+        ]
+        assert dst_ptrs == [
+            0x2000 + 30 * block_len,
+            0x6000 + 40 * block_len,
+        ]
+        assert lengths == [2 * block_len, 2 * block_len]
 
         worker.shutdown()
 
@@ -331,7 +378,7 @@ async def test_build_transfer_params_group_count_mismatch(monkeypatch):
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector", kv_role="kv_producer", block_size=block_size
     )
-    kv_cache_config = make_kv_cache_config(block_size=block_size, swa_enabled=True)
+    kv_cache_config = _make_lp_kv_cache_config(block_size=block_size, swa_enabled=True)
 
     with set_current_vllm_config(vllm_config), patch_worker_dependencies():
         connector = MooncakeConnector(
@@ -362,6 +409,7 @@ async def test_build_transfer_params_group_count_mismatch(monkeypatch):
             kv_caches_base_addr=[0x2000],
             block_lens=[block_len],
             kv_block_lens=[block_len],
+            group_geometries=[GroupGeometry(1, block_len)] * 2,
         )
 
         local_regions = [
@@ -417,7 +465,7 @@ def test_request_finished_with_hma_groups():
         block_size=block_size,
     )
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
-    kv_cache_config = make_kv_cache_config(
+    kv_cache_config = _make_lp_kv_cache_config(
         block_size=block_size, swa_enabled=True, sw_size=128
     )
 
@@ -464,7 +512,7 @@ def _make_kv_consumer_worker(
         block_size=block_size,
     )
     if kv_cache_config is None:
-        kv_cache_config = make_kv_cache_config(
+        kv_cache_config = _make_lp_kv_cache_config(
             block_size=block_size, swa_enabled=swa_enabled
         )
     with set_current_vllm_config(vllm_config), patch_worker_dependencies():
@@ -484,80 +532,51 @@ def _make_pull_meta(d_req_id: str, local_block_ids: list[list[int]]) -> PullReqM
     )
 
 
-# The tests below construct a MooncakeConnectorWorker, whose __init__
-# requires an accelerator device, so (like the worker tests in
-# test_mooncake_connector.py) they run on the GPU KV-connectors job only.
-@pytest.mark.parametrize(
-    "swa_enabled,expected_is_hma",
-    [
-        (True, True),  # multiple groups (FA + SWA)
-        (False, False),  # single group, block-level reporting is unambiguous
-    ],
-)
-def test_worker_is_hma_required(swa_enabled, expected_is_hma):
-    """Worker-side _is_hma_required mirrors the scheduler's condition."""
-    worker = _make_kv_consumer_worker(swa_enabled=swa_enabled)
-    assert worker._is_hma_required is expected_is_hma
-
-
-def test_worker_is_hma_required_multiple_full_attention_groups():
-    """Two full-attention groups with different block sizes also select
-    request-level failure reporting, matching the scheduler."""
-    block_size = maybe_update_block_size(16)
-    kv_cache_config = KVCacheConfig(
-        num_blocks=100,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer0"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=4,
-                    head_size=16,
-                    dtype=torch.float16,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["layer1"],
-                FullAttentionSpec(
-                    block_size=2 * block_size,
-                    num_kv_heads=4,
-                    head_size=16,
-                    dtype=torch.float16,
-                ),
-            ),
-        ],
-    )
-    worker = _make_kv_consumer_worker(kv_cache_config=kv_cache_config)
-    assert worker._is_hma_required
-
-
-def test_worker_failed_recv_reports_request_level_failure_with_hma():
-    """With HMA, load failures report the request, not ambiguous block IDs."""
+def test_worker_failed_recv_reports_group_tagged_block_ids():
+    """Load failures report (group, block) pairs regardless of group count."""
     worker = _make_kv_consumer_worker(swa_enabled=True)
-    assert worker._is_hma_required
 
     pull_meta = _make_pull_meta("d-req-1", [[1, 2], [3, 4]])
     worker._handle_failed_recv({"p-req-1": pull_meta}, ["p-req-1"], "boom")
 
-    assert worker.get_block_ids_with_load_errors() == set()
-    results = worker.get_transfer_results()
-    assert results.failed_recving == {"d-req-1"}
-    assert results.finished_recving == {"d-req-1"}
-
-
-def test_worker_failed_recv_reports_block_ids_without_hma():
-    """Without HMA, load failures keep reporting block-level errors."""
-    worker = _make_kv_consumer_worker(swa_enabled=False)
-    assert not worker._is_hma_required
-
-    pull_meta = _make_pull_meta("d-req-1", [[1, 2], [3, 4]])
-    worker._handle_failed_recv({"p-req-1": pull_meta}, ["p-req-1"], "boom")
-
-    assert worker.get_block_ids_with_load_errors() == {1, 2, 3, 4}
+    assert worker.get_block_ids_with_load_errors() == {(0, 1), (0, 2), (1, 3), (1, 4)}
     results = worker.get_transfer_results()
     assert results.failed_recving == set()
     assert results.finished_recving == {"d-req-1"}
+
+
+def test_worker_failed_recv_reports_full_group_ids():
+    """Load failures tag blocks with FULL group ids, not transfer-group indices.
+
+    A leading group with enable_kv_transfer=False (e.g. a HiSparse resident
+    group) occupies full-group id 0 but is absent from transfer-group space,
+    so the scheduler-side consumer must see ids shifted past it.
+    """
+    config = _make_lp_kv_cache_config(block_size=16, swa_enabled=True)
+    config.kv_cache_groups.insert(
+        0,
+        KVCacheGroupSpec(
+            ["resident.layer0"],
+            FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=4,
+                head_size=16,
+                dtype=torch.float16,
+            ),
+            enable_kv_transfer=False,
+            num_blocks=100,
+            blocks_per_page=1,
+            kernel_rows_per_block=1,
+            row_bytes=config.large_page_bytes,
+        ),
+    )
+    worker = _make_kv_consumer_worker(kv_cache_config=config)
+
+    # local_block_ids is in transfer-group space: the two transferable groups.
+    pull_meta = _make_pull_meta("d-req-1", [[1, 2], [3, 4]])
+    worker._handle_failed_recv({"p-req-1": pull_meta}, ["p-req-1"], "boom")
+
+    assert worker.get_block_ids_with_load_errors() == {(1, 1), (1, 2), (2, 3), (2, 4)}
 
 
 @pytest.mark.parametrize("swa_enabled", [False, True])
@@ -565,7 +584,14 @@ def test_worker_failed_recv_reports_block_ids_without_hma():
 def test_failed_receive_waits_for_every_peer(swa_enabled, outcomes):
     """A failed request keeps its destinations until the last peer completes."""
     worker = _make_kv_consumer_worker(swa_enabled=swa_enabled)
-    meta = _make_pull_meta("d-req-1", [[1, 2], [3, 4]])
+    # local_block_ids has one entry per transferable group of the config.
+    block_ids = [[1, 2], [3, 4]] if swa_enabled else [[1, 2]]
+    expected_invalid = {
+        (group_id, block_id)
+        for group_id, group in enumerate(block_ids)
+        for block_id in group
+    }
+    meta = _make_pull_meta("d-req-1", block_ids)
     meta.pull_tasks_count = 2
     error_reports = 0
     try:
@@ -579,14 +605,13 @@ def test_failed_receive_waits_for_every_peer(swa_enabled, outcomes):
             worker.process_pulling_result(response, {"d-req-1": meta})
             result = worker.get_transfer_results()
             invalid = worker.get_block_ids_with_load_errors()
-            error_reports += bool(result.failed_recving or invalid)
+            error_reports += bool(invalid)
             assert meta.pull_tasks_count == 1 - index
             assert result.finished_recving == ({"d-req-1"} if index else set())
+            assert result.failed_recving == set()
             assert meta.failed == (not all(outcomes[: index + 1]))
-            if result.failed_recving:
-                assert result.failed_recving == {"d-req-1"}
             if invalid:
-                assert invalid == {1, 2, 3, 4}
+                assert invalid == expected_invalid
         assert error_reports == 1
         assert worker.get_transfer_results().finished_recving == set()
     finally:

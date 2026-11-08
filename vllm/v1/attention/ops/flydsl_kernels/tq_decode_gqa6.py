@@ -180,10 +180,10 @@ def build_tq_decode_gqa6_module(
     _stride_q_head = HEAD_SIZE
     _stride_bt_seq = max_blocks_per_seq
 
-    _data_region_bytes = _BS * num_kv_heads * DATA_BYTES_PER_SLOT
-    _meta_region_bytes = num_kv_heads * NUM_SOA_FIELDS * _BS * 2
-    _stride_cache_block = _data_region_bytes + _meta_region_bytes
-    _meta_region_offset = _data_region_bytes
+    # Only the block-local layout bakes in. The block-to-block byte stride is
+    # a runtime kernel arg: each layer's view has stride(0) spanning the
+    # whole layer group, not this layer's own block.
+    _meta_region_offset = _BS * num_kv_heads * DATA_BYTES_PER_SLOT
 
     _stride_out_part = QG * HEAD_SIZE
     _stride_out_head = num_partitions * QG * HEAD_SIZE
@@ -210,6 +210,7 @@ def build_tq_decode_gqa6_module(
         centroids_ptr: fx.Tensor,
         block_tables_ptr: fx.Tensor,
         seq_lens_ptr: fx.Tensor,
+        stride_cache_block: fx.Int64,
     ):
         # ---- IDs ---------------------------------------------------------
         tid = gpu.thread_idx.x
@@ -223,7 +224,6 @@ def build_tq_decode_gqa6_module(
 
         # ---- Buffer resources -------------------------------------------
         q_rsrc = buffer_ops.create_buffer_resource(query_ptr, max_size=True)
-        kv_rsrc = buffer_ops.create_buffer_resource(kv_cache_ptr, max_size=True)
         bt_rsrc = buffer_ops.create_buffer_resource(block_tables_ptr, max_size=True)
         sl_rsrc = buffer_ops.create_buffer_resource(seq_lens_ptr, max_size=True)
         cent_rsrc = buffer_ops.create_buffer_resource(centroids_ptr, max_size=True)
@@ -245,8 +245,7 @@ def build_tq_decode_gqa6_module(
         c_qh = fx.Int32(_stride_q_head)
         c_qg = fx.Int32(QG)
         c_bt = fx.Int32(_stride_bt_seq)
-        c_block = fx.Int32(_stride_cache_block)
-        c_meta_off = fx.Int32(_meta_region_offset)
+        c_meta_off_u16 = fx.Int32(_meta_region_offset // 2)
         c_data_per_slot = fx.Int32(DATA_BYTES_PER_SLOT)
         c_kv_heads = fx.Int32(num_kv_heads)
         c_keydata = fx.Int32(KEY_DATA_BYTES)
@@ -491,9 +490,19 @@ def build_tq_decode_gqa6_module(
                     vec_width=1,
                     dtype=T.i32,
                 )
-                block_base = phys_block * c_block
-                data_region = block_base
-                meta_region = block_base + c_meta_off
+                # A buffer descriptor addresses with a 32-bit voffset, so a
+                # pool-wide ``phys_block * stride_cache_block`` would wrap once
+                # the cache view exceeds 2 GiB. Fold the block base into the
+                # descriptor's 64-bit base pointer and keep only in-block
+                # offsets below (mirrors ultraquant_decode_hd256.py).
+                blk_off_i64 = arith.extui(T.i64, phys_block) * fx.Int64(
+                    stride_cache_block
+                )
+                blk_rsrc = buffer_ops.create_buffer_resource(
+                    kv_cache_ptr,
+                    max_size=True,
+                    base_byte_offset=blk_off_i64,
+                )
 
                 # ``slot`` is the absolute slot index within the cache block
                 # (range 0.._BS-1). For BS=16 it equals tok_in_tile; for BS=32
@@ -501,13 +510,11 @@ def build_tq_decode_gqa6_module(
                 # the K/V data region and SoA metadata region addressing.
                 slot = fx.Int32(tile_in_block * TILE_SIZE) + tok_in_tile
                 data_bases_byte = (
-                    data_region
-                    + slot * (c_kv_heads * c_data_per_slot)
-                    + kv_h * c_data_per_slot
+                    slot * (c_kv_heads * c_data_per_slot) + kv_h * c_data_per_slot
                 )
                 k_byte = data_bases_byte + chunk_in_tok * fx.Int32(16)
                 k_packed = buffer_ops.buffer_load(
-                    kv_rsrc,
+                    blk_rsrc,
                     k_byte // fx.Int32(4),
                     vec_width=4,
                     dtype=T.i32,
@@ -519,44 +526,35 @@ def build_tq_decode_gqa6_module(
                 # of the V HBM latency behind compute.
                 v_byte = data_bases_byte + c_keydata + chunk_in_tok * fx.Int32(16)
                 v_packed = buffer_ops.buffer_load(
-                    kv_rsrc,
+                    blk_rsrc,
                     v_byte // fx.Int32(4),
                     vec_width=4,
                     dtype=T.i32,
                 )
                 vscale_u16 = (
-                    meta_region // fx.Int32(2)
-                    + kv_h * c_meta_u16_per_kvh
-                    + c_vscale_off_u16
-                    + slot
+                    c_meta_off_u16 + kv_h * c_meta_u16_per_kvh + c_vscale_off_u16 + slot
                 )
                 vzero_u16 = (
-                    meta_region // fx.Int32(2)
-                    + kv_h * c_meta_u16_per_kvh
-                    + c_vzero_off_u16
-                    + slot
+                    c_meta_off_u16 + kv_h * c_meta_u16_per_kvh + c_vzero_off_u16 + slot
                 )
                 vscale_raw = buffer_ops.buffer_load(
-                    kv_rsrc,
+                    blk_rsrc,
                     vscale_u16,
                     vec_width=1,
                     dtype=T.i16,
                 )
                 vzero_raw = buffer_ops.buffer_load(
-                    kv_rsrc,
+                    blk_rsrc,
                     vzero_u16,
                     vec_width=1,
                     dtype=T.i16,
                 )
 
                 knorm_u16 = (
-                    meta_region // fx.Int32(2)
-                    + kv_h * c_meta_u16_per_kvh
-                    + c_knorm_off_u16
-                    + slot
+                    c_meta_off_u16 + kv_h * c_meta_u16_per_kvh + c_knorm_off_u16 + slot
                 )
                 knorm_raw = buffer_ops.buffer_load(
-                    kv_rsrc,
+                    blk_rsrc,
                     knorm_u16,
                     vec_width=1,
                     dtype=T.i16,
