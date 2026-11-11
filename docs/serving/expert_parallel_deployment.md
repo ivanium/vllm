@@ -218,6 +218,9 @@ For supported MoE drafts, target EPLB also enables draft EPLB by default. Set
 the draft while keeping it enabled for the target. In that case,
 `eplb_config.draft_num_redundant_experts` cannot be set.
 
+Elastic EP does not support draft EPLB. Set `draft_enable_eplb=false` and leave
+`draft_num_redundant_experts` unset when using elastic EP with a MoE draft.
+
 For every registered model, `(num_routed_experts + num_redundant_experts)` must
 be divisible by the EP world size.
 
@@ -226,10 +229,9 @@ expert count for a speculative MoE draft. This setting is ignored unless a
 speculative MoE draft is configured. When unset, vLLM inherits the target's
 count if the target and draft have the same routed-expert counts and that count
 is valid for the draft. Otherwise, vLLM computes the minimum valid count from
-the draft's routed expert counts and the shared EP size. A valid explicit value
-is used; an invalid explicit value falls back to the minimum valid count and
-emits a warning naming the requested value. This applies to Eagle, Eagle3, MTP,
-DFlash, and supported DSpark drafts. A single redundant-expert count must make
+the draft's routed expert counts and the shared EP size. An invalid explicit
+value raises a configuration error. This applies to Eagle, Eagle3, MTP, DFlash,
+and supported DSpark drafts. A single redundant-expert count must make
 every draft layer's total expert count divisible by the EP size; configuration
 fails when the draft's layers require different padding counts.
 For DSpark drafts, divisibility is checked against the target EP group. If EPLB
@@ -246,7 +248,7 @@ Configure EPLB with the `--eplb-config` argument, which accepts a JSON string. T
 | `step_interval` | Frequency of rebalancing (every N engine steps) | 3000 |
 | `log_balancedness` | Log balancedness metrics (avg tokens per expert ÷ max tokens per expert) | `false` |
 | `num_redundant_experts` | Additional experts needed to make the total divisible by EP size; computed when unset | `auto` |
-| `draft_num_redundant_experts` | Redundant expert count for a speculative MoE draft; inherits a valid target count for matching routed expert counts, otherwise computed when unset or invalid. An invalid explicit value falls back to the minimum valid count with a warning. Ignored without a speculative MoE draft. | `auto` |
+| `draft_num_redundant_experts` | Redundant expert count for a speculative MoE draft; inherits a valid target count for matching routed expert counts, otherwise computed when unset. Invalid explicit values are rejected. Ignored without a speculative MoE draft. | `auto` |
 | `use_async` | Use non-blocking EPLB for reduced latency overhead | `true` |
 | `policy` | The policy type for expert parallel load balancing | `"default"` |
 | `communicator` | Backend for expert weight transfers: `"torch_nccl"`, `"torch_gloo"`, `"pynccl"`, `"nixl"`, `"symm_mem"`, or `null` (auto) | `null` |

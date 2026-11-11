@@ -94,8 +94,7 @@ class EPLBConfig:
     """Redundant expert count for an EPLB-backed MoE draft. If unset, the
     target count is inherited when target and draft routed expert counts match
     and the target count is valid for the draft; otherwise, the draft's minimum
-    valid count is computed. An invalid explicit value also falls back to the
-    minimum valid count.
+    valid count is computed. Invalid explicit values are rejected.
     """
 
     log_balancedness: bool = False

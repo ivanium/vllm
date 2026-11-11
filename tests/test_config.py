@@ -2172,42 +2172,26 @@ def test_draft_eplb_defaults_from_draft_expert_count(
 
 
 @pytest.mark.skip_global_cleanup
-@pytest.mark.parametrize("draft_redundant", [None, 1])
-def test_draft_eplb_defaults_to_minimum_for_unset_or_invalid_count(
+@pytest.mark.parametrize(("target_experts", "target_redundant"), [(4, 0), (6, 6)])
+def test_draft_eplb_rejects_invalid_explicit_count(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    draft_redundant: int | None,
+    target_experts: int,
+    target_redundant: int,
 ):
     monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
-    target_model_config = _write_deepseek_v2_config(tmp_path / "target", 4)
+    target_model_config = _write_deepseek_v2_config(tmp_path / "target", target_experts)
     draft_model_config = _write_deepseek_v2_config(tmp_path / "draft", 6)
-    target_parallel_config = _eplb_parallel_config(0, draft_redundant)
+    target_parallel_config = _eplb_parallel_config(target_redundant, 1)
 
-    speculative_config = SpeculativeConfig(
-        method="eagle3",
-        model=draft_model_config.model,
-        num_speculative_tokens=1,
-        target_model_config=target_model_config,
-        target_parallel_config=target_parallel_config,
-    )
-    base_vllm_config = VllmConfig(
-        model_config=target_model_config,
-        parallel_config=target_parallel_config,
-        device_config=DeviceConfig(device="cpu"),
-        speculative_config=speculative_config,
-    )
-    draft_vllm_config = speculative_config.apply_draft_eplb_overrides(base_vllm_config)
-    assert draft_vllm_config.parallel_config.eplb_config.num_redundant_experts == 2
-    if draft_redundant is not None:
-        warning = next(
-            record.getMessage()
-            for record in caplog.records
-            if record.levelname == "WARNING"
-            and "eplb_config.draft_num_redundant_experts" in record.getMessage()
+    with pytest.raises(ValueError, match=r"eplb_config\.draft_num_redundant_experts=1"):
+        SpeculativeConfig(
+            method="eagle3",
+            model=draft_model_config.model,
+            num_speculative_tokens=1,
+            target_model_config=target_model_config,
+            target_parallel_config=target_parallel_config,
         )
-        assert "=1" in warning
-        assert "using 2" in warning
 
 
 @pytest.mark.skip_global_cleanup
@@ -2251,8 +2235,8 @@ def _write_deepseek_v41_config(path: Path) -> ModelConfig:
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
     ("draft_redundant", "expected_draft_redundant"),
-    [(None, 0), (0, 0), (1, 0)],
-    ids=["auto-count", "explicit-draft-count", "invalid-explicit-count"],
+    [(None, 0), (0, 0)],
+    ids=["auto-count", "explicit-draft-count"],
 )
 def test_dspark_draft_eplb_uses_draft_expert_count(
     tmp_path: Path,
@@ -2299,35 +2283,39 @@ def test_dspark_draft_eplb_uses_draft_expert_count(
 
 
 @pytest.mark.skip_global_cleanup
-def test_dspark_eplb_requires_draft_parallelism(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("draft_tp", "elastic_ep", "error"),
+    [
+        (1, False, "EPLB for a DSpark draft requires"),
+        (4, True, "Elastic EP is not supported with draft EPLB"),
+    ],
+)
+def test_dspark_eplb_rejects_unsupported_parallelism(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    draft_tp: int,
+    elastic_ep: bool,
+    error: str,
 ):
     monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
     monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
     target_model_config = _write_deepseek_v41_config(tmp_path / "target")
 
-    with pytest.raises(
-        ValueError,
-        match=(
-            "EPLB for a DSpark draft requires its tensor parallel size, "
-            "prefill context parallel size, or data parallel size to be "
-            "greater than 1. If you want to disable draft EPLB, remove "
-            "eplb_config.draft_num_redundant_experts and set "
-            "speculative_config.draft_enable_eplb=false."
-        ),
-    ):
+    with pytest.raises(ValueError, match=error):
         SpeculativeConfig(
             method="dspark",
             num_speculative_tokens=1,
             target_model_config=target_model_config,
-            draft_tensor_parallel_size=1,
+            draft_tensor_parallel_size=draft_tp,
             target_parallel_config=ParallelConfig(
                 tensor_parallel_size=4,
                 enable_expert_parallel=True,
                 enable_eplb=True,
+                enable_elastic_ep=elastic_ep,
                 eplb_config=EPLBConfig(
                     num_redundant_experts=4,
                     draft_num_redundant_experts=0,
+                    use_async=False,
                 ),
                 distributed_executor_backend="mp",
             ),
@@ -2335,8 +2323,9 @@ def test_dspark_eplb_requires_draft_parallelism(
 
 
 @pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("elastic_ep", [False, True])
 def test_dspark_draft_eplb_can_be_disabled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, elastic_ep: bool
 ):
     monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
     monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
@@ -2345,7 +2334,8 @@ def test_dspark_draft_eplb_can_be_disabled(
         tensor_parallel_size=4,
         enable_expert_parallel=True,
         enable_eplb=True,
-        eplb_config=EPLBConfig(num_redundant_experts=4),
+        enable_elastic_ep=elastic_ep,
+        eplb_config=EPLBConfig(num_redundant_experts=4, use_async=False),
         distributed_executor_backend="mp",
     )
 
@@ -2391,8 +2381,10 @@ def test_dspark_draft_eplb_can_be_disabled(
     draft_vllm_config = speculative_config.apply_draft_eplb_overrides(base_vllm_config)
 
     assert not draft_vllm_config.parallel_config.enable_eplb
+    assert not draft_vllm_config.parallel_config.enable_elastic_ep
     assert draft_vllm_config.parallel_config.eplb_config.num_redundant_experts == 0
     assert target_parallel_config.enable_eplb
+    assert target_parallel_config.enable_elastic_ep == elastic_ep
     assert target_parallel_config.eplb_config.num_redundant_experts == 4
 
 

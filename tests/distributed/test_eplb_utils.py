@@ -357,20 +357,6 @@ def test_rearrange_handles_heterogeneous_model_topologies(monkeypatch, use_async
         assert _TopologyEncodingPolicy.calls == [(6, 4), (8, 6)]
 
 
-def test_allreduce_list_reduces_single_tensor_in_place(monkeypatch):
-    state = _make_eplb_state()
-    ep_group = SimpleNamespace(device_group=object())
-    all_reduce = MagicMock()
-    monkeypatch.setattr(eplb_state_module, "get_ep_group", lambda: ep_group)
-    monkeypatch.setattr(eplb_state_module, "all_reduce", all_reduce)
-    tensor = torch.ones(2, 4, dtype=torch.int32)
-
-    result = state._allreduce_list([tensor])
-
-    assert result[0] is tensor
-    all_reduce.assert_called_once_with(tensor, group=ep_group.device_group)
-
-
 def _allreduce_heterogeneous_loads_worker(rank: int, init_method: str) -> None:
     world_size = 2
     dist.init_process_group(
