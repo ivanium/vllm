@@ -41,6 +41,10 @@ class _SpeculativeConfig:
     draft_model_config: object = None
     draft_load_config: object = None
 
+    draft_enable_eplb: bool = True
+    resolved_draft_num_redundant_experts: int | None = None
+
+    apply_draft_eplb_overrides = SpeculativeConfig.apply_draft_eplb_overrides
     apply_draft_overrides = SpeculativeConfig.apply_draft_overrides
 
 

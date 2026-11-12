@@ -2409,8 +2409,9 @@ def test_dspark_eplb_requires_draft_parallelism(
 
 
 @pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("elastic_ep", [False, True])
 def test_dspark_draft_eplb_can_be_disabled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, elastic_ep: bool
 ):
     monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
     monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
@@ -2419,7 +2420,8 @@ def test_dspark_draft_eplb_can_be_disabled(
         tensor_parallel_size=4,
         enable_expert_parallel=True,
         enable_eplb=True,
-        eplb_config=EPLBConfig(num_redundant_experts=4),
+        enable_elastic_ep=elastic_ep,
+        eplb_config=EPLBConfig(num_redundant_experts=4, use_async=False),
         distributed_executor_backend="mp",
     )
 
@@ -2464,8 +2466,10 @@ def test_dspark_draft_eplb_can_be_disabled(
 
     draft_vllm_config = speculative_config.apply_draft_eplb_overrides(base_vllm_config)
 
+    assert not draft_vllm_config.parallel_config.enable_elastic_ep
     assert not draft_vllm_config.parallel_config.enable_eplb
     assert draft_vllm_config.parallel_config.eplb_config.num_redundant_experts == 0
+    assert target_parallel_config.enable_elastic_ep == elastic_ep
     assert target_parallel_config.enable_eplb
     assert target_parallel_config.eplb_config.num_redundant_experts == 4
 

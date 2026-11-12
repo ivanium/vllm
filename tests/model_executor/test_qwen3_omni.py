@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -10,7 +11,7 @@ import torch
 import torch.nn as nn
 from transformers import PreTrainedConfig
 
-from vllm.config import ParallelConfig
+from vllm.config import ParallelConfig, SpeculativeConfig
 from vllm.multimodal.processing import InputProcessingContext
 
 
@@ -364,12 +365,19 @@ def test_dspark_shares_target_embedding_with_smaller_draft_vocabulary():
             kv_cache_dtype=None,
             draft_load_config=None,
             draft_lm_head_quantization=None,
+            draft_enable_eplb=True,
+            resolved_draft_num_redundant_experts=None,
         ),
         parallel_config=ParallelConfig(),
         attention_config=SimpleNamespace(backend=None),
         cache_config=SimpleNamespace(),
         load_config=SimpleNamespace(load_format="auto"),
         model_config=SimpleNamespace(get_vocab_size=Mock(return_value=100)),
+    )
+
+    spec = vllm_config.speculative_config
+    spec.apply_draft_eplb_overrides = partial(
+        SpeculativeConfig.apply_draft_eplb_overrides, spec
     )
 
     def fake_replace(config, **changes):

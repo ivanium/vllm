@@ -573,6 +573,11 @@ def test_standalone_draft_kv_dtype_override(
         moe_backend=draft_moe,
         attention_backend=draft_attn,
         draft_parallel_config=ParallelConfig(),
+        draft_enable_eplb=True,
+        resolved_draft_num_redundant_experts=None,
+    )
+    spec.apply_draft_eplb_overrides = partial(
+        SpeculativeConfig.apply_draft_eplb_overrides, spec
     )
     spec.apply_draft_overrides = partial(SpeculativeConfig.apply_draft_overrides, spec)
     speculator.speculative_config = spec

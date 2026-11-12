@@ -8,13 +8,24 @@ from vllm.config.speculative import (
     _get_minimax_m3_dspark_draft,
     _validate_qwen3_omni_dspark,
 )
+from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.dflash.config import DFlashSpeculatorConfig
 from vllm.v1.worker.gpu.spec_decode.eagle.config import (
     check_draft_lm_head_quantization,
 )
 
 if TYPE_CHECKING:
-    from vllm.config import ParallelConfig, SpeculativeConfig
+    from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
+
+
+def dspark_draft_supports_eplb(draft_model_config: "ModelConfig") -> bool:
+    """Return whether a DSpark draft should register with EPLB on this platform."""
+    if current_platform.is_rocm():
+        return False
+    return getattr(draft_model_config.hf_config, "model_type", None) in (
+        "deepseek_v4",
+        "deepseek_v41",
+    )
 
 
 class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
