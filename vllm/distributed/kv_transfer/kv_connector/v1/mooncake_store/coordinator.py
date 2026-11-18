@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     MambaManager,
+    SingleTypeKVCacheManager,
     SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
@@ -202,6 +203,7 @@ class MooncakeStoreCoordinator:
         cached_block_pool: ExternalCachedBlockPool,
         *,
         apply_eagle: bool = True,
+        num_request_tokens: int | None = None,
     ) -> tuple[tuple[list[bool], ...], int]:
         """Returns `(load_mask_per_group, hit_length)`. `mask[g][i]` is True iff
         group `g` populates physical block `i` (e.g. SWA and Mamba tail-only);
@@ -212,9 +214,17 @@ class MooncakeStoreCoordinator:
         the last block); load-mask callers must not, because `token_len`
         already reflects the eagle-pruned hit length and a second pop would
         leave the trailing block unloaded.
+
+        `num_request_tokens` is the request's length, for managers whose hit
+        rule depends on where it ends (`uses_request_length`). The lookup and
+        the load of one request must pass the same value.
         """
         blocks_per_group, hit_length = self._find_hit_blocks(
-            block_hashes, max_length, cached_block_pool, apply_eagle=apply_eagle
+            block_hashes,
+            max_length,
+            cached_block_pool,
+            apply_eagle=apply_eagle,
+            num_request_tokens=num_request_tokens,
         )
         masks = tuple(
             [blk is not cached_block_pool.null_block for blk in blocks]
@@ -226,6 +236,7 @@ class MooncakeStoreCoordinator:
         self,
         block_hashes: Sequence[BlockHash],
         token_len: int,
+        num_request_tokens: int | None = None,
     ) -> tuple[list[bool], ...]:
         """Per-group load masks: `mask[g][i]` is True iff group `g`'s
         spec would populate physical block `i` at length `token_len`
@@ -237,6 +248,7 @@ class MooncakeStoreCoordinator:
             token_len,
             ExternalCachedBlockPool(self.hash_block_size),
             apply_eagle=False,
+            num_request_tokens=num_request_tokens,
         )
         return masks
 
@@ -269,19 +281,37 @@ class MooncakeStoreCoordinator:
     def lookup_mask(
         self,
         aligned_token_len: int,
+        num_request_tokens: int | None = None,
     ) -> tuple[list[bool] | None, ...]:
         """Per-group lookup masks.
 
         `mask[g][i]` is True iff physical block `i` of group `g` should be
         looked up as an aligned hit boundary. `None` is the all-True
-        sentinel.
+        sentinel. With `num_request_tokens`, a group whose hit rule depends on
+        where the request ends skips the blocks the request never reads.
         """
-        return self._reachable_masks(
+        masks = self._reachable_masks(
             aligned_token_len,
             0,
             retention_interval=None,
             num_prompt_tokens=None,
         )
+        if num_request_tokens is None:
+            return masks
+        restricted: list[list[bool] | None] = []
+        for group, mask in zip(self.kv_cache_groups, masks):
+            first_read_block = getattr(group.manager_cls, "first_read_block", None)
+            if not group.manager_cls.uses_request_length or first_read_block is None:
+                restricted.append(mask)
+                continue
+            first = first_read_block(
+                num_request_tokens, group.block_size, group.manager_config
+            )
+            num_blocks = aligned_token_len // group.block_size
+            restricted.append(
+                [i >= first and (mask is None or mask[i]) for i in range(num_blocks)]
+            )
+        return tuple(restricted)
 
     def _reachable_masks(
         self,
@@ -343,6 +373,7 @@ class MooncakeStoreCoordinator:
         cached_block_pool: ExternalCachedBlockPool,
         *,
         apply_eagle: bool = True,
+        num_request_tokens: int | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """Converge registered managers' hits as in HybridKVCacheCoordinator."""
         alignment_tokens = (
@@ -350,6 +381,14 @@ class MooncakeStoreCoordinator:
             if self.enable_partial_hash_hits
             else self.lcm_block_size
         )
+
+        def request_length_kwargs(
+            manager_cls: type[SingleTypeKVCacheManager],
+        ) -> dict[str, int]:
+            if num_request_tokens is None or not manager_cls.uses_request_length:
+                return {}
+            return {"num_request_tokens": num_request_tokens}
+
         if len(self.attention_groups) == 1:
             manager_config, block_size, group_ids, group_eagle = self.attention_groups[
                 0
@@ -364,6 +403,7 @@ class MooncakeStoreCoordinator:
                 manager_config=manager_config,
                 drop_eagle_block=apply_eagle and group_eagle,
                 alignment_tokens=alignment_tokens,
+                **request_length_kwargs(manager_cls),
             )
             num_groups = len(self.kv_cache_groups)
             blocks_by_group: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
@@ -423,6 +463,7 @@ class MooncakeStoreCoordinator:
                     manager_config=manager_config,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=alignment_tokens,
+                    **request_length_kwargs(manager_cls),
                 )
                 if drop_eagle_block:
                     eagle_verified.add(idx)

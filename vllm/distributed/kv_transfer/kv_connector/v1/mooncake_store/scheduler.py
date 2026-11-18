@@ -276,6 +276,10 @@ class MooncakeStoreScheduler:
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=False,
             tail_key_boundaries=lookup_result.tail_key_boundaries,
+            # The KV cache manager backs the external blocks against this same
+            # length (`allocate_slots`); a lookup made at a shorter length
+            # verified a superset of the blocks it needs.
+            num_request_tokens=request.num_tokens,
         )
 
         return need_to_allocate, self.load_async

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from vllm.distributed.kv_events import MEDIUM_CPU
+from vllm.logger import init_logger
 from vllm.utils.gc_utils import untracked_list
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
@@ -38,6 +39,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.hisparse.coordinator import HiSparseCoordinator
 
+logger = init_logger(__name__)
+
 
 class SingleTypeKVCacheManager(ABC):
     """An abstract base class for a manager that handle the kv cache management
@@ -63,6 +66,11 @@ class SingleTypeKVCacheManager(ABC):
 
     # Keep this group's longer prefix until external cache lookup completes.
     retains_longer_hit: bool = False
+
+    # Whether `find_longest_cache_hit` and `allocate_external_computed_blocks`
+    # take `num_request_tokens`, the length of the request being served. Callers
+    # pass it only to managers that set this.
+    uses_request_length: ClassVar[bool] = False
 
     @classmethod
     def config(cls, **params: Any) -> ManagerConfig:
@@ -1365,6 +1373,201 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return max(
             0,
             num_computed_tokens - self.sliding_window + 1 - self.extra_retained_tokens,
+        )
+
+
+class DFlashSlidingWindowManager(SlidingWindowManager):
+    """Sliding-window KV of a DFlash/DSpark drafter, read only before the
+    request end.
+
+    The drafter's context KV at a position is a projection of the target's
+    hidden state there, and draft attention runs only past the last target
+    token. A prefix hit at `h` for a request of `L` tokens therefore needs
+    cached drafter blocks only in `[L - sliding_window + 1, h)`: the target
+    prefill from `h` rewrites the drafter context KV of every later position,
+    and nothing below the window is read. Plain sliding window asks for the
+    window before `h` itself, so a hit on a shared prefix that no earlier
+    request ended at (a new session on a shared system prompt, a fork
+    mid-history) falls back to recomputing the whole prefix.
+
+    Allocation, freeing and the admission cap are plain sliding window's, except
+    that a KV-connector load leaves the request's blocks below that window null:
+    the load fills exactly the blocks the hit verified, so no block is ever
+    backed with drafter KV that was neither loaded nor computed.
+
+    The hit rule and the retention mask follow vllm-project/vllm#64109.
+    """
+
+    uses_request_length: ClassVar[bool] = True
+
+    def __init__(self, kv_cache_group: KVCacheGroup, **kwargs) -> None:
+        super().__init__(kv_cache_group, **kwargs)
+        logger.info_once(
+            "KV cache group %d: %d drafter sliding-window layers (window %d) "
+            "need cached KV only in the window before the request end.",
+            self.kv_cache_group_id,
+            len(kv_cache_group.layer_names),
+            self.sliding_window,
+        )
+
+    @classmethod
+    def first_read_block(
+        cls, num_request_tokens: int, block_size: int, manager_config: ManagerConfig
+    ) -> int:
+        """The first block a request of `num_request_tokens` tokens reads."""
+        reach = cls.sliding_window_reach(manager_config)
+        return max(num_request_tokens - reach, 0) // block_size
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        block_size: int,
+        manager_config: ManagerConfig,
+        drop_eagle_block: bool,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+        num_request_tokens: int | None = None,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Longest hit whose blocks in `[L - sliding_window + 1, hit)` are cached.
+
+        `num_request_tokens` (`L`) defaults to `max_length`, which asks for the
+        window before `max_length`. Underestimating `L` only asks for more
+        blocks than needed.
+        """
+        if (
+            drop_eagle_block
+            or dcp_world_size != 1
+            or pcp_world_size != 1
+            or alignment_tokens % block_size != 0
+        ):
+            return super().find_longest_cache_hit(
+                block_hashes=block_hashes,
+                max_length=max_length,
+                kv_cache_group_ids=kv_cache_group_ids,
+                block_pool=block_pool,
+                block_size=block_size,
+                manager_config=manager_config,
+                drop_eagle_block=drop_eagle_block,
+                alignment_tokens=alignment_tokens,
+                dcp_world_size=dcp_world_size,
+                pcp_world_size=pcp_world_size,
+            )
+        block_hashes = resolve_block_hashes(
+            block_hashes,
+            block_pool.hash_block_size,
+            block_size,
+            supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
+            alignment_tokens=alignment_tokens,
+        )
+        if num_request_tokens is None:
+            num_request_tokens = max_length
+        max_num_blocks = max_length // block_size
+        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [block_pool.null_block] * max_num_blocks for _ in kv_cache_group_ids
+        )
+        num_blocks = min(
+            cls.first_read_block(num_request_tokens, block_size, manager_config),
+            max_num_blocks,
+        )
+        while num_blocks < max_num_blocks and (
+            cached_block := block_pool.get_cached_block(
+                block_hashes[num_blocks], kv_cache_group_ids
+            )
+        ):
+            for computed, cached in zip(computed_blocks, cached_block):
+                computed[num_blocks] = cached
+            num_blocks += 1
+        blocks_per_alignment = alignment_tokens // block_size
+        num_blocks = num_blocks // blocks_per_alignment * blocks_per_alignment
+        for computed in computed_blocks:
+            del computed[num_blocks:]
+        return computed_blocks, num_blocks * block_size
+
+    @classmethod
+    def reachable_block_mask(
+        cls,
+        start_block: int,
+        end_block: int,
+        alignment_tokens: int | None,
+        block_size: int,
+        manager_config: ManagerConfig,
+        use_eagle: bool,
+        retention_interval: int | None = None,
+        reachable_boundaries: Sequence[int] = (),
+        dcp_world_size: int = 1,
+        final_segment_end_block: int | None = None,
+    ) -> list[bool] | None:
+        """Under sparse retention, keep only the tail a hit at a reachable
+        boundary `b` reads, `[b + 2 - sliding_window, b)`. A segment boundary
+        needs drafter KV only for a request ending within the window past it,
+        so segments keep nothing; dense retention is plain sliding window's."""
+        if (
+            retention_interval is None
+            or alignment_tokens is None
+            or use_eagle
+            or dcp_world_size != 1
+            or alignment_tokens % block_size != 0
+        ):
+            return super().reachable_block_mask(
+                start_block=start_block,
+                end_block=end_block,
+                alignment_tokens=alignment_tokens,
+                block_size=block_size,
+                manager_config=manager_config,
+                use_eagle=use_eagle,
+                retention_interval=retention_interval,
+                reachable_boundaries=reachable_boundaries,
+                dcp_world_size=dcp_world_size,
+                final_segment_end_block=final_segment_end_block,
+            )
+        mask = [False] * (end_block - start_block)
+        for boundary_tokens in reachable_boundaries:
+            hit_tokens = boundary_tokens // alignment_tokens * alignment_tokens
+            # A request ending at `boundary_tokens + 1` reads the most.
+            first = cls.first_read_block(
+                boundary_tokens + 1, block_size, manager_config
+            )
+            for j in range(
+                max(start_block, first), min(end_block, hit_tokens // block_size)
+            ):
+                mask[j - start_block] = True
+        return mask
+
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
+        num_request_tokens: int | None = None,
+    ) -> None:
+        """Leave the loaded range's blocks below the request's window null, so
+        a load backs only the blocks its hit verified, then allocate the rest
+        as plain sliding window does."""
+        if num_request_tokens is not None and num_external_computed_tokens > 0:
+            num_computed_blocks = cdiv(
+                num_local_computed_tokens + num_external_computed_tokens,
+                self.block_size,
+            )
+            first_block = min(
+                self.first_read_block(
+                    num_request_tokens, self.block_size, self.manager_config
+                ),
+                num_computed_blocks,
+            )
+            req_blocks = self.req_to_blocks[request_id]
+            if first_block > len(req_blocks):
+                req_blocks.extend([self._null_block] * (first_block - len(req_blocks)))
+        super().allocate_external_computed_blocks(
+            request_id,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+            record_for_zeroing=record_for_zeroing,
         )
 
 

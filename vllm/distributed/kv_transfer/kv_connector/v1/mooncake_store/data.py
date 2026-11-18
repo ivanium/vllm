@@ -227,6 +227,9 @@ class LoadSpec:
     can_load: bool
     token_len: int = 0
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
+    # The request's length at lookup, which the load's masks must reuse for
+    # groups whose hit rule depends on where the request ends; 0 means unset.
+    num_request_tokens: int = 0
 
 
 @dataclass

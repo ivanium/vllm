@@ -269,7 +269,9 @@ class KVCacheManager:
             return 0
         # Mirrors `get_computed_blocks`: the last token is always recomputed.
         _, num_computed_tokens, _ = self.coordinator.find_longest_cache_hit(
-            request.block_hashes, request.num_tokens - 1
+            request.block_hashes,
+            request.num_tokens - 1,
+            num_request_tokens=request.num_tokens,
         )
         return num_computed_tokens
 
@@ -323,7 +325,9 @@ class KVCacheManager:
         max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+                request.block_hashes,
+                max_cache_hit_length,
+                num_request_tokens=request.num_tokens,
             )
         )
 
@@ -619,6 +623,7 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
                 skip_zeroing_group_ids=skip_zeroing_group_ids,
+                num_request_tokens=request.num_tokens,
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(

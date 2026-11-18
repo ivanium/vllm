@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
@@ -15,6 +16,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
 )
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import (
@@ -22,6 +24,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
+from vllm.v1.core.single_type_kv_cache_manager import (
+    DFlashSlidingWindowManager,
+    SlidingWindowManager,
+)
 from vllm.v1.hisparse.binding import (
     init_hisparse_kv_cache,
     resolve_hisparse_specs,
@@ -31,6 +37,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayerConfig,
     KVCacheSpec,
     MambaSpec,
+    ManagerConfig,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
@@ -49,6 +56,39 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.cudagraph_utils import (
         BatchExecutionDescriptor,
         CudaGraphManager,
+    )
+
+logger = init_logger(__name__)
+
+
+def _use_dflash_draft_kv_tail(vllm_config: VllmConfig) -> bool:
+    """Whether a DFlash/DSpark drafter's sliding-window layers use
+    `DFlashSlidingWindowManager` (`VLLM_DFLASH_DRAFT_KV_TAIL=1`, default off)."""
+    spec_config = vllm_config.speculative_config
+    return (
+        os.environ.get("VLLM_DFLASH_DRAFT_KV_TAIL", "0") == "1"
+        and spec_config is not None
+        and (spec_config.use_dflash() or spec_config.use_dspark())
+    )
+
+
+def _dflash_draft_kv_tail_config(
+    layer_config: KVCacheLayerConfig,
+) -> KVCacheLayerConfig:
+    """A drafter sliding-window layer's config with `DFlashSlidingWindowManager`.
+
+    Only plain sliding window is switched. Planning still promotes the layer to
+    full attention, dropping this manager, when the hybrid KV cache manager is
+    off or cannot keep the drafter in a group of its own."""
+    manager_config = layer_config.manager_config
+    params = manager_config.params
+    if manager_config.manager_cls is not SlidingWindowManager or (
+        isinstance(params, SlidingWindowManager.Params) and params.bounded_replay
+    ):
+        return layer_config
+    return replace(
+        layer_config,
+        manager_config=ManagerConfig(DFlashSlidingWindowManager, params),
     )
 
 
@@ -139,6 +179,8 @@ def get_kv_cache_layer_configs(
     layer_configs: dict[str, KVCacheLayerConfig] = {}
     layer_type = cast(type[Any], AttentionLayerBase)
     attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
+    draft_kv_tail = _use_dflash_draft_kv_tail(vllm_config)
+    draft_kv_tail_layers = 0
     for layer_name, attn_module in attn_layers.items():
         if attn_module.kv_sharing_target_layer_name:
             # This layer will use KV cache of the sharing target layer.
@@ -150,7 +192,18 @@ def get_kv_cache_layer_configs(
             )
             if attn_module.is_draft_layer:
                 layer_config = replace(layer_config, is_draft=True)
+                if draft_kv_tail:
+                    new_config = _dflash_draft_kv_tail_config(layer_config)
+                    draft_kv_tail_layers += new_config is not layer_config
+                    layer_config = new_config
             layer_configs[layer_name] = layer_config
+    if draft_kv_tail:
+        logger.info_once(
+            "VLLM_DFLASH_DRAFT_KV_TAIL: %d drafter sliding-window layers need cached "
+            "KV only in the window before the request end; this applies once the "
+            "hybrid KV cache manager keeps them in their own group.",
+            draft_kv_tail_layers,
+        )
     if vllm_config.attention_config.hisparse_config is not None:
         layer_configs = resolve_hisparse_specs(vllm_config, layer_configs, attn_layers)
     return layer_configs

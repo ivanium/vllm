@@ -1313,7 +1313,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
         # Skip chunks the consumer's per-group spec wouldn't populate
         # locally (e.g. SWA pre-window) even if the producer stored them.
-        load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
+        # The request length the lookup used, so both verify the same blocks.
+        num_request_tokens = (
+            req_meta.load_spec.num_request_tokens  # type: ignore[union-attr]
+            or None
+        )
+        load_mask_per_group = self.coord.load_mask(
+            req_meta.block_hashes, token_len, num_request_tokens=num_request_tokens
+        )
         tail_key_boundaries = {
             boundary.group_id: boundary.num_tokens
             for boundary in (
@@ -2579,7 +2586,11 @@ class MooncakeStoreWorker:
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes, int]] = []
         fine_grained = self.coord.enable_partial_hash_hits
-        lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
+        lookup_masks = (
+            None
+            if fine_grained
+            else self.coord.lookup_mask(token_len, num_request_tokens=num_tokens)
+        )
         for g_idx, db in enumerate(self.token_dbs):
             if not self._kv_cache_groups[g_idx].prefix_cacheable:
                 continue
@@ -2683,6 +2694,7 @@ class MooncakeStoreWorker:
             block_hashes,
             token_len,
             cached_block_pool,
+            num_request_tokens=num_tokens,
         )
         if hit_length >= num_tokens:
             usable_length = self.coord.align_lookup_length(num_tokens - 1)
@@ -2692,6 +2704,7 @@ class MooncakeStoreWorker:
                 block_hashes,
                 usable_length,
                 cached_block_pool,
+                num_request_tokens=num_tokens,
             )
         return (
             MooncakeLookupResult(
