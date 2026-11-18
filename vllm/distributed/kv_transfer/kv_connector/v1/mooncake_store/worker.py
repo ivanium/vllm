@@ -2237,6 +2237,15 @@ class MooncakeStoreWorker:
                     group_tensors = [views[0] for views in group_views]
                 else:
                     group_tensors = [cache for views in group_views for cache in views]
+                if self._kv_cache_config.pool_num_blocks:
+                    # Private pools (VLLM_DRAFT_KV_POOL): each group's block
+                    # IDs index its own pool, the rows of its own part of the
+                    # backing, so objects keep the bytes and layout they have
+                    # without the pools. A group without layers here stores
+                    # nothing from this rank.
+                    if group_tensors:
+                        self._register_pool_group_kv_caches(group, db, group_tensors)
+                    continue
                 group_tensors = group_tensors or cache_tensors
                 if not isinstance(db.store_layout, RankLocalStoreLayout):
                     group_tensors = [
@@ -2401,6 +2410,39 @@ class MooncakeStoreWorker:
             ready_event_recving.wait()
         logger.info(
             "Started %d Mooncake KV-load receive thread(s)", self.num_recv_threads
+        )
+
+    def _register_pool_group_kv_caches(
+        self,
+        group: KVCacheGroup,
+        db: ChunkedTokenDatabase,
+        group_tensors: list[torch.Tensor],
+    ) -> None:
+        """Register one group's caches when the KV cache has private pools."""
+        if not isinstance(db.store_layout, RankLocalStoreLayout):
+            raise NotImplementedError(
+                "The Mooncake store with private KV cache pools "
+                "(VLLM_DRAFT_KV_POOL) needs the rank-local store layout."
+            )
+        num_blocks = self._kv_cache_config.num_blocks_of_pool(group.pool_id)
+        pool_extent = None
+        if self.cache_config.get_resolved_kv_cache_layout().is_block_outermost:
+            # Each block of the pool is one row holding every layer's page.
+            storage = group_tensors[0].untyped_storage()
+            cache = group_kernel_blocks(group_tensors[0], num_blocks)
+            block_stride = cache.stride(0) * cache.element_size()
+            pool_offset = (
+                self._kv_cache_config.pool_offsets[group.pool_id]
+                if group.pool_id
+                else 0
+            )
+            pool_extent = (
+                storage.data_ptr() + pool_offset,
+                num_blocks * block_stride,
+            )
+            assert pool_offset + pool_extent[1] <= storage.nbytes()
+        db.store_layout.register_kv_caches(
+            group_tensors, num_blocks, pool_extent=pool_extent
         )
 
     @staticmethod

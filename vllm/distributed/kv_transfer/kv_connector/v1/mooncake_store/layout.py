@@ -223,7 +223,11 @@ class RankLocalStoreLayout(StoreLayout):
         self,
         kv_caches: Sequence[torch.Tensor],
         num_blocks: int,
+        pool_extent: tuple[int, int] | None = None,
     ) -> None:
+        """`pool_extent` is the (start, length) of the group's block pool in
+        the backing storage, for a group whose pool does not span the whole
+        storage (private pools, VLLM_DRAFT_KV_POOL)."""
         # Map each region's base address to its entry in the parallel lists.
         region_index: dict[int, int] = {}
         base_addrs: list[int] = []
@@ -248,6 +252,9 @@ class RankLocalStoreLayout(StoreLayout):
             storage = cache.untyped_storage()
             storage_addr = storage.data_ptr()
             storage_len = storage.nbytes()
+            if pool_extent is not None:
+                # The pool's blocks are the rows of its own part of the backing.
+                storage_addr, storage_len = pool_extent
             # Up to the last byte of this layer's block: a grouped manager
             # block can be compact yet gapped by kernel-block tail padding.
             block = cache[0]

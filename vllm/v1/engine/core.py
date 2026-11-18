@@ -58,6 +58,7 @@ from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.kv_cache_planning import (
+    draft_kv_pool_requested,
     finalize_extensible_kv_cache,
     get_global_kv_cache_groups,
     get_kv_cache_configs,
@@ -343,6 +344,11 @@ class EngineCore:
                 # The store mounts the segment when its connector is created,
                 # before the KV cache is allocated from the profiled budget.
                 reason = "the Mooncake hbm_pool is sized from the profiled KV budget"
+            if reason is None and draft_kv_pool_requested():
+                reason = (
+                    "VLLM_DRAFT_KV_POOL lays the drafter's pool out after the "
+                    "shared pool, at an offset fixed when the KV cache is planned"
+                )
             if reason is not None:
                 executor.disable_extensible_kv_cache(reason)
         layout = resolve_kv_cache_layout(
@@ -391,10 +397,19 @@ class EngineCore:
             # An "auto" Mooncake HBM pool takes the KV budget beyond one
             # max_model_len request, the null block and one spare block.
             config = kv_cache_configs[0]
-            per_request = round(
-                config.num_blocks
-                / get_max_concurrency_for_kv_cache_config(vllm_config, config)
-            )
+            if config.pool_num_blocks:
+                # Private pools (VLLM_DRAFT_KV_POOL) keep their own blocks and
+                # memory: the shared pool keeps one request's shared blocks.
+                per_request = sum(
+                    group.max_allocated_blocks_per_request(vllm_config)
+                    for group in config.kv_cache_groups
+                    if not group.host_resident and not group.pool_id
+                )
+            else:
+                per_request = round(
+                    config.num_blocks
+                    / get_max_concurrency_for_kv_cache_config(vllm_config, config)
+                )
             kept_blocks = min(per_request + 2, config.num_blocks)
             vllm_config.cache_config.num_gpu_blocks_override = kept_blocks
             kv_cache_configs = get_kv_cache_configs(
@@ -402,6 +417,14 @@ class EngineCore:
             )
             spare_blocks = config.num_blocks - kv_cache_configs[0].num_blocks
             block_bytes = min(available_gpu_memory) // config.num_blocks
+            if config.pool_num_blocks:
+                # Only shared-pool blocks go to the segment; the shared pool
+                # ends where the first private pool starts.
+                shared_bytes = min(
+                    config.pool_offsets.values(),
+                    default=config.kv_cache_tensors[0].size,
+                )
+                block_bytes = shared_bytes // config.num_blocks
             segment_bytes = spare_blocks * block_bytes
             logger.info(
                 "Mooncake hbm_pool auto: %d of %d KV cache blocks stay in vLLM; "

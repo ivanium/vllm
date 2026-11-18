@@ -1798,15 +1798,20 @@ def get_kv_cache_configs(
 
 
 # KV connectors whose workers address each group's blocks in that group's
-# pool: NIXL regions carry their pool's blocks.
-_DRAFT_KV_POOL_CONNECTORS = ("NixlConnector",)
+# pool: NIXL regions and Mooncake store regions carry their pool's blocks.
+_DRAFT_KV_POOL_CONNECTORS = ("NixlConnector", "MooncakeStoreConnector")
 
 
 def _draft_kv_pool_connectors_supported(vllm_config: VllmConfig) -> bool:
     kv_transfer_config = vllm_config.kv_transfer_config
     if kv_transfer_config is None or kv_transfer_config.kv_connector is None:
         return True
-    return kv_transfer_config.kv_connector in _DRAFT_KV_POOL_CONNECTORS
+    if kv_transfer_config.kv_connector != "MultiConnector":
+        return kv_transfer_config.kv_connector in _DRAFT_KV_POOL_CONNECTORS
+    return all(
+        child.get("kv_connector") in _DRAFT_KV_POOL_CONNECTORS
+        for child in kv_transfer_config.kv_connector_extra_config.get("connectors", [])
+    )
 
 
 def _pop_draft_kv_pool_layers(
@@ -1842,7 +1847,8 @@ def _pop_draft_kv_pool_layers(
         )
     if not _draft_kv_pool_connectors_supported(vllm_config):
         raise NotImplementedError(
-            f"{DRAFT_KV_POOL_ENV}=1 supports NixlConnector as the KV connector."
+            f"{DRAFT_KV_POOL_ENV}=1 supports NixlConnector and MooncakeStoreConnector "
+            "(alone or in a MultiConnector) as KV connectors."
         )
     kv_transfer_config = vllm_config.kv_transfer_config
     if (

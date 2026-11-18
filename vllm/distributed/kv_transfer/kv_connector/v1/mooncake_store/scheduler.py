@@ -5,7 +5,8 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -31,6 +32,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
     is_mamba_align_group,
     is_mamba_group,
     resolve_kv_cache_block_sizes,
@@ -125,6 +127,14 @@ def _partial_tail_non_mamba_puts(
 class MooncakeStoreScheduler:
     """Scheduler-side component for MooncakeStoreConnector."""
 
+    # With private block pools (VLLM_DRAFT_KV_POOL), block IDs are per pool:
+    # the store groups that draw from a private pool, by store group index
+    # (set by `bind_kv_cache_block_pools`), and the blocks a store job
+    # references in those pools, which `_pinned_saves` (shared-pool IDs) does
+    # not hold.
+    _private_block_pools: Mapping[int, BlockPool] = MappingProxyType({})
+    _pinned_private_blocks: dict[int, list[KVCacheBlock]]
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -205,6 +215,43 @@ class MooncakeStoreScheduler:
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
+
+    def bind_kv_cache_block_pools(self, block_pools: Sequence[BlockPool]) -> None:
+        """Bind the block pool of each KV cache group, indexed by group ID, for
+        the groups with a private pool (VLLM_DRAFT_KV_POOL)."""
+        self._private_block_pools = {
+            store_group_id: block_pools[group_id]
+            for store_group_id, group_id in enumerate(self._store_group_ids)
+            if self.kv_cache_config.kv_cache_groups[group_id].pool_id
+        }
+        self._pinned_private_blocks = {}
+
+    def _pin_private_blocks(
+        self,
+        store_job_id: int,
+        block_ids_by_store_group: Sequence[tuple[int, int]],
+    ) -> None:
+        """Take one reference per distinct private-pool block a store job
+        reads, given as (store group index, block ID)."""
+        blocks: dict[tuple[int, int], KVCacheBlock] = {}
+        for store_group_id, block_id in block_ids_by_store_group:
+            assert block_id != NULL_BLOCK_ID
+            pool = self._private_block_pools[store_group_id]
+            blocks.setdefault((id(pool), block_id), pool.blocks[block_id])
+        if not blocks:
+            return
+        pinned = list(blocks.values())
+        for pool in {id(p): p for p in self._private_block_pools.values()}.values():
+            pool.touch([block for block in pinned if block.pool() is pool])
+        self._pinned_private_blocks[store_job_id] = pinned
+
+    def _unpin_private_blocks(self, store_job_id: int) -> None:
+        if not self._private_block_pools:
+            return
+        blocks = self._pinned_private_blocks.pop(store_job_id, None)
+        if blocks:
+            # Tail-first; `free_blocks` returns each block to its own pool.
+            blocks[0].pool().free_blocks(reversed(blocks))
 
     def _lookup_align(self) -> int:
         # Fine-grained hits may land on a hash boundary inside a block; without
@@ -568,16 +615,36 @@ class MooncakeStoreScheduler:
                 )
             req_meta.store_job_id = store_job_id = self._next_store_job_id
             self._next_store_job_id += 1
-            block_ids = [put.block_id for put in req_meta.boundary_puts or []]
+            private = self._private_block_pools
+            block_ids = [
+                put.block_id
+                for put in req_meta.boundary_puts or []
+                if put.group_id not in private
+            ]
             assert NULL_BLOCK_ID not in block_ids, (
                 "A null block cannot back a boundary put"
             )
+            # (store group index, block ID) in private pools.
+            private_block_ids = [
+                (put.group_id, put.block_id)
+                for put in req_meta.boundary_puts or []
+                if put.group_id in private
+            ]
             if req_meta.token_len_chunk:
                 # Each rank may retry from an earlier successful save offset.
                 block_ids.extend(
                     block_id
                     for group_id, group in enumerate(req_meta.block_ids)
                     if group_id not in self._boundary_state_group_ids
+                    and group_id not in private
+                    for block_id in group
+                    if block_id != NULL_BLOCK_ID
+                )
+                private_block_ids.extend(
+                    (group_id, block_id)
+                    for group_id, group in enumerate(req_meta.block_ids)
+                    if group_id not in self._boundary_state_group_ids
+                    and group_id in private
                     for block_id in group
                     if block_id != NULL_BLOCK_ID
                 )
@@ -585,10 +652,12 @@ class MooncakeStoreScheduler:
             # block table. Take and release exactly one reference per block.
             block_ids = list(dict.fromkeys(block_ids))
             assert NULL_BLOCK_ID not in block_ids
-            if not block_ids:
+            if not block_ids and not private_block_ids:
                 continue
             self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
+            if private_block_ids:
+                self._pin_private_blocks(store_job_id, private_block_ids)
 
     def register_finished_lookahead_save(
         self,
@@ -684,8 +753,13 @@ class MooncakeStoreScheduler:
             ),
             *mamba_puts,
         ]
+        private = self._private_block_pools
         pinned_block_ids = list(
-            dict.fromkeys(put.block_id for put in req_meta.boundary_puts)
+            dict.fromkeys(
+                put.block_id
+                for put in req_meta.boundary_puts
+                if put.group_id not in private
+            )
         )
 
         pool = self._gpu_block_pool
@@ -697,6 +771,15 @@ class MooncakeStoreScheduler:
         self._next_store_job_id += 1
         self._pinned_saves[store_job_id] = (pinned_block_ids, self._num_workers)
         pool.touch([pool.blocks[block_id] for block_id in pinned_block_ids])
+        if private:
+            self._pin_private_blocks(
+                store_job_id,
+                [
+                    (put.group_id, put.block_id)
+                    for put in req_meta.boundary_puts
+                    if put.group_id in private
+                ],
+            )
 
         req_meta.store_job_id = store_job_id
         self._finished_partial_tail_metas[request.request_id] = req_meta
@@ -782,6 +865,7 @@ class MooncakeStoreScheduler:
             del self._pinned_saves[store_job_id]
             # Tail-first, as elsewhere, so the shared prefix is evicted last.
             pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
+            self._unpin_private_blocks(store_job_id)
 
     def has_pending_push_work(self) -> bool:
         """Keep the engine stepping while any store job still holds block refs.
