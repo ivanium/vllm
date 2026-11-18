@@ -151,7 +151,42 @@ logger = init_logger(__name__)
 # MoE and use the regular fused all-reduce + norm.
 FUSED_MOE_FINALIZE_MAX_TOKENS = 32
 
+# Smallest batch whose qkv_proj runs the fused QKV+indexer epilogue by default;
+# VLLM_MINIMAX_M3_QKV_FUSED_EPILOGUE_MIN_TOKENS overrides it.
 _QKV_FUSED_EPILOGUE_MIN_TOKENS = 512
+
+
+def _qkv_fused_epilogue_min_tokens(supported: bool) -> int:
+    """Smallest batch that runs minimax_m3_qkv_index_fused_epilogue: 512, or
+    VLLM_MINIMAX_M3_QKV_FUSED_EPILOGUE_MIN_TOKENS, a positive integer (1: every
+    batch, decode included). Smaller batches run qkv_proj, then
+    fused_minimax_m3_qknorm_rope_kv_insert."""
+    value = os.getenv("VLLM_MINIMAX_M3_QKV_FUSED_EPILOGUE_MIN_TOKENS", "")
+    if not value:
+        return _QKV_FUSED_EPILOGUE_MIN_TOKENS
+    try:
+        min_tokens = int(value)
+    except ValueError:
+        min_tokens = 0
+    if min_tokens < 1:
+        raise ValueError(
+            "VLLM_MINIMAX_M3_QKV_FUSED_EPILOGUE_MIN_TOKENS must be a positive "
+            f"integer, got {value!r}."
+        )
+    if not supported:
+        logger.warning_once(
+            "VLLM_MINIMAX_M3_QKV_FUSED_EPILOGUE_MIN_TOKENS=%s has no effect: this "
+            "layer cannot run the fused QKV+indexer epilogue.",
+            value,
+        )
+    elif min_tokens != _QKV_FUSED_EPILOGUE_MIN_TOKENS:
+        logger.info_once(
+            "MiniMax-M3: the fused QKV+indexer epilogue serves batches of %d or "
+            "more tokens (VLLM_MINIMAX_M3_QKV_FUSED_EPILOGUE_MIN_TOKENS).",
+            min_tokens,
+        )
+    return min_tokens
+
 
 # Smallest batch whose o_proj/down_proj runs the fused GEMM-RS kernel. Below
 # it, the GEMM followed by sp_reduce_scatter is as fast (TP4 GB300, see
@@ -1050,6 +1085,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.kv_cache = torch.tensor([])  # replaced by bind_kv_cache
 
         self.use_qkv_fused_epilogue = _supports_qkv_fused_epilogue(self)
+        self.qkv_fused_epilogue_min_tokens = _qkv_fused_epilogue_min_tokens(
+            self.use_qkv_fused_epilogue
+        )
         if self.use_qkv_fused_epilogue:
             from vllm.models.minimax_m3.nvidia.ops.qkv_index_fused_epilogue import (
                 register_qkv_index_fused_epilogue_warmup,
@@ -1217,7 +1255,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
         # FlashInfer autotunes the GEMMs its dummy runs call: take the unfused
-        # path there so qkv_proj is tuned for the M < 512 fallback.
+        # path there so qkv_proj is tuned for the fallback under
+        # qkv_fused_epilogue_min_tokens (512 unless set).
         if isinstance(hidden_states, QuantizedActivation):
             num_tokens = hidden_states.orig_shape[0]
             dtype, device = hidden_states.orig_dtype, hidden_states.data.device
@@ -1226,9 +1265,18 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             dtype, device = hidden_states.dtype, hidden_states.device
         fused = (
             self.use_qkv_fused_epilogue
-            and num_tokens >= _QKV_FUSED_EPILOGUE_MIN_TOKENS
+            and num_tokens >= self.qkv_fused_epilogue_min_tokens
             and not is_flashinfer_autotuning()
         )
+        if fused and num_tokens < _QKV_FUSED_EPILOGUE_MIN_TOKENS:
+            # Under CUDA graphs this prints while the decode graphs capture.
+            logger.info_once(
+                "MiniMax-M3: the fused QKV+indexer epilogue runs a batch under %d "
+                "tokens (VLLM_MINIMAX_M3_QKV_FUSED_EPILOGUE_MIN_TOKENS=%d).",
+                _QKV_FUSED_EPILOGUE_MIN_TOKENS,
+                self.qkv_fused_epilogue_min_tokens,
+                scope="process",
+            )
         if not fused:
             # Single fused projection emitting [q | k | v | index_q | index_k].
             qkv, _ = self.qkv_proj(hidden_states)
