@@ -21,7 +21,10 @@ from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention.attention import get_attention_context
-from vllm.model_executor.layers.fusion.quant_activation import get_input_quant_key
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    get_input_quant_key,
+)
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
@@ -72,6 +75,11 @@ def _shared_slot_mapping(
     ):
         return None
     return first
+
+
+def _activation_dtype(x: torch.Tensor | QuantizedActivation) -> torch.dtype:
+    """The dtype an activation stands for (a pre-quantized one's original)."""
+    return x.orig_dtype if isinstance(x, QuantizedActivation) else x.dtype
 
 
 def _gemma_rms_norm(hidden_size: int, eps: float) -> nn.Module:
@@ -203,7 +211,7 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | QuantizedActivation,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         # The target's fused per-head Gemma QK-norm + partial NeoX RoPE on q/k,
@@ -235,9 +243,12 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
         )
         q = qkv[:, : self.q_size] if q_fp8 is None else q_fp8
         # output_dtype must be stated: it otherwise follows the query, which
-        # may be FP8.
+        # may be FP8. The input may be the input norm's MXFP8 output.
         attn_output = self.attn(
-            q, None, None, output_dtype=self._attn_output_dtype or hidden_states.dtype
+            q,
+            None,
+            None,
+            output_dtype=self._attn_output_dtype or _activation_dtype(hidden_states),
         )
         output, _ = self.o_proj(attn_output)
         return output
@@ -423,6 +434,124 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         )
 
 
+class _ShardedContextFc:
+    """`combine_hidden_states` under VLLM_MINIMAX_M3_DSPARK_SHARDED_CONTEXT_FC=1:
+    the context projection `fc` ([hidden, 5 x hidden], unquantized and
+    replicated, so every rank streams all of it for the few rows of a decode
+    step) split over the TP ranks. Each rank multiplies its 1/TP slice of the
+    input features (strided views, no copies) into FP32; the FP32 partials are
+    all-reduced and rounded to the model dtype once, as a split-K GEMM would.
+    Larger (prefill) batches keep the replicated GEMM. As vLLM #66324's
+    `ShardedContextFc` (MiniMax-M3 specialized decode)."""
+
+    # Rows up to which the split runs: the decode steps' (8 requests x 8 tokens).
+    MAX_ROWS = 64
+
+    def __init__(self, model: nn.Module, stock, tp_size: int, tp_rank: int) -> None:
+        self._model = model
+        self._stock = stock
+        self._tp_size = tp_size
+        self._tp_rank = tp_rank
+        self._logged = False
+
+    @staticmethod
+    def unsupported(model: nn.Module, tp_size: int) -> str | None:
+        """Why the split cannot run (None when it can); the same on every rank."""
+        inner = model.model
+        fc = getattr(inner, "fc", None)
+        if tp_size == 1:
+            return "a single TP rank"
+        if not getattr(inner, "use_aux_hidden_state", False) or fc is None:
+            return "no context fc"
+        if not isinstance(fc.quant_method, UnquantizedLinearMethod):
+            return f"a context fc on {type(fc.quant_method).__name__}"
+        if fc.weight.dtype not in (torch.bfloat16, torch.float16):
+            return f"a {fc.weight.dtype} context fc"
+        if getattr(fc, "bias", None) is not None:
+            return "a context fc bias"
+        if fc.input_size % tp_size:
+            return f"{fc.input_size} input features over {tp_size} ranks"
+        return None
+
+    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        weight = self._model.model.fc.weight
+        if (
+            hidden_states.dim() != 2
+            or not 0 < hidden_states.shape[0] <= self.MAX_ROWS
+            or hidden_states.shape[-1] != weight.shape[1]
+        ):
+            return self._stock(hidden_states)
+        width = weight.shape[1] // self._tp_size
+        cols = slice(self._tp_rank * width, (self._tp_rank + 1) * width)
+        x = hidden_states.to(weight.dtype)[:, cols]
+        partial = torch.mm(x, weight[:, cols].t(), out_dtype=torch.float32)
+        out = tensor_model_parallel_all_reduce(partial).to(weight.dtype)
+        if not self._logged:
+            self._logged = True
+            logger.info(
+                "MiniMax-M3 DSpark: context fc of %d rows split over %d TP ranks.",
+                hidden_states.shape[0],
+                self._tp_size,
+            )
+        return out
+
+
+class _DraftNormMxfp8:
+    """`forward` of a draft Gemma RMSNorm under VLLM_MINIMAX_M3_DSPARK_NORM_MXFP8=1:
+    when the linear it feeds takes FlashInfer's MXFP8 input (the 128x4 scale
+    layout), the norm's kernel writes that input itself (`mxfp8=True`, as the
+    target's input norms do), so the linear skips its own quantize launch. The
+    residual update and the scales are those of the BF16 path; a code can be
+    one E4M3 step off where the kernel's FP32 sum of squares, summed in another
+    order in its MXFP8 variant, moves the BF16 norm across a rounding boundary
+    (`ops/norm_mxfp8.py`). Otherwise the norm keeps its BF16 output. Checked
+    per call, as the target checks its qkv_proj."""
+
+    def __init__(
+        self, name: str, norm: nn.Module, consumer, takes_mxfp8, status: dict
+    ) -> None:
+        self._name = name
+        self._norm = norm
+        self._consumer = consumer  # () -> the linear, or None while it cannot fuse
+        self._takes_mxfp8 = takes_mxfp8  # nvidia.model._consumes_mxfp8_128x4
+        self._status = status
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        mxfp8: bool = False,
+    ):
+        norm = self._norm
+        if not mxfp8 and x.dim() == 2:
+            consumer = self._consumer()
+            mxfp8 = (
+                consumer is not None
+                and x.dtype == getattr(consumer, "params_dtype", None)
+                and self._takes_mxfp8(consumer)
+            )
+            self._record(mxfp8)
+        return type(norm).forward(norm, x, residual, mxfp8=mxfp8)
+
+    def _record(self, fused: bool) -> None:
+        """Log, once per process, which norms fused at their first call."""
+        status = self._status
+        if self._name in status["first"]:
+            return
+        status["first"][self._name] = fused
+        if len(status["first"]) == status["total"]:
+            kept = [name for name, f in status["first"].items() if not f]
+            logger.info(
+                "MiniMax-M3 DSpark: %d of %d draft norms write their linear's "
+                "MXFP8 input; BF16 kept for: %s.",
+                status["total"] - len(kept),
+                status["total"],
+                ", ".join(kept) or "none",
+            )
+
+
 def _speculator_loop(speculator, num_reqs: int, head_hidden: torch.Tensor) -> bool:
     """`sample_sequential` fallback: False has the speculator run its loop."""
     return False
@@ -454,6 +583,7 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._attach_draft_step_kernels(vllm_config)
         # VLLM_MINIMAX_M3_DSPARK_SHARDED_MARKOV=1: sample the draft Markov chain
         # with the vocabulary-sharded cooperative kernel (one launch per draft
         # step) instead of the speculator's per-position loop, where the loop
@@ -488,6 +618,116 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         self.markov_cache_dtype = vllm_config.model_config.head_dtype
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.num_speculative_steps = spec_config.num_speculative_tokens
+
+    def _attach_draft_step_kernels(self, vllm_config: VllmConfig) -> None:
+        """The draft step's opt-in kernels, each behind its own variable:
+        VLLM_MINIMAX_M3_DSPARK_SHARDED_CONTEXT_FC=1 splits the context fc over
+        the TP ranks, VLLM_MINIMAX_M3_DSPARK_NORM_MXFP8=1 has the draft norms
+        write the MXFP8 input of the linear they feed."""
+        if os.environ.get("VLLM_MINIMAX_M3_DSPARK_SHARDED_CONTEXT_FC", "0") == "1":
+            tp_group = get_tp_group()
+            draft_tp = vllm_config.speculative_config.draft_tensor_parallel_size
+            if not current_platform.is_cuda():
+                reason = "a non-CUDA platform"
+            elif draft_tp not in (None, tp_group.world_size):
+                reason = f"a TP{draft_tp} draft in a TP{tp_group.world_size} group"
+            else:
+                reason = _ShardedContextFc.unsupported(self, tp_group.world_size)
+            if reason is not None:
+                logger.info_once(
+                    "VLLM_MINIMAX_M3_DSPARK_SHARDED_CONTEXT_FC=1 has no effect: the "
+                    "DSpark context fc stays replicated (%s).",
+                    reason,
+                    scope="process",
+                )
+            else:
+                self.combine_hidden_states = _ShardedContextFc(
+                    self,
+                    self.combine_hidden_states,
+                    tp_group.world_size,
+                    tp_group.rank_in_group,
+                )
+                logger.info_once(
+                    "MiniMax-M3 DSpark: the context fc of draft steps of up to %d "
+                    "rows is split over the %d TP ranks (FP32 partials, one "
+                    "all-reduce; VLLM_MINIMAX_M3_DSPARK_SHARDED_CONTEXT_FC=1).",
+                    _ShardedContextFc.MAX_ROWS,
+                    tp_group.world_size,
+                    scope="process",
+                )
+        if os.environ.get("VLLM_MINIMAX_M3_DSPARK_NORM_MXFP8", "0") == "1":
+            if not current_platform.is_cuda():
+                logger.info_once(
+                    "VLLM_MINIMAX_M3_DSPARK_NORM_MXFP8=1 has no effect on a non-CUDA "
+                    "platform.",
+                    scope="process",
+                )
+                return
+            from vllm.models.minimax_m3.nvidia.model import (
+                MiniMAXGemmaRMSNorm,
+                _consumes_mxfp8_128x4,
+            )
+
+            inner = self.model
+            # (name, norm, () -> the linear that is the norm output's only reader)
+            pairs = []
+            for i, layer in enumerate(inner.layers):
+                attn = layer.self_attn
+                pairs.append(
+                    (
+                        f"layers.{i}.input_layernorm",
+                        layer.input_layernorm,
+                        lambda attn=attn: attn.qkv_proj,
+                    )
+                )
+                pairs.append(
+                    (
+                        f"layers.{i}.post_attention_layernorm",
+                        layer.post_attention_layernorm,
+                        lambda mlp=layer.mlp: mlp.gate_up_proj,
+                    )
+                )
+            # The context states' norm feeds the context K/V projection unless the
+            # BF16 fused K/V weight is there (_project_context_kv_token_major).
+            pairs.append(
+                (
+                    "hidden_norm",
+                    inner.hidden_norm,
+                    lambda: (
+                        inner._context_kv_proj
+                        if inner._fused_kv_weight is None
+                        else None
+                    ),
+                )
+            )
+            reason = next(
+                (
+                    f"a {type(norm).__name__} {name}"
+                    for name, norm, _ in pairs
+                    if type(norm) is not MiniMAXGemmaRMSNorm
+                ),
+                None,
+            )
+            if reason is not None:
+                logger.info_once(
+                    "VLLM_MINIMAX_M3_DSPARK_NORM_MXFP8=1 has no effect: the DSpark "
+                    "draft norms keep their BF16 output (%s).",
+                    reason,
+                    scope="process",
+                )
+            else:
+                status: dict = {"total": len(pairs), "first": {}}
+                for name, norm, consumer in pairs:
+                    norm.forward = _DraftNormMxfp8(
+                        name, norm, consumer, _consumes_mxfp8_128x4, status
+                    )
+                logger.info_once(
+                    "MiniMax-M3 DSpark: %d draft norms write the MXFP8 input of the "
+                    "linear they feed where it takes it "
+                    "(VLLM_MINIMAX_M3_DSPARK_NORM_MXFP8=1).",
+                    len(pairs),
+                    scope="process",
+                )
 
     def draft_logits_shard(self) -> tuple[int, int] | None:
         """`(first column, width)` of `compute_draft_logits_local` within
