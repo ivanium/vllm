@@ -406,7 +406,7 @@ def msa_cutlass_sparse_decode(
     query_fp8: torch.Tensor,
     kv_cache: torch.Tensor,
     topk: torch.Tensor,
-    output: torch.Tensor,
+    output: torch.Tensor | None,
     metadata: MSACutlassDecodeMetadata,
     *,
     scale: float,
@@ -415,11 +415,14 @@ def msa_cutlass_sparse_decode(
     v_scale_float: float,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    output_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Run CUTLASS sparse decode with metadata prepared by the MSA builder.
 
     NVFP4 caches are uint8 head-slot pages (see `nvfp4_kv_cache_views`) and
-    take the device global scales `k_scale`/`v_scale`.
+    take the device global scales `k_scale`/`v_scale`. `output_mxfp8`
+    (`(data, scale)`, Q8KV4 plans only) receives the output as MXFP8, E4M3
+    data and 128x4-swizzled UE8M0 scales, instead of the BF16 `output`.
     """
     if kv_cache.dtype == torch.uint8:
         assert k_scale is not None and v_scale is not None
@@ -432,6 +435,7 @@ def msa_cutlass_sparse_decode(
 
     from vllm.third_party.fmha_sm100.api import fmha_sm100
 
+    mxfp8_kwargs = {} if output_mxfp8 is None else {"out_mxfp8": output_mxfp8}
     fmha_sm100(
         query_fp8,
         key,
@@ -447,4 +451,5 @@ def msa_cutlass_sparse_decode(
         k_scale=k_scale_arg,
         v_scale=v_scale_arg,
         o_scale=1.0,
+        **mxfp8_kwargs,
     )

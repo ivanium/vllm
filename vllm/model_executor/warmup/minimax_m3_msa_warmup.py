@@ -61,7 +61,7 @@ def _msa_prebuild_kwargs(
         num_q_heads=module.num_heads,
         num_kv_heads=module.num_kv_heads,
     )
-    return dict(
+    kwargs: dict[str, Any] = dict(
         kv_cache_dtype=module.kv_cache_dtype if attention else "auto",
         index_cache_dtype=index_cache_dtype,
         num_q_heads=module.num_heads,
@@ -77,6 +77,10 @@ def _msa_prebuild_kwargs(
         prefill_backend=msa.prefill_backend if msa is not None else "cute_dsl",
         device=torch.device("cuda", torch.accelerator.current_device_index()),
     )
+    if q8kv4_decode and module.uses_mxfp8_attn_output():
+        # Decode then runs the Q8KV4 kernels that write MXFP8 instead of BF16.
+        kwargs["decode_output_mxfp8"] = True
+    return kwargs
 
 
 @instrument(span_name="MiniMax M3 MSA warmup")

@@ -16,7 +16,7 @@ import functools
 import os
 import weakref
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
@@ -449,11 +449,13 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
     """MSA block-sparse attention over an NVFP4 KV cache, SM100 family only.
 
     Decode and prefill run the CUTLASS Q8KV4 kernels, which read the E4M3
-    query; there is no BF16-query kernel and no Triton fallback.
+    query; there is no BF16-query kernel and no Triton fallback. Both can
+    write the output as MXFP8 instead of BF16 (`forward(output_mxfp8=...)`).
     """
 
     use_cutlass_decode = True
     prefill_backend = "q8kv4"
+    supports_mxfp8_output = True
 
     def __init__(
         self,
@@ -519,11 +521,22 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
         layer: AttentionLayer,
         query: torch.Tensor,
         kv_cache: torch.Tensor,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
+        output: torch.Tensor | None,
+        output_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | None:
+        """Attend into the BF16 `output`, or, with `output_mxfp8` given and
+        `output` None, into o_proj's MXFP8 input `(data, scale)`: E4M3 `data`
+        `[tokens, num_heads * head_size]` and a flat uint8 `scale` of UE8M0
+        scales in FlashInfer's 128x4 swizzled layout, rows padded to 128."""
         assert query.dtype == torch.float8_e4m3fn
+        assert (output is None) != (output_mxfp8 is None)
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
+            if output_mxfp8 is not None:
+                # Zeros rather than uninitialized E4M3/UE8M0 bytes, which can
+                # hold NaN codes (a BF16 output is sanitized by its quantize).
+                output_mxfp8[0].zero_()
+                output_mxfp8[1].zero_()
             return output  # profiling run; caches unbound
         main_md = attn_metadata[layer.layer_name]  # type: ignore[attr-defined]
         assert isinstance(main_md, MiniMaxM3SparseMetadata)
@@ -534,7 +547,17 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
         assert topk is not None
         hd = self.head_size
         q_fp8 = query[:num_tokens].view(-1, self.num_heads, hd)
-        out = output[:num_tokens].view(-1, self.num_heads, hd)
+        out = (
+            None if output is None else output[:num_tokens].view(-1, self.num_heads, hd)
+        )
+        if output_mxfp8 is not None and output_mxfp8[0].shape[0] > num_tokens:
+            # Rows past the batch (piecewise cudagraph padding) get zeros. The
+            # kernels clear the scales up to the next 128-row tile; the tiles
+            # after it are a contiguous byte range of the swizzled layout.
+            mx_data, mx_scale = output_mxfp8
+            mx_data[num_tokens:].zero_()
+            tile_rows = (num_tokens + 127) // 128 * 128
+            mx_scale[tile_rows * (mx_data.shape[1] // 32) :].zero_()
         q_scale_float = getattr(layer, "_q_scale_float", 1.0)
         k_scale = getattr(layer, "_k_scale", None)
         v_scale = getattr(layer, "_v_scale", None)
@@ -563,7 +586,7 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
                 q_fp8[:nd],
                 kv_cache,
                 topk[:nd],
-                out[:nd],
+                None if out is None else out[:nd],
                 msa_metadata,
                 scale=self.scale,
                 q_scale_float=q_scale_float,
@@ -571,6 +594,11 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
                 v_scale_float=getattr(layer, "_v_scale_float", 1.0),
                 k_scale=k_scale,
                 v_scale=v_scale,
+                output_mxfp8=(
+                    None
+                    if output_mxfp8 is None
+                    else (output_mxfp8[0][:nd], output_mxfp8[1])
+                ),
             )
 
         if main_md.num_prefills > 0:
@@ -580,6 +608,16 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
             assert p is not None
             k2q_row_ptr, _, schedule = self._build_prefill_csr(topk, nd, num_tokens, p)
             k_data, k_sf, v_data, v_sf = nvfp4_kv_cache_views(kv_cache)
+            mxfp8_kwargs: dict[str, Any] = {}
+            if output_mxfp8 is not None:
+                # Decode rows come first: the combine writes rows [nd, num_tokens)
+                # of the same activation (scales indexed from row nd) and clears
+                # the scales of its padding rows.
+                mx_data, mx_scale = output_mxfp8
+                mx_rows = mx_data[nd:num_tokens].view(-1, self.num_heads, hd)
+                mxfp8_kwargs = dict(
+                    out_mxfp8=(mx_rows, mx_scale), out_mxfp8_first_row=nd
+                )
             run_prefill(
                 q_fp8[nd:],
                 (k_data, v_data),
@@ -596,7 +634,8 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
                 k_global_scale=k_scale,
                 v_global_scale=v_scale,
                 block_scale_shift=NVFP4_BLOCK_SCALE_SHIFT,
-                out=out[nd:],
+                out=None if out is None else out[nd:],
                 workspace=self._prefill_workspace,
+                **mxfp8_kwargs,
             )
         return output

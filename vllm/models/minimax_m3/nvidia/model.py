@@ -12,6 +12,7 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+import os
 from collections.abc import Iterable
 from functools import partial
 from typing import TYPE_CHECKING
@@ -336,6 +337,13 @@ def _consumes_mxfp8_128x4(linear: nn.Module) -> bool:
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
     )
+
+
+def _msa_mxfp8_output_requested() -> bool:
+    """Whether VLLM_MINIMAX_M3_MSA_MXFP8_OUTPUT=1 asks the MSA Q8KV4 attention
+    kernels to write o_proj's MXFP8 input themselves, in place of the BF16
+    output and o_proj's own quantize kernel."""
+    return os.getenv("VLLM_MINIMAX_M3_MSA_MXFP8_OUTPUT", "0") == "1"
 
 
 class MiniMAXGemmaRMSNorm(nn.Module):
@@ -1000,6 +1008,18 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 vllm_config.attention_config.minimax_m3_msa_decode_backend
             ),
         )
+        # Opt-in (VLLM_MINIMAX_M3_MSA_MXFP8_OUTPUT=1): the impl's kernels write
+        # o_proj's MXFP8 input; see uses_mxfp8_attn_output.
+        self.msa_mxfp8_output = False
+        if _msa_mxfp8_output_requested():
+            self.msa_mxfp8_output = getattr(self.impl, "supports_mxfp8_output", False)
+            if not self.msa_mxfp8_output:
+                logger.warning_once(
+                    "VLLM_MINIMAX_M3_MSA_MXFP8_OUTPUT=1 has no effect: only the "
+                    "NVFP4 KV cache's MSA Q8KV4 kernels write an MXFP8 output "
+                    "(this layer runs %s).",
+                    type(self.impl).__name__,
+                )
         # Self-contained nn.Module: owns its side cache, selects its impl in init.
         self.indexer = MiniMaxM3Indexer(
             num_kv_heads=self.num_kv_heads,
@@ -1118,6 +1138,56 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             device=device,
         )
 
+    def uses_mxfp8_attn_output(self) -> bool:
+        """Whether attention writes o_proj's input as MXFP8 rather than BF16.
+
+        Opted in by VLLM_MINIMAX_M3_MSA_MXFP8_OUTPUT=1 on the NVFP4 KV cache,
+        and only while o_proj takes FlashInfer's 128x4-swizzled MXFP8 input
+        (checked per call, as the input norm does). Not under sequence
+        parallelism, whose o_proj may run the fused GEMM + reduce-scatter.
+        """
+        return (
+            self.msa_mxfp8_output
+            and not self.use_sequence_parallel
+            and _consumes_mxfp8_128x4(self.o_proj)
+        )
+
+    def _attention_mxfp8(
+        self,
+        query: torch.Tensor,
+        index_query: torch.Tensor,
+        num_tokens: int,
+        device: torch.device,
+    ) -> QuantizedActivation:
+        """Attention whose kernels write o_proj's MXFP8 input directly.
+
+        The MSA Q8KV4 decode kernel and prefill combine store E4M3 data and
+        UE8M0 scales in FlashInfer's 128x4 swizzled layout, the bytes
+        `mxfp8_e4m3_quantize(out, is_sf_swizzled_layout=True)` makes of the
+        BF16 output (vllm-project/MSA#49), so o_proj skips its quantize kernel.
+        """
+        logger.info_once(
+            "MiniMax M3 NVFP4 MSA: the Q8KV4 attention kernels write o_proj's "
+            "MXFP8 input (VLLM_MINIMAX_M3_MSA_MXFP8_OUTPUT=1)."
+        )
+        data = torch.empty(
+            (num_tokens, self.q_size), dtype=torch.float8_e4m3fn, device=device
+        )
+        # One UE8M0 scale per 32 values; rows pad to the 128-row swizzle tile
+        # (q_size // 32 is a multiple of its 4 columns: 4 per head).
+        padded_rows = (num_tokens + 127) // 128 * 128
+        scale = torch.empty(
+            padded_rows * (self.q_size // 32), dtype=torch.uint8, device=device
+        )
+        self._run_attention_mxfp8(query, index_query, data, scale)
+        return QuantizedActivation(
+            data=data,
+            scale=scale,
+            orig_dtype=torch.bfloat16,
+            orig_shape=torch.Size((num_tokens, self.q_size)),
+            quant_key=kMxfp8Dynamic,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1209,8 +1279,12 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 write_qkv=not q_is_fp8,
             )
 
-        output = torch.empty((num_tokens, self.q_size), dtype=dtype, device=device)
-        attn_output = self._run_attention(q, index_q, output)
+        attn_output: torch.Tensor | QuantizedActivation
+        if dtype == torch.bfloat16 and self.uses_mxfp8_attn_output():
+            attn_output = self._attention_mxfp8(q, index_q, num_tokens, device)
+        else:
+            output = torch.empty((num_tokens, self.q_size), dtype=dtype, device=device)
+            attn_output = self._run_attention(q, index_q, output)
         if self.use_sequence_parallel:
             return _row_parallel_reduce_scatter(attn_output, self.o_proj, self.gemm_rs)
         output, _ = self.o_proj(attn_output)
@@ -1228,6 +1302,22 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
         self.indexer(index_query)
         return self.impl.forward(self, query, self.kv_cache, output)
+
+    @eager_break_during_capture
+    def _run_attention_mxfp8(
+        self,
+        query: torch.Tensor,
+        index_query: torch.Tensor,
+        output_data: torch.Tensor,
+        output_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        # _run_attention with the output as MXFP8 data and scales; separate
+        # tensor arguments, so a breakable capture holds both by weak reference.
+        self.indexer(index_query)
+        self.impl.forward(  # type: ignore[call-arg]
+            self, query, self.kv_cache, None, output_mxfp8=(output_data, output_scale)
+        )
+        return output_data
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
