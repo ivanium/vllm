@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -473,6 +474,35 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills: set[Request] = set()
         self._parked_reservations: dict[Request, int] = {}
         self._parked_reserved_blocks = 0
+        # Opt-in, VLLM_ASYNC_KV_LOAD_PREFILL_RESERVE_CHUNKS=N: against async KV
+        # loads, an in-flight prefill reserves only the blocks its next N chunks
+        # need, so a load may borrow the rest while the prefill keeps a runway
+        # of N chunks (_inflight_prefill_horizon_reserved_blocks).
+        self._prefill_reserve_horizon_tokens = self._get_prefill_reserve_horizon(
+            kv_cache_config
+        )
+        self._kv_load_lend_backoff = False
+        self._kv_load_full_reserved_blocks = 0
+        self._kv_load_horizon_tokens = 0
+        # Async loads started while lending is on, until their blocks are freed:
+        # request id -> (scheduler step, time, whether it borrowed reserved KV).
+        self._kv_load_starts: dict[str, tuple[int, float, bool]] = {}
+        self._num_kv_loans_out = 0
+        # Steps each of the last returned loads held its blocks (start to free).
+        self._kv_load_hold_steps: deque[int] = deque(maxlen=64)
+        self._num_kv_load_lends = 0
+        self._num_kv_load_lend_backoffs = 0
+        # In-flight prefills short of KV, counted once per step, in all and
+        # with loans outstanding.
+        self._num_prefill_kv_shortfalls = 0
+        self._num_prefill_kv_shortfalls_with_loans = 0
+        self._prefill_kv_shortfall_step = -1
+        self._kv_load_lend_max_borrowed = 0
+        # Returned loans since the last lending line: count, steps (sum, max)
+        # and seconds (sum, max) from admission to free.
+        self._kv_loan_lifetimes: list[float] = [0, 0, 0, 0.0, 0.0]
+        self._kv_load_lend_logged = (0, 0, 0, 0)
+        self._kv_load_lend_log_time: float | None = None
 
         # Requests with an async KV load, by stage (KV_FETCH_STAGES).
         # None when not tracked (no KV connector, or no stats or load cap).
@@ -888,6 +918,9 @@ class Scheduler(SchedulerInterface):
                     if new_blocks is not None:
                         # The request can be scheduled.
                         break
+
+                    if self._prefill_reserve_horizon_tokens:
+                        self._record_prefill_kv_shortfall(request)
 
                     if (
                         self.connector is not None
@@ -1454,7 +1487,9 @@ class Scheduler(SchedulerInterface):
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations)
                     # plus its own spec decode step blocks, to avoid deadlock and
-                    # predictable preemptions.
+                    # predictable preemptions. With
+                    # VLLM_ASYNC_KV_LOAD_PREFILL_RESERVE_CHUNKS, in-flight
+                    # prefills reserve only their next chunks.
                     reserved_blocks = (
                         self._inflight_prefill_reserved_blocks()
                         + self._spec_decode_step_blocks
@@ -1547,6 +1582,8 @@ class Scheduler(SchedulerInterface):
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     num_async_kv_loads += 1
+                    if self._prefill_reserve_horizon_tokens:
+                        self._record_kv_load_start(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
                     # the request finished the KV transfer.
@@ -3172,6 +3209,8 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        if self._kv_load_starts:
+            self._end_kv_load(request)
         if self._request_blocks_can_be_freed(request):
             self.kv_cache_manager.free(request)
             return
@@ -3512,9 +3551,275 @@ class Scheduler(SchedulerInterface):
 
     def _inflight_prefill_reserved_blocks(self) -> int:
         """Num blocks in-flight prefills still need to finish (their reservation)."""
+        if self._prefill_reserve_horizon_tokens:
+            return self._inflight_prefill_horizon_reserved_blocks()
         return self._parked_reserved_blocks + sum(
             self._request_remaining_blocks(req) for req in self._inflight_prefills
         )
+
+    def _get_prefill_reserve_horizon(self, kv_cache_config: KVCacheConfig) -> int:
+        """Tokens an in-flight prefill reserves against async KV loads: the
+        next VLLM_ASYNC_KV_LOAD_PREFILL_RESERVE_CHUNKS chunks of
+        max_num_scheduled_tokens. 0 (the default) reserves its whole remaining
+        sequence."""
+        name = "VLLM_ASYNC_KV_LOAD_PREFILL_RESERVE_CHUNKS"
+        value = os.environ.get(name, "0").strip() or "0"
+        try:
+            num_chunks = int(value)
+        except ValueError:
+            logger.warning("Ignoring %s=%r: not an integer.", name, value)
+            return 0
+        if num_chunks <= 0:
+            return 0
+        if self.connector is None:
+            logger.warning("Ignoring %s: no KV connector.", name)
+            return 0
+        if kv_cache_config.hisparse_host_num_blocks is not None:
+            # HiSparse parks async loads among the in-flight prefills.
+            logger.warning("Ignoring %s: not supported with HiSparse.", name)
+            return 0
+        horizon = num_chunks * self.max_num_scheduled_tokens
+        logger.info(
+            "Async KV loads may use KV that in-flight prefills reserve beyond "
+            "their next %d chunks (%d tokens), or beyond as many chunks as the "
+            "steps loads hold their KV if more; lending starts once a load has "
+            "returned its KV, and stops while the runway is under half (%s=%d)",
+            num_chunks,
+            horizon,
+            name,
+            num_chunks,
+        )
+        return horizon
+
+    def _request_horizon_blocks(
+        self, request: Request, remaining_blocks: int, horizon_tokens: int
+    ) -> int:
+        """Blocks an in-flight prefill needs for its next `horizon_tokens`; all
+        of its `remaining_blocks` once those reach its end."""
+        num_tokens = request.num_computed_tokens + horizon_tokens
+        if num_tokens >= min(request.num_tokens, self.max_model_len):
+            return remaining_blocks
+        horizon_blocks = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=min(num_tokens + self.num_lookahead_tokens, self.max_model_len),
+            new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=request.num_computed_tokens,
+            num_local_computed_tokens=request.num_computed_tokens,
+            num_tokens_main_model=num_tokens,
+            apply_admission_cap=True,
+            prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+        )
+        return min(horizon_blocks, remaining_blocks)
+
+    def _inflight_prefill_horizon_reserved_blocks(self) -> int:
+        """The async KV load reservation with lending: parked loads keep their
+        whole remaining reservation, and each in-flight prefill reserves what
+        its next chunks need (`_request_horizon_blocks`) instead of its whole
+        remaining sequence.
+
+        A load holds its blocks until it is promoted, computed and its KV freed
+        (on a prefill instance, once the decode instance has read it), and is
+        not preemptible meanwhile; a prefill that runs out of KV before then
+        preempts or waits. This is not excluded by construction. Instead:
+
+        - Each prefill keeps a runway of one chunk per step that loads hold
+          their KV (`_kv_load_hold_estimate`), plus one, and at least N chunks.
+          Nothing is lent before a load has returned its KV.
+        - Lending stops (the full reservation is returned) once the free blocks
+          beyond the parked loads' reservations fall under half of that runway
+          or a prefill runs short, until they cover the full reservations again.
+        - Nothing is lent while an in-flight prefill on the rank has been
+          preempted: lending preempts a prefill at most once, and a preempted
+          prefill cannot be the victim of another prefill's late loans.
+        """
+        parked = self._parked_reserved_blocks
+        hold_steps = self._kv_load_hold_estimate()
+        horizon_tokens = (
+            0
+            if hold_steps is None
+            or any(req.num_preemptions for req in self._inflight_prefills)
+            else max(
+                self._prefill_reserve_horizon_tokens,
+                (hold_steps + 1) * self.max_num_scheduled_tokens,
+            )
+        )
+        self._kv_load_horizon_tokens = horizon_tokens
+        full = horizon = parked
+        for req in self._inflight_prefills:
+            remaining = self._request_remaining_blocks(req)
+            full += remaining
+            horizon += (
+                self._request_horizon_blocks(req, remaining, horizon_tokens)
+                if horizon_tokens
+                else remaining
+            )
+        self._kv_load_full_reserved_blocks = full
+        if horizon == full:
+            return full
+        free = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        if self._kv_load_lend_backoff:
+            if free < full:
+                return full
+            self._kv_load_lend_backoff = False
+        elif 2 * (free - parked) < horizon - parked:
+            self._enter_kv_load_lend_backoff(
+                f"free blocks beyond parked async KV loads ({free - parked}) are "
+                "under half the in-flight prefills' next-chunk reservation "
+                f"({horizon - parked})"
+            )
+            return full
+        return horizon
+
+    def _enter_kv_load_lend_backoff(self, reason: str) -> None:
+        if self._kv_load_lend_backoff:
+            return
+        self._kv_load_lend_backoff = True
+        self._num_kv_load_lend_backoffs += 1
+        if self._num_kv_load_lend_backoffs == 1:
+            # Later back-offs are counted in the periodic lending line.
+            logger.warning(
+                "Async KV loads stop using KV reserved by in-flight prefills "
+                "until free blocks cover the full reservations again: %s",
+                reason,
+            )
+        self._maybe_log_kv_load_lending()
+
+    def _record_kv_load_start(self, request: Request) -> None:
+        """Track an async KV load until its blocks are freed. It is a loan if it
+        was admitted into blocks that the in-flight prefills' full reservation
+        holds (`_kv_load_full_reserved_blocks`)."""
+        borrowed = (
+            self._kv_load_full_reserved_blocks
+            + self._spec_decode_step_blocks
+            - self.kv_cache_manager.block_pool.get_num_free_blocks()
+        )
+        lent = borrowed > 0
+        start = self._kv_load_starts.get(request.request_id)
+        if start is None:
+            self._kv_load_starts[request.request_id] = (
+                self.current_step,
+                time.monotonic(),
+                lent,
+            )
+            self._num_kv_loans_out += lent
+        elif lent and not start[2]:
+            self._kv_load_starts[request.request_id] = (start[0], start[1], True)
+            self._num_kv_loans_out += 1
+        if not lent:
+            return
+        if not self._num_kv_load_lends:
+            logger.info(
+                "Admitted an async KV load into %d KV blocks that in-flight "
+                "prefills reserve beyond their next chunks",
+                borrowed,
+            )
+        self._num_kv_load_lends += 1
+        self._kv_load_lend_max_borrowed = max(self._kv_load_lend_max_borrowed, borrowed)
+        self._maybe_log_kv_load_lending()
+
+    def _end_kv_load(self, request: Request) -> None:
+        """A tracked load (and its loan, if any) ends when its blocks are freed."""
+        start = self._kv_load_starts.pop(request.request_id, None)
+        if start is None:
+            return
+        steps = self.current_step - start[0]
+        self._kv_load_hold_steps.append(steps)
+        if start[2]:
+            self._num_kv_loans_out -= 1
+            seconds = time.monotonic() - start[1]
+            lifetimes = self._kv_loan_lifetimes
+            lifetimes[0] += 1
+            lifetimes[1] += steps
+            lifetimes[2] = max(lifetimes[2], steps)
+            lifetimes[3] += seconds
+            lifetimes[4] = max(lifetimes[4], seconds)
+        # Also when nothing is lent, so the hold estimate and runway show.
+        self._maybe_log_kv_load_lending()
+
+    def _kv_load_hold_estimate(self) -> int | None:
+        """Steps an async load holds its blocks, from its start until they are
+        freed: the longest of the last 64 returned and of those still out. None
+        until one has returned."""
+        if not self._kv_load_hold_steps:
+            return None
+        steps = max(self._kv_load_hold_steps)
+        if self._kv_load_starts:
+            oldest_start = next(iter(self._kv_load_starts.values()))[0]
+            steps = max(steps, self.current_step - oldest_start)
+        return steps
+
+    def _record_prefill_kv_shortfall(self, request: Request) -> None:
+        """An in-flight prefill could not allocate its next chunk (it preempts
+        or waits) while lending is on: count it once per step, and stop
+        lending."""
+        if (
+            request not in self._inflight_prefills
+            or self._prefill_kv_shortfall_step == self.current_step
+        ):
+            return
+        self._prefill_kv_shortfall_step = self.current_step
+        self._num_prefill_kv_shortfalls += 1
+        self._num_prefill_kv_shortfalls_with_loans += self._num_kv_loans_out > 0
+        free = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        self._enter_kv_load_lend_backoff(
+            f"an in-flight prefill could not allocate its next chunk ({free} free "
+            "blocks)"
+        )
+        self._maybe_log_kv_load_lending()
+
+    def _maybe_log_kv_load_lending(self) -> None:
+        """Log the lending counters at most once a minute."""
+        now = time.monotonic()
+        start = self._kv_load_lend_log_time
+        if start is None:
+            start = self._kv_load_lend_log_time = now
+        elapsed = now - start
+        if elapsed < 60.0:
+            return
+        lends, backoffs, shortfalls, lent_shortfalls = self._kv_load_lend_logged
+        returned, steps, max_steps, seconds, max_seconds = self._kv_loan_lifetimes
+        num_shortfalls = self._num_prefill_kv_shortfalls - shortfalls
+        num_lent_shortfalls = self._num_prefill_kv_shortfalls_with_loans - (
+            lent_shortfalls
+        )
+        logger.info(
+            "Async KV loads admitted into KV reserved by in-flight prefills in "
+            "the last %.0f s: %d (most blocks borrowed: %d); loans returned: %d, "
+            "lifetime mean %.1f / max %d steps, mean %.2f / max %.2f s; loans "
+            "outstanding: %d; load hold estimate: %s steps, runway %d tokens; "
+            "lending back-offs: %d; in-flight prefill KV shortfalls: %d with "
+            "loans outstanding, %d without (since start: %d loans, %d back-offs, "
+            "%d shortfalls with loans, %d without)",
+            elapsed,
+            self._num_kv_load_lends - lends,
+            self._kv_load_lend_max_borrowed,
+            returned,
+            steps / returned if returned else 0.0,
+            max_steps,
+            seconds / returned if returned else 0.0,
+            max_seconds,
+            self._num_kv_loans_out,
+            self._kv_load_hold_estimate(),
+            self._kv_load_horizon_tokens,
+            self._num_kv_load_lend_backoffs - backoffs,
+            num_lent_shortfalls,
+            num_shortfalls - num_lent_shortfalls,
+            self._num_kv_load_lends,
+            self._num_kv_load_lend_backoffs,
+            self._num_prefill_kv_shortfalls_with_loans,
+            self._num_prefill_kv_shortfalls
+            - self._num_prefill_kv_shortfalls_with_loans,
+        )
+        self._kv_load_lend_logged = (
+            self._num_kv_load_lends,
+            self._num_kv_load_lend_backoffs,
+            self._num_prefill_kv_shortfalls,
+            self._num_prefill_kv_shortfalls_with_loans,
+        )
+        self._kv_loan_lifetimes = [0, 0, 0, 0.0, 0.0]
+        self._kv_load_lend_max_borrowed = 0
+        self._kv_load_lend_log_time = now
 
     def _reserve_parked(self, request: Request) -> None:
         """Cache a parked async KV load's reservation. Set when parked and refreshed
@@ -3589,6 +3894,8 @@ class Scheduler(SchedulerInterface):
                 # (Freed blocks are re-recorded for zeroing when
                 # reallocated, so the skipped blocks need no handling.)
                 self.kv_cache_manager.free(request)
+                if self._kv_load_starts:
+                    self._end_kv_load(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
