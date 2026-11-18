@@ -188,6 +188,23 @@ def _qkv_fused_epilogue_min_tokens(supported: bool) -> int:
     return min_tokens
 
 
+def _qkv_fused_epilogue_small_m(supported: bool) -> bool:
+    """Whether VLLM_MINIMAX_M3_QKV_FUSED_EPILOGUE_SMALL_M=1 applies: batches
+    of up to 64 tokens that take the fused QKV+indexer epilogue run its
+    small-M tile config (64-row activation stages, a deeper weight pipeline,
+    the weights prefetched before the PDL wait), whose outputs are the
+    default config's, bit for bit."""
+    if os.getenv("VLLM_MINIMAX_M3_QKV_FUSED_EPILOGUE_SMALL_M", "0") != "1":
+        return False
+    if not supported:
+        logger.warning_once(
+            "VLLM_MINIMAX_M3_QKV_FUSED_EPILOGUE_SMALL_M=1 has no effect: this "
+            "layer cannot run the fused QKV+indexer epilogue."
+        )
+        return False
+    return True
+
+
 # Smallest batch whose o_proj/down_proj runs the fused GEMM-RS kernel. Below
 # it, the GEMM followed by sp_reduce_scatter is as fast (TP4 GB300, see
 # benchmarks/kernels/benchmark_gemm_rs_ar.py --model minimax_m3).
@@ -1126,6 +1143,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.qkv_fused_epilogue_min_tokens = _qkv_fused_epilogue_min_tokens(
             self.use_qkv_fused_epilogue
         )
+        self.qkv_fused_epilogue_small_m = _qkv_fused_epilogue_small_m(
+            self.use_qkv_fused_epilogue
+        )
         if self.use_qkv_fused_epilogue:
             from vllm.models.minimax_m3.nvidia.ops.qkv_index_fused_epilogue import (
                 register_qkv_index_fused_epilogue_warmup,
@@ -1143,6 +1163,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                     block_size=block_size,
                     weight_bytes=self.qkv_proj.output_size_per_partition
                     * self.hidden_size,
+                    small_m=self.qkv_fused_epilogue_small_m,
                 )
 
     def get_attn_backend(self) -> type[MiniMaxM3SparseBackend]:
@@ -1172,6 +1193,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         """qkv_proj + QK-norm/RoPE + KV/index-cache insert as one MXFP8 kernel,
         writing q (bf16 or E4M3, as allocated) and index_q."""
         from vllm.models.minimax_m3.nvidia.ops.qkv_index_fused_epilogue import (
+            SMALL_M_ROWS,
             minimax_m3_qkv_index_fused_epilogue,
         )
 
@@ -1185,6 +1207,17 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             assert isinstance(hidden_states, torch.Tensor)
             xq, xsf = mxfp8_e4m3_quantize(hidden_states, is_sf_swizzled_layout=True)
         q_is_fp8 = q.dtype == torch.float8_e4m3fn
+        if self.qkv_fused_epilogue_small_m and xq.shape[0] <= SMALL_M_ROWS:
+            # Under CUDA graphs this prints while the decode graphs capture.
+            logger.info_once(
+                "MiniMax-M3: the fused QKV+indexer epilogue runs batches of up to "
+                "%d tokens on its small-M tile config: %d-row activation stages, "
+                "a deeper weight pipeline, weights loaded before the PDL wait "
+                "(VLLM_MINIMAX_M3_QKV_FUSED_EPILOGUE_SMALL_M=1).",
+                SMALL_M_ROWS,
+                SMALL_M_ROWS,
+                scope="process",
+            )
         minimax_m3_qkv_index_fused_epilogue(
             xq,
             xsf,
@@ -1207,6 +1240,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             q_fp8_scale=self._q_scale_float,
             k_scale=self._k_scale_float,
             v_scale=self._v_scale_float,
+            small_m=self.qkv_fused_epilogue_small_m,
         )
 
     def _allocate_query(

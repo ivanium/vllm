@@ -42,6 +42,9 @@ from vllm.model_executor.warmup.jit_warmup_cutedsl_helper import VllmCuTeDSLJitK
 HEAD_DIM = 128  # one 128-col N-tile per head
 # epilogue outputs are consumed by other kernels: stores bypass L1
 _NO_L1_ALLOC = dict(level1_eviction_priority="evict_no_allocate")
+# Largest batch the small-M tile config serves: the A rows one of its
+# pipeline stages holds (see QkvIndexFusedEpilogueKernel)
+SMALL_M_ROWS = 64
 
 
 @cute.jit
@@ -173,6 +176,18 @@ class QkvIndexFusedEpilogueKernel:
     CTA (finer tiles for small M). Warps: 4 * cta_group epilogue, then MMA and
     TMA; cta_group=2 adds 2 padding warps so setmaxnreg can move registers to
     the epilogue (at cta_group=1, 6 warps already fit 255 regs each).
+
+    small_m (cta_group=1, M <= SMALL_M_ROWS): a pipeline stage holds only
+    the first SMALL_M_ROWS rows of A. The MMA still reads BM rows; the rest
+    are the next stage's A rows (or a spare stage after the last one), so
+    output rows from SMALL_M_ROWS on are garbage and, being >= M, never
+    stored: every stored value is the default config's, bit for bit. The
+    smem this frees holds 8 weight stages instead of 6, so each CTA keeps a
+    third more of B in flight (decode M has one M-tile: 77 CTAs at TP1, each
+    streaming its 128-row panel of the weight at the latency-bound rate).
+    prefetch_weights: the TMA warp puts the first tile's first stages of B
+    and SFB in flight before the PDL wait, as the norm weights already are;
+    A and SFA, the previous kernel's output, load after it.
     """
 
     def __init__(
@@ -182,10 +197,13 @@ class QkvIndexFusedEpilogueKernel:
         cta_group: int = 2,
         group_m: int = 1,
         use_pdl: bool = True,
+        small_m: bool = False,
+        prefetch_weights: bool = False,
     ) -> None:
         assert nkv in (1, 2, 4)
         assert block_size % 4 == 0  # V scales swizzle over 4-token quads
         assert cta_group in (1, 2)
+        assert cta_group == 1 or not small_m
         self.cta_group = cta_group
         self.group_m = group_m
         self.num_warps = 12 if cta_group == 2 else 6
@@ -207,12 +225,18 @@ class QkvIndexFusedEpilogueKernel:
 
         BM, BN, BK = 128, cta_group * HEAD_DIM, 128
         self.cta_tile = (BM, BN, BK)
+        self.small_m = small_m
+        self.prefetch_weights = prefetch_weights
+        # A rows one stage holds (and its TMA box)
+        self.a_rows = SMALL_M_ROWS if small_m else BM
         # per CTA and stage: A + this CTA's share of B (cta_group=2 splits B
         # across the pair) + SFA + full SFB (each CTA multicasts its half)
-        self.stage_size = (BM + BN // cta_group) * BK + (BM + BN) * (BK // 32)
-        self.num_stages = (
-            cutlass.memory.SmemAllocator.capacity_in_bytes() // self.stage_size
-        )
+        self.stage_size = (self.a_rows + BN // cta_group) * BK + (BM + BN) * (BK // 32)
+        smem_bytes = cutlass.memory.SmemAllocator.capacity_in_bytes()
+        if small_m:
+            # less the spare A stage, the norm weights, barriers and alignment
+            smem_bytes -= (BM - self.a_rows) * BK + 2048
+        self.num_stages = smem_bytes // self.stage_size
 
     @cute.jit
     def prepare_AB(self, A: cute.Tensor, BM: int, BK: int) -> cpasync.TmaInfo:
@@ -270,7 +294,7 @@ class QkvIndexFusedEpilogueKernel:
         N, _ = B.shape
         BM, BN, BK = self.cta_tile
 
-        A_tma = self.prepare_AB(A, BM, BK)
+        A_tma = self.prepare_AB(A, self.a_rows, BK)
         B_tma = self.prepare_AB(B, BN // self.cta_group, BK)
         SFA_tma = self.prepare_SF(
             SFA, M, K // 32, cpasync.CopyBulkTensorTileG2SOp(self.tma_group)
@@ -370,6 +394,10 @@ class QkvIndexFusedEpilogueKernel:
             byte_alignment=128,
             swizzle=A_tma.smem_layout.inner,
         )
+        if cutlass.const_expr(self.small_m):
+            # spare A stage right after the last one, which its MMA reads
+            # rows SMALL_M_ROWS.. of (sA ends 128B-aligned)
+            smem.allocate_array(Uint8, (BM - self.a_rows) * BK)
         sB = smem.allocate_tensor(
             Float8E4M3FN,
             B_tma.smem_layout.outer,
@@ -452,18 +480,26 @@ class QkvIndexFusedEpilogueKernel:
                         sW[None, t % 16, i],
                     )
             cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()  # sW visible (cluster_arrive is relaxed)
+            if cutlass.const_expr(not self.small_m):
+                cute.arch.cp_async_wait_group(0)
+        # sW visible (cluster_arrive is relaxed); small_m: the epilogue waits
+        # for it, so its load stays off the TMA warp's first issue
+        cute.arch.sync_threads()
         cute.arch.cluster_arrive_relaxed()
         cute.arch.cluster_wait()
-
-        if cutlass.const_expr(self.use_pdl):
-            cute.arch.griddepcontrol_wait()
 
         # warps: 4 * cg epilogue (one warpgroup per head), then MMA, TMA (and 2
         # padding warps at cg=2, completing the producer warpgroup)
         MMA_WARP = 4 * cg
         TMA_WARP = MMA_WARP + 1
+
+        if cutlass.const_expr(self.use_pdl):
+            if cutlass.const_expr(self.prefetch_weights):
+                # the TMA warp waits once the weights are in flight
+                if warp_id != TMA_WARP:
+                    cute.arch.griddepcontrol_wait()
+            else:
+                cute.arch.griddepcontrol_wait()
         # setmaxnreg (cg=2): the producer warpgroup drops to 40 regs, the
         # epilogue rises to 232 (2*128*232 + 128*40 <= 64K)
         REG_DEC = 40
@@ -484,51 +520,127 @@ class QkvIndexFusedEpilogueKernel:
             tma_empty_parity = 1
             tma_full_mbar_ = to_cta0_smem(tma_full_mbar)
 
-            gA_tiles = cute.zipped_divide(A_tma.tma_tensor, (BM, BK))
+            gA_tiles = cute.zipped_divide(A_tma.tma_tensor, (self.a_rows, BK))
             gB_tiles = cute.zipped_divide(B_tma.tma_tensor, (BN // cg, BK))
             # SF boxes: one [32, 4, 4] atom = (64, 1) Int64 (see prepare_SF)
             gSFA_tiles = cute.zipped_divide(SFA_tma.tma_tensor, (64, 1))
             gSFB_tiles = cute.zipped_divide(SFB_tma.tma_tensor, (64, 1))
 
-            for bid in range(raw_bid, total_tiles, num_bids):
-                bid_m, bid_n = tile_coords(bid, grid_mp, grid_n, cg, self.group_m)
-
-                for iter_k in cutlass.range(cute.ceil_div(K, BK), unroll=1):
-                    mbar = tma_full_mbar_ + tma_stage
-                    cute.arch.mbarrier_wait(
-                        tma_empty_mbar + tma_stage, tma_empty_parity
-                    )
+            if cutlass.const_expr(self.prefetch_weights):
+                # The weights do not depend on the previous kernel: the first
+                # tile's first stages (fresh, so no empty wait) take B and SFB
+                # now, and A and SFA after the PDL wait (the wrapper keeps
+                # every CTA's first tile in range: grid <= tiles). Copies are
+                # written out in place: the DSL does not capture into staged
+                # loops.
+                num_k = cute.ceil_div(K, BK)
+                num_prefetch = cutlass.min(num_stages, num_k)
+                bid_m, bid_n = tile_coords(raw_bid, grid_mp, grid_n, cg, self.group_m)
+                for iter_k in cutlass.range(num_prefetch, unroll=1):
+                    mbar = tma_full_mbar_ + iter_k
                     with cute.arch.elect_one():
                         mbarrier.arrive_expect_tx(mbar, self.stage_size, "cluster")
                     simple_tma_copy(
-                        A_tma.atom,
-                        gA_tiles[None, (bid_m, iter_k)],
-                        sA[None, None, tma_stage],
-                        mbar,
-                    )
-                    simple_tma_copy(
                         B_tma.atom,
                         gB_tiles[None, (cg * bid_n + cta_rank, iter_k)],
-                        sB[None, None, tma_stage],
-                        mbar,
-                    )
-                    simple_tma_copy(
-                        SFA_tma.atom,
-                        gSFA_tiles[None, (iter_k, bid_m)],
-                        sSFA[None, None, tma_stage],
+                        sB[None, None, iter_k],
                         mbar,
                     )
                     simple_tma_copy(
                         SFB_tma.atom,
                         gSFB_tiles[None, (iter_k, cg * bid_n + cta_rank)],
-                        sSFB[None, None, cta_rank, tma_stage],
+                        sSFB[None, None, cta_rank, iter_k],
                         mbar,
                         mcast_mask=cta_pair,
                     )
+                if cutlass.const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_wait()
 
-                    tma_stage = (tma_stage + 1) % num_stages
-                    if tma_stage == 0:
-                        tma_empty_parity ^= 1
+                for bid in range(raw_bid, total_tiles, num_bids):
+                    bid_m, bid_n = tile_coords(bid, grid_mp, grid_n, cg, self.group_m)
+
+                    for iter_k in cutlass.range(num_k, unroll=1):
+                        mbar = tma_full_mbar_ + tma_stage
+                        # B and SFB of the prefetched stages are in flight
+                        if bid != raw_bid or iter_k >= num_prefetch:
+                            cute.arch.mbarrier_wait(
+                                tma_empty_mbar + tma_stage, tma_empty_parity
+                            )
+                            with cute.arch.elect_one():
+                                mbarrier.arrive_expect_tx(
+                                    mbar, self.stage_size, "cluster"
+                                )
+                        simple_tma_copy(
+                            A_tma.atom,
+                            gA_tiles[None, (bid_m, iter_k)],
+                            sA[None, None, tma_stage],
+                            mbar,
+                        )
+                        simple_tma_copy(
+                            SFA_tma.atom,
+                            gSFA_tiles[None, (iter_k, bid_m)],
+                            sSFA[None, None, tma_stage],
+                            mbar,
+                        )
+                        if bid != raw_bid or iter_k >= num_prefetch:
+                            simple_tma_copy(
+                                B_tma.atom,
+                                gB_tiles[None, (cg * bid_n + cta_rank, iter_k)],
+                                sB[None, None, tma_stage],
+                                mbar,
+                            )
+                            simple_tma_copy(
+                                SFB_tma.atom,
+                                gSFB_tiles[None, (iter_k, cg * bid_n + cta_rank)],
+                                sSFB[None, None, cta_rank, tma_stage],
+                                mbar,
+                                mcast_mask=cta_pair,
+                            )
+
+                        tma_stage = (tma_stage + 1) % num_stages
+                        if tma_stage == 0:
+                            tma_empty_parity ^= 1
+
+            else:
+                for bid in range(raw_bid, total_tiles, num_bids):
+                    bid_m, bid_n = tile_coords(bid, grid_mp, grid_n, cg, self.group_m)
+
+                    for iter_k in cutlass.range(cute.ceil_div(K, BK), unroll=1):
+                        mbar = tma_full_mbar_ + tma_stage
+                        cute.arch.mbarrier_wait(
+                            tma_empty_mbar + tma_stage, tma_empty_parity
+                        )
+                        with cute.arch.elect_one():
+                            mbarrier.arrive_expect_tx(mbar, self.stage_size, "cluster")
+                        simple_tma_copy(
+                            A_tma.atom,
+                            gA_tiles[None, (bid_m, iter_k)],
+                            sA[None, None, tma_stage],
+                            mbar,
+                        )
+                        simple_tma_copy(
+                            B_tma.atom,
+                            gB_tiles[None, (cg * bid_n + cta_rank, iter_k)],
+                            sB[None, None, tma_stage],
+                            mbar,
+                        )
+                        simple_tma_copy(
+                            SFA_tma.atom,
+                            gSFA_tiles[None, (iter_k, bid_m)],
+                            sSFA[None, None, tma_stage],
+                            mbar,
+                        )
+                        simple_tma_copy(
+                            SFB_tma.atom,
+                            gSFB_tiles[None, (iter_k, cg * bid_n + cta_rank)],
+                            sSFB[None, None, cta_rank, tma_stage],
+                            mbar,
+                            mcast_mask=cta_pair,
+                        )
+
+                        tma_stage = (tma_stage + 1) % num_stages
+                        if tma_stage == 0:
+                            tma_empty_parity ^= 1
 
             if cutlass.const_expr(self.use_pdl):
                 cute.arch.griddepcontrol_launch_dependents()
@@ -646,6 +758,11 @@ class QkvIndexFusedEpilogueKernel:
             grid_mp, grid_n, total_tiles = num_tiles(M, N, cg)
             tmem_stage = 0
             tmem_parity = 0
+            if cutlass.const_expr(self.small_m):
+                # the norm weights warps 2-3 loaded (visible to warps 0-1
+                # after the first tile's BAR_EPI)
+                if warp_id >= 2:
+                    cute.arch.cp_async_wait_group(0)
             for bid in range(raw_bid, total_tiles, num_bids):
                 bid_m, bid_n = tile_coords(bid, grid_mp, grid_n, cg, self.group_m)
                 acc_base = acc_odd * tmem_stage
@@ -827,16 +944,32 @@ class _QkvIndexFusedEpilogueJit(
         group_m: int
         cta_group: int
         use_pdl: bool = True
+        # the small-M tile config and the weight prefetch (cta_group=1)
+        small_m: bool = False
+        prefetch_weights: bool = False
 
     @staticmethod
     def kernel(key: CompileKey) -> QkvIndexFusedEpilogueKernel:
         return QkvIndexFusedEpilogueKernel(
-            key.nkv, key.block_size, key.cta_group, key.group_m, key.use_pdl
+            key.nkv,
+            key.block_size,
+            key.cta_group,
+            key.group_m,
+            key.use_pdl,
+            key.small_m,
+            key.prefetch_weights,
         )
 
-    def get_warmup_keys(self, **fields) -> list[CompileKey]:
+    def get_warmup_keys(self, small_m: bool = False, **fields) -> list[CompileKey]:
         # a layer's keys differ only in the tile config, picked per batch size
-        return [self.CompileKey(cta_group=cg, **fields) for cg in (1, 2)]
+        keys = [self.CompileKey(cta_group=cg, **fields) for cg in (1, 2)]
+        if small_m:
+            keys.append(
+                self.CompileKey(
+                    cta_group=1, small_m=True, prefetch_weights=True, **fields
+                )
+            )
+        return keys
 
     def warmup_inputs(self, key: CompileKey) -> tuple:
         M = cute.sym_int()
@@ -942,17 +1075,28 @@ def _group_m(weight_bytes: int, l2_bytes: int) -> int:
 
 
 def register_qkv_index_fused_epilogue_warmup(
-    *, has_q: bool, has_qfp8: bool, nkv: int, block_size: int, weight_bytes: int
+    *,
+    has_q: bool,
+    has_qfp8: bool,
+    nkv: int,
+    block_size: int,
+    weight_bytes: int,
+    small_m: bool = False,
 ) -> None:
-    """Compile this layer's kernels (both tile configs) during JIT warmup."""
+    """Compile this layer's kernels (both tile configs) during JIT warmup.
+    small_m: also the small-M config the layer's batches of up to
+    SMALL_M_ROWS tokens run."""
     _, l2_bytes = _device_info(torch.accelerator.current_device_index())
-    _JIT.register_warmup(
+    fields = dict(
         has_q=has_q,
         has_qfp8=has_qfp8,
         nkv=nkv,
         block_size=block_size,
         group_m=_group_m(weight_bytes, l2_bytes),
     )
+    if small_m:
+        fields["small_m"] = True
+    _JIT.register_warmup(**fields)
 
 
 def minimax_m3_qkv_index_fused_epilogue(
@@ -981,6 +1125,8 @@ def minimax_m3_qkv_index_fused_epilogue(
     cta_group: int | None = None,
     use_pdl: bool = True,
     grid: int | None = None,
+    small_m: bool = False,
+    prefetch_weights: bool | None = None,
 ) -> None:
     """QKV+indexer projection with fused epilogue: writes q (bf16 and / or
     fp8; at least one) and index_q, and NVFP4-inserts k / v / index_k into the
@@ -1015,6 +1161,12 @@ def minimax_m3_qkv_index_fused_epilogue(
             tiles) or None (pick by wave count).
         use_pdl: launch with programmatic dependent launch.
         grid: persistent grid size override (testing).
+        small_m: run batches of up to SMALL_M_ROWS tokens on the 1-SM tile
+            config with SMALL_M_ROWS-row A stages, a deeper weight pipeline
+            and the weights prefetched before the PDL wait (same outputs,
+            bit for bit). No effect on larger batches or at cta_group=2.
+        prefetch_weights: override the prefetch of the small-M config
+            (testing; None: on exactly when the small-M config runs).
 
     """
     M, K = xq.shape
@@ -1057,6 +1209,11 @@ def minimax_m3_qkv_index_fused_epilogue(
         cta_group = 1 if 2 * waves1 < 3 * waves2 else 2
     if grid is None:
         grid = min(num_sms, num_tiles(cta_group))
+    small_m = small_m and cta_group == 1 and M <= SMALL_M_ROWS
+    if prefetch_weights is None:
+        prefetch_weights = small_m
+    # a CTA without a tile must not prefetch one
+    assert not prefetch_weights or (cta_group == 1 and grid <= num_tiles(1))
     # caches as [nb, page_bytes], keeping the page stride (a flat 1-D view
     # exceeds the DSL's int32 shapes at production sizes)
     slot_bytes = block_size * token_bytes
@@ -1074,6 +1231,8 @@ def minimax_m3_qkv_index_fused_epilogue(
         group_m=_group_m(wq.numel(), l2_bytes),
         cta_group=cta_group,
         use_pdl=use_pdl,
+        small_m=small_m,
+        prefetch_weights=prefetch_weights,
     )
     _JIT._get_or_compile(key)(
         xq,
