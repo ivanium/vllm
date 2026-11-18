@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
+import os
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -66,10 +69,96 @@ def activation_to_flashinfer_type(activation: MoEActivation) -> "ActivationType"
     return ACTIVATION_TO_FI_ACTIVATION[activation]
 
 
+_NVFP4_PER_TOKEN_SKIP_ZERO_FILL_ENV = "VLLM_NVFP4_PER_TOKEN_QUANT_SKIP_ZERO_FILL"
+
+
+@functools.cache
+def _nvfp4_per_token_quantize_into(
+    device_index: int,
+) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None] | None:
+    """FlashInfer's per-token NVFP4 quantize, linear scale-factor layout, into
+    caller-allocated buffers; None unless
+    VLLM_NVFP4_PER_TOKEN_QUANT_SKIP_ZERO_FILL=1 and this FlashInfer has it.
+
+    Runs the kernel `nvfp4_quantize(..., per_token_activation=True)` runs, with
+    the same 4over6 recipe (resolved from the FLASHINFER_NVFP4_4OVER6*
+    environment, as an omitted `nvfp4_4over6` argument is).
+    """
+    if os.environ.get(_NVFP4_PER_TOKEN_SKIP_ZERO_FILL_ENV, "0") != "1":
+        return None
+    try:
+        from flashinfer import SfLayout
+        from flashinfer.quantization import (
+            get_fp4_quantization_module,
+            nvfp4_4over6_code,
+            resolve_nvfp4_4over6,
+        )
+
+        major, minor = torch.cuda.get_device_capability(device_index)
+        quantize_out = get_fp4_quantization_module(
+            f"{major * 10 + minor}"
+        ).nvfp4_quant_and_per_token_scale_out_sm100
+    except (ImportError, AttributeError, ValueError) as e:
+        logger.warning_once(
+            "%s=1 has no effect: this FlashInfer has no per-token NVFP4 "
+            "quantize into caller-allocated buffers (%s).",
+            _NVFP4_PER_TOKEN_SKIP_ZERO_FILL_ENV,
+            e,
+            scope="process",
+        )
+        return None
+    recipe_code = nvfp4_4over6_code(resolve_nvfp4_4over6())
+    sf_layout = SfLayout.layout_linear.value
+    logger.info_once(
+        "NVFP4 per-token activation quantization writes its scale factors "
+        "into an uninitialized buffer: no zero fill, so no memset node per MoE "
+        "layer in CUDA graphs (%s=1).",
+        _NVFP4_PER_TOKEN_SKIP_ZERO_FILL_ENV,
+        scope="process",
+    )
+
+    def quantize_into(
+        x: torch.Tensor,
+        out: torch.Tensor,
+        out_scale: torch.Tensor,
+        out_per_token_scale: torch.Tensor,
+    ) -> None:
+        quantize_out(
+            x,
+            NVFP4_PER_TOKEN_BASE_GLOBAL_SCALE,
+            out,
+            out_scale,
+            out_per_token_scale,
+            None,
+            sf_layout,
+            recipe_code,
+        )
+
+    return quantize_into
+
+
 def quantize_nvfp4_per_token_input(
     hidden_states: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize NVFP4 activations with one FP32 decode scale per token."""
+    """Quantize NVFP4 activations with one FP32 decode scale per token.
+
+    With VLLM_NVFP4_PER_TOKEN_QUANT_SKIP_ZERO_FILL=1 the scale factors go into
+    an uninitialized buffer. The linear layout has no padding and the kernel
+    writes all of it, so the zero fill `nvfp4_quantize` gives its own buffer
+    changes nothing. Since torch zeroes CUDA tensors with cudaMemsetAsync, a
+    captured CUDA graph holds that fill as a memset node per call (per MoE
+    layer and step), which replays several microseconds slower than a kernel
+    and stops programmatic dependent launch across it.
+    """
+    quantize_into = _nvfp4_per_token_quantize_into(hidden_states.device.index)
+    if quantize_into is not None:
+        m, k = hidden_states.shape
+        out = hidden_states.new_empty((m, k // 2), dtype=torch.uint8)
+        out_scale = hidden_states.new_empty((m, k // 16), dtype=torch.uint8)
+        out_per_token_scale = hidden_states.new_empty((m,), dtype=torch.float32)
+        quantize_into(hidden_states, out, out_scale, out_per_token_scale)
+        return out, out_scale, out_per_token_scale
+
     from flashinfer import SfLayout, nvfp4_quantize
 
     return nvfp4_quantize(
