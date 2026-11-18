@@ -273,6 +273,8 @@ class ReqMeta:
     # Worker-only, per-group range of the remote-sized sub-blocks of each local
     # group a pull covers. None derives it from the block counts.
     covered_sub_blocks: list[range] | None = None
+    receiver_generation: int = 0
+    receiver_is_async: bool = False
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -290,6 +292,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.reqs_not_processed: set[ReqId] = set()
         # Heartbeat data grouped by remote engine, sent by D worker to P.
         self.heartbeat_by_engine: dict[EngineId, HeartbeatInfo] = {}
+        # None means unchanged; a version with an empty mapping removes all targets.
+        self.receiver_heartbeat_version: int | None = None
         # Push mode (D side): registration data the D worker should send to
         # P workers via NIXL notification on this step.
         self.push_registrations: dict[ReqId, dict[str, Any]] = {}
