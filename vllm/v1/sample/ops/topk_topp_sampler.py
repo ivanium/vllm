@@ -15,10 +15,12 @@ from vllm.utils.flashinfer import has_flashinfer
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import (
         _topk_topp,
+        _topp_split_fused,
         _topp_split_mask,
         _topp_split_stats,
         _topp_split_step,
         apply_top_k_top_p_triton,
+        topp_split_fused_enabled,
     )
 
 logger = init_logger(__name__)
@@ -32,6 +34,8 @@ def register_top_k_top_p_warmups() -> None:
             _topp_split_stats.register_warmup()
             _topp_split_step.register_warmup()
             _topp_split_mask.register_warmup()
+            if topp_split_fused_enabled():
+                _topp_split_fused.register_warmup()
 
 
 def _flashinfer_jit_unsupported_reason(capability: DeviceCapability) -> str | None:

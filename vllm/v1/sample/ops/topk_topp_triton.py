@@ -8,10 +8,12 @@ using Pivot-based Truncation and Selection" By Park et al.
 
 """
 
+import os
 from typing import Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup import (
     WarmupChoices,
     WarmupIntRange,
@@ -27,6 +29,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.platform_utils import num_compute_units
+
+logger = init_logger(__name__)
 
 _TRITON_TABLE_CACHE: dict[tuple[torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 _TRITON_BUFFER_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
@@ -1569,6 +1573,452 @@ def _topp_split_mask(
     )
 
 
+# ---------------------------------------------------------------------------
+# The split-row pipeline in one launch (VLLM_TOPP_SPLIT_FUSED=1).
+#
+# Each program is one (row, slice), as in the kernels above, but it carries
+# its slice through every phase: stats, the rounds, then the mask. After
+# each phase it publishes its partials, meets the row's other S programs at
+# a barrier (an arrival counter per row), and combines the published
+# partials itself, as the next kernel of the pipeline would. Every phase
+# runs the code of its kernel above on the same tiles, so every partial,
+# every combine and the kept set are bitwise the pipeline's. What goes away
+# is six launches, the row-stats reload of every kernel and the combine
+# replay (15 combines per row become 5).
+#
+# Within a round, a tile whose probabilities all lie outside the round's
+# pivot ladder takes an exact shortcut. With nothing above the lowest pivot
+# it adds nothing to any partial (+0.0, an inf minimum and a zero count are
+# no-ops), so it is skipped. With nothing between the lowest and the
+# highest pivot, every pivot sees the same set above it, so one row of the
+# (F, BLOCK) reduction, with the same layout and thus the same reduction
+# tree as each row of the full one, gives all F partials.
+#
+# A program takes its (row, slice) from a ticket counter instead of its
+# program id, so the programs that run always hold a prefix of the tickets
+# and a row's barrier only waits for programs that are already running:
+# whatever order the hardware starts them in, nothing deadlocks as long as
+# S programs fit on the GPU at once. The last program out zeroes the
+# counters for the next launch, so the workspace needs no reset (CUDA-graph
+# safe). Calls must not overlap on one device, as for the pipeline above.
+# ---------------------------------------------------------------------------
+
+# Counters after the per-row arrival counters: the ticket, then the exits.
+_FUSED_SYNC_SLOTS = _SPLIT_MAX_BATCH + 2
+# The step kernel's tile (so its reductions' layout); the mask uses it too.
+_SPLIT_FUSED_STEP_BLOCK = 2048
+# Two programs per SM (8 warps each), so more rows run at once.
+_SPLIT_FUSED_MAXNREG = 128
+
+_topp_split_fused_enabled: bool | None = None
+_topp_split_fused_logged = False
+
+
+def topp_split_fused_enabled() -> bool:
+    """VLLM_TOPP_SPLIT_FUSED=1, read once per process: run the small-batch
+    top-p pipeline in one launch (CUDA only)."""
+    global _topp_split_fused_enabled
+    if _topp_split_fused_enabled is None:
+        _topp_split_fused_enabled = os.environ.get(
+            "VLLM_TOPP_SPLIT_FUSED", "0"
+        ).lower() in ("1", "true")
+        if _topp_split_fused_enabled and not current_platform.is_cuda():
+            logger.info(
+                "VLLM_TOPP_SPLIT_FUSED=1 is CUDA only; top-p masking for "
+                "small batches keeps its multi-launch pipeline here."
+            )
+            _topp_split_fused_enabled = False
+    return _topp_split_fused_enabled
+
+
+def _topp_split_fused_fits(logits: torch.Tensor, num_sm: int) -> bool:
+    """A row's programs must all fit on the GPU at once."""
+    splits = _topp_split_count(logits.shape[0], logits.shape[1], num_sm)
+    if splits <= num_sm:
+        return True
+    logger.info_once(
+        "VLLM_TOPP_SPLIT_FUSED=1: %d programs per row exceed %d SMs; top-p "
+        "masking for small batches keeps its multi-launch pipeline.",
+        splits,
+        num_sm,
+    )
+    return False
+
+
+@triton.jit
+def _topp_sb_row_barrier(COUNTER, target):
+    """Arrive at a row's barrier and wait until `target` arrivals."""
+    # Every thread's stores of this phase come before the arrival.
+    tl.debug_barrier()
+    arrived = tl.atomic_add(COUNTER, 1, sem="acq_rel", scope="gpu") + 1
+    while arrived < target:
+        arrived = tl.atomic_add(COUNTER, 0, sem="acquire", scope="gpu")
+    tl.debug_barrier()
+
+
+@triton.jit
+def _topp_sb_tile(
+    ROW,
+    i,
+    end,
+    offs,
+    M,
+    Z,
+    pivs,
+    piv_lo,
+    piv_hi,
+    pmax_t,
+    first_round,
+    F: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One round's partials of one tile: the step kernel's loop body, with
+    exact shortcuts. Returns (sum, min, count) per pivot, an upper bound on
+    the tile's probabilities, and (first round) the tile's largest logit."""
+    tsum = tl.zeros([F], dtype=tl.float32)
+    tmin = tl.full([F], float("inf"), dtype=tl.float32)
+    tcnt = tl.zeros([F], dtype=tl.float32)
+    pmax_new = piv_lo
+    xmax = tl.full((), float("inf"), dtype=tl.float32)
+    # Nothing above the lowest pivot: the tile adds nothing to any partial
+    # (+0.0, an inf minimum and a zero count), so it is not even loaded.
+    if pmax_t > piv_lo:
+        x = tl.load(ROW + i + offs, mask=i + offs < end, other=-float("inf"))
+        pr = tl.exp(x - M) / Z
+        # 2: some probability inside the ladder (and all of the first round);
+        # 1: the same set above every pivot; 0: nothing above any pivot.
+        path = tl.full((), 2, dtype=tl.int32)
+        if first_round:
+            xmax = tl.max(x)
+        else:
+            above_lo = (pr > piv_lo).to(tl.int32)
+            above_hi = (pr > piv_hi).to(tl.int32)
+            counts = tl.sum(above_lo + above_hi * 4096)
+            n_above = counts % 4096
+            n_top = counts // 4096
+            path = tl.where(n_above > n_top, 2, tl.where(n_top > 0, 1, 0))
+        if path == 2:
+            pr2 = tl.broadcast_to(pr[None, :], (F, BLOCK))
+            above = pr2 > pivs[:, None]
+            tsum = tl.sum(tl.where(above, pr2, 0.0), axis=1)
+            cand = tl.where(above, pr2, float("inf"))
+            tmin = tl.min(cand, axis=1)
+            teq = above & (tl.abs(pr2 - tmin[:, None]) < 1e-9)
+            tcnt = tl.sum(teq.to(tl.float32), axis=1)
+            # The lowest pivot with nothing above it bounds the tile.
+            pmax_new = tl.min(tl.where(tmin == float("inf"), pivs, float("inf")))
+        elif path == 1:
+            # Every pivot sees the same set: one row of the reduction, in the
+            # same layout and so the same tree as each row of the full one.
+            pr1 = pr[None, :]
+            above1 = pr1 > piv_hi
+            tsum1 = tl.sum(tl.where(above1, pr1, 0.0), axis=1)
+            tmin1 = tl.min(tl.where(above1, pr1, float("inf")), axis=1)
+            teq1 = above1 & (tl.abs(pr1 - tmin1[:, None]) < 1e-9)
+            tcnt1 = tl.sum(teq1.to(tl.float32), axis=1)
+            tsum = tl.zeros([F], dtype=tl.float32) + tsum1
+            tmin = tl.zeros([F], dtype=tl.float32) + tmin1
+            tcnt = tl.zeros([F], dtype=tl.float32) + tcnt1
+            pmax_new = tl.full((), float("inf"), dtype=tl.float32)
+    return tsum, tmin, tcnt, pmax_new, xmax
+
+
+@triton.jit
+def _topp_sb_fold(mass, minl, nmin, tsum, tmin, tcnt):
+    """The step kernel's per-tile accumulation, in tile order."""
+    mass = mass + tsum
+    is_new = tmin < minl
+    is_same = tl.abs(tmin - minl) < 1e-9
+    nmin = tl.where(is_new, tcnt, nmin + tl.where(is_same, tcnt, 0.0))
+    minl = tl.minimum(minl, tmin)
+    return mass, minl, nmin
+
+
+@triton.jit
+def _topp_sb_fused_kernel(
+    LOGITS,
+    LOGITS_STRIDE_0,
+    STATS,
+    PARTS,
+    SYNC,
+    K,
+    P,
+    HAS_K: tl.constexpr,
+    MASK_VALUE: tl.constexpr,
+    S: tl.constexpr,
+    F: tl.constexpr,
+    NUM_ROUNDS: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+    STATS_BLOCK: tl.constexpr,
+    STEP_BLOCK: tl.constexpr,
+    TILES: tl.constexpr,
+    TILES_P2: tl.constexpr,
+    MAX_ROWS: tl.constexpr,
+    SYNC_SLOTS: tl.constexpr,
+):
+    ticket = tl.atomic_add(SYNC + MAX_ROWS, 1, sem="relaxed", scope="gpu")
+    row = ticket // S
+    slice_id = ticket % S
+    p = tl.load(P + row)
+    skip = p >= 1.0
+    if HAS_K:
+        skip = skip | (tl.load(K + row) < VOCAB_SIZE)
+    if skip == 0:
+        slice_len = (VOCAB_SIZE + S - 1) // S
+        start = slice_id * slice_len
+        end = tl.minimum(start + slice_len, VOCAB_SIZE)
+        ROW = LOGITS + row.to(tl.int64) * LOGITS_STRIDE_0
+        # Phase 1, _topp_sb_stats_kernel: this slice's online-softmax
+        # partials (max, sum_exp, min, finite_count).
+        offs_stats = tl.arange(0, STATS_BLOCK)
+        m = -float("inf")
+        exp_sum = 0.0
+        mn = float("inf")
+        cnt = tl.zeros((), dtype=tl.float32)
+        for i in range(start, end, STATS_BLOCK):
+            xs = tl.load(
+                ROW + i + offs_stats, mask=i + offs_stats < end, other=-float("inf")
+            )
+            finite = xs > -float("inf")
+            nm = tl.maximum(m, tl.max(xs))
+            rescale = tl.where(m == -float("inf"), 0.0, tl.exp(m - nm))
+            e = tl.where(finite, tl.exp(xs - nm), 0.0)
+            exp_sum = exp_sum * rescale + tl.sum(e)
+            m = nm
+            mn = tl.minimum(mn, tl.min(tl.where(finite, xs, float("inf"))))
+            cnt += tl.sum(finite.to(tl.float32))
+        base = (row * S + slice_id) * 4
+        tl.store(STATS + base + 0, m)
+        tl.store(STATS + base + 1, exp_sum)
+        tl.store(STATS + base + 2, mn)
+        tl.store(STATS + base + 3, cnt)
+        _topp_sb_row_barrier(SYNC + row, S)
+
+        M, Z, mn, num_finite = _topp_sb_row_stats(STATS, row, S)
+        max_prob = 1.0 / Z
+        min_prob = tl.maximum(tl.exp(mn - M) / Z, 1e-30)
+        # The step and mask kernels' early returns: no finite logit, or a
+        # (nearly) uniform row, keeps everything.
+        stop = (Z <= 0.0) | (num_finite < 1.0)
+        stop = stop | (max_prob <= min_prob * (1.0 + 1e-6))
+        if stop == 0:
+            # Phase 2, _topp_sb_step_kernel per round, each round's combine
+            # done once here instead of replayed by every later kernel.
+            lo = min_prob
+            hi = max_prob
+            best = -1.0
+            best_mass = 0.0
+            best_minl = 1.0
+            best_nmin = 0.0
+            done = 0.0
+            nomask = 0.0
+            pivot = 0.0
+            dup = 1.0
+            numdup = 1.0
+            numkeep = 1.0
+            fin = -1.0
+            best_fin = -1.0
+            offs_step = tl.arange(0, STEP_BLOCK)
+            fidx = tl.arange(0, F)
+            # Exact bounds on the slice's tiles, refined every round: no
+            # probability in tile t exceeds tile_pmax[t], and tile_xmax[t] is
+            # its largest logit.
+            tidx = tl.arange(0, TILES_P2)
+            tile_pmax = tl.full([TILES_P2], float("inf"), dtype=tl.float32)
+            tile_xmax = tl.full([TILES_P2], float("inf"), dtype=tl.float32)
+            for j in range(NUM_ROUNDS):
+                if done == 0.0:
+                    pivs = _topp_sb_ladder(lo, hi, F)
+                    piv_lo = tl.min(pivs)
+                    piv_hi = tl.max(pivs)
+                    mass = tl.zeros([F], dtype=tl.float32)
+                    minl = tl.full([F], 1.0, dtype=tl.float32)
+                    nmin = tl.zeros([F], dtype=tl.float32)
+                    for t in range(TILES):
+                        here = tidx == t
+                        tsum, tmin, tcnt, pmax_new, xmax = _topp_sb_tile(
+                            ROW,
+                            start + t * STEP_BLOCK,
+                            end,
+                            offs_step,
+                            M,
+                            Z,
+                            pivs,
+                            piv_lo,
+                            piv_hi,
+                            tl.max(tl.where(here, tile_pmax, 0.0)),
+                            j == 0,
+                            F=F,
+                            BLOCK=STEP_BLOCK,
+                        )
+                        tile_pmax = tl.where(
+                            here, tl.minimum(tile_pmax, pmax_new), tile_pmax
+                        )
+                        if j == 0:
+                            tile_xmax = tl.where(here, xmax, tile_xmax)
+                        mass, minl, nmin = _topp_sb_fold(
+                            mass, minl, nmin, tsum, tmin, tcnt
+                        )
+                    pslice = PARTS + ((row * NUM_ROUNDS + j) * S + slice_id) * F * 3
+                    tl.store(pslice + fidx * 3 + 0, mass)
+                    tl.store(pslice + fidx * 3 + 1, minl)
+                    tl.store(pslice + fidx * 3 + 2, nmin)
+                    _topp_sb_row_barrier(SYNC + row, S * (j + 2))
+                    (
+                        done,
+                        nomask,
+                        pivot,
+                        dup,
+                        numdup,
+                        numkeep,
+                        lo,
+                        hi,
+                        best,
+                        best_mass,
+                        best_minl,
+                        best_nmin,
+                        sel_fidx,
+                        best_sel,
+                    ) = _topp_sb_combine(
+                        PARTS + (row * NUM_ROUNDS + j) * S * F * 3,
+                        Z,
+                        p,
+                        lo,
+                        hi,
+                        best,
+                        best_mass,
+                        best_minl,
+                        best_nmin,
+                        S=S,
+                        F=F,
+                        IS_LAST=j == NUM_ROUNDS - 1,
+                    )
+                    if sel_fidx >= 0.0:
+                        fin = j * F + sel_fidx
+                    if best_sel >= 0.0:
+                        best_fin = j * F + best_sel
+            if nomask == 0.0:
+                # Phase 3, _topp_sb_mask_kernel. The mask is elementwise (and
+                # the tie budget an exact count in index order), so its tile
+                # size does not change it; it uses the rounds' tiles.
+                if fin < 0.0:
+                    fin = best_fin
+                ties = numkeep < numdup
+                num_preceding = 0.0
+                if ties:
+                    fin_round = tl.cast(fin / F, tl.int32)
+                    fin_slot = tl.cast(fin - tl.cast(fin_round, tl.float32) * F, tl.int32)
+                    pbase = PARTS + ((row * NUM_ROUNDS + fin_round) * S * F + fin_slot) * 3
+                    sidx = tl.arange(0, S)
+                    minl_s = tl.load(pbase + sidx * (F * 3) + 1)
+                    nmin_s = tl.load(pbase + sidx * (F * 3) + 2)
+                    dupc_s = tl.where(tl.abs(minl_s - dup) < 1e-9, nmin_s, 0.0)
+                    num_preceding = tl.sum(tl.where(sidx < slice_id, dupc_s, 0.0))
+                for t in range(TILES):
+                    here = tidx == t
+                    pmax_t = tl.max(tl.where(here, tile_pmax, 0.0))
+                    xmax_t = tl.max(tl.where(here, tile_xmax, -float("inf")))
+                    i = start + t * STEP_BLOCK
+                    mask_n = i + offs_step < end
+                    # No probability above the pivot and no logit at the max:
+                    # nothing is kept (the boundary value `dup` is above the
+                    # pivot too), so the tile is masked without a load.
+                    if (pmax_t <= pivot) & (xmax_t < M):
+                        tl.store(
+                            ROW + i + offs_step,
+                            tl.full([STEP_BLOCK], MASK_VALUE, dtype=tl.float32),
+                            mask=mask_n,
+                        )
+                    else:
+                        xm = tl.load(ROW + i + offs_step, mask=mask_n, other=-float("inf"))
+                        prob = tl.exp(xm - M) / Z
+                        keep = (prob > pivot) | (xm == M)
+                        if ties:
+                            dmask = prob == dup
+                            cum = (
+                                tl.cumsum(dmask.to(tl.int32)).to(tl.float32)
+                                + num_preceding
+                            )
+                            keep_dup = dmask & (cum <= numkeep)
+                            keep = keep & (~dmask | keep_dup)
+                            num_preceding += tl.sum(dmask.to(tl.float32))
+                        tl.store(
+                            ROW + i + offs_step,
+                            tl.where(keep, xm, MASK_VALUE),
+                            mask=mask_n,
+                        )
+    # The last program out zeroes the counters for the next launch.
+    tl.debug_barrier()
+    exits = tl.atomic_add(SYNC + MAX_ROWS + 1, 1, sem="acq_rel", scope="gpu")
+    if exits == tl.num_programs(0) - 1:
+        sync_idx = tl.arange(0, SYNC_SLOTS)
+        tl.store(
+            SYNC + sync_idx,
+            tl.zeros([SYNC_SLOTS], dtype=tl.int32),
+            mask=sync_idx < MAX_ROWS + 2,
+        )
+
+
+def _topp_split_fused_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+    vocab_size = vllm_config.model_config.get_vocab_size()
+    num_sm = num_compute_units()
+    logits_stride: Any = WarmupChoices(16, 2)
+    batch_size: Any = WarmupIntRange(
+        1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
+    )
+    has_k: Any = WarmupChoices(False, True)
+    logits = TritonWarmupTensor(
+        torch.float32,
+        shape=(batch_size, vocab_size),
+        strides=(logits_stride, 1),
+    )
+    return dict(
+        logits=logits,
+        stats=TritonWarmupTensor(torch.float32),
+        parts=TritonWarmupTensor(torch.float32),
+        sync=TritonWarmupTensor(torch.int32),
+        k=TritonWarmupTensor(torch.int32) if has_k else None,
+        p=TritonWarmupTensor(torch.float32),
+        mask_value=float("-inf"),
+        num_sm=num_sm,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_topp_sb_fused_kernel,
+    warmup_inputs=_topp_split_fused_warmup_inputs,
+)
+def _topp_split_fused(
+    logits: torch.Tensor,
+    stats: torch.Tensor,
+    parts: torch.Tensor,
+    sync: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor,
+    mask_value: float,
+    num_sm: int,
+) -> DispatchSpec:
+    batch_size, vocab_size = logits.shape
+    splits = _topp_split_count(batch_size, vocab_size, num_sm)
+    tiles = triton.cdiv(triton.cdiv(vocab_size, splits), _SPLIT_FUSED_STEP_BLOCK)
+    return (batch_size * splits,), dict(
+        K=k if k is not None else logits,
+        HAS_K=k is not None,
+        S=splits,
+        F=_SPLIT_FANOUT,
+        NUM_ROUNDS=_SPLIT_ROUNDS,
+        VOCAB_SIZE=vocab_size,
+        STATS_BLOCK=8192,
+        STEP_BLOCK=_SPLIT_FUSED_STEP_BLOCK,
+        TILES=tiles,
+        TILES_P2=next_power_of_2(tiles),
+        MAX_ROWS=_SPLIT_MAX_BATCH,
+        SYNC_SLOTS=next_power_of_2(_FUSED_SYNC_SLOTS),
+        num_warps=8,
+        maxnreg=_SPLIT_FUSED_MAXNREG,
+    )
+
+
 def _apply_topp_split(
     logits: torch.Tensor,
     k: torch.Tensor | None,
@@ -1577,6 +2027,7 @@ def _apply_topp_split(
     num_sm: int,
 ) -> None:
     """Split-row top-p pipeline for small batches; masks logits in place."""
+    global _topp_split_fused_logged
     ws = _TRITON_SPLIT_CACHE.get(logits.device)
     if ws is None:
         ws = {
@@ -1586,6 +2037,38 @@ def _apply_topp_split(
             ),
         }
         _TRITON_SPLIT_CACHE[logits.device] = ws
+
+    if topp_split_fused_enabled() and _topp_split_fused_fits(logits, num_sm):
+        sync = ws.get("sync")
+        if sync is None:
+            # Zeroed once; every launch leaves it zeroed.
+            sync = torch.zeros(
+                _FUSED_SYNC_SLOTS, dtype=torch.int32, device=logits.device
+            )
+            ws["sync"] = sync
+        if not _topp_split_fused_logged:
+            _topp_split_fused_logged = True
+            batch_size, vocab_size = logits.shape
+            logger.info(
+                "Top-p masking for small batches runs in one launch "
+                "(VLLM_TOPP_SPLIT_FUSED=1): first call %d rows x %d vocab, %d "
+                "programs per row, top-k %s.",
+                batch_size,
+                vocab_size,
+                _topp_split_count(batch_size, vocab_size, num_sm),
+                "on" if k is not None else "off",
+            )
+        _topp_split_fused(
+            logits,
+            ws["stats"],
+            ws["parts"],
+            sync,
+            k,
+            p,
+            mask_value,
+            num_sm,
+        )
+        return
 
     _topp_split_stats(
         logits,
