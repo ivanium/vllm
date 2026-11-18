@@ -9,8 +9,9 @@ E4M3 scale per 1x16 block plus a per-expert FP32 global scale; NVFP4 dispatch
 scales each token by its own FP32 scale.
 """
 
+import contextlib
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
 from inspect import signature
 from typing import Any, ClassVar, Literal
@@ -25,8 +26,11 @@ from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.prepare_megamoe import (
+    megamoe_staging_overlap_enabled,
     prepare_megamoe_inputs,
     prepare_megamoe_nvfp4_inputs,
+    stage_megamoe_nvfp4_hidden_states,
+    stage_megamoe_topk,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP8_DTYPE,
@@ -40,6 +44,8 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import aux_stream, current_stream
+from vllm.v1.worker.ubatching import dbo_enabled
 
 logger = init_logger(__name__)
 
@@ -346,6 +352,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
         self.l2_input_scale = l2_input_scale
         self._kernel_kwargs = activation.kernel_kwargs()
         self.eplb_state = EplbLayerState()
+        # Fork and join events of hidden-state staging on the aux stream.
+        self._staging_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
         # L2 input scale of every logical expert; the NVFP4 kernel takes the max.
         self._w2_input_scales = torch.zeros(self.num_logical_experts, device="cpu")
         self.l2_activation_scale = 1.0
@@ -916,12 +924,71 @@ class DeepGemmMegaMoEExperts(nn.Module):
         # Warmup: every rank runs the same token counts.
         return num_tokens
 
+    @contextlib.contextmanager
+    def staging_hidden_states(self, hidden_states: torch.Tensor) -> Iterator[bool]:
+        """Stage `hidden_states` into the symmetric buffer on the aux stream
+        alongside the router, under `VLLM_MEGAMOE_STAGING_OVERLAP=1`.
+
+        Run the router in the block: staging forks from the stream before it
+        and is enqueued after it, so the router's CTAs are placed first. Yields
+        whether it stages (NVFP4 formats on CUDA, without DBO); if so, pass the
+        same `hidden_states` to `forward` with `hidden_states_staged=True`.
+        """
+        stream = None
+        if (
+            megamoe_staging_overlap_enabled()
+            and self.weight_format.uses_nvfp4_api
+            and current_platform.is_cuda()
+            and not dbo_enabled()
+            and hidden_states.shape[0] <= self.max_num_tokens
+        ):
+            stream = aux_stream()
+        if stream is None:
+            yield False
+            return
+        num_tokens = hidden_states.shape[0]
+        # Before the fork, so whatever creating the buffer enqueues precedes it.
+        symm_buffer = self.get_symm_buffer()
+        shared_x_sf = None
+        shared_block_m = None
+        if self.shared_spec is not None and self.shared_spec.scale_group_k:
+            shared_x_sf = symm_buffer.shared_l1_acts_sf
+            # As forward's: NVFP4 picks BLOCK_M from this rank's token count.
+            shared_block_m = self.get_block_m(num_tokens)
+        if self._staging_events is None:
+            self._staging_events = (torch.cuda.Event(), torch.cuda.Event())
+        fork, join = self._staging_events
+        fork.record(current_stream())
+        yield True
+        with torch.cuda.stream(stream):
+            fork.wait(stream)
+            stage_megamoe_nvfp4_hidden_states(
+                hidden_states,
+                symm_buffer.x[:num_tokens],
+                symm_buffer.x_sf[:num_tokens],
+                symm_buffer.x_scales[:num_tokens],
+                shared_x=symm_buffer.shared_l1_acts[:num_tokens]
+                if self.has_fused_shared_experts
+                else None,
+                shared_x_sf=shared_x_sf,
+                shared_block_m=shared_block_m,
+                w2_global_scale=self.w2_weight_scale_2,
+                l2_alpha=self._l2_alpha,
+                l2_activation_scale=self.l2_activation_scale,
+            )
+            join.record(stream)
+        logger.info_once(
+            "MegaMoE NVFP4 staging runs on the aux stream alongside the router "
+            "(VLLM_MEGAMOE_STAGING_OVERLAP=1)."
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         shared_experts: nn.Module | None = None,
+        hidden_states_staged: bool = False,
     ) -> torch.Tensor:
         """Run the routed and shared experts on this rank's tokens.
 
@@ -932,6 +999,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
             shared_experts: Unfused shared MLP, run on `hidden_states` and
                 added to the output. Must be `None` when this layer fused the
                 shared expert at construction.
+            hidden_states_staged: `staging_hidden_states` staged
+                `hidden_states`; only the routing is staged here.
 
         Returns:
             BF16 `[num_tokens, hidden_size]` routed plus shared expert output.
@@ -976,7 +1045,24 @@ class DeepGemmMegaMoEExperts(nn.Module):
         if self.shared_spec is not None and self.shared_spec.scale_group_k:
             shared_x_sf = symm_buffer.shared_l1_acts_sf
             shared_block_m = self.get_block_m(block_m_num_tokens)
-        if fmt.uses_nvfp4_api:
+        if fmt.uses_nvfp4_api and hidden_states_staged:
+            assert self._staging_events is not None
+            stage_megamoe_topk(
+                topk_weights,
+                topk_ids,
+                symm_buffer.topk_idx[:num_tokens],
+                symm_buffer.topk_weights[:num_tokens],
+                is_padding=is_padding,
+                eplb_state=self.eplb_state,
+            )
+            self._staging_events[1].wait(current_stream())
+            kwargs.update(
+                l1_alpha=self.w13_weight_scale_2,
+                l2_alpha=self._l2_alpha,
+                l2_activation_scale=self.l2_activation_scale,
+                use_x_scales=True,
+            )
+        elif fmt.uses_nvfp4_api:
             l2_activation_scale = self.l2_activation_scale
             prepare_megamoe_nvfp4_inputs(
                 hidden_states,

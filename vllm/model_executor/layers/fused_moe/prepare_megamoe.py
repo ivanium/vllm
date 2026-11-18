@@ -8,9 +8,13 @@ the int64/float32 layout that the DeepGEMM MegaMoE kernels consume. Given an
 EPLB layer state, routing ids are mapped to physical replicas on the way.
 """
 
+import functools
+import os
+
 import torch
 
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.eplb_triton import eplb_map_and_record
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP8_DTYPE,
@@ -20,9 +24,30 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
+logger = init_logger(__name__)
+
 _E8M0_SCALE_DTYPES = (torch.uint8, torch.float8_e8m0fnu)
 # Inverse of the NVFP4 range: E2M1 max (6) times E4M3 max (448).
 _INV_NVFP4_MAX = tl.constexpr(1.0 / 2688.0)
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in ("1", "true")
+
+
+@functools.cache
+def nvfp4_row_staging_enabled() -> bool:
+    """`VLLM_MEGAMOE_NVFP4_ROW_STAGING=1` stages NVFP4 MegaMoE inputs with the
+    row-block kernel (same bytes, fewer instructions per element)."""
+    return _env_flag("VLLM_MEGAMOE_NVFP4_ROW_STAGING")
+
+
+@functools.cache
+def megamoe_staging_overlap_enabled() -> bool:
+    """`VLLM_MEGAMOE_STAGING_OVERLAP=1` stages the NVFP4 MegaMoE hidden states
+    on the aux stream while the router runs (row-block kernel, split in its
+    hidden-state and routing halves)."""
+    return _env_flag("VLLM_MEGAMOE_STAGING_OVERLAP")
 
 
 @triton.jit
@@ -486,6 +511,483 @@ def _prepare_megamoe_nvfp4_inputs_kernel(
                 tl.store(shared_ptrs, hidden, mask=k_mask)
 
 
+@triton.jit
+def _div_rn_by_recip(a, b, b_inv):
+    """`tl.div_rn(a, b)` given `b_inv = tl.div_rn(1.0, b)`, in one multiply and
+    two FMAs instead of a division.
+
+    Markstein's correction: with `b_inv` the correctly rounded reciprocal, the
+    residual `a - b * q` of `q = a * b_inv` is exact and `q + residual * b_inv`
+    rounds to the correctly rounded quotient, while quotient and residual are
+    normal. Callers only use quotients whose code cannot depend on the
+    subnormal range.
+    """
+    quotient = a * b_inv
+    residual = tl.fma(-b, quotient, a)
+    return tl.fma(residual, b_inv, quotient)
+
+
+@triton.jit
+def _e2m1_codes(values):
+    """E2M1 codes (round to nearest even, saturating), `+0` for values that
+    round to zero and for NaN, as int32."""
+    magnitude = tl.abs(values)
+    # Round to nearest even on the grid {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+    code = (
+        (magnitude > 0.25).to(tl.int32)
+        + (magnitude >= 0.75).to(tl.int32)
+        + (magnitude > 1.25).to(tl.int32)
+        + (magnitude >= 1.75).to(tl.int32)
+        + (magnitude > 2.5).to(tl.int32)
+        + (magnitude >= 3.5).to(tl.int32)
+        + (magnitude > 5.0).to(tl.int32)
+    )
+    return tl.where((values < 0) & (code != 0), code | 8, code)
+
+
+@triton.jit
+def _e2m1x2_cvt(high, low):
+    """`_e2m1_codes(low) | _e2m1_codes(high) << 4` as uint8, through the SM100
+    E2M1 conversion: it rounds to nearest even and saturates the same way, and
+    the sign of every nibble that rounds to zero is cleared to match. Inputs
+    must not be NaN (the conversion saturates NaN)."""
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+        .reg .b8 b0, b1, b2, b3;
+        .reg .b32 w, m, s;
+        cvt.rn.satfinite.e2m1x2.f32 b0, $1, $5;
+        cvt.rn.satfinite.e2m1x2.f32 b1, $2, $6;
+        cvt.rn.satfinite.e2m1x2.f32 b2, $3, $7;
+        cvt.rn.satfinite.e2m1x2.f32 b3, $4, $8;
+        mov.b32 w, {b0, b1, b2, b3};
+        and.b32 m, w, 0x77777777;
+        add.u32 s, m, 0x77777777;
+        and.b32 s, s, 0x88888888;
+        and.b32 s, s, w;
+        or.b32 $0, m, s;
+        }
+        """,
+        constraints="=r,r,r,r,r,r,r,r,r",
+        args=[high, low],
+        dtype=tl.uint8,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
+def _max_propagate_nan(a, b):
+    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@triton.jit
+def _stage_nvfp4_chunk(
+    raw,
+    k0,
+    rows,
+    row_mask,
+    x_scale,
+    x_scale_inv,
+    shared_sf_rows,
+    x_out,
+    x_sf,
+    shared_x,
+    shared_x_sf,
+    x_stride_m: tl.constexpr,
+    x_sf_stride_m: tl.constexpr,
+    shared_x_stride_m: tl.constexpr,
+    shared_x_sf_stride_m: tl.constexpr,
+    shared_x_sf_stride_k: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SHARED_MXFP8: tl.constexpr,
+    E2M1_CVT: tl.constexpr,
+    NON_FINITE: tl.constexpr,
+):
+    """Quantize the BF16 `raw` = hidden[rows, k0:k0 + BLOCK_K] and store its
+    NVFP4 bytes, E4M3 block scales and shared-expert input.
+
+    Values are viewed as [row, group of 16, pair, value]: pairs share a byte,
+    groups a scale; memory is accessed in contiguous rows. Scale bytes are
+    stored one by one: byte j of a little-endian int32 scale word is the
+    scale of the word's group j, as `_pack_bytes` packs them.
+    """
+    mask = row_mask[:, None]
+    hidden = tl.reshape(raw.to(tl.float32), [BLOCK_M, BLOCK_K // 16, 8, 2])
+
+    # E2M1 values with one E4M3 scale per 16, relative to the token scale; both
+    # divisions equal tl.div_rn (see _div_rn_by_recip).
+    values = _div_rn_by_recip(hidden, x_scale, x_scale_inv)
+    block_scale = tl.max(tl.max(tl.abs(values), axis=3), axis=2) * (1.0 / 6.0)
+    block_scale = tl.minimum(tl.maximum(block_scale, 2.0**-9), 448.0)
+    block_scale = block_scale.to(tl.float8e4nv)
+    scale = block_scale.to(tl.float32)
+    scale_inv = tl.math.div_rn(1.0, scale)[:, :, None, None]
+    values = _div_rn_by_recip(values, scale[:, :, None, None], scale_inv)
+    if NON_FINITE:
+        # NaN codes as +0; only rows with NaN or Inf produce NaN here.
+        values = tl.where(values == values, values, 0.0)
+    low, high = tl.split(values)
+    if E2M1_CVT:
+        packed = _e2m1x2_cvt(high, low)
+    else:
+        packed = (_e2m1_codes(low) | (_e2m1_codes(high) << 4)).to(tl.uint8)
+    tl.store(
+        x_out
+        + rows[:, None] * x_stride_m
+        + (k0 // 2 + tl.arange(0, BLOCK_K // 2))[None, :],
+        tl.reshape(packed, [BLOCK_M, BLOCK_K // 2]),
+        mask=mask,
+    )
+    tl.store(
+        x_sf.to(tl.pointer_type(tl.uint8))
+        + rows[:, None] * (x_sf_stride_m * 4)
+        + (k0 // 16 + tl.arange(0, BLOCK_K // 16))[None, :],
+        block_scale.to(tl.uint8, bitcast=True),
+        mask=mask,
+    )
+
+    if shared_x is not None:
+        shared_ptrs = (
+            shared_x
+            + rows[:, None] * shared_x_stride_m
+            + (k0 + tl.arange(0, BLOCK_K))[None, :]
+        )
+        if SHARED_MXFP8:
+            # As _quantize_fp8_groups: one UE8M0 scale per 32 values.
+            group_amax = tl.max(tl.max(tl.abs(hidden), axis=3), axis=2)
+            group_amax = tl.max(
+                tl.reshape(group_amax, [BLOCK_M, BLOCK_K // 32, 2]), axis=2
+            )
+            group_amax = tl.maximum(group_amax, 1.0e-4)
+            bits = tl.math.div_rn(group_amax, 448.0).to(tl.uint32, bitcast=True)
+            scale_exp = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(
+                tl.uint32
+            )
+            scale_exp = tl.minimum(tl.maximum(scale_exp, 1), 254)
+            # tl.div_rn(1.0, 2^(e - 127)) bit for bit; 2^-127 is subnormal.
+            inv_bits = tl.where(scale_exp == 254, 0x00400000, (254 - scale_exp) << 23)
+            inv_scale = tl.reshape(
+                tl.broadcast_to(
+                    inv_bits.to(tl.float32, bitcast=True)[:, :, None],
+                    [BLOCK_M, BLOCK_K // 32, 2],
+                ),
+                [BLOCK_M, BLOCK_K // 16],
+            )
+            fp8 = (hidden * inv_scale[:, :, None, None]).to(tl.float8e4nv)
+            tl.store(shared_ptrs, tl.reshape(fp8, [BLOCK_M, BLOCK_K]), mask=mask)
+            groups32 = tl.arange(0, BLOCK_K // 32)
+            sf_offsets = (k0 // 128 + groups32 // 4) * (
+                shared_x_sf_stride_k * 4
+            ) + groups32 % 4
+            tl.store(
+                shared_x_sf.to(tl.pointer_type(tl.uint8))
+                + shared_sf_rows[:, None] * (shared_x_sf_stride_m * 4)
+                + sf_offsets[None, :],
+                scale_exp.to(tl.uint8),
+                mask=mask,
+            )
+        else:
+            tl.store(shared_ptrs, raw, mask=mask)
+
+
+@triton.jit
+def _stage_nvfp4_rows(
+    hidden_rows,
+    rows,
+    row_mask,
+    split,
+    first,
+    amax,
+    x_out,
+    x_sf,
+    x_scales,
+    shared_x,
+    shared_x_sf,
+    hidden_stride_k: tl.constexpr,
+    x_stride_m: tl.constexpr,
+    x_sf_stride_m: tl.constexpr,
+    shared_x_stride_m: tl.constexpr,
+    shared_x_sf_stride_m: tl.constexpr,
+    shared_x_sf_stride_k: tl.constexpr,
+    hidden_size: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    SHARED_BLOCK_M: tl.constexpr,
+    SHARED_MXFP8: tl.constexpr,
+    E2M1_CVT: tl.constexpr,
+    NON_FINITE: tl.constexpr,
+):
+    """Store the token scales from `amax` (split 0) and quantize this split's
+    chunks; `first` is the split's first chunk, already loaded."""
+    x_scale = tl.maximum(amax, 1.0e-12) * _INV_NVFP4_MAX
+    if split == 0:
+        tl.store(x_scales + rows, x_scale, mask=row_mask)
+    x_scale_inv = tl.math.div_rn(1.0, x_scale)[:, None, None, None]
+    x_scale = x_scale[:, None, None, None]
+    shared_sf_rows = rows
+    if SHARED_MXFP8:
+        shared_sf_rows = _shared_sf_row(rows, SHARED_BLOCK_M)
+    _stage_nvfp4_chunk(
+        first,
+        split * BLOCK_K,
+        rows,
+        row_mask,
+        x_scale,
+        x_scale_inv,
+        shared_sf_rows,
+        x_out,
+        x_sf,
+        shared_x,
+        shared_x_sf,
+        x_stride_m,
+        x_sf_stride_m,
+        shared_x_stride_m,
+        shared_x_sf_stride_m,
+        shared_x_sf_stride_k,
+        BLOCK_M,
+        BLOCK_K,
+        SHARED_MXFP8,
+        E2M1_CVT,
+        NON_FINITE,
+    )
+    for chunk in tl.range(1, hidden_size // (BLOCK_K * NUM_SPLITS)):
+        k0 = (chunk * NUM_SPLITS + split) * BLOCK_K
+        raw = tl.load(
+            hidden_rows[:, None] + (k0 + tl.arange(0, BLOCK_K))[None, :] * hidden_stride_k,
+            mask=row_mask[:, None],
+            other=0.0,
+        )
+        _stage_nvfp4_chunk(
+            raw,
+            k0,
+            rows,
+            row_mask,
+            x_scale,
+            x_scale_inv,
+            shared_sf_rows,
+            x_out,
+            x_sf,
+            shared_x,
+            shared_x_sf,
+            x_stride_m,
+            x_sf_stride_m,
+            shared_x_stride_m,
+            shared_x_sf_stride_m,
+            shared_x_sf_stride_k,
+            BLOCK_M,
+            BLOCK_K,
+            SHARED_MXFP8,
+            E2M1_CVT,
+            NON_FINITE,
+        )
+
+
+@triton.jit(do_not_specialize=["num_tokens", "l2_activation_scale"])
+def _prepare_megamoe_nvfp4_rows_kernel(
+    hidden_states,
+    x_out,
+    x_sf,
+    x_scales,
+    shared_x,
+    shared_x_sf,
+    topk_ids,
+    topk_weights,
+    is_padding,
+    topk_idx_out,
+    topk_weights_out,
+    logical_to_physical,
+    replica_count,
+    expert_load,
+    record_enabled,
+    num_unpadded_tokens,
+    num_logical,
+    map_stride,
+    num_physical,
+    w2_global_scale,
+    l2_alpha,
+    hidden_stride_m: tl.constexpr,
+    hidden_stride_k: tl.constexpr,
+    x_stride_m: tl.constexpr,
+    x_sf_stride_m: tl.constexpr,
+    shared_x_stride_m: tl.constexpr,
+    shared_x_sf_stride_m: tl.constexpr,
+    shared_x_sf_stride_k: tl.constexpr,
+    topk_ids_stride_m: tl.constexpr,
+    topk_ids_stride_k: tl.constexpr,
+    topk_weights_stride_m: tl.constexpr,
+    topk_weights_stride_k: tl.constexpr,
+    is_padding_stride_m: tl.constexpr,
+    topk_idx_stride_m: tl.constexpr,
+    topk_idx_stride_k: tl.constexpr,
+    topk_weights_out_stride_m: tl.constexpr,
+    topk_weights_out_stride_k: tl.constexpr,
+    num_tokens,
+    l2_activation_scale,
+    hidden_size: tl.constexpr,
+    top_k: tl.constexpr,
+    num_local_experts: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    AMAX_BLOCK_K: tl.constexpr,
+    ROUTE_BLOCK_M: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    SHARED_BLOCK_M: tl.constexpr,
+    SHARED_MXFP8: tl.constexpr,
+    QUANTIZE: tl.constexpr,
+    ROUTE: tl.constexpr,
+    E2M1_CVT: tl.constexpr,
+) -> None:
+    """The bytes of `_prepare_megamoe_nvfp4_inputs_kernel`, from a 1D grid of
+    quantize programs (BLOCK_M rows by every NUM_SPLITS-th BLOCK_K chunk) then
+    routing programs (ROUTE_BLOCK_M rows of top-k), which run side by side
+    instead of one after the other. QUANTIZE and ROUTE pick the halves, so the
+    hidden-state half can run before routing is known.
+    """
+    pid = tl.program_id(0)
+    num_quantize = 0
+    if QUANTIZE:
+        num_quantize = tl.cdiv(num_tokens, BLOCK_M) * NUM_SPLITS
+        if l2_alpha is not None:
+            experts = tl.arange(0, BLOCK_E)
+            expert_mask = (experts < num_local_experts) & (pid == 0)
+            alpha = tl.load(w2_global_scale + experts, mask=expert_mask)
+            tl.store(l2_alpha + experts, alpha * l2_activation_scale, mask=expert_mask)
+
+    if QUANTIZE:
+        if pid < num_quantize:
+            split = pid % NUM_SPLITS
+            rows = (pid // NUM_SPLITS) * BLOCK_M + tl.arange(0, BLOCK_M)
+            row_mask = rows < num_tokens
+            rows = rows.to(tl.int64)
+            hidden_rows = hidden_states + rows * hidden_stride_m
+            # The split's first chunk is loaded with the row, for the amax.
+            first = tl.load(
+                hidden_rows[:, None]
+                + (split * BLOCK_K + tl.arange(0, BLOCK_K))[None, :] * hidden_stride_k,
+                mask=row_mask[:, None],
+                other=0.0,
+            )
+            # The token scale needs the whole row: amax first, then quantize.
+            row_max = tl.zeros([BLOCK_M, AMAX_BLOCK_K], dtype=tl.float32)
+            for a0 in tl.static_range(0, hidden_size, AMAX_BLOCK_K):
+                row_chunk = tl.load(
+                    hidden_rows[:, None]
+                    + (a0 + tl.arange(0, AMAX_BLOCK_K))[None, :] * hidden_stride_k,
+                    mask=row_mask[:, None],
+                    other=0.0,
+                )
+                row_max = _max_propagate_nan(row_max, tl.abs(row_chunk.to(tl.float32)))
+            amax = tl.reduce(row_max, 1, _max_propagate_nan)
+            # NaN and Inf fail the comparison.
+            non_finite = (amax <= 3.4028234663852886e38) == 0
+            if tl.max(non_finite.to(tl.int32), axis=0) != 0:
+                # A NaN or Inf in the block: take the NaN-ignoring amax, as
+                # _prepare_megamoe_nvfp4_inputs_kernel does, and code NaN as 0.
+                row_max = tl.zeros([BLOCK_M, AMAX_BLOCK_K], dtype=tl.float32)
+                for a0 in tl.static_range(0, hidden_size, AMAX_BLOCK_K):
+                    row_chunk = tl.load(
+                        hidden_rows[:, None]
+                        + (a0 + tl.arange(0, AMAX_BLOCK_K))[None, :] * hidden_stride_k,
+                        mask=row_mask[:, None],
+                        other=0.0,
+                    )
+                    row_max = tl.maximum(row_max, tl.abs(row_chunk.to(tl.float32)))
+                _stage_nvfp4_rows(
+                    hidden_rows,
+                    rows,
+                    row_mask,
+                    split,
+                    first,
+                    tl.max(row_max, axis=1),
+                    x_out,
+                    x_sf,
+                    x_scales,
+                    shared_x,
+                    shared_x_sf,
+                    hidden_stride_k,
+                    x_stride_m,
+                    x_sf_stride_m,
+                    shared_x_stride_m,
+                    shared_x_sf_stride_m,
+                    shared_x_sf_stride_k,
+                    hidden_size,
+                    BLOCK_M,
+                    BLOCK_K,
+                    NUM_SPLITS,
+                    SHARED_BLOCK_M,
+                    SHARED_MXFP8,
+                    E2M1_CVT,
+                    True,
+                )
+            else:
+                _stage_nvfp4_rows(
+                    hidden_rows,
+                    rows,
+                    row_mask,
+                    split,
+                    first,
+                    amax,
+                    x_out,
+                    x_sf,
+                    x_scales,
+                    shared_x,
+                    shared_x_sf,
+                    hidden_stride_k,
+                    x_stride_m,
+                    x_sf_stride_m,
+                    shared_x_stride_m,
+                    shared_x_sf_stride_m,
+                    shared_x_sf_stride_k,
+                    hidden_size,
+                    BLOCK_M,
+                    BLOCK_K,
+                    NUM_SPLITS,
+                    SHARED_BLOCK_M,
+                    SHARED_MXFP8,
+                    E2M1_CVT,
+                    False,
+                )
+
+    if ROUTE:
+        route_pid = pid - num_quantize
+        if route_pid >= 0:
+            token_ids = route_pid * ROUTE_BLOCK_M + tl.arange(0, ROUTE_BLOCK_M)
+            _store_topk(
+                token_ids,
+                token_ids < num_tokens,
+                topk_ids,
+                topk_weights,
+                is_padding,
+                topk_idx_out,
+                topk_weights_out,
+                logical_to_physical,
+                replica_count,
+                expert_load,
+                record_enabled,
+                num_unpadded_tokens,
+                num_logical,
+                map_stride,
+                num_physical,
+                topk_ids_stride_m,
+                topk_ids_stride_k,
+                topk_weights_stride_m,
+                topk_weights_stride_k,
+                is_padding_stride_m,
+                topk_idx_stride_m,
+                topk_idx_stride_k,
+                topk_weights_out_stride_m,
+                topk_weights_out_stride_k,
+                top_k,
+                ROUTE_BLOCK_M,
+                BLOCK_TOPK,
+            )
+
+
 def _resolve_hidden_quant(hidden_quant: QuantKey, block_k: int) -> tuple[int, bool]:
     """Map a hidden-state `QuantKey` to the kernel's `(GROUP_K, USE_UE8M0)`."""
     scale = hidden_quant.scale
@@ -732,6 +1234,32 @@ def prepare_megamoe_nvfp4_inputs(
         if tensor is not None and tensor.stride(-1) != 1:
             raise ValueError(f"MegaMoE NVFP4 staging requires a row-major {name}.")
 
+    if nvfp4_row_staging_enabled():
+        logger.info_once(
+            "MegaMoE NVFP4 staging: row-block kernel "
+            "(VLLM_MEGAMOE_NVFP4_ROW_STAGING=1)."
+        )
+        _launch_nvfp4_rows(
+            num_tokens,
+            hidden_states,
+            x,
+            x_sf,
+            x_scales,
+            shared_x,
+            shared_x_sf,
+            shared_block_m,
+            w2_global_scale,
+            l2_alpha,
+            l2_activation_scale,
+            topk_weights,
+            topk_ids,
+            topk_idx_out,
+            topk_weights_out,
+            is_padding,
+            eplb_state,
+        )
+        return
+
     top_k = topk_ids.shape[1]
     num_local_experts = 0 if l2_alpha is None else l2_alpha.numel()
     # Up to 512 tokens each row is split over programs; larger batches fill the
@@ -789,4 +1317,223 @@ def prepare_megamoe_nvfp4_inputs(
         SHARED_BLOCK_M=shared_block_m or 1,
         SHARED_MXFP8=shared_mxfp8,
         num_warps=4,
+    )
+
+
+# Tokens per routing program of the row-block kernel.
+_ROUTE_BLOCK_M = 64
+
+
+def _nvfp4_rows_config(num_tokens: int, hidden_size: int) -> tuple[int, int, int, int]:
+    """`(BLOCK_M, BLOCK_K, NUM_SPLITS, num_warps)` of the row-block kernel,
+    by token band, from a GB300 sweep at hidden 6144 (every config writes
+    the same bytes): 8-warp programs from 5 to 192 tokens, then one row per
+    program over 2048-value chunks."""
+    if num_tokens <= 4:
+        block_m, block_k, chunks_per_program, num_warps = 1, 1024, 1, 4
+    elif num_tokens <= 108 or 144 < num_tokens <= 192:
+        block_m, block_k, chunks_per_program, num_warps = 2, 1024, 2, 8
+    elif num_tokens <= 192:
+        block_m, block_k, chunks_per_program, num_warps = 1, 2048, 3, 8
+    else:
+        block_m, block_k, chunks_per_program, num_warps = 1, 2048, 0, 4
+    block_k = min(block_k, hidden_size & -hidden_size)  # a power of two dividing it
+    num_chunks = hidden_size // block_k
+    if chunks_per_program == 0:
+        num_splits = 1  # each program loops over its rows' chunks
+    elif num_chunks % chunks_per_program == 0:
+        num_splits = num_chunks // chunks_per_program
+    else:
+        num_splits = num_chunks
+    return block_m, block_k, num_splits, num_warps
+
+
+@functools.cache
+def _e2m1_cvt_supported() -> bool:
+    """SM100-family GPUs convert fp32 pairs to E2M1 in one instruction."""
+    from vllm.platforms import current_platform
+
+    return current_platform.is_device_capability_family(100)
+
+
+def _launch_nvfp4_rows(
+    num_tokens: int,
+    hidden_states: torch.Tensor | None,
+    x: torch.Tensor | None,
+    x_sf: torch.Tensor | None,
+    x_scales: torch.Tensor | None,
+    shared_x: torch.Tensor | None,
+    shared_x_sf: torch.Tensor | None,
+    shared_block_m: int | None,
+    w2_global_scale: torch.Tensor | None,
+    l2_alpha: torch.Tensor | None,
+    l2_activation_scale: float,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    topk_idx_out: torch.Tensor | None,
+    topk_weights_out: torch.Tensor | None,
+    is_padding: torch.Tensor | None,
+    eplb_state: EplbLayerState | None,
+) -> None:
+    """Launch `_prepare_megamoe_nvfp4_rows_kernel` for the halves given: the
+    hidden-state half when `hidden_states` is set, routing when `topk_ids` is."""
+    quantize = hidden_states is not None
+    route = topk_ids is not None
+    hidden_size = hidden_states.shape[1] if quantize else 128
+    block_m, block_k, num_splits, num_warps = _nvfp4_rows_config(
+        num_tokens, hidden_size
+    )
+    num_quantize = triton.cdiv(num_tokens, block_m) * num_splits if quantize else 0
+    num_route = triton.cdiv(num_tokens, _ROUTE_BLOCK_M) if route else 0
+    top_k = topk_ids.shape[1] if route else 1
+    num_local_experts = 0 if l2_alpha is None else l2_alpha.numel()
+
+    def stride(tensor: torch.Tensor | None, dim: int) -> int:
+        return tensor.stride(dim) if tensor is not None else 0
+
+    # One program even without tokens, to write l2_alpha.
+    grid = (max(num_quantize + num_route, 1),)
+    _prepare_megamoe_nvfp4_rows_kernel[grid](
+        hidden_states,
+        x.view(torch.uint8) if x is not None else None,
+        x_sf,
+        x_scales,
+        shared_x,
+        shared_x_sf,
+        topk_ids,
+        topk_weights,
+        is_padding,
+        topk_idx_out,
+        topk_weights_out,
+        *_eplb_kernel_args(eplb_state if route else None),
+        w2_global_scale,
+        l2_alpha,
+        stride(hidden_states, 0),
+        stride(hidden_states, 1),
+        stride(x, 0),
+        stride(x_sf, 0),
+        stride(shared_x, 0),
+        stride(shared_x_sf, 0),
+        stride(shared_x_sf, 1),
+        stride(topk_ids, 0),
+        stride(topk_ids, 1),
+        stride(topk_weights, 0),
+        stride(topk_weights, 1),
+        stride(is_padding, 0),
+        stride(topk_idx_out, 0),
+        stride(topk_idx_out, 1),
+        stride(topk_weights_out, 0),
+        stride(topk_weights_out, 1),
+        num_tokens,
+        l2_activation_scale,
+        hidden_size,
+        top_k,
+        num_local_experts,
+        BLOCK_M=block_m,
+        BLOCK_K=block_k,
+        NUM_SPLITS=num_splits,
+        AMAX_BLOCK_K=min(2048, hidden_size & -hidden_size),
+        ROUTE_BLOCK_M=_ROUTE_BLOCK_M,
+        BLOCK_TOPK=triton.next_power_of_2(top_k),
+        BLOCK_E=triton.next_power_of_2(max(num_local_experts, 1)),
+        SHARED_BLOCK_M=shared_block_m or 1,
+        SHARED_MXFP8=shared_x is not None and shared_x.dtype == FP8_DTYPE,
+        QUANTIZE=quantize,
+        ROUTE=route,
+        # The conversion packs four output bytes per thread.
+        E2M1_CVT=quantize
+        and _e2m1_cvt_supported()
+        and block_m * block_k // 2 >= 4 * 32 * num_warps,
+        num_warps=num_warps,
+    )
+
+
+def stage_megamoe_nvfp4_hidden_states(
+    hidden_states: torch.Tensor,
+    x: torch.Tensor,
+    x_sf: torch.Tensor,
+    x_scales: torch.Tensor,
+    shared_x: torch.Tensor | None = None,
+    shared_x_sf: torch.Tensor | None = None,
+    shared_block_m: int | None = None,
+    w2_global_scale: torch.Tensor | None = None,
+    l2_alpha: torch.Tensor | None = None,
+    l2_activation_scale: float = 1.0,
+) -> None:
+    """The hidden-state half of `prepare_megamoe_nvfp4_inputs`, with its
+    arguments and bytes: `x`, `x_sf`, `x_scales`, the shared-expert input and
+    `l2_alpha`. It needs no routing, so it can run alongside the router;
+    `stage_megamoe_topk` stages the rest."""
+    num_tokens, hidden_size = hidden_states.shape
+    if hidden_size % 128 != 0:
+        raise ValueError(
+            "MegaMoE input staging requires hidden_size to be a multiple of 128."
+        )
+    shared_mxfp8 = shared_x is not None and shared_x.dtype == FP8_DTYPE
+    if shared_mxfp8 != (shared_x_sf is not None) or (shared_x_sf is None) != (
+        shared_block_m is None
+    ):
+        raise ValueError(
+            "MegaMoE NVFP4 staging needs shared_x_sf and shared_block_m exactly "
+            "for an fp8 shared_x."
+        )
+    if (w2_global_scale is None) != (l2_alpha is None):
+        raise ValueError("MegaMoE NVFP4 staging needs w2_global_scale with l2_alpha.")
+    for name, tensor in (("x", x), ("x_sf", x_sf), ("shared_x", shared_x)):
+        if tensor is not None and tensor.stride(-1) != 1:
+            raise ValueError(f"MegaMoE NVFP4 staging requires a row-major {name}.")
+    _launch_nvfp4_rows(
+        num_tokens,
+        hidden_states,
+        x,
+        x_sf,
+        x_scales,
+        shared_x,
+        shared_x_sf,
+        shared_block_m,
+        w2_global_scale,
+        l2_alpha,
+        l2_activation_scale,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def stage_megamoe_topk(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_idx_out: torch.Tensor,
+    topk_weights_out: torch.Tensor,
+    is_padding: torch.Tensor | None = None,
+    eplb_state: EplbLayerState | None = None,
+) -> None:
+    """The routing half of `prepare_megamoe_nvfp4_inputs`: repack the top-k
+    ids (EPLB-mapped, padding unrouted, load recorded) and weights."""
+    if topk_weights.shape != topk_ids.shape:
+        raise ValueError(
+            "MegaMoE input staging requires topk_weights and "
+            "topk_ids to have the same shape."
+        )
+    _launch_nvfp4_rows(
+        topk_ids.shape[0],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1.0,
+        topk_weights,
+        topk_ids,
+        topk_idx_out,
+        topk_weights_out,
+        is_padding,
+        eplb_state,
     )

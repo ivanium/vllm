@@ -729,7 +729,9 @@ class MiniMaxM3MoE(nn.Module):
         return output[:num_tokens]
 
     def _forward_mega_moe_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits, _ = self.gate(hidden_states)
+        # Staging the hidden states needs no routing: it can run beside the router.
+        with self.experts.staging_hidden_states(hidden_states) as staged:
+            router_logits, _ = self.gate(hidden_states)
         topk_weights, topk_ids = fused_topk_bias(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -740,7 +742,11 @@ class MiniMaxM3MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
         return self.experts(
-            hidden_states, topk_weights, topk_ids, shared_experts=self.shared_experts
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            shared_experts=self.shared_experts,
+            hidden_states_staged=staged,
         )
 
 
