@@ -1298,6 +1298,129 @@ def test_nvfp4_kv_cache_with_tp8_fails_at_config_time(architecture: str) -> None
         verify(vllm_config(8, "nvfp4"))
 
 
+@pytest.mark.parametrize(
+    "architecture",
+    ["MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration"],
+)
+def test_nvfp4_kv_cache_with_tp8_pads_prefill_at_config_time(
+    architecture: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VLLM_MINIMAX_M3_MSA_PREFILL_PAD_HEADS=1 accepts 8 query heads per KV
+    head (TP8) with an NVFP4 KV cache; 4 per KV head (TP16) is still refused,
+    since the Q8KV4 decode serves only 8 or 16."""
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+    monkeypatch.setenv("VLLM_MINIMAX_M3_MSA_PREFILL_PAD_HEADS", "1")
+    text_config = SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+    verify = MODELS_CONFIG_MAP[architecture].verify_and_update_config
+    for tensor_parallel_size in (1, 2, 4, 8):
+        verify(
+            SimpleNamespace(
+                model_config=SimpleNamespace(hf_text_config=text_config),
+                cache_config=SimpleNamespace(cache_dtype="nvfp4"),
+                parallel_config=SimpleNamespace(
+                    tensor_parallel_size=tensor_parallel_size
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="NVFP4 KV cache with tensor_parallel_size=16"):
+        verify(
+            SimpleNamespace(
+                model_config=SimpleNamespace(hf_text_config=text_config),
+                cache_config=SimpleNamespace(cache_dtype="nvfp4"),
+                parallel_config=SimpleNamespace(tensor_parallel_size=16),
+            )
+        )
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+def test_msa_prefill_nvfp4_padded_heads_match_unpadded(
+    num_kv_heads: int, default_vllm_config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With VLLM_MINIMAX_M3_MSA_PREFILL_PAD_HEADS=1, a rank with 8 Q heads per
+    KV head prefills on the Q8KV4 kernel through a zero-padded 16-head query.
+    Each half of a 16-head rank's heads (the two TP8 ranks that split a TP4
+    rank) comes out bitwise as the 16-head call computes it."""
+    _skip_without_q8kv4_prefill(16 * num_kv_heads, num_kv_heads)
+    torch.manual_seed(0)
+    q_lens = [300, 128, 77]
+    seq_lens_list = [300, 640, 1100]
+    block_table, num_pages = _make_paged_layout(seq_lens_list)
+    k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+    v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+    kv_cache, _ = _make_nvfp4_kv_cache(
+        num_pages, num_kv_heads, "nvfp4", k_scale, v_scale
+    )
+    total_q = sum(q_lens)
+    metadata, topk = _make_prefill_metadata(
+        q_lens, seq_lens_list, block_table, num_kv_heads
+    )
+    layer_name = "model.layers.0.self_attn.attn"
+    layer = SimpleNamespace(
+        layer_name=layer_name,
+        topk_indices_buffer=topk,
+        _q_scale_float=1.0,
+        _k_scale=k_scale,
+        _v_scale=v_scale,
+    )
+    query16 = torch.randn(
+        total_q, num_kv_heads, 16, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    ).to(torch.float8_e4m3fn)
+    common = dict(
+        head_size=HEAD_DIM,
+        scale=SM_SCALE,
+        num_kv_heads=num_kv_heads,
+        topk_blocks=TOPK,
+        sparse_block_size=BLOCK_SIZE,
+    )
+    forward_context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={layer_name: metadata},
+        slot_mapping={},
+    )
+    with override_forward_context(forward_context):
+        expected = MiniMaxM3SparseMSANvfp4Impl(
+            num_heads=16 * num_kv_heads, **common
+        ).forward(
+            layer,
+            query16.view(total_q, -1),
+            kv_cache,
+            torch.zeros(
+                total_q,
+                16 * num_kv_heads * HEAD_DIM,
+                dtype=torch.bfloat16,
+                device="cuda",
+            ),
+        )
+        monkeypatch.setenv("VLLM_MINIMAX_M3_MSA_PREFILL_PAD_HEADS", "1")
+        padded = MiniMaxM3SparseMSANvfp4Impl(num_heads=8 * num_kv_heads, **common)
+        assert (
+            padded.prefill_pad_heads and padded.prefill_num_heads == 16 * num_kv_heads
+        )
+        assert not padded.supports_mxfp8_output
+        for half in (slice(0, 8), slice(8, 16)):
+            actual = padded.forward(
+                layer,
+                query16[:, :, half].reshape(total_q, -1),
+                kv_cache,
+                torch.full(
+                    (total_q, 8 * num_kv_heads * HEAD_DIM),
+                    float("nan"),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                ),
+            )
+            current_platform.synchronize()
+            want = expected.view(total_q, num_kv_heads, 16, HEAD_DIM)[:, :, half]
+            assert torch.equal(
+                actual.view(total_q, num_kv_heads, 8, HEAD_DIM).view(torch.int16),
+                want.view(torch.int16),
+            )
+    # Nothing writes the pad heads: they stay zero across calls and layers.
+    assert padded._padded_prefill is not None
+    assert not padded._padded_prefill.query[:, :, 8:].view(torch.uint8).any()
+
+
 def test_msa_triton_decode_fallback_reads_dequantized_query_fp8() -> None:
     """With CUTLASS decode on but not planned for the batch, the Triton decode
     fallback attends with the dequantized E4M3 query."""

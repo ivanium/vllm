@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
+import os
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -103,16 +104,23 @@ class MiniMaxM3SparseConfig(VerifyAndUpdateConfig):
             return
         # The NVFP4 KV attention kernels (MSA's CUTLASS Q8KV4 prefill) need 16
         # query heads per KV head on each rank; fail before the workers start.
+        # With VLLM_MINIMAX_M3_MSA_PREFILL_PAD_HEADS=1 a rank with 8 (e.g. TP8)
+        # is served too: the Q8KV4 decode takes 8 per KV head, and the prefill
+        # pads its query to 16 (MiniMaxM3SparseMSANvfp4Impl).
         text_config = vllm_config.model_config.hf_text_config
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         num_heads = text_config.num_attention_heads // tp_size
         num_kv_heads = max(1, text_config.num_key_value_heads // tp_size)
+        pad_prefill = os.getenv("VLLM_MINIMAX_M3_MSA_PREFILL_PAD_HEADS", "0") == "1"
+        if num_heads == 8 * num_kv_heads and pad_prefill:
+            return
         if num_heads != 16 * num_kv_heads:
             raise ValueError(
                 "MiniMax-M3 does not support an NVFP4 KV cache with "
                 f"tensor_parallel_size={tp_size} yet: each rank holds {num_heads} "
                 f"query heads over {num_kv_heads} KV head(s), and the NVFP4 "
-                "attention kernels need 16 per KV head. Use a smaller "
+                "attention kernels need 16 per KV head (or 8 with "
+                "VLLM_MINIMAX_M3_MSA_PREFILL_PAD_HEADS=1). Use a smaller "
                 "tensor_parallel_size (with data/expert parallelism) or another "
                 "kv_cache_dtype."
             )

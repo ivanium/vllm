@@ -85,6 +85,19 @@ def _get_msa_cutlass_min_batch_size() -> int | None:
     return int(value) if value is not None else None
 
 
+# Q heads per KV head the Q8KV4 prefill kernel serves, and the ratio it can
+# serve with a padded query (the Q8KV4 decode serves both).
+_Q8KV4_PREFILL_Q_HEADS_PER_KV = 16
+_Q8KV4_PADDED_PREFILL_Q_HEADS_PER_KV = 8
+
+
+def _q8kv4_prefill_pad_heads_enabled() -> bool:
+    """VLLM_MINIMAX_M3_MSA_PREFILL_PAD_HEADS=1: on a rank with 8 Q heads per KV
+    head (e.g. TP8), the NVFP4 prefill pads its query to the 16 the Q8KV4
+    kernel serves."""
+    return os.getenv("VLLM_MINIMAX_M3_MSA_PREFILL_PAD_HEADS", "0") == "1"
+
+
 def _dequantize_query(
     query_fp8: torch.Tensor, q_scale: float, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -173,6 +186,105 @@ def _shared_prefill_workspace(
     workspace.split_buffers(topk_blocks, max_tokens, num_q_heads)
     _prefill_workspaces[key] = workspace
     return workspace
+
+
+class _PaddedPrefillBuffers:
+    """The padded Q8KV4 prefill's query and output, reserved for the largest
+    batch and shared by the layers of a process (they run in order on one
+    stream, as the split workspace does).
+
+    `query` is E4M3 `[max_tokens, num_kv_heads, 16, head_size]`: each KV head's
+    first `num_heads_per_kv` heads take the real query, and the rest stay zero
+    from the allocation on (nothing writes them). `output` is the kernel's BF16
+    output over all 16 heads; only the real heads are read back.
+    """
+
+    def __init__(
+        self,
+        device_index: int,
+        max_tokens: int,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> None:
+        device = torch.device("cuda", device_index)
+        self.max_tokens = max_tokens
+        self.query = torch.zeros(
+            (max_tokens, num_kv_heads, _Q8KV4_PREFILL_Q_HEADS_PER_KV, head_size),
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+        self.output = torch.empty(
+            (max_tokens, num_kv_heads * _Q8KV4_PREFILL_Q_HEADS_PER_KV, head_size),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+
+_padded_prefill_buffers: weakref.WeakValueDictionary[tuple, _PaddedPrefillBuffers] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _shared_padded_prefill_buffers(
+    device_index: int, max_tokens: int, num_kv_heads: int, head_size: int
+) -> _PaddedPrefillBuffers:
+    key = (device_index, max_tokens, num_kv_heads, head_size)
+    if (buffers := _padded_prefill_buffers.get(key)) is not None:
+        return buffers
+    buffers = _PaddedPrefillBuffers(device_index, max_tokens, num_kv_heads, head_size)
+    _padded_prefill_buffers[key] = buffers
+    return buffers
+
+
+def _padded_prefill_views(
+    tokens: int,
+    num_kv_heads: int,
+    head_size: int,
+    buffers: _PaddedPrefillBuffers,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The padded query `[tokens, num_kv_heads, 16, head_size]` (zero past each
+    group's real heads) and the BF16 output `[tokens, num_kv_heads * 16,
+    head_size]` for one prefill, from the reservation when it fits."""
+    if tokens <= buffers.max_tokens:
+        return buffers.query[:tokens], buffers.output[:tokens]
+    # Past the reservation (not reached by the scheduler's batches).
+    shape = (tokens, num_kv_heads, _Q8KV4_PREFILL_Q_HEADS_PER_KV, head_size)
+    return (
+        torch.zeros(shape, dtype=torch.float8_e4m3fn, device=device),
+        torch.empty(
+            (tokens, num_kv_heads * _Q8KV4_PREFILL_Q_HEADS_PER_KV, head_size),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+    )
+
+
+def _pad_prefill_query(query: torch.Tensor, padded: torch.Tensor) -> torch.Tensor:
+    """Write `query` `[tokens, num_kv_heads * n, head_size]` into the first n
+    heads of each KV head's group of `padded` `[tokens, num_kv_heads, 16,
+    head_size]` and return `padded` as the contiguous `[tokens, num_kv_heads *
+    16, head_size]` query the Q8KV4 prefill reads."""
+    tokens, num_kv_heads, _, head_size = padded.shape
+    heads_per_kv = query.shape[1] // num_kv_heads
+    padded[:, :, :heads_per_kv].copy_(
+        query.view(tokens, num_kv_heads, heads_per_kv, head_size)
+    )
+    return padded.view(tokens, -1, head_size)
+
+
+def _unpad_prefill_output(padded: torch.Tensor, out: torch.Tensor) -> None:
+    """Copy the real heads of the padded prefill's output `padded` `[tokens,
+    num_kv_heads * 16, head_size]` into `out` `[tokens, num_kv_heads * n,
+    head_size]`: the first n heads of each KV head's group."""
+    tokens, num_heads, head_size = out.shape
+    num_kv_heads = padded.shape[1] // _Q8KV4_PREFILL_Q_HEADS_PER_KV
+    heads_per_kv = num_heads // num_kv_heads
+    out.view(tokens, num_kv_heads, heads_per_kv, head_size).copy_(
+        padded.view(tokens, num_kv_heads, _Q8KV4_PREFILL_Q_HEADS_PER_KV, head_size)[
+            :, :, :heads_per_kv
+        ]
+    )
 
 
 class MiniMaxM3SparseMSAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
@@ -281,9 +393,14 @@ class MiniMaxM3SparseMSABaseImpl(MiniMaxM3SparseImpl):
         nd: int,
         num_tokens: int,
         p: MiniMaxM3SparsePrefillMetadata,
+        qhead_per_kv: int | None = None,
     ):
+        """`qhead_per_kv` is the Q heads per KV head the prefill kernel runs
+        (its tile packs 128 // qhead_per_kv tokens); default the layer's."""
         from vllm.third_party.fmha_sm100.sparse import build_k2q_csr
 
+        if qhead_per_kv is None:
+            qhead_per_kv = self.num_heads // self.num_kv_heads
         # [H, prefill, MK] transposed view; build_k2q_csr consumes the strided
         # view directly (topK stays innermost-contiguous).
         return build_k2q_csr(
@@ -295,7 +412,7 @@ class MiniMaxM3SparseMSABaseImpl(MiniMaxM3SparseImpl):
             max_seqlen_k=p.max_seq_len,
             max_seqlen_q=p.max_query_len,
             total_rows=p.total_kv_blocks,
-            qhead_per_kv=self.num_heads // self.num_kv_heads,
+            qhead_per_kv=qhead_per_kv,
             return_schedule=True,
         )
 
@@ -497,23 +614,54 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
                 f"(num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads}, "
                 f"block_size={self.block_size}, topk_blocks={self.topk_blocks})"
             )
+        # With 8 Q heads per KV head (e.g. TP8) the prefill can pad its query
+        # to the 16 the Q8KV4 kernel serves: each row of its tiles is one
+        # (token, head) whose softmax, P x V and split combine read no other
+        # row, so the real heads come out as an unpadded call computes them.
+        self.prefill_pad_heads = (
+            self.num_heads == _Q8KV4_PADDED_PREFILL_Q_HEADS_PER_KV * self.num_kv_heads
+            and _q8kv4_prefill_pad_heads_enabled()
+        )
+        self.prefill_num_heads = (
+            _Q8KV4_PREFILL_Q_HEADS_PER_KV * self.num_kv_heads
+            if self.prefill_pad_heads
+            else self.num_heads
+        )
         blocker = _q8kv4_prefill_blocker(
-            self.num_heads, self.num_kv_heads, self.block_size, self.topk_blocks
+            self.prefill_num_heads, self.num_kv_heads, self.block_size, self.topk_blocks
         )
         if blocker is not None:
             raise ValueError(
                 "MiniMax M3 NVFP4 KV cache requires the CUTLASS Q8KV4 prefill, "
                 f"which cannot serve this layout or device: {blocker}"
             )
-        logger.info_once("MiniMax M3 NVFP4 MSA: CUTLASS Q8KV4 decode and prefill")
+        max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        device_index = torch.accelerator.current_device_index()
+        self._padded_prefill: _PaddedPrefillBuffers | None = None
+        if self.prefill_pad_heads:
+            # The padded call writes BF16 over all 16 heads, so its MXFP8
+            # output (VLLM_MINIMAX_M3_MSA_MXFP8_OUTPUT) is not offered.
+            self.supports_mxfp8_output = False
+            self._padded_prefill = _shared_padded_prefill_buffers(
+                device_index, max_tokens, self.num_kv_heads, self.head_size
+            )
+            logger.info_once(
+                "MiniMax M3 NVFP4 MSA: CUTLASS Q8KV4 decode at %d Q heads per KV "
+                "head; the Q8KV4 prefill pads its query to %d with zero heads "
+                "(VLLM_MINIMAX_M3_MSA_PREFILL_PAD_HEADS=1).",
+                self.num_heads // self.num_kv_heads,
+                _Q8KV4_PREFILL_Q_HEADS_PER_KV,
+            )
+        else:
+            logger.info_once("MiniMax M3 NVFP4 MSA: CUTLASS Q8KV4 decode and prefill")
         # NVFP4_BLOCK_SCALE_SHIFT assumes unit global scales; checked on the
         # first forward, once the checkpoint's KV scales are loaded.
         self._check_global_scales = True
         self._prefill_workspace = _shared_prefill_workspace(
-            torch.accelerator.current_device_index(),
+            device_index,
             self.topk_blocks,
-            get_current_vllm_config().scheduler_config.max_num_batched_tokens,
-            self.num_heads,
+            max_tokens,
+            self.prefill_num_heads,
         )
 
     def forward(
@@ -606,8 +754,30 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
 
             p = main_md.prefill
             assert p is not None
-            k2q_row_ptr, _, schedule = self._build_prefill_csr(topk, nd, num_tokens, p)
+            k2q_row_ptr, _, schedule = self._build_prefill_csr(
+                topk,
+                nd,
+                num_tokens,
+                p,
+                qhead_per_kv=self.prefill_num_heads // self.num_kv_heads,
+            )
             k_data, k_sf, v_data, v_sf = nvfp4_kv_cache_views(kv_cache)
+            prefill_q = q_fp8[nd:]
+            prefill_out = None if out is None else out[nd:]
+            if self._padded_prefill is not None:
+                assert out is not None and output_mxfp8 is None
+                logger.info_once(
+                    "MiniMax M3 NVFP4 MSA: prefill runs the Q8KV4 kernel on the "
+                    "zero-padded query."
+                )
+                padded_q, prefill_out = _padded_prefill_views(
+                    num_tokens - nd,
+                    self.num_kv_heads,
+                    hd,
+                    self._padded_prefill,
+                    q_fp8.device,
+                )
+                prefill_q = _pad_prefill_query(prefill_q, padded_q)
             mxfp8_kwargs: dict[str, Any] = {}
             if output_mxfp8 is not None:
                 # Decode rows come first: the combine writes rows [nd, num_tokens)
@@ -619,7 +789,7 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
                     out_mxfp8=(mx_rows, mx_scale), out_mxfp8_first_row=nd
                 )
             run_prefill(
-                q_fp8[nd:],
+                prefill_q,
                 (k_data, v_data),
                 (k_sf, v_sf),
                 kv_indices=p.block_table,
@@ -634,8 +804,11 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
                 k_global_scale=k_scale,
                 v_global_scale=v_scale,
                 block_scale_shift=NVFP4_BLOCK_SCALE_SHIFT,
-                out=None if out is None else out[nd:],
+                out=prefill_out,
                 workspace=self._prefill_workspace,
                 **mxfp8_kwargs,
             )
+            if self._padded_prefill is not None:
+                assert out is not None and prefill_out is not None
+                _unpad_prefill_output(prefill_out, out[nd:])
         return output

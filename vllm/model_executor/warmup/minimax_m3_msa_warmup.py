@@ -83,6 +83,28 @@ def _msa_prebuild_kwargs(
     return kwargs
 
 
+def _split_padded_prefill_kwargs(
+    module: MiniMaxM3SparseAttention, kwargs: dict[str, Any]
+) -> dict[str, Any] | None:
+    """With a padded Q8KV4 prefill (VLLM_MINIMAX_M3_MSA_PREFILL_PAD_HEADS), the
+    prefill kernels run at the padded head count while decode runs at the
+    layer's: move the prefill out of `kwargs` into the returned warmup call."""
+    prefill_heads = getattr(module.impl, "prefill_num_heads", module.num_heads)
+    if not kwargs["sparse_prefill"] or prefill_heads == kwargs["num_q_heads"]:
+        return None
+    kwargs["sparse_prefill"] = False
+    prefill_kwargs = dict(
+        kwargs,
+        index_cache_dtype=None,
+        num_q_heads=prefill_heads,
+        sparse_decode=False,
+        sparse_prefill=True,
+    )
+    # A decode-only option, passed only where the MSA warmup takes it.
+    prefill_kwargs.pop("decode_output_mxfp8", None)
+    return prefill_kwargs
+
+
 @instrument(span_name="MiniMax M3 MSA warmup")
 def minimax_m3_msa_warmup(worker: "Worker") -> None:
     sparse_module = next(
@@ -108,7 +130,14 @@ def minimax_m3_msa_warmup(worker: "Worker") -> None:
     if kwargs is not None:
         from vllm.third_party.fmha_sm100 import warmup
 
+        prefill_kwargs = _split_padded_prefill_kwargs(sparse_module, kwargs)
         logger.info("MiniMax M3 MSA kernels: %s", warmup(**kwargs))
+        if prefill_kwargs is not None:
+            logger.info(
+                "MiniMax M3 MSA padded-prefill kernels (%d Q heads): %s",
+                prefill_kwargs["num_q_heads"],
+                warmup(**prefill_kwargs),
+            )
 
     # Cover sparse prefill (and its CuTe-DSL kernels) through the normal model
     # path.
