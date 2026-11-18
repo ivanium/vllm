@@ -571,6 +571,9 @@ def extend_kv_cache(
     runner.kv_connector = get_kv_connector(
         runner.vllm_config, runner.kv_caches_by_layer
     )
+    # Flags derived from the connector were computed for the no-op one that
+    # `initialize_kv_cache` held; recompute them for the real connector.
+    runner.arm_output_fence()
 
 
 def measure_kv_cache_bytes(

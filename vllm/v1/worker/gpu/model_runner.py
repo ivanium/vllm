@@ -143,6 +143,7 @@ from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
     KVConnector,
     get_kv_connector,
+    output_waits_for_drafter,
 )
 from vllm.v1.worker.gpu.lora_utils import (
     LoraState,
@@ -368,6 +369,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # KV Connector if configured.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
+        # The connector `output_waits_for_drafter` was last computed for.
+        self._output_fence_connector: KVConnector | None = None
+        self._output_waits_for_drafter = False
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
@@ -862,6 +866,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.model, self.vllm_config
                     )
                 self.aux_output_connector.initialize_output_storage(kv_cache_config)
+        self.arm_output_fence()
+
+    def arm_output_fence(self) -> bool:
+        """Compute `output_waits_for_drafter` for the KV connector held now.
+
+        Call it whenever `self.kv_connector` is replaced: with the extensible
+        KV cache, `initialize_kv_cache` runs before the KV transfer group
+        exists (no-op connector) and `extend_kv_cache` creates the real one.
+        `output_waits_for_drafter` also re-arms on its own if the connector
+        changed since, so a missed call cannot leave the fence off.
+        """
+        connector = self.kv_connector
+        self._output_fence_connector = connector
+        self._output_waits_for_drafter = output_waits_for_drafter(
+            self.speculator is not None, connector, self.vllm_config
+        )
+        if self._output_waits_for_drafter:
+            backend = getattr(connector, "kv_connector", connector)
+            logger.info(
+                "Drafter KV fence armed (%s): a step's output is ready only "
+                "after the drafter's KV writes of that step.",
+                type(backend).__name__,
+            )
+        return self._output_waits_for_drafter
+
+    @property
+    def output_waits_for_drafter(self) -> bool:
+        """Whether a step's output waits for the drafter's KV writes, for the
+        KV connector the runner holds now (see `output_waits_for_drafter`)."""
+        if self.kv_connector is not self._output_fence_connector:
+            return self.arm_output_fence()
+        return self._output_waits_for_drafter
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -2416,6 +2452,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if defer_kv_finalize:
             self.kv_connector.finalize_step()
         model_runner_output.ec_connector_output = ec_connector_output
+
+        if self.output_waits_for_drafter:
+            # The scheduler frees finished requests' blocks once this output is
+            # ready, and a KV connector may then refill them with no GPU sync:
+            # the drafter's KV writes above must have landed by then.
+            async_output.wait_for_stream(self.main_stream)
 
         return async_output
 

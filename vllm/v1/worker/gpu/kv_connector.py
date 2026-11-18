@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -182,6 +183,36 @@ class ActiveKVConnector(KVConnector):
 
 
 NO_OP_KV_CONNECTOR = KVConnector()
+
+
+def output_waits_for_drafter(
+    has_speculator: bool, kv_connector: KVConnector, vllm_config: VllmConfig
+) -> bool:
+    """Whether a step's output must not be ready before the speculator's KV
+    writes of that step complete.
+
+    The scheduler takes a step's output as proof that the step's GPU writes are
+    done: it then returns finished requests' blocks to the pool (under async
+    scheduling, deferred until that output; see `Scheduler._free_request_blocks`),
+    and a KV connector fills reused blocks (a consumer's NIXL READ) or sends a
+    finished request's blocks (a producer) with no GPU sync. The output copy
+    event is recorded before `propose()`, so the drafter's KV writes of the step
+    can land after such a transfer. Under the hybrid KV cache manager's packed
+    layouts, cache groups alias the same block bytes, so a late drafter write into
+    a reused block overwrites the new owner's target-layer KV.
+
+    `VLLM_OUTPUT_WAITS_FOR_DRAFTER=0` opts an engine out (e.g. to measure the
+    cost per role); it is on by default whenever the conditions hold.
+    """
+    if os.environ.get("VLLM_OUTPUT_WAITS_FOR_DRAFTER", "1") == "0":
+        return False
+    kv_transfer_config = vllm_config.kv_transfer_config
+    return (
+        has_speculator
+        and kv_connector is not NO_OP_KV_CONNECTOR
+        and kv_transfer_config is not None
+        and (kv_transfer_config.is_kv_producer or kv_transfer_config.is_kv_consumer)
+    )
 
 
 def get_kv_connector(
