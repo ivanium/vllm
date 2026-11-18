@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import dataclasses
+import os
+
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     as_quantized_activation,
@@ -22,6 +26,90 @@ from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
+
+logger = init_logger(__name__)
+
+_CUTE_DSL_COLD_CHAIN_ENV = "VLLM_FLASHINFER_MXFP8_COLD_CHAIN_LAUNCHES"
+_cute_dsl_cold_chain_checked = False
+
+
+def _maybe_chain_cute_dsl_mxfp8_tuning() -> None:
+    """VLLM_FLASHINFER_MXFP8_COLD_CHAIN_LAUNCHES=<n>, n >= 2: FlashInfer's
+    autotuner ranks the mm_mxfp8(backend="cute-dsl") tactics on cold-L2
+    samples of n back-to-back launches, each on its own copy of the weight and
+    its scales, as it ranks BF16 GEMM tactics (flashinfer-ai/flashinfer#6360),
+    instead of on one isolated launch, whose ~2 us timing grain at decode M
+    makes the pick a draw among near-equal tiles. The tuning config change of
+    flashinfer-ai/flashinfer#8836 (16 launches). It changes only which of the
+    tactics the autotuner already offers is picked per M bucket. Applied once
+    per process, before any tuning; unset leaves FlashInfer's config as is."""
+    global _cute_dsl_cold_chain_checked
+    if _cute_dsl_cold_chain_checked:
+        return
+    _cute_dsl_cold_chain_checked = True
+    value = os.getenv(_CUTE_DSL_COLD_CHAIN_ENV, "")
+    if not value:
+        return
+    try:
+        launches = int(value)
+    except ValueError:
+        launches = 0
+    if launches < 2:
+        raise ValueError(
+            f"{_CUTE_DSL_COLD_CHAIN_ENV} must be an integer of at least 2, "
+            f"got {value!r}."
+        )
+    from flashinfer.gemm import gemm_base
+
+    config = getattr(gemm_base, "_MM_MXFP8_CUTE_DSL_TUNING_CONFIG", None)
+    if not all(
+        hasattr(config, name)
+        for name in (
+            "cold_chain_launches",
+            "profile_arena_input_indices",
+            "uses_cold_chain",
+            "l2_cache_policy",
+        )
+    ):
+        logger.warning(
+            "%s=%s has no effect: this FlashInfer has no cold-chain autotuning "
+            "for mm_mxfp8.",
+            _CUTE_DSL_COLD_CHAIN_ENV,
+            value,
+        )
+        return
+    if config.uses_cold_chain:
+        logger.info(
+            "%s=%s has no effect: FlashInfer already ranks mm_mxfp8 CuTe-DSL "
+            "tactics on a cold chain (%s).",
+            _CUTE_DSL_COLD_CHAIN_ENV,
+            value,
+            config.l2_cache_policy,
+        )
+        return
+    chained = dataclasses.replace(
+        config,
+        cold_chain_launches=launches,
+        profile_arena_input_indices=(1, 3),  # b, b_descale
+    )
+    if not chained.uses_cold_chain:
+        logger.warning(
+            "%s=%s has no effect: FlashInfer's mm_mxfp8 CuTe-DSL tuning config "
+            "cannot chain launches (policy %s).",
+            _CUTE_DSL_COLD_CHAIN_ENV,
+            value,
+            chained.l2_cache_policy,
+        )
+        return
+    gemm_base._MM_MXFP8_CUTE_DSL_TUNING_CONFIG = chained
+    logger.info(
+        "FlashInfer autotunes mm_mxfp8(backend='cute-dsl') on cold-L2 chains "
+        "of %d launches over weight copies (%s=%d; L2 policy %s).",
+        launches,
+        _CUTE_DSL_COLD_CHAIN_ENV,
+        launches,
+        chained.l2_cache_policy,
+    )
 
 
 def _check_mm_mxfp8_shape(weight_shape: tuple[int, int]) -> tuple[bool, str | None]:
@@ -127,6 +215,11 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer CuTe-DSL (SM100/SM103)."""
 
     supports_pre_processed_weights = True
+
+    def __init__(self, c: Mxfp8LinearLayerConfig) -> None:
+        super().__init__(c)
+        # Built with the model, before warmup autotunes any GEMM.
+        _maybe_chain_cute_dsl_mxfp8_tuning()
 
     @classmethod
     def is_supported(
