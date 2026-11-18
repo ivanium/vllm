@@ -83,7 +83,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.protocol import
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.selective_lease import (  # noqa: E501
     SelectiveLookupLease,
 )
-from vllm.distributed.mooncake_store import MooncakeStoreConfig, setup_mooncake_store
+from vllm.distributed.mooncake_store import (
+    MooncakeStoreConfig,
+    _parse_size,
+    setup_mooncake_store,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_socket
@@ -1646,6 +1650,10 @@ class MooncakeStoreWorker:
         setup_mooncake_store(
             self.store, store_config, local_hostname, engine=shared_engine
         )
+        self._hbm_segment: torch.Tensor | None = None
+        hbm_pool = extra_config.get("hbm_pool")
+        if hbm_pool and os.environ.get("VLLM_MOONCAKE_STORE_HBM_POOL") == "1":
+            self._mount_hbm_segment(hbm_pool["segment_size"], kv_cache_config)
 
         preferred_segment = rdma_utils.get_configured_preferred_segment(extra_config)
         self.preferred_segment = preferred_segment
@@ -1774,6 +1782,52 @@ class MooncakeStoreWorker:
                 self._lookup_key_prefixes,
                 self._record_kv_connector_operation,
             )
+
+    def _mount_hbm_segment(
+        self, segment_size: int | str, kv_cache_config: KVCacheConfig
+    ) -> None:
+        """Lend GPU memory to the store pool as a segment of its own."""
+        if segment_size == "auto":
+            raise RuntimeError(
+                "hbm_pool segment_size 'auto' is resolved by the engine core, "
+                "but reached this worker unresolved."
+            )
+        if not hasattr(self.store, "mount_external_segment"):
+            raise RuntimeError(
+                "hbm_pool needs a Mooncake store with mount_external_segment."
+            )
+        # Mooncake segments are aligned to and sized in 4 MiB cachelib slabs.
+        slab = 4 << 20
+        requested = _parse_size(segment_size)
+        if requested < 0 or 0 < requested < slab:
+            raise ValueError(
+                f"hbm_pool segment_size={segment_size!r} is {requested} bytes; "
+                "give at least 4 MiB (plain numbers are bytes, or add GB/MB)."
+            )
+        size = requested // slab * slab
+        if size == 0:
+            logger.warning("The Mooncake hbm_pool has no GPU memory to mount.")
+            return
+        device = f"cuda:{torch.accelerator.current_device_index()}"
+        # The KV cache is allocated after this connector, from the same memory.
+        kv_bytes = max(
+            (t.size for t in kv_cache_config.kv_cache_tensors if not t.host_resident),
+            default=0,
+        )
+        free = torch.cuda.mem_get_info(device)[0] + (
+            torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+        )
+        if size + slab + kv_bytes > free:
+            raise ValueError(
+                f"hbm_pool segment ({size >> 30} GiB) and KV cache "
+                f"({kv_bytes >> 30} GiB) need more than the {free >> 30} GiB free "
+                f"on {device}: lower kv-cache-memory or gpu-memory-utilization."
+            )
+        self._hbm_segment = torch.empty(size + slab, dtype=torch.uint8, device=device)
+        base = cdiv(self._hbm_segment.data_ptr(), slab) * slab
+        if self.store.mount_external_segment(base, size, device) != 0:
+            raise RuntimeError("Failed to mount the HBM segment.")
+        logger.info("Mounted %d GiB HBM segment.", size >> 30)
 
     def _select_store_layout(
         self, extra_config: dict[str, Any]

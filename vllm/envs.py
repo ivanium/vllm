@@ -252,6 +252,7 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_STORE_SELECTIVE_LEASE: bool = False
+    VLLM_MOONCAKE_STORE_HBM_POOL: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
@@ -1891,6 +1892,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOONCAKE_STORE_SELECTIVE_LEASE": lambda: (
         os.getenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "False").lower()
         in ("true", "1")
+    ),
+    # Mount the MooncakeStoreConnector's "hbm_pool" (kv_connector_extra_config)
+    # as a GPU-memory store segment. "auto" gives a producer's KV budget beyond
+    # one max_model_len request to the store. Needs a Mooncake build with
+    # mount_external_segment. Read from os.environ at its call sites.
+    "VLLM_MOONCAKE_STORE_HBM_POOL": lambda: (
+        os.getenv("VLLM_MOONCAKE_STORE_HBM_POOL", "0") == "1"
     ),
     # Number of parallel KV-load receive threads per worker rank. Lets the
     # per-request control overhead (Python prep + master key lookup) of one

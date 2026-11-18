@@ -66,6 +66,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     frontend_block_hashes,
     generate_scheduler_kv_cache_config,
+    get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher,
     init_none_hash,
     resolve_cache_hit_alignment_tokens,
@@ -124,6 +125,47 @@ logger = init_logger(__name__)
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+
+def _get_mooncake_hbm_pool(vllm_config: VllmConfig) -> dict[str, Any] | None:
+    """The MooncakeStoreConnector's ``hbm_pool`` (a GPU-memory store segment),
+    also under a MultiConnector, if VLLM_MOONCAKE_STORE_HBM_POOL=1."""
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
+        return None
+    extra = kv_transfer_config.kv_connector_extra_config
+    configs: list[tuple[str | None, dict[str, Any]]] = []
+    if kv_transfer_config.kv_connector == "MooncakeStoreConnector":
+        configs.append((kv_transfer_config.kv_role, extra))
+    elif kv_transfer_config.kv_connector == "MultiConnector":
+        configs += [
+            (c.get("kv_role"), c.get("kv_connector_extra_config", {}))
+            for c in extra.get("connectors", [])
+            if c.get("kv_connector") == "MooncakeStoreConnector"
+        ]
+    role, pool = next(
+        ((r, c["hbm_pool"]) for r, c in configs if c.get("hbm_pool")), (None, None)
+    )
+    if pool is None:
+        return None
+    if os.environ.get("VLLM_MOONCAKE_STORE_HBM_POOL") != "1":
+        logger.warning_once(
+            "Ignoring the Mooncake hbm_pool: set VLLM_MOONCAKE_STORE_HBM_POOL=1."
+        )
+        return None
+    if pool.get("segment_size") == "auto" and role not in ("kv_producer", "kv_both"):
+        # "auto" would cut a consumer's KV cache to one max_model_len request.
+        raise ValueError(
+            f"hbm_pool segment_size 'auto' needs a kv_producer or kv_both "
+            f"MooncakeStoreConnector, not {role}; give a consumer an explicit size."
+        )
+    return pool
+
+
+def _size_auto_hbm_pool(worker: Any, nbytes: int) -> None:
+    pool = _get_mooncake_hbm_pool(worker.vllm_config)
+    assert pool is not None
+    pool["segment_size"] = nbytes
 
 
 class EngineCore:
@@ -292,10 +334,15 @@ class EngineCore:
         # capture full cudagraphs initialize a minimal KV cache during it.
         # Attention-free models resolve the default so layout reads never precede
         # resolution.
+        hbm_pool = _get_mooncake_hbm_pool(vllm_config)
         if vllm_config.cache_config.enable_extensible_kv_cache:
             # Disable it, everywhere, where it cannot be used.
             executor = self.model_executor
             reason = executor.extensible_kv_cache_unsupported_reason(layer_configs)
+            if reason is None and hbm_pool is not None:
+                # The store mounts the segment when its connector is created,
+                # before the KV cache is allocated from the profiled budget.
+                reason = "the Mooncake hbm_pool is sized from the profiled KV budget"
             if reason is not None:
                 executor.disable_extensible_kv_cache(reason)
         layout = resolve_kv_cache_layout(
@@ -336,6 +383,34 @@ class EngineCore:
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, layer_configs, available_gpu_memory, global_kv_cache_groups
         )
+        if (
+            has_kv_cache
+            and hbm_pool is not None
+            and hbm_pool.get("segment_size") == "auto"
+        ):
+            # An "auto" Mooncake HBM pool takes the KV budget beyond one
+            # max_model_len request, the null block and one spare block.
+            config = kv_cache_configs[0]
+            per_request = round(
+                config.num_blocks
+                / get_max_concurrency_for_kv_cache_config(vllm_config, config)
+            )
+            kept_blocks = min(per_request + 2, config.num_blocks)
+            vllm_config.cache_config.num_gpu_blocks_override = kept_blocks
+            kv_cache_configs = get_kv_cache_configs(
+                vllm_config, layer_configs, available_gpu_memory, global_kv_cache_groups
+            )
+            spare_blocks = config.num_blocks - kv_cache_configs[0].num_blocks
+            block_bytes = min(available_gpu_memory) // config.num_blocks
+            segment_bytes = spare_blocks * block_bytes
+            logger.info(
+                "Mooncake hbm_pool auto: %d of %d KV cache blocks stay in vLLM; "
+                "%d bytes go to the store's HBM segment.",
+                kv_cache_configs[0].num_blocks,
+                config.num_blocks,
+                segment_bytes,
+            )
+            self.collective_rpc(_size_auto_hbm_pool, args=(segment_bytes,))
         for kv_cache_config in kv_cache_configs:
             kv_cache_config.kv_cache_layout = vllm_config.cache_config.kv_cache_layout
 
