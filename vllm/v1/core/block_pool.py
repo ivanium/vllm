@@ -152,6 +152,12 @@ class BlockPool:
         self.use_contiguous_allocation = bool(
             int(os.environ.get("VLLM_KV_CONTIG_ALLOC", "0"))
         )
+        if self.use_contiguous_allocation:
+            logger.info_once(
+                "VLLM_KV_CONTIG_ALLOC=1: KV allocations of %d or more blocks "
+                "take contiguous block-ID runs where the free queue has them.",
+                _CONTIGUOUS_ALLOC_MIN_BLOCKS,
+            )
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx, pool=self._weak_self) for idx in range(num_gpu_blocks)
