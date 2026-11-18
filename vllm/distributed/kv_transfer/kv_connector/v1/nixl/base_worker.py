@@ -49,6 +49,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     TransferHandle,
     compute_nixl_compatibility_hash,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.registration import (
+    CHUNKED_KV_REGISTRATION_ENV,
+    RegionRun,
+    chunked_kv_registration_enabled,
+    plan_registration_pieces,
+    spans_4gib_boundary,
+    split_strided_descs,
+    ucx_rcache_enabled,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
@@ -799,6 +808,29 @@ class NixlBaseConnectorWorker:
         params = self.kv_transfer_config.get_from_extra_config("ucx_backend_params", {})
         ucx_backend_params = {k: str(v) for k, v in params.items()}
         sleep_mode = vllm_config.model_config.enable_sleep_mode and config is not None
+        if chunked_kv_registration_enabled() and "UCX" in self.nixl_backends:
+            # KV storages are registered in pieces (register_kv_caches). UCX's
+            # registration cache registers a CUDA buffer's whole allocation and
+            # merges overlapping regions, so it would map the pieces to one MR
+            # again. NIXL passes each transfer's memory handle, so transfers do
+            # not use the cache. UCX reads this when the backend is created;
+            # a value set by the user wins.
+            engine_config = ucx_backend_params.get("engine_config", "")
+            if "RCACHE_ENABLE" not in engine_config:
+                os.environ.setdefault("UCX_RCACHE_ENABLE", "n")
+            if ucx_rcache_enabled(engine_config):
+                logger.warning(
+                    "UCX's registration cache is on (UCX_RCACHE_ENABLE or the UCX "
+                    "engine_config): it registers each KV piece's whole CUDA "
+                    "allocation as one MR, so dma-buf MRs of 4 GiB or more can "
+                    "still wrap (vllm#64048)."
+                )
+            else:
+                logger.info(
+                    "NIXL KV registration: UCX registration cache off, so each "
+                    "registered KV piece is its own MR (%s=0 to restore).",
+                    CHUNKED_KV_REGISTRATION_ENV,
+                )
         # With UCX params, create every backend here, in the configured order.
         explicit_backends = (config is not None and not sleep_mode) and (
             bool(ucx_backend_params) and "UCX" in self.nixl_backends
@@ -980,6 +1012,9 @@ class NixlBaseConnectorWorker:
         self._dst_pairs: dict[EngineId, _RegionPairs] = {}
         self.dst_region_mem_types: dict[EngineId, list[str]] = {}
         self._registered_descs: list[Any] = []
+        # Interior cuts of the VRAM KV registrations, sorted (see
+        # nixl/registration.py); descriptor runs are split at them.
+        self._kv_registration_cuts: list[int] = []
         self._kv_unregistered = False
 
         # In progress transfers.
@@ -1934,6 +1969,11 @@ class NixlBaseConnectorWorker:
                 "Mixed-device KV registration is only supported for MLA "
                 "models without Mamba layers."
             )
+        # A dma-buf MR of 4 GiB or more can wrap on RDMA stacks without linux
+        # 15fe76e23615 (vllm#64048), so device KV storages are registered in
+        # pieces no descriptor crosses (nixl/registration.py).
+        chunk_registrations = chunked_kv_registration_enabled() and not self._has_mamba
+        self._kv_registration_cuts = []
         for mem_type in sorted(set(region_mem_types)):
             if mem_type == "DRAM" and self._skip_dram_xfer:
                 continue
@@ -1946,9 +1986,19 @@ class NixlBaseConnectorWorker:
                 ) in registration_ranges.items()
                 if cache_mem_type == mem_type
             ]
-            descs = self.nixl_wrapper.get_reg_descs(ranges_for_mem_type, mem_type)
+            pieces_for_mem_type: list[tuple[int, int, int, str]] = []
+            for start, length, device_id, _ in ranges_for_mem_type:
+                pieces = [(start, start + length)]
+                if chunk_registrations and mem_type != "DRAM":
+                    pieces = self._plan_kv_registration(start, length, mem_type)
+                pieces_for_mem_type.extend(
+                    (lo, hi - lo, device_id, "") for lo, hi in pieces
+                )
+                self._log_kv_registration(mem_type, start, length, device_id, pieces)
+            descs = self.nixl_wrapper.get_reg_descs(pieces_for_mem_type, mem_type)
             self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
             self._registered_descs.append(descs)
+        self._kv_registration_cuts.sort()
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
@@ -2007,6 +2057,7 @@ class NixlBaseConnectorWorker:
                 for name in names
             },
             packed_member_layouts=self._packed_member_layouts,
+            kv_registration_cuts=self._kv_registration_cuts,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -2028,6 +2079,94 @@ class NixlBaseConnectorWorker:
             "PLE region registered without its page length"
         )
         return self._ple_block_len
+
+    def _plan_kv_registration(
+        self, start: int, length: int, mem_type: str
+    ) -> list[tuple[int, int]]:
+        """Pieces of the storage [start, start + length) to register, cut
+        where none of its regions' descriptors cross; records the cuts."""
+        end = start + length
+        base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+        runs = [
+            RegionRun(base, block_len, block_stride, num_blocks)
+            for base, block_len, block_stride, num_blocks, region_mem_type in zip(
+                base_addresses,
+                self.block_len_per_layer,
+                self.block_stride_per_layer,
+                self.region_num_blocks,
+                self.region_mem_types,
+                strict=True,
+            )
+            if region_mem_type == mem_type and start <= base < end
+        ]
+        try:
+            pieces = plan_registration_pieces(start, end, runs)
+        except ValueError as e:
+            logger.warning(
+                "NIXL KV registration: cannot cut %s storage 0x%x (%d bytes) "
+                "where no descriptor crosses (%s); registering it whole.",
+                mem_type,
+                start,
+                length,
+                e,
+            )
+            return [(start, end)]
+        self._kv_registration_cuts.extend(lo for lo, _ in pieces[1:])
+        return pieces
+
+    def _log_kv_registration(
+        self,
+        mem_type: str,
+        start: int,
+        length: int,
+        device_id: int,
+        pieces: list[tuple[int, int]],
+    ) -> None:
+        """Log each KV storage registration once, so an engine whose transfers
+        corrupt can be matched to it (vllm#64048)."""
+        align = (start & -start).bit_length() - 1 if start else 0
+        if len(pieces) > 1:
+            cuts = [lo for lo, _ in pieces[1:]]
+            region_ends = [
+                (base, base + (num_blocks - 1) * stride + block_len)
+                for base, block_len, stride, num_blocks in zip(
+                    self.kv_caches_base_addr[self.engine_id][self.tp_rank],
+                    self.block_len_per_layer,
+                    self.block_stride_per_layer,
+                    self.region_num_blocks,
+                )
+                if start <= base < start + length
+            ]
+            split_runs = sum(
+                any(lo < cut < hi for cut in cuts) for lo, hi in region_ends
+            )
+            longest = max(hi - lo for lo, hi in pieces)
+            crossing = sum(spans_4gib_boundary(lo, hi) for lo, hi in pieces)
+            detail = (
+                f"; registered as {len(pieces)} pieces of at most {longest} "
+                f"bytes, {split_runs} of {len(region_ends)} region runs split; "
+                f"{crossing} pieces cross a 2^32 boundary, each under 4 GiB, "
+                "so no dma-buf MR can wrap"
+            )
+        elif align >= 32 and length > (1 << align):
+            switch = (
+                ""
+                if mem_type == "DRAM" or chunked_kv_registration_enabled()
+                else f" ({CHUNKED_KV_REGISTRATION_ENV}=0)"
+            )
+            detail = f"; past 2^{align} it would wrap on a dma-buf MR{switch}"
+        else:
+            detail = ""
+        logger.info(
+            "NIXL KV registration: %s base 0x%x, %d bytes, device %d, "
+            "base aligned to 2^%d%s",
+            mem_type,
+            start,
+            length,
+            device_id,
+            align,
+            detail,
+        )
 
     def unregister_kv_caches(self) -> None:
         if self._kv_unregistered or not self._registered_descs:
@@ -2406,14 +2545,19 @@ class NixlBaseConnectorWorker:
                 )
             device_handle = self.nixl_wrapper.prep_xfer_dlist(
                 "NIXL_INIT_AGENT",
-                blocks_data[~strided_is_dram],
+                split_strided_descs(
+                    blocks_data[~strided_is_dram], self._kv_registration_cuts
+                ),
                 mem_type=self.nixl_memory_type,
             )
             return device_handle, blocks_data
 
         # NIXL_INIT_AGENT to be used for preparations of local descs.
+        # Each run lies in one registered piece; the split keeps flat indices.
         handle = self.nixl_wrapper.prep_xfer_dlist(
-            "NIXL_INIT_AGENT", blocks_data, mem_type=self.region_mem_types[0]
+            "NIXL_INIT_AGENT",
+            split_strided_descs(blocks_data, self._kv_registration_cuts),
+            mem_type=self.region_mem_types[0],
         )
         return handle, blocks_data
 
@@ -2691,7 +2835,9 @@ class NixlBaseConnectorWorker:
                     self._dram_src_handles_by_tp_ratio[split_key].append(dram_handle)
                     handle_data = handle_data[~strided_is_dram]
                 handle = self.nixl_wrapper.prep_xfer_dlist(
-                    "NIXL_INIT_AGENT", handle_data, mem_type=self.nixl_memory_type
+                    "NIXL_INIT_AGENT",
+                    split_strided_descs(handle_data, self._kv_registration_cuts),
+                    mem_type=self.nixl_memory_type,
                 )
                 self.src_xfer_handles_by_tp_ratio[split_key].append(handle)
 
@@ -2731,6 +2877,10 @@ class NixlBaseConnectorWorker:
             raise NotImplementedError(
                 "NIXL pull does not yet support a mixed-memory producer"
             )
+        # The remote registered its storages in pieces cut at these addresses.
+        blocks_data = split_strided_descs(
+            blocks_data, nixl_agent_meta.kv_registration_cuts
+        )
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(
                 remote_agent_name, blocks_data, mem_type=remote_mem_types.pop()

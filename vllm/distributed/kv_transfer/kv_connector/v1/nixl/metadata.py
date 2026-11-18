@@ -85,6 +85,9 @@ class NixlAgentMetadata:
     layer_group_ids: dict[str, int] = field(default_factory=dict)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Addresses where device KV storages are cut into separately registered
+    # pieces, sorted; descriptor runs are split there (nixl/registration.py).
+    kv_registration_cuts: list[int] = field(default_factory=list)
 
 
 @dataclass
