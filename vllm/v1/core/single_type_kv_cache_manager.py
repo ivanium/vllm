@@ -72,6 +72,10 @@ class SingleTypeKVCacheManager(ABC):
     # pass it only to managers that set this.
     uses_request_length: ClassVar[bool] = False
 
+    # Set once this manager has logged an admission estimate for a request
+    # whose block table is past the admission cap.
+    _reported_admission_past_cap: bool = False
+
     @classmethod
     def config(cls, **params: Any) -> ManagerConfig:
         """This manager's policy with `Params(**params)`."""
@@ -313,9 +317,10 @@ class SingleTypeKVCacheManager(ABC):
             num_tokens_main_model: The number of tokens for the main model (aka target
                 model in spec decode). w/o spec decode, it is num_tokens;
                 with spec decode, it is num_tokens - num_lookahead_tokens.
-            apply_admission_cap: If True, clamp by `num_required_blocks` by
-                `max_admission_blocks_per_request`for recycling-aware specs
-                (SWA, chunked-local).
+            apply_admission_cap: If True, bound the result for recycling-aware
+                specs (SWA, chunked-local) by the blocks the request can still
+                take from the pool under `max_admission_blocks_per_request`
+                (see `_cap_admission_blocks`).
             prefill_end: The token index the request's prefill ends at, the
                 same value the scheduler splits chunks against. Mamba reserves
                 a prefill checkpoint only on the chunk reaching it; 0 (dense
@@ -326,19 +331,8 @@ class SingleTypeKVCacheManager(ABC):
 
         """
         num_required_blocks = cdiv(num_tokens, self.block_size)
-        if apply_admission_cap and self.max_admission_blocks_per_request is not None:
-            # Recycling-aware specs (SWA, chunked-local) cap the per-request
-            # reservation here so admission matches the startup pool sizer
-            # (`max_admission_blocks`). `remove_skipped_blocks` runs from
-            # `allocate_slots` before each chunk's `get_num_blocks_to_allocate`,
-            # so per-request peak real-held blocks <= this cap, which keeps
-            # `sum(reservations) <= pool` <=> `sum(peak_real_held) <= pool`.
-            # Drift between the two would re-introduce the deadlock from
-            # issue #39734 or, worse, mid-prefill OOM.
-            num_required_blocks = min(
-                num_required_blocks, self.max_admission_blocks_per_request
-            )
-        num_req_blocks = len(self.req_to_blocks.get(request_id, ()))
+        req_blocks = self.req_to_blocks.get(request_id, ())
+        num_req_blocks = len(req_blocks)
 
         if request_id in self.num_cached_block:
             # Fast-path: a running request won't have any new prefix-cache hits.
@@ -346,7 +340,10 @@ class SingleTypeKVCacheManager(ABC):
             # NOTE: With speculative decoding, request's blocks may be allocated
             # for draft tokens which are later rejected. In this case,
             # num_required_blocks may be smaller than num_req_blocks.
-            return max(num_required_blocks - num_req_blocks, 0)
+            num_new_blocks = max(num_required_blocks - num_req_blocks, 0)
+            if apply_admission_cap:
+                return self._cap_admission_blocks(req_blocks, num_new_blocks)
+            return num_new_blocks
 
         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks
@@ -372,11 +369,70 @@ class SingleTypeKVCacheManager(ABC):
         num_evictable_blocks = self._get_num_evictable_blocks(
             new_computed_blocks[num_skipped_new_computed_blocks:]
         )
+        if apply_admission_cap:
+            num_new_blocks = self._cap_admission_blocks(
+                req_blocks, num_new_blocks + num_evictable_blocks
+            )
+            num_evictable_blocks = 0
         if self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens):
             # Reserve the extra block that allocate_new_blocks pulls for the
             # partial-hit CoW redirect.
             num_new_blocks += 1
         return num_new_blocks + num_evictable_blocks
+
+    def _cap_admission_blocks(
+        self, req_blocks: Sequence[KVCacheBlock], num_new_blocks: int
+    ) -> int:
+        """Bound `num_new_blocks`, the blocks a request still allocates or takes
+        off the free queue over the tokens asked for, by what it can take from
+        the pool at once under the admission cap.
+
+        Recycling-aware specs (SWA, chunked-local) hold at most
+        `max_admission_blocks_per_request` real blocks per request at any time:
+        `remove_skipped_blocks` runs from `allocate_slots` before each chunk's
+        `get_num_blocks_to_allocate`. That is the bound the startup pool sizer
+        uses (`max_admission_blocks`), so `sum(reservations) <= pool` <=>
+        `sum(peak_real_held) <= pool`; drift between the two would
+        re-introduce the deadlock from issue #39734 or, worse, mid-prefill OOM.
+
+        The cap bounds blocks held at once, so it is compared with the real
+        blocks the request holds, not with the length of its block table. That
+        length is positional: it counts the null blocks below the window (a
+        skipped prefix, an external load's prefix, recycled blocks), and once
+        past the cap it would leave nothing for a request with tokens still to
+        compute, such as an async KV load with a long hit and a short tail.
+        Only blocks this request alone references count as held: a block shared
+        through the prefix cache, or pinned by a connector's save, does not
+        return to the pool when the window moves past it.
+        """
+        cap = self.max_admission_blocks_per_request
+        if cap is None:
+            return num_new_blocks
+        # Blocks below the window are null, so the held blocks are a suffix.
+        num_held_blocks = 0
+        for block in reversed(req_blocks):
+            if block.is_null:
+                break
+            if block.ref_cnt == 1:
+                num_held_blocks += 1
+        num_new_blocks = min(num_new_blocks, max(cap - num_held_blocks, 0))
+        if (
+            num_new_blocks > 0
+            and len(req_blocks) >= cap
+            and not self._reported_admission_past_cap
+        ):
+            self._reported_admission_past_cap = True
+            logger.info(
+                "KV cache group %d: admission reserves %d blocks for a request "
+                "whose block table (%d blocks, %d held) is past the %d-block "
+                "admission cap; it counts the blocks the request holds.",
+                self.kv_cache_group_id,
+                num_new_blocks,
+                len(req_blocks),
+                num_held_blocks,
+                cap,
+            )
+        return num_new_blocks
 
     def add_local_computed_blocks(
         self,

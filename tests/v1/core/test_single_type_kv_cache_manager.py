@@ -9,6 +9,7 @@ import torch
 from tests.v1.core.utils import new_kv_cache_group
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -20,9 +21,11 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
     CircularBufferManager,
+    DFlashSlidingWindowManager,
     FullAttentionManager,
     MambaManager,
     RSWAManager,
+    SingleTypeKVCacheManager,
     SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
@@ -982,6 +985,253 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+ADMISSION_BLOCK_SIZE = 16
+ADMISSION_CHUNK_TOKENS = 64
+# One scheduled chunk in flight beside the one being allocated.
+ADMISSION_MAX_IN_FLIGHT_TOKENS = 2 * ADMISSION_CHUNK_TOKENS
+RECYCLING_KINDS = ["sliding-window", "dflash-sliding-window", "chunked-local"]
+
+
+def _recycling_manager(
+    kind: str, num_blocks: int = 400
+) -> tuple[SingleTypeKVCacheManager, int]:
+    """A recycling-aware manager (window 64, or local chunks of 128) with the
+    admission cap the startup pool sizer gives it, and that cap."""
+    manager_cls: type[SingleTypeKVCacheManager]
+    if kind == "chunked-local":
+        manager_cls = ChunkedLocalAttentionManager
+        params = {"attention_chunk_size": 128}
+    else:
+        manager_cls = (
+            DFlashSlidingWindowManager
+            if kind == "dflash-sliding-window"
+            else SlidingWindowManager
+        )
+        params = {"sliding_window": 64}
+    layer = manager_cls.layer_config(
+        AttentionSpec(
+            block_size=ADMISSION_BLOCK_SIZE,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+        **params,
+    )
+    cap = manager_cls.max_admission_blocks(
+        layer.manager_config,
+        ADMISSION_BLOCK_SIZE,
+        max_in_flight_tokens=ADMISSION_MAX_IN_FLIGHT_TOKENS,
+        max_model_len=1 << 20,
+    )
+    assert cap is not None
+    manager = manager_cls(
+        new_kv_cache_group(["layer"], layer),
+        block_pool=BlockPool(
+            num_gpu_blocks=num_blocks,
+            enable_caching=True,
+            hash_block_size=ADMISSION_BLOCK_SIZE,
+        ),
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=ADMISSION_BLOCK_SIZE,
+        max_admission_blocks_per_request=cap,
+    )
+    return manager, cap
+
+
+def _admission_estimate(
+    manager: SingleTypeKVCacheManager,
+    num_tokens: int,
+    computed_tokens: int,
+    capped: bool,
+    hit_blocks: list[KVCacheBlock] | None = None,
+    num_local_computed_tokens: int | None = None,
+) -> int:
+    if num_local_computed_tokens is None:
+        num_local_computed_tokens = computed_tokens
+    return manager.get_num_blocks_to_allocate(
+        request_id="req",
+        num_tokens=num_tokens,
+        new_computed_blocks=hit_blocks or [],
+        total_computed_tokens=computed_tokens,
+        num_local_computed_tokens=num_local_computed_tokens,
+        num_tokens_main_model=num_tokens,
+        apply_admission_cap=capped,
+    )
+
+
+def _adopt_hit(
+    manager: SingleTypeKVCacheManager,
+    num_local_tokens: int,
+    num_external_tokens: int,
+    num_tokens: int,
+    hit_blocks: list[KVCacheBlock] | None = None,
+) -> None:
+    """Adopt a local hit and allocate an external (KV connector) load, as
+    `allocate_new_computed_blocks` does for a request of `num_tokens`."""
+    manager.add_local_computed_blocks(
+        "req", hit_blocks or [], num_local_tokens, num_external_tokens
+    )
+    if num_external_tokens > 0:
+        kwargs = (
+            {"num_request_tokens": num_tokens} if manager.uses_request_length else {}
+        )
+        manager.allocate_external_computed_blocks(
+            "req", num_local_tokens, num_external_tokens, **kwargs
+        )
+
+
+def _hit_blocks(
+    manager: SingleTypeKVCacheManager, num_hit_tokens: int, shared: bool
+) -> list[KVCacheBlock]:
+    """A prefix-cache hit of `num_hit_tokens`: null blocks below the window,
+    then blocks another request holds (`shared`) or that are free (evictable)."""
+    pool = manager.block_pool
+    num_skipped_blocks = (
+        manager.get_num_skipped_tokens(num_hit_tokens) // ADMISSION_BLOCK_SIZE
+    )
+    num_hit_blocks = num_hit_tokens // ADMISSION_BLOCK_SIZE
+    window_blocks = pool.get_new_blocks(num_hit_blocks - num_skipped_blocks)
+    if not shared:
+        pool.free_blocks(window_blocks)
+    return [pool.null_block] * num_skipped_blocks + window_blocks
+
+
+def _prefill_peak_demand(
+    manager: SingleTypeKVCacheManager,
+    computed_tokens: int,
+    num_tokens: int,
+    free_before: int,
+    in_flight_tokens: int = 0,
+) -> int:
+    """Prefill from `computed_tokens` to `num_tokens` as `allocate_slots` does:
+    free the blocks below the window on the processed tokens (the previous
+    chunk is still in flight), then allocate the next chunk. Returns the most
+    blocks taken from the pool at once, counted from `free_before`."""
+    pool = manager.block_pool
+    peak = free_before - pool.get_num_free_blocks()
+    while computed_tokens < num_tokens:
+        chunk = min(ADMISSION_CHUNK_TOKENS, num_tokens - computed_tokens)
+        manager.remove_skipped_blocks("req", computed_tokens - in_flight_tokens)
+        manager.allocate_new_blocks(
+            "req", computed_tokens + chunk, computed_tokens + chunk
+        )
+        computed_tokens += chunk
+        in_flight_tokens = chunk
+        peak = max(peak, free_before - pool.get_num_free_blocks())
+    return peak
+
+
+@pytest.mark.parametrize("kind", RECYCLING_KINDS)
+@pytest.mark.parametrize("shared", [False, True], ids=["private", "shared"])
+def test_admission_cap_counts_held_blocks_not_the_block_table(kind, shared):
+    """A request that holds blocks is capped at the admission cap less the real
+    blocks only it holds, not less its block table's length.
+
+    After an async KV load of a long prefix the table is null below the window
+    and far past the cap. Subtracting its length from the cap reserved nothing
+    for the group, however much of the prompt was left to compute.
+    """
+    manager, cap = _recycling_manager(kind)
+    hit, tail = 1600, 48
+    _adopt_hit(manager, 0, hit, hit + tail)
+    req_blocks = manager.req_to_blocks["req"]
+    held = [block for block in req_blocks if not block.is_null]
+    assert len(req_blocks) > cap > len(held) > 0
+    if shared:
+        # Another request holds the same blocks (a prefix-cache hit), so this
+        # request's window moving past them returns nothing to the pool.
+        manager.block_pool.touch(held)
+    num_private = 0 if shared else len(held)
+
+    # The tail: the uncapped need is the tighter bound.
+    num_tail_blocks = cdiv(hit + tail, ADMISSION_BLOCK_SIZE) - len(req_blocks)
+    assert _admission_estimate(manager, hit + tail, hit, capped=False) == 3
+    assert num_tail_blocks == 3
+    assert _admission_estimate(manager, hit + tail, hit, capped=True) == 3
+    # A long remainder: the cap, less the blocks only this request holds.
+    num_tokens = hit + 100 * cap * ADMISSION_BLOCK_SIZE
+    assert _admission_estimate(manager, num_tokens, hit, capped=False) > cap
+    assert (
+        _admission_estimate(manager, num_tokens, hit, capped=True) == cap - num_private
+    )
+
+
+@pytest.mark.parametrize("kind", RECYCLING_KINDS)
+@pytest.mark.parametrize("shared", [False, True], ids=["evictable", "shared"])
+def test_admission_cap_with_a_local_hit_past_the_cap(kind, shared):
+    """A new request whose prefix-cache hit is longer than the cap still needs
+    blocks for the rest of its prompt: the hit's null blocks below the window
+    must not cancel them."""
+    manager, cap = _recycling_manager(kind)
+    hit = 1600
+    hit_blocks = _hit_blocks(manager, hit, shared)
+    assert len(hit_blocks) > cap
+    num_evictable = 0 if shared else sum(not block.is_null for block in hit_blocks)
+
+    def estimate(num_tokens: int, capped: bool) -> int:
+        return _admission_estimate(
+            manager, num_tokens, hit, capped, hit_blocks=hit_blocks
+        )
+
+    assert estimate(hit + 32, capped=True) == estimate(hit + 32, False)
+    assert estimate(hit + 32, capped=True) == 2 + num_evictable
+    num_tokens = hit + 100 * cap * ADMISSION_BLOCK_SIZE
+    assert estimate(num_tokens, capped=False) > cap
+    assert estimate(num_tokens, capped=True) == cap
+
+
+@pytest.mark.parametrize("kind", RECYCLING_KINDS)
+@pytest.mark.parametrize("seed", range(4))
+def test_admission_estimate_covers_peak_pool_demand(kind, seed):
+    """The capped estimate bounds the blocks a request takes from the pool at
+    once over the rest of its prefill, and never exceeds the uncapped one: for
+    parked async KV loads, in-flight prefills, and new requests with external
+    or local hits, private or shared with another request."""
+    rng = random.Random(seed)
+    modes = ["parked-load", "in-flight-prefill", "new-external-hit", "new-local-hit"]
+    for _ in range(50):
+        manager, cap = _recycling_manager(kind, num_blocks=1000)
+        pool = manager.block_pool
+        mode = rng.choice(modes)
+        shared = rng.random() < 0.5
+        hit = rng.randrange(ADMISSION_BLOCK_SIZE, 2400, ADMISSION_BLOCK_SIZE)
+        num_tokens = hit + rng.randint(1, 1500)
+        in_flight = 0
+        hit_blocks = None
+        num_local = None
+        if mode == "parked-load":
+            _adopt_hit(manager, 0, hit, num_tokens)
+            if shared:
+                pool.touch([b for b in manager.req_to_blocks["req"] if not b.is_null])
+        elif mode == "in-flight-prefill":
+            if rng.random() < 0.5:
+                # Tracked like a request adopted through the prefix cache.
+                manager.add_local_computed_blocks("req", [], 0, 0)
+            _prefill_peak_demand(manager, 0, hit, pool.get_num_free_blocks())
+            # The last chunk is still in flight.
+            in_flight = (hit - 1) % ADMISSION_CHUNK_TOKENS + 1
+            if shared:
+                pool.touch([b for b in manager.req_to_blocks["req"] if not b.is_null])
+        elif mode == "new-external-hit":
+            num_local = 0
+        else:
+            hit_blocks = _hit_blocks(manager, hit, shared)
+        free_before = pool.get_num_free_blocks()
+        estimate = _admission_estimate(
+            manager, num_tokens, hit, True, hit_blocks, num_local
+        )
+        uncapped = _admission_estimate(
+            manager, num_tokens, hit, False, hit_blocks, num_local
+        )
+        if mode == "new-external-hit":
+            _adopt_hit(manager, 0, hit, num_tokens)
+        elif mode == "new-local-hit":
+            _adopt_hit(manager, hit, 0, num_tokens, hit_blocks)
+        peak = _prefill_peak_demand(manager, hit, num_tokens, free_before, in_flight)
+        assert peak <= estimate <= uncapped, (mode, shared, hit, num_tokens, cap)
 
 
 def test_pop_blocks_for_free_trims_null_head():
