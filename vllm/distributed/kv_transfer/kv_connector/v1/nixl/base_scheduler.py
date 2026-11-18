@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
     NixlHandshakePayload,
     ReqId,
+    copy_block_ids,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
 from vllm.logger import init_logger
@@ -622,10 +623,10 @@ class NixlBaseConnectorScheduler:
                 recv_meta.receiver_generation, recv_meta.receiver_is_async = (
                     self._receiver_request_metadata.pop(req_id)
                 )
-                recv_meta.local_block_ids = deepcopy(recv_meta.local_block_ids)
+                recv_meta.local_block_ids = copy_block_ids(recv_meta.local_block_ids)
                 recv_meta.local_physical_block_ids = recv_meta.local_block_ids
                 assert recv_meta.remote is not None
-                recv_meta.remote.block_ids = deepcopy(recv_meta.remote.block_ids)
+                recv_meta.remote.block_ids = copy_block_ids(recv_meta.remote.block_ids)
 
         if self.use_host_buffer:
             self._build_save_meta(meta, scheduler_output)

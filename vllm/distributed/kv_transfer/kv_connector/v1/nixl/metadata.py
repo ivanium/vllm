@@ -234,6 +234,12 @@ class HeartbeatInfo:
     pp_size: int = 1
 
 
+def copy_block_ids(block_ids: BlockIds) -> BlockIds:
+    """A copy that owns each group's list. Block ids are ints, so this equals
+    deepcopy at a fraction of its cost."""
+    return type(block_ids)(list(group) for group in block_ids)
+
+
 @dataclass
 class RemoteMeta:
     block_ids: BlockIds

@@ -6,7 +6,7 @@ import os
 import time
 from collections.abc import Iterator
 from concurrent.futures import Future
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
     NixlConnectorMetadata,
     ReqMeta,
+    copy_block_ids,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_receiver import (
     BackendEvent,
@@ -169,7 +170,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # Only logical block metadata is copied here. Descriptor expansion
             # and native construction run exclusively on the receiver.
             if receiver.submit(
-                ReadJob(key, deepcopy(meta), not meta.receiver_is_async)
+                ReadJob(key, _owned_req_meta(meta), not meta.receiver_is_async)
             ):
                 self._receiver_keys[req_id] = key
         receiver.check_health()
@@ -967,6 +968,19 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     self._reqs_to_process.remove(req_id)
                     self._reqs_to_send.pop(req_id, None)
         return notified_req_ids
+
+
+def _owned_req_meta(meta: ReqMeta) -> ReqMeta:
+    """The receiver's own copy of a request: the block-id lists, which are the
+    only fields it reads that the engine thread could still change, copied
+    group by group rather than deep-copying the whole request."""
+    owned = copy(meta)
+    owned.local_block_ids = copy_block_ids(meta.local_block_ids)
+    owned.local_physical_block_ids = owned.local_block_ids
+    if meta.remote is not None:
+        owned.remote = copy(meta.remote)
+        owned.remote.block_ids = copy_block_ids(meta.remote.block_ids)
+    return owned
 
 
 @dataclass
