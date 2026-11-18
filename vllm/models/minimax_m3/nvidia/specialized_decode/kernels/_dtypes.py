@@ -10,7 +10,8 @@ refused with a clear message instead of silently reinterpreting bytes.
 
 NVFP4 caches are rejected explicitly: an nvfp4 cache is stored as uint8 with
 element size 1, the same as fp8, so a size-only check would accept it and the
-kernels would read 4-bit codes as e4m3.
+kernels would read 4-bit codes as e4m3. A stage that writes the NVFP4 pages
+itself (the front's stores) opts in with `allow_nvfp4`.
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ import enum
 class CacheFormat(enum.Enum):
     FP8_E4M3 = "fp8_e4m3"
     BF16 = "bf16"  # declared; no kernel instantiation yet
+    # Packed E2M1 + E4M3 block-scale pages; only stages that opt in (`allow_nvfp4`).
+    NVFP4 = "nvfp4"
 
 
 # Formats with device code in this package.
@@ -44,8 +47,12 @@ class CacheDtypeError(ValueError):
     pass
 
 
-def _resolve(kind: str, name: str, table: dict) -> CacheFormat:
+def _resolve(
+    kind: str, name: str, table: dict, allow_nvfp4: bool = False
+) -> CacheFormat:
     n = str(name).lower()
+    if allow_nvfp4 and n == "nvfp4":
+        return CacheFormat.NVFP4
     if "nvfp4" in n or "fp4" in n:
         raise CacheDtypeError(
             f"{kind} cache dtype {name!r}: NVFP4/FP4 caches are not supported by "
@@ -62,15 +69,17 @@ def _resolve(kind: str, name: str, table: dict) -> CacheFormat:
     return fmt
 
 
-def kv_cache_format(cache_dtype: str) -> CacheFormat:
+def kv_cache_format(cache_dtype: str, allow_nvfp4: bool = False) -> CacheFormat:
     """From `CacheConfig.cache_dtype`."""
-    return _resolve("KV", cache_dtype, _KV_NAMES)
+    return _resolve("KV", cache_dtype, _KV_NAMES, allow_nvfp4)
 
 
-def indexer_cache_format(indexer_kv_dtype: str) -> CacheFormat:
+def indexer_cache_format(
+    indexer_kv_dtype: str, allow_nvfp4: bool = False
+) -> CacheFormat:
     """From `AttentionConfig.indexer_kv_dtype` (before 'auto' resolution
     is fine: 'auto' maps to the model default bf16)."""
-    return _resolve("indexer K", indexer_kv_dtype, _INDEXER_NAMES)
+    return _resolve("indexer K", indexer_kv_dtype, _INDEXER_NAMES, allow_nvfp4)
 
 
 def check_cache_tensor(kind: str, t, fmt: CacheFormat) -> None:
@@ -80,6 +89,7 @@ def check_cache_tensor(kind: str, t, fmt: CacheFormat) -> None:
     ok = {
         CacheFormat.FP8_E4M3: (torch.float8_e4m3fn, torch.uint8),
         CacheFormat.BF16: (torch.bfloat16,),
+        CacheFormat.NVFP4: (torch.uint8,),
     }[fmt]
     if t.dtype not in ok:
         raise CacheDtypeError(

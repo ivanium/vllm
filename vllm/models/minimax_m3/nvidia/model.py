@@ -1849,6 +1849,13 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         )
         return deferring
 
+    def process_weights_after_loading(self) -> None:
+        # After every layer's own hook (the loader runs children first): the
+        # decode executor's fused attention front reads the final qkv_proj
+        # weights. Collective over the TP group when requested.
+        if self.specialized_decode is not None:
+            self.specialized_decode.build_fused_front()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 

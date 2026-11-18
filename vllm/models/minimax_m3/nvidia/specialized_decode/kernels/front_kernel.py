@@ -16,11 +16,12 @@ Grid: 4 * (heads + meta) CTAs, cluster 4, 512 threads, one CTA per SM (~226 KB s
    normed row into this rank's private hand-off buffer (two parities, sentinel-armed);
 3. every CTA: re-arm the other parity, poll its K slice of every row's MXFP8 activation into shared memory, 48
    tcgen05 block-scaled MMAs (M 128 weight rows, N 8/16 rows, K 32), K-split reduce over the cluster (st.async);
-4. warps 0..3: per-head Gemma RMSNorm + NeoX RoPE, FP8 Q / index-Q, FP8 K/V and index-K cache inserts;
+4. warps 0..3: per-head Gemma RMSNorm + NeoX RoPE, FP8 Q / index-Q, FP8 K/V and index-K cache inserts, or
+   (NVFP4) the stock insert's NVFP4 K/V and index-K pages with unit global scales, byte for byte;
 5. optionally one more cluster writes the step metadata of the layer.
 
 Compile-time parameters: the bucket (MAXT 8 / 16), rows (0 = runtime), the TP world, the per-rank head geometry
-(nq, nkv, niq: TP4 16/1/1, TP8 8/1/1), the rotary dim, the page size and the exchange mode.
+(nq, nkv, niq: TP4 16/1/1, TP8 8/1/1), the rotary dim, the page size, the exchange mode and the cache format.
 """
 
 from __future__ import annotations
@@ -267,6 +268,70 @@ def ue8m0_value(code, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def e4m3_value(code, *, loc=None, ip=None):
+    """The float value of an E4M3 byte (exact, through f16)."""
+    return F32(
+        _asm(
+            _f32t(),
+            [I32(code)],
+            "{\n\t.reg .b16 h, lo, hi;\n\t.reg .b32 r;\n\tcvt.u16.u32 h, $1;\n\tand.b16 h, h, 255;\n\t"
+            "cvt.rn.f16x2.e4m3x2 r, h;\n\tmov.b32 {lo, hi}, r;\n\tcvt.f32.f16 $0, lo;\n\t}",
+            "=f,r",
+            side=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def e2m1x4(q0, q1, q2, q3, *, loc=None, ip=None):
+    """E2M1 codes (RN, satfinite) of q0..q3 in 16 bits, q0 in the low nibble."""
+    return I32(
+        _asm(
+            _i32t(),
+            [F32(q0), F32(q1), F32(q2), F32(q3)],
+            "{\n\t.reg .b8 lo, hi;\n\t.reg .b16 h;\n\tcvt.rn.satfinite.e2m1x2.f32 lo, $2, $1;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 hi, $4, $3;\n\tmov.b16 h, {lo, hi};\n\tcvt.u32.u16 $0, h;\n\t}",
+            "=r,f,f,f,f",
+            side=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+# NVFP4 cache pages (the stock insert's layout, csrc/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu):
+# a head row is 64 B of E2M1 codes and 8 E4M3 scales of 16-value groups; a page of BS rows holds the BS code
+# rows, then the BS scale rows (K and index-K linear, V in the SM100 trtllm-gen 4x4 token-quad swizzle).
+NVFP4_ROW = 72
+NVFP4_RCP6 = float.fromhex("0x1.555556p-3")  # RN(1 / 6) in fp32
+NVFP4_MIN_SCALE = 2.0**-9
+
+
+def nvfp4_unit_encode(e):
+    """The stock insert's NVFP4 encoding with a unit global scale (nvfp4QuantizeElems with nvfp4EncodeElems'
+    scale == 1 path) of this lane's 4 values of a head row (lane l holds dims 4l..4l+3; a 16-value group is 4
+    lanes): x = bf16(e), group amax, scale = E4M3(max(amax * RN(1 / 6), 2^-9)), codes = E2M1(x *rz
+    rcp.approx(scale)) with -0 stored as +0. Returns (16 bits of codes, the group's scale byte). Every lane of
+    the warp must call it (the group amax shuffles)."""
+    x = [bf16_round(e[z]) for z in range(4)]
+    amax = F32(0.0)
+    for z in range(4):
+        amax = fop("max", amax, f1("abs", x[z]))
+    amax = fop("max", amax, shfl_xor(amax, I32(1)))
+    amax = fop("max", amax, shfl_xor(amax, I32(2)))
+    sf = e4m3x2(
+        fop("max", fop("mul.rn", amax, F32(NVFP4_RCP6)), F32(NVFP4_MIN_SCALE)),
+        F32(0.0),
+    ) & I32(255)
+    rcp = f1("rcp.approx.ftz", e4m3_value(sf))
+    codes = e2m1x4(*[fop("mul.rz", x[z], rcp) for z in range(4)])
+    # clearNegZeroNibbles: a nibble's sign survives only with a nonzero magnitude
+    return codes & (((codes & I32(0x7777)) + I32(0x7777)) | I32(0x7777)), sf
+
+
+@dsl_user_op
 def zero_byte_mask(t, *, loc=None, ip=None):
     """0x80 in every byte of t that is zero, else 0 (exact per byte)."""
     return I32(
@@ -450,6 +515,19 @@ def stg_b32(addr, w, pred, *, loc=None, ip=None):
         None,
         [I64(addr), I32(w), I32(pred)],
         "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $2, 0;\n\t@p st.global.b32 [$0], $1;\n\t}",
+        "l,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def stg_u16(addr, w, pred, *, loc=None, ip=None):
+    _asm(
+        None,
+        [I64(addr), I32(w), I32(pred)],
+        "{\n\t.reg .pred p;\n\t.reg .b16 h;\n\tsetp.ne.b32 p, $2, 0;\n\tcvt.u16.u32 h, $1;\n\t"
+        "@p st.global.b16 [$0], h;\n\t}",
         "l,r,r",
         loc=loc,
         ip=ip,
@@ -910,6 +988,8 @@ def front_kernel(
     nd: cutlass.Int32,
     num_sl_heads: cutlass.Int32,
     pt_maxp: cutlass.Int32,
+    idx_s_block: cutlass.Int64,
+    qkv_out: cutlass.Int64,
     MAXT: cutlass.Constexpr[int],
     ROWS: cutlass.Constexpr[int],
     WORLD: cutlass.Constexpr[int],
@@ -921,6 +1001,7 @@ def front_kernel(
     PREPUSHED: cutlass.Constexpr[bool],
     EARLY: cutlass.Constexpr[bool],
     META: cutlass.Constexpr[bool],
+    NVFP4: cutlass.Constexpr[bool],
 ):
     L = asl(MAXT)
     HEADS = NQ + 2 * NKV + NIQ + 1
@@ -1371,6 +1452,15 @@ def front_kernel(
                     s4 = [fop("add.rn", s4[z], rv4[z]) for z in range(4)]
                 e = [bf16_round(s4[z]) for z in range(4)]
                 hq = I64(h * I32(HD) + d0)
+                if qkv_out != I64(0):
+                    # The projection row before the head norms, [q | k | v | index_q | index_k] as the
+                    # stock qkv_proj lays it out (lets tests run the stock insert on the same values).
+                    stg_v2(
+                        qkv_out + (I64(er) * I64(HEADS * HD) + hq) * I64(2),
+                        bf16x2(e[0], e[1]),
+                        bf16x2(e[2], e[3]),
+                        I32(1),
+                    )
                 # normAndRopePre (every warp computes it; the V head keeps e)
                 ss = ffma(e[0], e[0], F32(0.0))
                 for z in cutlass.range_constexpr(1, 4):
@@ -1426,36 +1516,68 @@ def front_kernel(
                         e4m3x2(sc[0], sc[1]) | (e4m3x2(sc[2], sc[3]) << I32(16)),
                         I32(1),
                     )
-                if (isK | isV) & (pslot >= I64(0)):
-                    head = cutlass.select_(isK, h - I32(NQ), h - I32(NQ + NKV))
-                    blk = pslot // I64(BS)
-                    tt = pslot % I64(BS)
-                    kv = [e4m3x2(e[z], F32(0.0)) for z in range(4)]
-                    word = (
-                        kv[0]
-                        | (kv[1] << I32(8))
-                        | (kv[2] << I32(16))
-                        | (kv[3] << I32(24))
-                    )
-                    stg_b32(
-                        kv_cache
-                        + blk * kv_s_block
-                        + I64(head) * kv_s_head
-                        + tt * kv_s_token
-                        + I64(cutlass.select_(isK, I32(0), I32(HD)) + d0),
-                        word,
-                        I32(1),
-                    )
-                if isIK & (pslot >= I64(0)):
-                    ik = [
-                        fop("min", fop("max", e[z], F32(-448.0)), F32(448.0))
-                        for z in range(4)
-                    ]
-                    stg_b32(
-                        index_cache + pslot * I64(HD) + I64(d0),
-                        e4m3x2(ik[0], ik[1]) | (e4m3x2(ik[2], ik[3]) << I32(16)),
-                        I32(1),
-                    )
+                if cutlass.const_expr(NVFP4):
+                    if (isK | isV | isIK) & (pslot >= I64(0)):
+                        # The stock insert's NVFP4 store (unit K/V scales): KV page [2 * NKV, BS, 72],
+                        # K of head kh at 2 * kh and V at 2 * kh + 1; index-K page [BS, 72].
+                        codes, sf = nvfp4_unit_encode(e)
+                        blk = pslot // I64(BS)
+                        tt = pslot % I64(BS)
+                        kh = cutlass.select_(isK, h - I32(NQ), h - I32(NQ + NKV))
+                        page = cutlass.select_(
+                            isIK,
+                            index_cache + blk * idx_s_block,
+                            kv_cache
+                            + blk * kv_s_block
+                            + I64(I32(2) * kh + b2i(isV)) * I64(BS * NVFP4_ROW),
+                        )
+                        g = I64(lane >> I32(2))
+                        soff = cutlass.select_(
+                            isV,
+                            ((tt // I64(4)) * I64(4) + g // I64(2)) * I64(8)
+                            + (g % I64(2)) * I64(4)
+                            + tt % I64(4),
+                            tt * I64(8) + g,
+                        )
+                        stg_u16(
+                            page + tt * I64(HD // 2) + I64(lane * I32(2)), codes, I32(1)
+                        )
+                        stg_u8(
+                            page + I64(BS * (HD // 2)) + soff,
+                            sf,
+                            b2i((lane & I32(3)) == I32(0)),
+                        )
+                if cutlass.const_expr(not NVFP4):
+                    if (isK | isV) & (pslot >= I64(0)):
+                        head = cutlass.select_(isK, h - I32(NQ), h - I32(NQ + NKV))
+                        blk = pslot // I64(BS)
+                        tt = pslot % I64(BS)
+                        kv = [e4m3x2(e[z], F32(0.0)) for z in range(4)]
+                        word = (
+                            kv[0]
+                            | (kv[1] << I32(8))
+                            | (kv[2] << I32(16))
+                            | (kv[3] << I32(24))
+                        )
+                        stg_b32(
+                            kv_cache
+                            + blk * kv_s_block
+                            + I64(head) * kv_s_head
+                            + tt * kv_s_token
+                            + I64(cutlass.select_(isK, I32(0), I32(HD)) + d0),
+                            word,
+                            I32(1),
+                        )
+                    if isIK & (pslot >= I64(0)):
+                        ik = [
+                            fop("min", fop("max", e[z], F32(-448.0)), F32(448.0))
+                            for z in range(4)
+                        ]
+                        stg_b32(
+                            index_cache + pslot * I64(HD) + I64(d0),
+                            e4m3x2(ik[0], ik[1]) | (e4m3x2(ik[2], ik[3]) << I32(16)),
+                            I32(1),
+                        )
         if tid == I32(0):
             stg_b32(ctr + I64(bx * I32(4)), lds_b32(s_call) + I32(1), I32(1))
         if cutlass.const_expr(not EARLY):
@@ -1777,6 +1899,8 @@ def front_launch(
     nd: cutlass.Int32,
     num_sl_heads: cutlass.Int32,
     pt_maxp: cutlass.Int32,
+    idx_s_block: cutlass.Int64,
+    qkv_out: cutlass.Int64,
     stream: cuda_driver.CUstream,
     MAXT: cutlass.Constexpr[int],
     ROWS: cutlass.Constexpr[int],
@@ -1789,6 +1913,7 @@ def front_launch(
     PREPUSHED: cutlass.Constexpr[bool],
     EARLY: cutlass.Constexpr[bool],
     META: cutlass.Constexpr[bool],
+    NVFP4: cutlass.Constexpr[bool],
     PDL: cutlass.Constexpr[bool],
 ):
     heads = NQ + 2 * NKV + NIQ + 1
@@ -1873,6 +1998,8 @@ def front_launch(
         nd,
         num_sl_heads,
         pt_maxp,
+        idx_s_block,
+        qkv_out,
         MAXT,
         ROWS,
         WORLD,
@@ -1884,6 +2011,7 @@ def front_launch(
         PREPUSHED,
         EARLY,
         META,
+        NVFP4,
     ).launch(
         grid=((heads + (1 if META else 0)) * CL, 1, 1),
         block=(THREADS, 1, 1),

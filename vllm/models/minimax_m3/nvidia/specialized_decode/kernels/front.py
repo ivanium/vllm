@@ -11,7 +11,9 @@ at build). One cluster-of-4 grid does, per decode row:
 2. QKV + index-Q + index-K MXFP8 GEMV (tcgen05 `kind::mxf8f6f4`), split-K over
    the 4 CTAs of a cluster, DSMEM reduce;
 3. epilogue: per-head Gemma RMSNorm + NeoX RoPE, bf16/FP8 Q, FP8 index-Q, FP8 K/V
-   insert into the KV cache, FP8 index-K insert into the indexer cache;
+   insert into the KV cache, FP8 index-K insert into the indexer cache; or, with
+   NVFP4 caches, the stock insert's NVFP4 K/V and index-K pages (unit K/V global
+   scales), byte for byte;
 4. optionally the step metadata of the layer (one extra cluster).
 
 Exchange modes (`prepushed`):
@@ -31,7 +33,7 @@ The per-rank head geometry (nq, nkv, niq) is a compile-time parameter: TP4 is
 16 / 1 / 1 (20 head clusters), TP8 8 / 1 / 1 (12 head clusters).
 
 Exchange buffers come from `_comm.PeerTransport`; cache formats are
-checked (FP8 e4m3 only; NVFP4 rejected).
+checked (FP8 e4m3, or NVFP4 for both caches).
 """
 
 from __future__ import annotations
@@ -65,10 +67,10 @@ class CuteDslUnavailable(RuntimeError):
 
 
 def _ext(fmt: _dtypes.CacheFormat = _dtypes.CacheFormat.FP8_E4M3, world: int = 4):
-    """The kernel module (CuTe DSL). Only the FP8 e4m3 cache format has device code;
-    `world` is a compile-time
+    """The kernel module (CuTe DSL). The FP8 e4m3 and NVFP4 cache formats have
+    device code; `world` is a compile-time
     parameter of each launch, accepted here for the registry's build phase."""
-    if fmt is not _dtypes.CacheFormat.FP8_E4M3:
+    if fmt not in (_dtypes.CacheFormat.FP8_E4M3, _dtypes.CacheFormat.NVFP4):
         raise _dtypes.CacheDtypeError(
             f"front: no device code for the {fmt.value} cache format"
         )
@@ -163,8 +165,8 @@ class QkvFrontStage:
         workspace: _exchange.PushWorkspace | None = None,
         ndst: int | None = None,
     ):
-        self.kv_fmt = _dtypes.kv_cache_format(kv_cache_dtype)
-        self.ix_fmt = _dtypes.indexer_cache_format(indexer_kv_dtype)
+        self.kv_fmt = _dtypes.kv_cache_format(kv_cache_dtype, allow_nvfp4=True)
+        self.ix_fmt = _dtypes.indexer_cache_format(indexer_kv_dtype, allow_nvfp4=True)
         if self.kv_fmt != self.ix_fmt:
             # One build define covers both caches today.
             raise _dtypes.CacheDtypeError(
@@ -182,6 +184,11 @@ class QkvFrontStage:
         self.early_trigger, self.pdl = early_trigger, pdl
         self.max_rows = max_rows
         self.maxt = _exchange.bucket(max_rows)
+        self.nvfp4 = self.kv_fmt is _dtypes.CacheFormat.NVFP4
+        if self.nvfp4 and block_size % 4:
+            raise ValueError(
+                f"front: NVFP4 pages of {block_size} rows (V scales in quads)"
+            )
 
         self.spec = _arch.device_spec()
         world = workspace.world if workspace is not None else transport.world
@@ -298,6 +305,7 @@ class QkvFrontStage:
             self.prepushed,
             self.early_trigger,
             step_meta,
+            self.nvfp4,
             bool(self.pdl),
         )
         fn = _compiled.get(key)
@@ -336,7 +344,7 @@ class QkvFrontStage:
                 + tuple(int(p) for p in self.peer_table)
                 + (int(rows), self.rank, self.ndst, 0, 0, 0)
                 + (float(self.eps), float(self.head_eps), float(1.0 / self.q_scale))
-                + (0,) * 12
+                + (0,) * 14
             )
             self._compiled(rows, self.with_step_meta, args)
 
@@ -367,6 +375,7 @@ class QkvFrontStage:
         q_out: torch.Tensor | None = None,
         step_meta: StepMetaIO | None = None,
         single_round: bool = False,
+        qkv_out: torch.Tensor | None = None,
     ) -> None:
         """One front launch (graph-capturable; no host sync).
 
@@ -376,6 +385,10 @@ class QkvFrontStage:
         (slot -1 skips the insert); kv_cache [blocks, nkv, block_size, 2 * 128]
         (fp8, k then v); index_cache [slots, 128] (fp8); q_fp8 [rows, nq * 128];
         index_q [rows, niq * 128]; q_out bf16 [rows, nq * 128] optional.
+        NVFP4 caches (uint8): kv_cache [blocks, 2 * nkv, block_size, 72] and
+        index_cache [blocks, block_size, 72], each page contiguous (any page
+        stride). qkv_out bf16 [rows, heads * 128] optional: the projection rows
+        before the head norms.
         single_round: residual_mid = bf16(sum of the partials + residual)
         with one rounding, as the stock deferred-MoE finalize + all-reduce +
         norm rounds it; otherwise bf16(bf16(sum) + residual), as FlashInfer's
@@ -406,16 +419,50 @@ class QkvFrontStage:
                 f"front: weight {tuple(w.shape)} must be [{self.heads * HEAD_DIM}, "
                 f"{HIDDEN}] E4M3"
             )
-        if (
-            kv_cache.dim() != 4
-            or kv_cache.stride(3) != 1
-            or kv_cache.element_size() != 1
+        if self.nvfp4:
+            row = HEAD_DIM // 2 + HEAD_DIM // 16
+            bs = self.block_size
+            if (
+                tuple(kv_cache.shape[1:]) != (2 * self.nkv, bs, row)
+                or kv_cache.stride()[1:] != (bs * row, row, 1)
+                or kv_cache.stride(0) < 2 * self.nkv * bs * row
+            ):
+                raise ValueError(
+                    f"front: NVFP4 KV cache [blocks, {2 * self.nkv}, {bs}, {row}] with "
+                    f"contiguous pages expected, got {tuple(kv_cache.shape)} strides "
+                    f"{kv_cache.stride()}"
+                )
+            if (
+                index_cache.dim() != 3
+                or tuple(index_cache.shape[1:]) != (bs, row)
+                or index_cache.stride()[1:] != (row, 1)
+                or index_cache.stride(0) < bs * row
+            ):
+                raise ValueError(
+                    f"front: NVFP4 index cache [blocks, {bs}, {row}] with contiguous "
+                    f"pages expected, got {tuple(index_cache.shape)} strides "
+                    f"{index_cache.stride()}"
+                )
+        else:
+            if (
+                kv_cache.dim() != 4
+                or kv_cache.stride(3) != 1
+                or kv_cache.element_size() != 1
+            ):
+                raise ValueError(
+                    "front: fp8 KV cache [blocks, heads, block_size, 2*D] expected"
+                )
+            if index_cache.element_size() != 1 or not index_cache.is_contiguous():
+                raise ValueError("front: fp8 index cache expected")
+        if qkv_out is not None and (
+            qkv_out.dtype != torch.bfloat16
+            or tuple(qkv_out.shape) != (rows, self.heads * HEAD_DIM)
+            or not qkv_out.is_contiguous()
         ):
             raise ValueError(
-                "front: fp8 KV cache [blocks, heads, block_size, 2*D] expected"
+                f"front: qkv_out must be contiguous bf16 [{rows}, "
+                f"{self.heads * HEAD_DIM}]"
             )
-        if index_cache.element_size() != 1 or not index_cache.is_contiguous():
-            raise ValueError("front: fp8 index cache expected")
         for name, t in (
             ("positions", positions),
             ("slot_mapping", slot_mapping),
@@ -488,6 +535,8 @@ class QkvFrontStage:
             int(m.num_decode_tokens) if m else 0,
             int(sl.size(0)) if sl is not None else 0,
             int(pt.size(1)) if pt is not None else 0,
+            int(index_cache.stride(0)) if self.nvfp4 else 0,
+            ptr(qkv_out),
         )
         if fin is not None and fin.topk > 8:
             raise ValueError("front: finalize top-k above 8")

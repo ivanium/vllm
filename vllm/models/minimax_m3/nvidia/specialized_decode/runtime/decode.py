@@ -16,7 +16,9 @@ Per layer the executor runs the stock modules through its own steps:
 - the attention: on the sparse layers, the stock qkv projection and KV
   insert, then ``attention.LowBatchAttention`` (indexer, sparse attention and
   o_proj) when the step's requests and queries fit it, the stock modules
-  otherwise;
+  otherwise; with ``VLLM_MINIMAX_M3_LOW_BATCH_FUSED_FRONT=1``, steps of up to
+  16 rows replace the input norm, qkv projection and KV insert ahead of the
+  low-batch attention with one fused front launch (``front.py``);
 - the fused all-reduce + post-attention norm;
 - the FFN: ``moe.LowBatchFfn`` on the MoE layers that leave their finalize to
   the next layer, the stock modules on the others.
@@ -46,6 +48,7 @@ from ..moe import MAX_ROWS
 
 if TYPE_CHECKING:
     from ...model import MiniMaxM3DecoderLayer, MiniMaxM3Model
+    from .front import FusedFront
 
 logger = init_logger(__name__)
 
@@ -95,6 +98,18 @@ class SpecializedDecode:
         ]
         for attn in self.sparse:
             attn.use_low_batch_attention = True
+        self.front: FusedFront | None = None
+        self._front_built = False
+
+    def build_fused_front(self) -> None:
+        """Build the fused attention fronts when requested (collective over
+        the TP group; after weight loading, before profiling and capture)."""
+        from . import front
+
+        if self._front_built or not front.requested():
+            return
+        self._front_built = True
+        self.front = front.build_fused_front(self)
 
     def plan(
         self,
@@ -191,13 +206,41 @@ class SpecializedDecode:
         attention: AttentionStep | None,
     ) -> tuple[torch.Tensor | MoEOutput, torch.Tensor]:
         aux_layers = self.backbone.aux_hidden_state_layers
+        front = self.front if attention is not None else None
+        fronts = 0
         residual = None
         for idx, layer in enumerate(self.layers, start=self.backbone.start_layer):
+            low_batch = getattr(layer.self_attn, "low_batch_attention", None)
+            fused = None
+            if (
+                front is not None
+                and low_batch is not None
+                and front.takes(layer, hidden_states, residual, positions)
+            ):
+                fused = front.run(layer, hidden_states, residual, positions)
+            if fused is not None:
+                # One launch for the input boundary, qkv_proj and the KV insert.
+                q, index_q, residual = fused
+                fronts += 1
+                if idx in aux_layers:
+                    aux_hidden_states.append(residual.clone())
+                attn = layer.self_attn
+                hidden_states = low_batch.run(
+                    attention,
+                    q,
+                    index_q,
+                    attn.kv_cache,
+                    attn.indexer.index_cache.kv_cache,
+                )
+                hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                    hidden_states, residual, layer.post_attention_layernorm
+                )
+                hidden_states = self._ffn(layer, hidden_states)
+                continue
             hidden_states, residual = layer.forward_input_norm(hidden_states, residual)
             # Aux hidden state k is the residual stream entering layer k.
             if idx in aux_layers:
                 aux_hidden_states.append(residual.clone())
-            low_batch = getattr(layer.self_attn, "low_batch_attention", None)
             if attention is not None and low_batch is not None:
                 hidden_states = layer.self_attn(
                     positions=positions,
@@ -212,6 +255,14 @@ class SpecializedDecode:
                 hidden_states, residual, layer.post_attention_layernorm
             )
             hidden_states = self._ffn(layer, hidden_states)
+        if front is not None:
+            logger.info_once(
+                "MiniMax-M3 specialized decode: FULL-graph decode step of %d rows "
+                "captured with the fused attention front on %d of %d sparse layers.",
+                positions.shape[0],
+                fronts,
+                len(self.sparse),
+            )
         return hidden_states, residual
 
     @staticmethod
