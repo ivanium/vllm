@@ -74,10 +74,8 @@ STAGING_OFFSET = 16384
 ARRIVAL_WORD = 128
 LAUNCH_WORD = 136
 END_WORD = 137
-TAG_BITS = 15
-TAG_MASK = (1 << TAG_BITS) - 1
-INDEX_BITS = 17
-INDEX_MASK = (1 << INDEX_BITS) - 1
+INDEX_BITS = 17  # the candidate key's default index field (vocabulary < 2^17)
+MAX_INDEX_BITS = 18
 ROW_BYTES = RANK_DIM * 2  # one BF16 embedding or head row
 
 assert RECORD_WORDS * 8 <= STAGING_OFFSET
@@ -363,24 +361,6 @@ def float_bits(value, *, loc=None, ip=None) -> Uint32:
 
 
 @cute.jit
-def candidate_key(score: Float32, index: Int32) -> Uint64:
-    """[48:17] order-preserving score bits, [16:0] inverted index (ties prefer
-    the smaller index, as `torch.argmax` does). Larger is better; 0 means "no
-    key"."""
-    bits = float_bits(score)
-    ordered = bits | Uint32(0x80000000)
-    if bits & Uint32(0x80000000) != Uint32(0):
-        ordered = bits ^ Uint32(0xFFFFFFFF)
-    return (Uint64(ordered) << INDEX_BITS) | Uint64(Uint32(INDEX_MASK) - Uint32(index))
-
-
-@cute.jit
-def key_index(key: Uint64) -> Int32:
-    """The vocabulary index of a candidate key."""
-    return Int32(Uint32(INDEX_MASK) - (Uint32(key) & Uint32(INDEX_MASK)))
-
-
-@cute.jit
 def shuffle_xor_u64(value: Uint64, offset: Int32) -> Uint64:
     """`__shfl_xor_sync` of a 64-bit value over the full warp."""
     lo = cute.arch.shuffle_sync_bfly(Uint32(value), offset)
@@ -406,46 +386,25 @@ def max_u64(a: Uint64, b: Uint64) -> Uint64:
     return result
 
 
-@cute.jit
-def await_record(
-    address: Int64, tag: Uint32, timeout_ns: Int64, step: Int32, source: Int32
-) -> Uint64:
-    """Spin until the mailbox record at `address` carries `tag`; return
-    its key. With a positive `timeout_ns` a wait that exceeds it reports and
-    traps instead of hanging (debug aid for ranks that disagree on the launch
-    sequence)."""
-    value = load_scalar(address, "ld.relaxed.sys.global.u64", Uint64, True)
-    if Uint32(value) & Uint32(TAG_MASK) != tag:
-        start = Int64(0)
-        if timeout_ns > 0:
-            start = cute.arch.globaltimer()
-        spins = Uint32(0)
-        while Uint32(value) & Uint32(TAG_MASK) != tag:
-            value = load_scalar(address, "ld.relaxed.sys.global.u64", Uint64, True)
-            spins = spins + Uint32(1)
-            if timeout_ns > 0 and spins & Uint32(1023) == Uint32(0):
-                waited = cute.arch.globaltimer() - start
-                if waited > timeout_ns:
-                    cute.printf(
-                        "sharded Markov sampler: step {} waited {} ns for rank {} "
-                        "(tag {}, saw {})",
-                        step,
-                        timeout_ns,
-                        source,
-                        tag,
-                        Uint32(value) & Uint32(TAG_MASK),
-                    )
-                    trap()
-    return value >> TAG_BITS
-
-
 class ShardedMarkovSample:
     """The sharded Markov chain kernel for `steps` draft positions, base
     logits of `base_dtype` and a draft-logits cache of `cache_dtype`
-    (`cutlass.BFloat16` or `cutlass.Float32`)."""
+    (`cutlass.BFloat16` or `cutlass.Float32`).
 
-    def __init__(self, steps: int, base_dtype, cache_dtype):
+    A candidate key holds 32 score bits and `index_bits` index bits; a mailbox
+    record holds a key and a `64 - 32 - index_bits` bit launch tag. The default
+    (17 index bits, 15 tag bits) covers vocabularies below 2^17; 18 index bits
+    (14 tag bits) cover those below 2^18. The tag only has to tell a launch from
+    the one two launches earlier (records alternate between two parities), so
+    either width is ample."""
+
+    def __init__(self, steps: int, base_dtype, cache_dtype, index_bits=INDEX_BITS):
         assert 1 <= steps <= MAX_STEPS
+        assert INDEX_BITS <= index_bits <= MAX_INDEX_BITS
+        self.index_bits = index_bits
+        self.index_mask = (1 << index_bits) - 1
+        self.tag_bits = 64 - 32 - index_bits
+        self.tag_mask = (1 << self.tag_bits) - 1
         self.steps = steps
         self.base_bf16 = base_dtype is BFloat16
         self.cache_dtype = cache_dtype
@@ -520,6 +479,61 @@ class ShardedMarkovSample:
     def peer_base(self, peers: Int64, peer: Int32) -> Int64:
         """The base address of `peer`'s buffer."""
         return load_scalar(peers + Int64(peer) * 8, "ld.global.nc.u64", Int64)
+
+    @cute.jit
+    def candidate_key(self, score: Float32, index: Int32) -> Uint64:
+        """[31 + index_bits : index_bits] order-preserving score bits,
+        [index_bits - 1 : 0] inverted index (ties prefer the smaller index, as
+        `torch.argmax` does). Larger is better; 0 means "no key"."""
+        bits = float_bits(score)
+        ordered = bits | Uint32(0x80000000)
+        if bits & Uint32(0x80000000) != Uint32(0):
+            ordered = bits ^ Uint32(0xFFFFFFFF)
+        return (Uint64(ordered) << self.index_bits) | Uint64(
+            Uint32(self.index_mask) - Uint32(index)
+        )
+
+    @cute.jit
+    def key_index(self, key: Uint64) -> Int32:
+        """The vocabulary index of a candidate key."""
+        return Int32(Uint32(self.index_mask) - (Uint32(key) & Uint32(self.index_mask)))
+
+    @cute.jit
+    def await_record(
+        self,
+        address: Int64,
+        tag: Uint32,
+        timeout_ns: Int64,
+        step: Int32,
+        source: Int32,
+    ) -> Uint64:
+        """Spin until the mailbox record at `address` carries `tag`; return
+        its key. With a positive `timeout_ns` a wait that exceeds it reports and
+        traps instead of hanging (debug aid for ranks that disagree on the launch
+        sequence)."""
+        value = load_scalar(address, "ld.relaxed.sys.global.u64", Uint64, True)
+        if Uint32(value) & Uint32(self.tag_mask) != tag:
+            start = Int64(0)
+            if timeout_ns > 0:
+                start = cute.arch.globaltimer()
+            spins = Uint32(0)
+            while Uint32(value) & Uint32(self.tag_mask) != tag:
+                value = load_scalar(address, "ld.relaxed.sys.global.u64", Uint64, True)
+                spins = spins + Uint32(1)
+                if timeout_ns > 0 and spins & Uint32(1023) == Uint32(0):
+                    waited = cute.arch.globaltimer() - start
+                    if waited > timeout_ns:
+                        cute.printf(
+                            "sharded Markov sampler: step {} waited {} ns for rank "
+                            "{} (tag {}, saw {})",
+                            step,
+                            timeout_ns,
+                            source,
+                            tag,
+                            Uint32(value) & Uint32(self.tag_mask),
+                        )
+                        trap()
+        return value >> self.tag_bits
 
     @cute.jit
     def load_base(
@@ -719,7 +733,7 @@ class ShardedMarkovSample:
             )
         cute.arch.sync_threads()
         launches = count[0]
-        tag = Uint32(1) + launches % Uint32(32767)
+        tag = Uint32(1) + launches % Uint32(self.tag_mask)
         parity = Int32(launches & Uint32(1))
         records = self.peer_base(peers, rank)
         arrivals = control + ARRIVAL_WORD * 4
@@ -817,7 +831,7 @@ class ShardedMarkovSample:
                             if temp[col] != Float32(0.0):
                                 score = add_rn(div_full(value, temp[col]), noise_value)
                             best[col] = max_u64(
-                                best[col], candidate_key(score, vocab_offset + row)
+                                best[col], self.candidate_key(score, vocab_offset + row)
                             )
                 # The tile's logits leave as 16-byte vectors: one per lane and
                 # request row for the local cache and for each peer's staging
@@ -954,12 +968,12 @@ class ShardedMarkovSample:
                             fence("sys")
                         store_scalar(
                             self.peer_base(peers, other_rank) + (record + rank) * 8,
-                            (mine << TAG_BITS) | Uint64(tag),
+                            (mine << self.tag_bits) | Uint64(tag),
                             "st.relaxed.sys.global.u64",
                         )
                 found = Uint64(0)
                 if exchanging:
-                    found = await_record(
+                    found = self.await_record(
                         records + (record + other_rank) * 8,
                         tag,
                         timeout_ns,
@@ -973,7 +987,7 @@ class ShardedMarkovSample:
                         # embedding row's HBM read while the other ranks'
                         # records are still in flight.
                         prefetch_row_l2(
-                            embed_table + Int64(key_index(found)) * ROW_BYTES
+                            embed_table + Int64(self.key_index(found)) * ROW_BYTES
                         )
                 for level in cutlass.range_constexpr(3):
                     if (1 << level) < world:
@@ -984,13 +998,13 @@ class ShardedMarkovSample:
             if cta == 0 and thread < rows:
                 store_scalar(
                     draft_tokens + (Int64(thread) * draft_stride + Int64(step)) * 8,
-                    Int64(key_index(winner[thread])),
+                    Int64(self.key_index(winner[thread])),
                     "st.global.u64",
                 )
             if step + 1 < steps and warp < rows:
                 next_words = load_v4(
                     embed_table
-                    + Int64(key_index(winner[warp])) * ROW_BYTES
+                    + Int64(self.key_index(winner[warp])) * ROW_BYTES
                     + Int64(lane * 16),
                     "ld.global.nc.v4.u32",
                     False,

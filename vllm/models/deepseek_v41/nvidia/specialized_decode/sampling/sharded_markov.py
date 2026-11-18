@@ -78,7 +78,11 @@ WARPS = 16  # per CTA (sharded_markov_cute.py)
 MAX_STEPS = 8
 MAX_RANKS = 8
 MAX_ROWS = 8  # MMA columns
-MAX_VOCAB = (1 << 17) - 1  # the candidate key's index field
+# The candidate key's index field: 17 bits (a 15-bit launch tag) below 2^17
+# entries, else 18 bits (a 14-bit tag); sharded_markov_cute.ShardedMarkovSample.
+INDEX_BITS = 17
+MAX_INDEX_BITS = 18
+MAX_VOCAB = (1 << MAX_INDEX_BITS) - 1
 STAGING_OFFSET = 16384  # bytes; the mailbox records come first
 CONTROL_WORDS = 256  # int32 control words (sharded_markov_cute.py)
 NOISE_BLOCK = 1024
@@ -112,14 +116,23 @@ def _shard_noise_kernel(
     tl.store(noise_ptr + sample * vocab_local + cols, gumbel_noise, mask=mask)
 
 
+def key_index_bits(vocab_size: int) -> int:
+    """The candidate key's index bits for a vocabulary of `vocab_size`."""
+    return INDEX_BITS if vocab_size < 1 << INDEX_BITS else MAX_INDEX_BITS
+
+
 @cache
 def _kernel(
-    device_index: int, steps: int, base_dtype: torch.dtype, cache_dtype: torch.dtype
+    device_index: int,
+    steps: int,
+    base_dtype: torch.dtype,
+    cache_dtype: torch.dtype,
+    index_bits: int = INDEX_BITS,
 ):
     """The CuTe DSL chain kernel compiled for a device, `steps` draft
-    positions and the base-logits and cache dtypes. Its 512-thread CTA fits one
-    per SM, and a call never launches more CTAs than the device has SMs, so the
-    cooperative grid is always co-resident."""
+    positions, the base-logits and cache dtypes and the key's index bits. Its
+    512-thread CTA fits one per SM, and a call never launches more CTAs than the
+    device has SMs, so the cooperative grid is always co-resident."""
     import cutlass
     import cutlass.cute as cute
     from cutlass import Int32, Int64
@@ -131,7 +144,9 @@ def _kernel(
     address = Int64(0)
     with torch.accelerator.device_index(device_index):
         return cute.compile(
-            ShardedMarkovSample(steps, types[base_dtype], types[cache_dtype]),
+            ShardedMarkovSample(
+                steps, types[base_dtype], types[cache_dtype], index_bits
+            ),
             *[address] * 7,
             Int32(1),
             *[address] * 10,
@@ -218,6 +233,7 @@ class DSparkShardedMarkovSampler:
             raise ValueError(f"sharded Markov sampling does not support {reason}")
         self.device = device
         self.vocab_size = vocab_size
+        self.index_bits = key_index_bits(vocab_size)
         self.num_steps = num_steps
         self.cache_dtype = cache_dtype
         self.timeout_ns = int(timeout_ms) * 1_000_000
@@ -249,7 +265,13 @@ class DSparkShardedMarkovSampler:
         failure = None
         try:
             for base_dtype in DTYPES:
-                _kernel(self.device_index, num_steps, base_dtype, cache_dtype)
+                _kernel(
+                    self.device_index,
+                    num_steps,
+                    base_dtype,
+                    cache_dtype,
+                    self.index_bits,
+                )
         except Exception as error:  # any compile failure is agreed on below
             failure = error
         if not _all_ranks_true(group, failure is None):
@@ -380,7 +402,11 @@ class DSparkShardedMarkovSampler:
         full_vocab = base_logits.shape[2] == self.vocab_size
         base_column = self.vocab_offset if full_vocab else 0
         kernel = _kernel(
-            self.device_index, self.num_steps, base_logits.dtype, self.cache_dtype
+            self.device_index,
+            self.num_steps,
+            base_logits.dtype,
+            self.cache_dtype,
+            self.index_bits,
         )
         kernel(
             Int64(base_logits.data_ptr()),

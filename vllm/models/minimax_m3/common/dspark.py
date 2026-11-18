@@ -8,6 +8,7 @@ Markov and confidence heads) built from MiniMax-M3 layers: Gemma RMSNorm
 checkpoint ships no token embedding or LM head; both are shared with the target.
 """
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -16,15 +17,21 @@ from transformers import MiniMaxM3VLTextConfig
 
 from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, VllmConfig
+from vllm.distributed import get_tp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.fusion.quant_activation import get_input_quant_key
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+)
 from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3Attention,
     DFlashQwen3DecoderLayer,
@@ -46,6 +53,8 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
 )
+
+logger = init_logger(__name__)
 
 _CHECKPOINT_PREFIX = "language_model.model.dspark."
 
@@ -414,8 +423,170 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         )
 
 
+def _speculator_loop(speculator, num_reqs: int, head_hidden: torch.Tensor) -> bool:
+    """`sample_sequential` fallback: False has the speculator run its loop."""
+    return False
+
+
+class _ShardedMarkovHook:
+    """`sample_sequential` of the draft model under
+    VLLM_MINIMAX_M3_DSPARK_SHARDED_MARKOV=1: the sharded chain, logging once
+    per process the first draft step it takes."""
+
+    def __init__(self, sampling) -> None:
+        self._sampling = sampling
+        self._logged = False
+
+    def __call__(self, speculator, num_reqs: int, head_hidden: torch.Tensor) -> bool:
+        taken = self._sampling(speculator, num_reqs, head_hidden)
+        if taken and not self._logged:
+            self._logged = True
+            logger.info(
+                "MiniMax-M3 DSpark: draft step of %d request(s) sampled by the "
+                "sharded Markov chain.",
+                num_reqs,
+            )
+        return taken
+
+
 class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
     model_cls = MiniMaxM3DSparkModel
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # VLLM_MINIMAX_M3_DSPARK_SHARDED_MARKOV=1: sample the draft Markov chain
+        # with the vocabulary-sharded cooperative kernel (one launch per draft
+        # step) instead of the speculator's per-position loop, where the loop
+        # would draw plain Gumbel noise into a full draft-logits cache.
+        self._sharded_markov_off_reason: str | None = None
+        self._sharded_markov_requested = (
+            os.environ.get("VLLM_MINIMAX_M3_DSPARK_SHARDED_MARKOV", "0") == "1"
+        )
+        if not self._sharded_markov_requested:
+            return
+        spec_config = vllm_config.speculative_config
+        reasons = []
+        if not current_platform.is_cuda():
+            reasons.append("a non-CUDA platform")
+        if spec_config.draft_sample_method != "probabilistic":
+            reasons.append(f"draft_sample_method={spec_config.draft_sample_method}")
+        if spec_config.enable_adaptive_verification:
+            reasons.append("adaptive verification")
+        if vllm_config.model_config.use_fp64_gumbel:
+            reasons.append("FP64 Gumbel sampling")
+        if getattr(vllm_config, "watermark_config", None) is not None:
+            reasons.append("watermarking")
+        if vllm_config.parallel_config.enable_batch_sharded_sampling:
+            reasons.append("batch-sharded sampling")
+        if getattr(self.config, "dspark_draft_topk", None) is not None:
+            reasons.append("top-k Markov sampling")
+        if self.draft_id_to_target_id is not None:
+            reasons.append("a reduced draft vocabulary")
+        self._sharded_markov_off_reason = "; ".join(reasons) or None
+        # The chain's settings: the draft logits cache is the speculator's
+        # DraftLogitsCache in the head dtype (Speculator.draft_logits_spec).
+        self.markov_cache_dtype = vllm_config.model_config.head_dtype
+        self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self.num_speculative_steps = spec_config.num_speculative_tokens
+
+    def draft_logits_shard(self) -> tuple[int, int] | None:
+        """`(first column, width)` of `compute_draft_logits_local` within
+        the full draft logits, or None when it is not a plain slice of them
+        (vocabulary padding or added vocabulary in the shard)."""
+        head = self.lm_head
+        shard = head.shard_indices
+        width = shard.num_org_elements
+        if (
+            self.logits_processor.logits_as_input
+            or self.logits_processor.org_vocab_size != self.config.draft_vocab_size
+            or shard.num_elements_padded != width
+            or head.num_embeddings_per_partition != width
+            or shard.org_vocab_start_index != head.tp_rank * width
+        ):
+            return None
+        return shard.org_vocab_start_index, width
+
+    def _markov_bias_unsupported(self) -> str | None:
+        """Why `markov_bias` is not a plain BF16 product with the Markov
+        head's `[vocab, rank]` weight, or None when it is."""
+        head = self.model.markov_head.markov_w2
+        processor = self.logits_processor
+        # The draft's ModelOpt config gives an excluded head an unquantized
+        # linear method; both run the same BF16 GEMM (LogitsProcessor._apply_head).
+        if not isinstance(
+            head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+        ):
+            return f"a Markov head on {type(head.quant_method).__name__}"
+        if head.weight.dtype != torch.bfloat16:
+            return f"a {head.weight.dtype} Markov head"
+        if processor.scale != 1.0 or processor.soft_cap is not None:
+            return "scaled or soft-capped draft logits"
+        if processor.logits_as_input:
+            return "logits as input"
+        if processor.head_dtype not in (None, torch.bfloat16):
+            return f"a {processor.head_dtype} head dtype"
+        return None
+
+    def markov_bias_weight(self) -> torch.Tensor | None:
+        """The `[vocab, rank]` matrix `markov_bias` multiplies by, when
+        `markov_bias` is a plain BF16 product with it (else None)."""
+        if self._markov_bias_unsupported() is not None:
+            return None
+        return self.model.markov_head.markov_w2.weight
+
+    def build_default_markov_sampling(self) -> None:
+        """Install the sharded Markov chain as `sample_sequential` when
+        VLLM_MINIMAX_M3_DSPARK_SHARDED_MARKOV=1. Called by the speculator after
+        the draft weights load, before KV-cache allocation and CUDA graph
+        capture, on every TP rank: the set-up is collective."""
+        if not self._sharded_markov_requested:
+            return
+        reason = self._sharded_markov_off_reason or self._markov_bias_unsupported()
+        if reason is not None:
+            logger.info_once(
+                "VLLM_MINIMAX_M3_DSPARK_SHARDED_MARKOV=1 has no effect: the "
+                "DSpark Markov chain stays on the speculator's loop (%s).",
+                reason,
+                scope="process",
+            )
+            return
+        from vllm.models.deepseek_v41.nvidia.specialized_decode.sampling.sharded_markov import (  # noqa: E501
+            ShardedMarkovSampling,
+            make_sharded_sampler,
+        )
+
+        tp_group = get_tp_group()
+        sharded = make_sharded_sampler(
+            self.model.markov_head.markov_w1.weight,
+            self.markov_bias_weight(),
+            self.config.draft_vocab_size,
+            self.num_speculative_steps,
+            self.markov_cache_dtype,
+            tp_group.cpu_group if tp_group.world_size > 1 else None,
+            self.max_num_reqs,
+        )
+        if sharded is None:
+            # make_sharded_sampler logged why, on every rank.
+            logger.info_once(
+                "VLLM_MINIMAX_M3_DSPARK_SHARDED_MARKOV=1 has no effect: the "
+                "DSpark Markov chain stays on the speculator's loop.",
+                scope="process",
+            )
+            return
+        local_logits = sharded.accepts_shard(self.draft_logits_shard())
+        self.sample_sequential = _ShardedMarkovHook(
+            ShardedMarkovSampling(sharded, _speculator_loop, local_logits)
+        )
+        logger.info_once(
+            "MiniMax-M3 DSpark: the draft Markov chain of up to %d requests is "
+            "sampled by the vocabulary-sharded kernel on %d ranks, one launch per "
+            "draft step (%s draft logits); larger batches keep the speculator's "
+            "loop (VLLM_MINIMAX_M3_DSPARK_SHARDED_MARKOV=1).",
+            sharded.max_rows,
+            sharded.world,
+            "rank-local" if local_logits else "gathered",
+            scope="process",
+        )
 
     @staticmethod
     def _rename_checkpoint_weights(
