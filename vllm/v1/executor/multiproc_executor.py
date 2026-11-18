@@ -349,13 +349,16 @@ class MultiprocExecutor(Executor):
         Only safe with spawn (fork passes inherited fds from one worker to the
         next) and when nothing changes process-global state around each start:
         OpenMP env setup on the CPU backend and the NUMA numactl wrapper both
-        patch os.environ / the multiprocessing executable per worker.
+        patch os.environ / the multiprocessing executable per worker. While
+        automatic NUMA binding is unresolved (numa_bind None, e.g. on a
+        --headless node, whose launcher started no EngineCore to resolve it),
+        the first start resolves it and may bind, so start one by one.
         """
         return (
             inherited_fds is None
             and self.local_world_size > 1
             and not current_platform.is_cpu()
-            and not self.parallel_config.numa_bind
+            and self.parallel_config.numa_bind is False
         )
 
     def _start_workers_concurrently(
