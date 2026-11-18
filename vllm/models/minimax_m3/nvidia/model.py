@@ -381,6 +381,24 @@ def _msa_mxfp8_output_requested() -> bool:
     return os.getenv("VLLM_MINIMAX_M3_MSA_MXFP8_OUTPUT", "0") == "1"
 
 
+def _input_norm_mxfp8_at_tp1() -> bool:
+    """Whether VLLM_MINIMAX_M3_INPUT_NORM_MXFP8=1 applies: at TP 1 the input
+    norm of a layer that completes the previous FFN's deferred all-reduce
+    (a no-op there) writes qkv_proj's MXFP8 input, in place of the BF16
+    output and qkv_proj's own quantize kernel. No effect at TP > 1."""
+    if os.getenv("VLLM_MINIMAX_M3_INPUT_NORM_MXFP8", "0") != "1":
+        return False
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size != 1:
+        logger.warning_once(
+            "VLLM_MINIMAX_M3_INPUT_NORM_MXFP8=1 has no effect at tensor "
+            "parallel size %d: the input norm keeps its fused all-reduce.",
+            tp_size,
+        )
+        return False
+    return True
+
+
 class MiniMAXGemmaRMSNorm(nn.Module):
     """Gemma-style RMS normalization.
 
@@ -1427,6 +1445,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # fused into this layer's input_layernorm.
         # Configured by MiniMaxM3Model.__init__
         self.fuse_input_allreduce = False
+        # At TP 1 that all-reduce is a no-op: with
+        # VLLM_MINIMAX_M3_INPUT_NORM_MXFP8=1 the input norm then takes the
+        # unfused branch and can write qkv_proj's MXFP8 input itself.
+        self.input_norm_mxfp8_at_tp1 = _input_norm_mxfp8_at_tp1()
 
         is_sparse_attention_layer = (
             force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
@@ -1523,7 +1545,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 self.input_layernorm.weight,
                 self.input_layernorm.variance_epsilon,
             )
-        if self.fuse_input_allreduce and residual is not None:
+        if (
+            self.fuse_input_allreduce
+            and residual is not None
+            and not self.input_norm_mxfp8_at_tp1
+        ):
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
             )
@@ -1534,6 +1560,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
             mxfp8 = not self.use_sequence_parallel and _consumes_mxfp8_128x4(
                 self.self_attn.qkv_proj
             )
+            if mxfp8 and self.fuse_input_allreduce and residual is not None:
+                logger.info_once(
+                    "MiniMax-M3: at TP 1 every layer's input norm writes "
+                    "qkv_proj's MXFP8 input (VLLM_MINIMAX_M3_INPUT_NORM_MXFP8=1).",
+                    scope="process",
+                )
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states, mxfp8=mxfp8)
