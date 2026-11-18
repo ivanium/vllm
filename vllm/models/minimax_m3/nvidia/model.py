@@ -88,6 +88,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
+    MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsEagle3,
     SupportsMultiModal,
@@ -594,18 +595,24 @@ class MiniMaxM3MoE(nn.Module):
         with torch.device("meta"):
             shared_experts = replicated_shared_experts()
         ep_group = get_ep_group()
-        num_experts = config.num_local_experts
+        vllm_config = get_current_vllm_config()
+        # EPLB replicas are extra physical experts; routing stays logical.
+        eplb_config = vllm_config.parallel_config.eplb_config
+        num_redundant = eplb_config.num_redundant_experts or 0
+        num_experts = config.num_local_experts + num_redundant
         if num_experts % ep_group.world_size != 0:
             raise ValueError(
-                f"MiniMax M3 MegaMoE needs num_experts={num_experts} divisible "
-                f"by the EP size {ep_group.world_size}."
+                f"MiniMax M3 MegaMoE needs num_experts={num_experts} (incl. "
+                f"{num_redundant} redundant) divisible by the EP size "
+                f"{ep_group.world_size}."
             )
         num_local_experts = num_experts // ep_group.world_size
         self.experts = DeepGemmMegaMoEExperts(
-            get_current_vllm_config(),
+            vllm_config,
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             experts_start_idx=ep_group.rank_in_group * num_local_experts,
+            num_logical_experts=config.num_local_experts,
             top_k=self.top_k,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -1650,7 +1657,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         )
 
 
-class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
+class MiniMaxM3SparseForCausalLM(
+    nn.Module, SupportsPP, SupportsEagle3, MixtureOfExperts
+):
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
 
     packed_modules_mapping = {
@@ -1701,6 +1710,46 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
+        self.set_moe_parameters(vllm_config)
+
+    def set_moe_parameters(self, vllm_config: VllmConfig) -> None:
+        """Expose the MegaMoE experts to EPLB.
+
+        Only the DeepGEMM MegaMoE experts take redundant physical slots, so
+        EPLB registers no layers on the other MoE backends.
+        """
+        config = self.config
+        enable_eplb = vllm_config.parallel_config.enable_eplb
+        if enable_eplb and not self.model.use_mega_moe:
+            logger.warning_once(
+                "MiniMax-M3 supports EPLB only with the deep_gemm_mega_moe MoE "
+                "backend; EPLB stays off for this model."
+            )
+        use_eplb = enable_eplb and self.model.use_mega_moe
+        layers = self.model.layers[self.model.start_layer : self.model.end_layer]
+        self.moe_layers = [
+            layer.block_sparse_moe.experts
+            for layer in layers
+            if use_eplb and getattr(layer, "is_moe_layer", False)
+        ]
+        self.num_moe_layers = len(self.moe_layers)
+        self.num_expert_groups = 1
+        self.num_shared_experts = getattr(config, "n_shared_experts", 0) or 0
+        self.num_logical_experts = config.num_local_experts
+        self.num_routed_experts = config.num_local_experts
+        self.num_physical_experts = self.num_logical_experts
+        self.num_local_physical_experts = 0
+        if self.moe_layers:
+            self.num_physical_experts = self.moe_layers[0].num_experts
+            self.num_local_physical_experts = self.moe_layers[0].num_local_experts
+        self.num_redundant_experts = (
+            self.num_physical_experts - self.num_logical_experts
+        )
+
+    def update_physical_experts_metadata(
+        self, num_physical_experts: int, num_local_physical_experts: int
+    ) -> None:
+        raise NotImplementedError("MiniMax-M3 EPLB does not support elastic EP.")
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
