@@ -20,6 +20,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     SlidingWindowManager,
     create_single_type_manager,
 )
+from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -139,6 +140,20 @@ class KVCacheCoordinator(ABC):
             metrics_collector=metrics_collector,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
+        # Device block pools by `KVCacheGroup.pool_id`; pool 0 is shared.
+        self.block_pools: list[BlockPool] = [self.block_pool]
+        for pool_id, num_blocks in sorted(kv_cache_config.pool_num_blocks.items()):
+            assert pool_id == len(self.block_pools)
+            self.block_pools.append(
+                SharedEventQueueBlockPool(
+                    num_gpu_blocks=num_blocks,
+                    enable_caching=enable_caching,
+                    hash_block_size=hash_block_size,
+                    enable_kv_cache_events=enable_kv_cache_events,
+                    num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+                    event_owner=self.block_pool,
+                )
+            )
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -177,13 +192,16 @@ class KVCacheCoordinator(ABC):
                 kv_cache_group,
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=self.block_pools[kv_cache_group.pool_id],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
-                needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
+                # Workers zero shared-pool blocks only: a private pool holds
+                # one group's precision and is never reused by another group.
+                needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing
+                and not kv_cache_group.pool_id,
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
@@ -243,17 +261,45 @@ class KVCacheCoordinator(ABC):
                 state, so it is ignored (0).
 
         Returns:
-            The number of blocks to allocate.
+            The number of blocks to allocate from the shared pool (pool 0),
+            which is every group's without private pools.
 
         """
-        num_blocks_to_allocate = 0
+        return self.get_num_blocks_to_allocate_by_pool(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            num_encoder_tokens,
+            total_computed_tokens,
+            num_local_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+            prefill_end=prefill_end,
+        )[0]
+
+    def get_num_blocks_to_allocate_by_pool(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+        prefill_end: int = 0,
+    ) -> list[int]:
+        """`get_num_blocks_to_allocate` for each device block pool, indexed by
+        `KVCacheGroup.pool_id`."""
+        num_blocks_to_allocate = [0] * len(self.block_pools)
         if self.retention_interval != 0:
             prefill_end = 0
         for i, manager in enumerate(self.single_type_managers):
+            pool_id = self.kv_cache_config.kv_cache_groups[i].pool_id
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                num_blocks_to_allocate[pool_id] += manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -263,7 +309,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                num_blocks_to_allocate[pool_id] += manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],

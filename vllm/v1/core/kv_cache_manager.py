@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -207,6 +208,31 @@ class KVCacheManager:
         # admitting waiting/preempted requests, to avoid frequent preemptions.
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        # Per device block pool (`KVCacheGroup.pool_id`); pool 0 is the shared
+        # one above. Admission checks every pool, so a private pool running
+        # out blocks admission on its own.
+        self.watermark_blocks_by_pool = [self.watermark_blocks] + [
+            int(watermark * pool.num_gpu_blocks)
+            for pool in self.coordinator.block_pools[1:]
+        ]
+        self.has_private_pools = len(self.coordinator.block_pools) > 1
+        self._num_private_pool_refusals = 0
+        # Peak usage of each private pool since the last periodic log line.
+        self._private_pool_peaks = [0.0] * (len(self.coordinator.block_pools) - 1)
+        self._private_pool_log_time = time.monotonic()
+        self._private_pool_logged_refusals = 0
+        if self.has_private_pools:
+            logger.info(
+                "KV cache groups %s draw blocks from their own pools of %s blocks "
+                "(VLLM_DRAFT_KV_POOL=1); the shared pool has %d blocks.",
+                [
+                    group_id
+                    for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+                    if group.pool_id
+                ],
+                [pool.num_gpu_blocks for pool in self.coordinator.block_pools[1:]],
+                kv_cache_config.num_blocks,
+            )
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_kind(group.manager_config, group.distinct_specs).value,
@@ -233,6 +259,11 @@ class KVCacheManager:
 
         """
         return self.block_pool.get_usage()
+
+    @property
+    def pool_usages(self) -> list[float]:
+        """Usage of each device block pool, by `KVCacheGroup.pool_id`."""
+        return [pool.get_usage() for pool in self.coordinator.block_pools]
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -412,7 +443,7 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
-        reserved_blocks: int = 0,
+        reserved_blocks: int | Sequence[int] = 0,
         has_scheduled_reqs: bool = True,
         skip_zeroing_group_ids: tuple[int, ...] = (),
     ) -> KVCacheBlocks | None:
@@ -445,6 +476,8 @@ class KVCacheManager:
                 made if it fits within (free blocks - reserved_blocks). Used to gate
                 async KV-connector loads so their initial allocation cannot consume
                 blocks an already in-flight (prefilling) sequence is relying on.
+                A sequence gives the blocks per device pool (`pool_id`); an int
+                reserves shared-pool blocks only.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
             skip_zeroing_group_ids: Groups whose external-token blocks will be
@@ -539,14 +572,12 @@ class KVCacheManager:
             self.max_model_len,
         )
 
-        watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
         # when there's at least one request already scheduled.
-        if has_scheduled_reqs and request.status in (
+        apply_watermark = has_scheduled_reqs and request.status in (
             RequestStatus.WAITING,
             RequestStatus.PREEMPTED,
-        ):
-            watermark_blocks = self.watermark_blocks
+        )
 
         # Matches the scheduler's own prefill boundary: `num_tokens - 1`
         # extends it to resumed requests replaying their output tokens.
@@ -556,7 +587,7 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            num_blocks_by_pool = self.coordinator.get_num_blocks_to_allocate_by_pool(
                 request_id=request.request_id,
                 num_tokens=full_num_tokens,
                 new_computed_blocks=new_computed_block_list,
@@ -567,8 +598,7 @@ class KVCacheManager:
                 apply_admission_cap=True,
                 prefill_end=prefill_end,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            if not self._fits_free_blocks(num_blocks_by_pool, apply_watermark):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -591,7 +621,7 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        num_blocks_by_pool = self.coordinator.get_num_blocks_to_allocate_by_pool(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -605,11 +635,13 @@ class KVCacheManager:
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
+        if not self._fits_free_blocks(
+            num_blocks_by_pool, apply_watermark, reserved_blocks
+        ):
             # Cannot allocate new blocks
             return None
+        if self.has_private_pools:
+            self._record_private_pool_usage(num_blocks_by_pool)
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
@@ -650,6 +682,74 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def _fits_free_blocks(
+        self,
+        num_blocks_by_pool: Sequence[int],
+        apply_watermark: bool,
+        reserved_blocks: int | Sequence[int] = 0,
+    ) -> bool:
+        """Whether every device pool has `num_blocks_by_pool` blocks free beyond
+        `reserved_blocks` (per pool; an int reserves shared-pool blocks) and,
+        if `apply_watermark`, its watermark."""
+        if isinstance(reserved_blocks, int):
+            reserved_blocks = (reserved_blocks,)
+        fits = True
+        for pool_id, num_blocks in enumerate(num_blocks_by_pool):
+            required = num_blocks
+            if apply_watermark:
+                required += self.watermark_blocks_by_pool[pool_id]
+            available = self.coordinator.block_pools[pool_id].get_num_free_blocks()
+            if pool_id < len(reserved_blocks):
+                available -= reserved_blocks[pool_id]
+            if required > available:
+                if not pool_id:
+                    return False
+                fits = False
+        if not fits:
+            # Only a private pool is short: count it, so an undersized pool
+            # shows in the log (at 1, 2, 4, ... refusals).
+            self._num_private_pool_refusals += 1
+            count = self._num_private_pool_refusals
+            if count & (count - 1) == 0:
+                logger.info(
+                    "A private KV cache pool refused an allocation the shared "
+                    "pool had room for (%d times so far; free blocks by pool %s, "
+                    "needed %s).",
+                    count,
+                    [
+                        pool.get_num_free_blocks()
+                        for pool in self.coordinator.block_pools
+                    ],
+                    list(num_blocks_by_pool),
+                )
+        return fits
+
+    def _record_private_pool_usage(self, num_blocks_by_pool: Sequence[int]) -> None:
+        """Track each private pool's peak usage, counting this allocation, and
+        log it at most once a minute."""
+        pools = self.coordinator.block_pools
+        for i, pool in enumerate(pools[1:]):
+            used = pool.num_gpu_blocks - 1 - pool.get_num_free_blocks()
+            peak = (used + num_blocks_by_pool[i + 1]) / (pool.num_gpu_blocks - 1)
+            self._private_pool_peaks[i] = max(self._private_pool_peaks[i], peak)
+        now = time.monotonic()
+        if now - self._private_pool_log_time < 60.0:
+            return
+        logger.info(
+            "Private KV cache pools (VLLM_DRAFT_KV_POOL): peak usage %s of %s "
+            "blocks in the last %.0f s, now %s; %d refusals the shared pool had "
+            "room for (%d since start).",
+            [f"{peak:.1%}" for peak in self._private_pool_peaks],
+            [pool.num_gpu_blocks for pool in pools[1:]],
+            now - self._private_pool_log_time,
+            [f"{pool.get_usage():.1%}" for pool in pools[1:]],
+            self._num_private_pool_refusals - self._private_pool_logged_refusals,
+            self._num_private_pool_refusals,
+        )
+        self._private_pool_peaks = [0.0] * len(self._private_pool_peaks)
+        self._private_pool_log_time = now
+        self._private_pool_logged_refusals = self._num_private_pool_refusals
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
@@ -883,7 +983,16 @@ class KVCacheManager:
         """Drain pending copies and return their retained endpoints."""
         pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
         for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
+            mgr_copies = mgr.take_pending_cow_copies()
+            group = self.kv_cache_config.kv_cache_groups[mgr.kv_cache_group_id]
+            if mgr_copies and group.pool_id:
+                # Copies carry shared-pool block IDs; the workers apply them
+                # to the shared pool's caches only.
+                raise NotImplementedError(
+                    "Copy-on-write in a private KV cache pool (KV cache group "
+                    f"{mgr.kv_cache_group_id}) is not supported."
+                )
+            pending_copies.extend(mgr_copies)
         copies = [
             KVCacheBlockCopy(
                 src_block_id=source_block.block_id,
