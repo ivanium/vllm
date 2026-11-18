@@ -21,6 +21,14 @@ to those shapes:
   other 8 with zero queries and their outputs left out of o_proj's input
   (o_proj keeps the rank's own weights). Without it a TP8 rank keeps the
   stock attention and says so.
+
+One more opt-in switch, at any TP size:
+
+- ``VLLM_MINIMAX_M3_LOW_BATCH_ATTN_CLUSTER=1``: each row's eight sparse
+  attention CTAs run as one thread block cluster, which ranks the row's pages
+  once between them and merges their partials through distributed shared
+  memory (``attention/sparse_cluster_cute.py``); o_proj's input is bitwise
+  the per-CTA kernel's.
 """
 
 import os
@@ -45,6 +53,7 @@ INTERMEDIATE_PER_RANK = 768
 TP8_INTERMEDIATE_PER_RANK = 384
 LOW_BATCH_FFN_TP8 = "VLLM_MINIMAX_M3_LOW_BATCH_FFN_TP8"
 LOW_BATCH_ATTN_PAD_HEADS = "VLLM_MINIMAX_M3_LOW_BATCH_ATTN_PAD_HEADS"
+LOW_BATCH_ATTN_CLUSTER = "VLLM_MINIMAX_M3_LOW_BATCH_ATTN_CLUSTER"
 
 
 def ffn_widths() -> tuple[int, ...]:
@@ -57,6 +66,11 @@ def ffn_widths() -> tuple[int, ...]:
 def attention_pads_heads() -> bool:
     """Whether the low-batch attention takes 8 query heads per rank (TP8)."""
     return os.environ.get(LOW_BATCH_ATTN_PAD_HEADS) == "1"
+
+
+def attention_cluster() -> bool:
+    """Whether the low-batch attention runs each row's CTAs as one cluster."""
+    return os.environ.get(LOW_BATCH_ATTN_CLUSTER) == "1"
 
 
 def unsupported(vllm_config: VllmConfig) -> list[str]:

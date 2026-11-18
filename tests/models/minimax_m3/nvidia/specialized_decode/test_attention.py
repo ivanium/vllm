@@ -168,6 +168,8 @@ def _lengths(context, num_reqs, query_len, generator):
     the CTA's warps, one pair a thread) and ``long`` a few thousand (32 pairs
     a thread), both with a query window straddling two pages and a
     zero-length padding request last."""
+    if isinstance(context, list):
+        return context
     if context == "short":
         edges = (query_len, 100, 15 * PAGE + 64, 16 * PAGE + 64)
         return [edges[i % 4] for i in range(num_reqs)]
@@ -567,3 +569,67 @@ def test_low_batch_attention_tp8_heads_are_16_head_rows(
         error = float((got - want).norm() / want.norm().clamp_min(1e-30))
         assert error < 1e-2, f"row {row}: o_proj 8 vs 16+zero heads {error:.5f}"
     _check(out8, expected, inputs["live"])
+
+
+@pytest.mark.parametrize("context", ["short", "medium", "long", "warm", "longest"])
+@pytest.mark.parametrize(
+    "num_reqs,query_len", [(1, 1), (1, 8), (2, 8), (4, 8), (32, 1)]
+)
+def test_low_batch_attention_cluster_is_bitwise(layer, num_reqs, query_len, context):
+    """With VLLM_MINIMAX_M3_LOW_BATCH_ATTN_CLUSTER=1 each row's CTAs rank its
+    pages together and merge through distributed shared memory; o_proj's
+    MXFP8 input and its scales are bitwise the per-CTA kernel's: short rows,
+    rows ranked from one and from four pages a thread (``longest``: more than
+    2048 pages), and crowded rankings (``warm``)."""
+    from vllm.config import set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+    from vllm.models.minimax_m3.nvidia.specialized_decode.attention import (
+        LowBatchAttention,
+        _kernels,
+        _scratch,
+    )
+    from vllm.models.minimax_m3.nvidia.specialized_decode.attention.o_proj import (
+        mxfp8_weights,
+    )
+
+    attrs, config, per_cta = layer
+    clustered = LowBatchAttention(
+        attrs, *mxfp8_weights(attrs.o_proj, HIDDEN, attrs.num_heads * HEAD_DIM)
+    )
+    clustered.kernels = _kernels(
+        attrs.o_proj.weight.device.index, attrs.num_heads, cluster=True
+    )
+    assert clustered.kernels.cluster and not per_cta.kernels.cluster
+    if context == "longest":
+        # More than 2048 history pages: two, three and four pages a ranking
+        # thread.
+        lengths = [(2500, 4500, 7000)[b % 3] * PAGE + 3 for b in range(num_reqs)]
+        inputs = _inputs(lengths, num_reqs, query_len, seed=7, heads=attrs.num_heads)
+    elif context == "warm":
+        inputs = _inputs(
+            "long", num_reqs, query_len, seed=9, warm=200, heads=attrs.num_heads
+        )
+    else:
+        inputs = _inputs(
+            context, num_reqs, query_len, seed=3 + num_reqs, heads=attrs.num_heads
+        )
+    rows = num_reqs * query_len
+    width = attrs.num_heads * HEAD_DIM
+    scratch = _scratch(inputs["q"].device)
+    results = []
+    with (
+        set_current_vllm_config(config),
+        set_forward_context(None, config),
+        torch.inference_mode(),
+    ):
+        for low in (per_cta, clustered):
+            scratch.act.zero_()
+            scratch.act_scale.zero_()
+            out = _run(low, inputs)
+            torch.accelerator.synchronize()
+            act = scratch.act.view(-1)[: rows * width].clone()
+            results.append((act, scratch.act_scale.clone(), out))
+    (act_a, scale_a, out_a), (act_b, scale_b, out_b) = results
+    assert torch.equal(act_a, act_b)
+    assert torch.equal(scale_a, scale_b)
+    assert torch.equal(out_a, out_b)

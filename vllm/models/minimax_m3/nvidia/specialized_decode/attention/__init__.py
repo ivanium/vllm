@@ -34,7 +34,12 @@ from vllm.logger import init_logger
 from vllm.models.common.ops.moe_tail_fusion.primitives import current_cu_stream
 from vllm.platforms import current_platform
 
-from .. import LOW_BATCH_ATTN_PAD_HEADS, attention_pads_heads
+from .. import (
+    LOW_BATCH_ATTN_CLUSTER,
+    LOW_BATCH_ATTN_PAD_HEADS,
+    attention_cluster,
+    attention_pads_heads,
+)
 from .o_proj import compile_all, mxfp8_weights, o_proj_gemm
 
 logger = init_logger(__name__)
@@ -96,12 +101,15 @@ class _Kernels(NamedTuple):
     work: Any
     indexer: Any
     attention: Any
+    # Whether ``attention`` is the cluster kernel (LOW_BATCH_ATTN_CLUSTER).
+    cluster: bool = False
 
 
 @cache
-def _kernels(device_index: int, heads: int = HEADS) -> _Kernels:
+def _kernels(device_index: int, heads: int = HEADS, cluster: bool = False) -> _Kernels:
     """The step's, the indexer's and (for ``heads`` query heads a row) the
-    attention's compiled kernels."""
+    attention's compiled kernels: ``cluster``, each row's CTAs as one thread
+    block cluster (``sparse_cluster_cute.py``), else ``SparseAttention``."""
     import cutlass.cute as cute
     from cutlass import Float32, Int32, Int64
     from cutlass.cute.runtime import make_fake_stream
@@ -109,15 +117,42 @@ def _kernels(device_index: int, heads: int = HEADS) -> _Kernels:
     from .sparse_cute import SparseAttention
 
     sms, work, indexer = _step_kernels(device_index)
+    args = (
+        *(Int64(0),) * 11,
+        Float32(0.0),
+        *(Int64(0), Int32(0)) * 2,
+        Int32(1),
+        make_fake_stream(),
+    )
     with torch.accelerator.device_index(device_index):
-        attention = cute.compile(
-            SparseAttention(ATTENTION_CTAS, heads),
-            *(Int64(0),) * 11,
-            Float32(0.0),
-            *(Int64(0), Int32(0)) * 2,
-            Int32(1),
-            make_fake_stream(),
-        )
+        if cluster:
+            from .sparse_cluster_cute import ClusterSparseAttention
+
+            try:
+                attention = cute.compile(ClusterSparseAttention(heads), *args)
+            except Exception as error:  # a DSL or driver without the cluster path
+                logger.warning_once(
+                    "MiniMax-M3 low-batch attention cluster kernel not used (%s=1): "
+                    "%s: %s; each sparse attention CTA ranks the row's pages and the "
+                    "row's last CTA merges them, as without the switch.",
+                    LOW_BATCH_ATTN_CLUSTER,
+                    type(error).__name__,
+                    str(error)[:200],
+                    scope="process",
+                )
+            else:
+                logger.info_once(
+                    "MiniMax-M3 low-batch attention: each row's %d sparse attention "
+                    "CTAs run as one thread block cluster (%s=1): they rank the "
+                    "row's pages together and merge through distributed shared "
+                    "memory, %d query heads a row.",
+                    ATTENTION_CTAS,
+                    LOW_BATCH_ATTN_CLUSTER,
+                    heads,
+                    scope="process",
+                )
+                return _Kernels(sms, work, indexer, attention, True)
+        attention = cute.compile(SparseAttention(ATTENTION_CTAS, heads), *args)
     return _Kernels(sms, work, indexer, attention)
 
 
@@ -205,7 +240,7 @@ class LowBatchAttention:
         self.weight_scale = weight_scale
         # 16, or 8 (TP8): o_proj's input is [rows, heads x 128] (its K).
         self.heads = layer.num_heads
-        self.kernels = _kernels(weight.device.index, self.heads)
+        self.kernels = _kernels(weight.device.index, self.heads, attention_cluster())
         # Outside any capture: a buffer first made inside one would not be
         # zeroed for the graphs captured later.
         _scratch(weight.device)

@@ -313,6 +313,37 @@ def ld_cg_f32x4(address: Int64, *, loc=None, ip=None):
     return [Float32(w) for w in _words(res, 4, loc, ip, T.f32())]
 
 
+@dsl_user_op
+def st_peer_f32(
+    smem: Int32, mbar: Int32, peer: Int32, value: Float32, *, loc=None, ip=None
+) -> None:
+    """Store ``value`` at shared address ``smem`` of cluster CTA ``peer`` (the
+    same offset as a local address), completing 4 bytes on that CTA's
+    mbarrier at ``mbar`` (as DeepSeek-V4.1's ``sparse_mla_cute.py``)."""
+    text = (
+        "{\n.reg .b32 ra, rb;\nmapa.shared::cluster.u32 ra, $0, $2;\n"
+        "mapa.shared::cluster.u32 rb, $1, $2;\n"
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [ra], $3, [rb];\n}"
+    )
+    operands = [_v(Int32(x), loc, ip) for x in (smem, mbar, peer)]
+    operands.append(_v(Float32(value), loc, ip))
+    _asm(None, operands, text, "r,r,r,f", loc, ip, True)
+
+
+@dsl_user_op
+def st_peer_s32(
+    smem: Int32, mbar: Int32, peer: Int32, value: Int32, *, loc=None, ip=None
+) -> None:
+    """``st_peer_f32`` of an int32."""
+    text = (
+        "{\n.reg .b32 ra, rb;\nmapa.shared::cluster.u32 ra, $0, $2;\n"
+        "mapa.shared::cluster.u32 rb, $1, $2;\n"
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [ra], $3, [rb];\n}"
+    )
+    operands = [_v(Int32(x), loc, ip) for x in (smem, mbar, peer, value)]
+    _asm(None, operands, text, "r,r,r,r", loc, ip, True)
+
+
 def scales_x4(scales: Uint32, count: int):
     """The first ``count`` E4M3 bytes of ``scales``, each repeated four
     times (QMUL4's scale operand)."""
