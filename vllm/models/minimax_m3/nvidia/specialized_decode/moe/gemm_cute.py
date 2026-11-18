@@ -57,17 +57,24 @@ from vllm.models.deepseek_v41.nvidia.specialized_decode.moe.routed_expert_gemm_c
 )
 
 from .front_cute import (
-    H_TILE_BYTES,
-    INTERMEDIATE,
     SF_VEC,
+    h_tile_bytes,
     local_amax,
     per_token_scales,
     quantize_x8,
 )
 
-H_ROW_WORDS = INTERMEDIATE // 2  # one BF16 h row as words
-# quantize_h_tile: 16 threads per row, three 16-value blocks each.
-assert INTERMEDIATE == 16 * 3 * SF_VEC
+# quantize_h_tile: three 16-value blocks a thread.
+H_BLOCKS_PER_THREAD = 3
+
+
+def h_row_threads(intermediate: int) -> int:
+    """quantize_h_tile's threads per ``h`` row: 16 at 768 columns (TP4), 8 at
+    384 (TP8), whose eight rows then take FC1's first 64 epilogue threads."""
+    threads, rest = divmod(intermediate, H_BLOCKS_PER_THREAD * SF_VEC)
+    assert rest == 0 and threads in (8, 16), intermediate
+    return threads
+
 
 # h = SwiGLU-OAI of up ($1) and gate ($2) at scale $3, as BF16 bits of two
 # columns packed (column p in the low half): $0 for (up $1, gate $2) and
@@ -152,21 +159,52 @@ def quantize_h_tile(
     h_quant: cute.Tensor,
     h_scale: cute.Tensor,
     h_pt: cute.Tensor,
+    intermediate: cutlass.Constexpr[int],
 ):
     """Per-token NVFP4 of token tile ``tile``'s BF16 ``h`` rows below
-    ``valid``, by FC1's 128 epilogue threads: thread ``t`` takes row ``t /
-    16`` of the tile, the 16-value blocks ``3 (t % 16) ..`` of it. The scales
-    go in the 128x4 atom layout FC2 loads with TMA (one 128-row atom per tile,
-    rows 0-7 used). Rows past ``valid`` hold no FC1 output: read as zero, not
-    stored."""
-    r = thread // 16
-    lane = thread % 16
+    ``valid``, by FC1's 128 epilogue threads: with ``n`` threads a row
+    (:func:`h_row_threads`), thread ``t`` takes row ``t / n`` of the tile, the
+    16-value blocks ``3 (t % n) ..`` of it; at 8 a row, threads 64-127 (two
+    whole warps) have no row. The scales go in the 128x4 atom layout FC2 loads
+    with TMA (one 128-row atom per tile, rows 0-7 used). Rows past ``valid``
+    hold no FC1 output: read as zero, not stored."""
+    lanes = h_row_threads(intermediate)
+    r = thread // lanes
+    lane = thread % lanes
+    if cutlass.const_expr(lanes * TILE == 128):
+        _quantize_h_row(h, tile, valid, r, lane, h_quant, h_scale, h_pt, intermediate)
+    else:
+        if r < TILE:
+            _quantize_h_row(
+                h, tile, valid, r, lane, h_quant, h_scale, h_pt, intermediate
+            )
+    # FC2 loads them with TMA.
+    cute.arch.fence_proxy("async.global")
+
+
+@cute.jit
+def _quantize_h_row(
+    h: cute.Tensor,
+    tile: Int32,
+    valid: Int32,
+    r: Int32,
+    lane: Int32,
+    h_quant: cute.Tensor,
+    h_scale: cute.Tensor,
+    h_pt: cute.Tensor,
+    intermediate: cutlass.Constexpr[int],
+):
+    """Lane ``lane``'s three blocks of tile row ``r`` (:func:`quantize_h_tile`);
+    the row's ``h_row_threads`` lanes are consecutive in one warp."""
+    row_words = intermediate // 2  # one BF16 h row as words
+    tile_bytes = h_tile_bytes(intermediate)
+    shifts = h_row_threads(intermediate).bit_length() - 1
     row = tile * TILE + r
     keep = Uint32(0) - Uint32(r < valid)
     words = cute.make_rmem_tensor((6, 4), Uint32)
     block_amax = cute.make_rmem_tensor((3,), Float32)
     for c in cutlass.range_constexpr(6):
-        loaded = load_global_u32x4(h.iterator + row * H_ROW_WORDS + lane * 24 + 4 * c)
+        loaded = load_global_u32x4(h.iterator + row * row_words + lane * 24 + 4 * c)
         for i in cutlass.range_constexpr(4):
             words[c, i] = loaded[i] & keep
     # Eight values (four words) a chunk, two chunks a 16-value block.
@@ -177,7 +215,7 @@ def quantize_h_tile(
             local_amax(chunks[2 * b]), local_amax(chunks[2 * b + 1])
         )
         row_amax = max_f32(row_amax, block_amax[b])
-    for shift in cutlass.range_constexpr(4):
+    for shift in cutlass.range_constexpr(shifts):
         row_amax = max_f32(row_amax, cute.arch.shuffle_sync_bfly(row_amax, 1 << shift))
     pt, encode = per_token_scales(row_amax)
     for b in cutlass.range_constexpr(3):
@@ -185,15 +223,13 @@ def quantize_h_tile(
         hi, _ = quantize_x8(chunks[2 * b + 1], block_amax[b], encode)
         block = lane * 3 + b
         if r < valid:
-            h_quant[row * (H_ROW_WORDS // 4) + 2 * block] = lo
-            h_quant[row * (H_ROW_WORDS // 4) + 2 * block + 1] = hi
-            h_scale[tile * H_TILE_BYTES + (block // 4) * 512 + r * 16 + block % 4] = (
+            h_quant[row * (row_words // 4) + 2 * block] = lo
+            h_quant[row * (row_words // 4) + 2 * block + 1] = hi
+            h_scale[tile * tile_bytes + (block // 4) * 512 + r * 16 + block % 4] = (
                 Uint8(sf)
             )
     if r < valid and lane == 0:
         h_pt[row] = pt
-    # FC2 loads them with TMA.
-    cute.arch.fence_proxy("async.global")
 
 
 class RoutedFc1(RoutedExpertGemm):
@@ -202,12 +238,13 @@ class RoutedFc1(RoutedExpertGemm):
     gathered with its linear scales by the B load warp, so accumulator column
     ``r`` is tile row ``r``.
 
-    FC2's per-token NVFP4 scale needs a whole ``h`` row, which
-    the tile's 12 items (m tiles) write. Each item's epilogue counts itself in
-    the tile's ``done`` word (acquire-release); the item that completes the
-    count quantizes the tile's rows (:func:`quantize_h_tile`) before the
-    base's ready word counts it, so a tile's ready count reaches 12 only once
-    FC2's input of the tile is stored. With ``overlap``, FC1 signals those
+    FC2's per-token NVFP4 scale needs a whole ``h`` row, which the tile's
+    items (m tiles: 12 at 768 intermediate columns, 6 at 384) write. Each
+    item's epilogue counts itself in the tile's ``done`` word
+    (acquire-release); the item that completes the count quantizes the tile's
+    rows (:func:`quantize_h_tile`) before the base's ready word counts it, so
+    a tile's ready count reaches the m tiles only once FC2's input of the tile
+    is stored. With ``overlap``, FC1 signals those
     counts and FC2 waits for them per item (``RoutedExpertGemm.signal_ready``);
     without, FC2 waits for the FC1 grid."""
 
@@ -231,6 +268,7 @@ class RoutedFc1(RoutedExpertGemm):
         self.signal_ready = overlap
         self.sf_vec_size = SF_VEC
         self.intermediate = intermediate
+        h_row_threads(intermediate)  # a width quantize_h_tile takes
         # A stage of a row is one or two 128-byte swizzle atoms.
         assert cta_k in (256, 512)
 
@@ -286,7 +324,8 @@ class RoutedFc1(RoutedExpertGemm):
             h_quant_ptr, cute.make_layout(h_rows * (self.intermediate // 8))
         )
         h_scale = cute.make_tensor(
-            h_scale_ptr, cute.make_layout(h_rows // TILE * H_TILE_BYTES)
+            h_scale_ptr,
+            cute.make_layout(h_rows // TILE * h_tile_bytes(self.intermediate)),
         )
         h_pt = cute.make_tensor(h_pt_ptr, cute.make_layout(h_rows))
         done = cute.make_tensor(done_ptr, cute.make_layout(cta_words))
@@ -479,7 +518,9 @@ class RoutedFc1(RoutedExpertGemm):
         if Int32(exchange[0]) == self.m_tiles - 1:
             # The other items' h rows, released by their counts.
             cute.arch.fence_acq_rel_gpu()
-            quantize_h_tile(mH, n_tile, valid, thread, mHQuant, mHScale, mHPt)
+            quantize_h_tile(
+                mH, n_tile, valid, thread, mHQuant, mHScale, mHPt, self.intermediate
+            )
 
 
 class RoutedFc2(RoutedExpertGemm):
@@ -497,6 +538,8 @@ class RoutedFc2(RoutedExpertGemm):
         num_ab_stage: int = 8,
     ) -> None:
         super().__init__(hidden, hidden // 128, intermediate, cta_k, num_ab_stage)
+        # K tiles cover K (384 columns take 128 or 384).
+        assert intermediate % cta_k == 0, (intermediate, cta_k)
         self.sf_vec_size = SF_VEC
         self.ready_target = fc1_m_tiles
 

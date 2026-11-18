@@ -22,14 +22,16 @@ pytestmark = pytest.mark.skipif(
     reason="the low-batch FFN kernels run on SM100-family GPUs",
 )
 
-HIDDEN, EXPERTS, INTERMEDIATE, TOP_K = 6144, 128, 768, 4
+HIDDEN, EXPERTS, TOP_K = 6144, 128, 4
 DEVICE = "cuda"
 
 
-@pytest.fixture(scope="module")
-def layer():
+@pytest.fixture(scope="module", params=[768, 384], ids=["tp4", "tp8"])
+def layer(request):
     """One stock ``MiniMaxM3MoE`` with processed random weights, its config
-    and its low-batch FFN."""
+    and its low-batch FFN: one TP4 rank's 768 intermediate columns, or one TP8
+    rank's 384 (VLLM_MINIMAX_M3_LOW_BATCH_FFN_TP8=1)."""
+    intermediate = request.param
     from vllm.config import (
         KernelConfig,
         ParallelConfig,
@@ -66,7 +68,7 @@ def layer():
         hidden_size=HIDDEN,
         num_local_experts=EXPERTS,
         num_experts_per_tok=TOP_K,
-        intermediate_size=INTERMEDIATE,
+        intermediate_size=intermediate,
         scoring_func="sigmoid",
         hidden_act="swigluoai",
         swiglu_limit=7.0,
@@ -81,6 +83,10 @@ def layer():
     fd, path = tempfile.mkstemp()
     os.close(fd)
     default_dtype = torch.get_default_dtype()
+    switch = "VLLM_MINIMAX_M3_LOW_BATCH_FFN_TP8"
+    saved_switch = os.environ.get(switch)
+    if intermediate == 384:
+        os.environ[switch] = "1"
     try:
         with set_current_vllm_config(config):
             init_distributed_environment(
@@ -104,6 +110,10 @@ def layer():
                     method.process_weights_after_loading(module)
             yield moe, config, build_low_batch_ffn(moe)
     finally:
+        if saved_switch is None:
+            os.environ.pop(switch, None)
+        else:
+            os.environ[switch] = saved_switch
         torch.set_default_dtype(default_dtype)
         cleanup_dist_env_and_memory()
         with suppress(FileNotFoundError):
@@ -199,7 +209,7 @@ def _stock_routed(moe, x):
         top_k=TOP_K,
         n_group=0,
         topk_group=0,
-        intermediate_size=INTERMEDIATE,
+        intermediate_size=impl.intermediate_size_per_partition,
         local_expert_offset=0,
         local_num_experts=EXPERTS,
         routed_scaling_factor=moe.routed_scaling_factor,
@@ -258,8 +268,31 @@ def test_low_batch_ffn_builds(layer):
     (``deepseek_v41/nvidia/specialized_decode/moe/``) and compile for every
     width when the layer is bound, so a change there that breaks them fails
     here."""
-    _, _, ffn = layer
+    moe, _, ffn = layer
     assert ffn is not None
+    impl = moe.experts.routed_experts.quant_method.moe_kernel.fused_experts
+    assert ffn.intermediate == impl.intermediate_size_per_partition
+
+
+def test_low_batch_ffn_tp8_needs_its_switch(layer):
+    """384 intermediate columns per rank (TP8) are refused without
+    VLLM_MINIMAX_M3_LOW_BATCH_FFN_TP8=1, 768 (TP4) are taken either way."""
+    from vllm.models.minimax_m3.nvidia.specialized_decode.moe import (
+        unsupported_reason,
+    )
+
+    moe, _, ffn = layer
+    switch = "VLLM_MINIMAX_M3_LOW_BATCH_FFN_TP8"
+    saved = os.environ.pop(switch, None)
+    try:
+        reason = unsupported_reason(moe)
+        if ffn.intermediate == 384:
+            assert reason is not None and switch in reason
+        else:
+            assert reason is None
+    finally:
+        if saved is not None:
+            os.environ[switch] = saved
 
 
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])

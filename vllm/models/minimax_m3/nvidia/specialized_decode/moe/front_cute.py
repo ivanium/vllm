@@ -25,7 +25,7 @@ rcp(f32(sf) * rcp(encode))``, ``code = e2m1(value * out)`` (``rcp`` is
 ``rcp.approx.ftz``, conversions round to nearest and saturate). The GEMMs
 dequantize with ``pt``. The input's scales are stored linearly ([rows,
 384]). FC1 quantizes its ``h`` rows for FC2 with the same helpers, the
-scales in the 128x4 atom layout (``H_TILE_BYTES`` per 8-row tile).
+scales in the 128x4 atom layout (``h_tile_bytes`` per 8-row tile).
 
 PDL: the front triggers its dependents on entry; every read of a previous
 kernel's output follows the grid-dependency wait (the routing bias, a weight,
@@ -64,17 +64,21 @@ from vllm.models.deepseek_v41.nvidia.specialized_decode.moe.routed_expert_route_
 )
 
 from .. import EXPERTS, HIDDEN, TOP_K
-from .. import INTERMEDIATE_PER_RANK as INTERMEDIATE
 
 MAX_ROWS = 32
 SF_VEC = 16
 THREADS = 768
 PER_LANE = EXPERTS // 32
 X_THREADS = HIDDEN // 8  # threads per input row
-H_TILE_BYTES = 128 * INTERMEDIATE // SF_VEC  # one tile's h scales
 
 assert X_THREADS == THREADS
 assert EXPERTS <= MAX_EXPERTS and MAX_ROWS * TOP_K <= THREADS
+
+
+def h_tile_bytes(intermediate: int) -> int:
+    """One 8-row tile's h scales: a 128-row atom block over ``intermediate``
+    columns."""
+    return 128 * intermediate // SF_VEC
 
 
 def _asm(result, operands: list, text: str, constraints: str, loc, ip):

@@ -21,8 +21,8 @@ every TP rank with the missing requirements:
 - Parallelism: tensor parallel only; no pipeline, data, expert or context
   parallelism, no micro-batching.
 - Layers: hidden size 6144, 128 experts, top-4, 768 intermediate columns per
-  rank for the routed and the shared expert (MiniMax-M3.1-Flash at TP4), no
-  MegaMoE.
+  rank for the routed and the shared expert (MiniMax-M3.1-Flash at TP4), or 384
+  (TP8) with `VLLM_MINIMAX_M3_LOW_BATCH_FFN_TP8=1`, no MegaMoE.
 - CUDA graphs: FULL graphs for decode batches only (`FULL_AND_PIECEWISE` or
   `FULL_DECODE_ONLY`).
 - No `torch.compile` of the model, no sleep mode, no LoRA or batch invariance.
@@ -47,11 +47,14 @@ configuration decides both:
 
 The low-batch attention needs no check of its own: a sparse attention layer
 without the CUTLASS decode and an NVFP4 index cache (`indexer_kv_dtype`, bf16
-by default) builds none, and one without 16 query heads on one KV head and one
-index head of 128, an NVFP4 KV cache, 16 top-k blocks, unit KV global scales
-and a FlashInfer `cute-dsl` MXFP8 o_proj gets none
-(`attention.build_low_batch_attention` returns None); either keeps its stock
-modules. The configuration decides this, so every rank agrees.
+by default) builds none, and one without 16 query heads on one KV head (or 8,
+a TP8 rank's, with `VLLM_MINIMAX_M3_LOW_BATCH_ATTN_PAD_HEADS=1`: rows 0-7 of
+the kernel's 16-head tile, the other rows zero queries left out of o_proj's
+input) and one index head of 128, an NVFP4 KV cache, 16 top-k blocks, unit KV
+global scales and a FlashInfer `cute-dsl` MXFP8 o_proj gets none
+(`attention.build_low_batch_attention` returns None and says why once per
+process); either keeps its stock modules. The configuration decides this, so
+every rank agrees.
 
 ## Structure
 

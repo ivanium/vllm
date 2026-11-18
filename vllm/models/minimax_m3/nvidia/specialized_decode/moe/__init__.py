@@ -22,6 +22,9 @@ takes, the stock chain runs about eleven small kernels. Here::
 * ``shared_cute.py``: the MXFP8 shared expert on the same GEMM, up to four
   8-row tiles.
 
+The kernels are built for the layer's intermediate columns per rank: 768
+(TP4), or 384 (TP8) with ``VLLM_MINIMAX_M3_LOW_BATCH_FFN_TP8=1``.
+
 The kernels read the weights vLLM prepares for the TRT-LLM-gen NVFP4 experts
 and the FlashInfer MXFP8 linears in place, are compiled once per device when a
 layer is bound, and launch with programmatic dependent launch, so CUDA graphs
@@ -55,14 +58,14 @@ from vllm.models.deepseek_v41.nvidia.specialized_decode.moe.routed_expert_gemm i
 )
 from vllm.utils.torch_utils import aux_stream
 
+from .. import LOW_BATCH_FFN_TP8, ffn_widths
 from .front_cute import (
     EXPERTS,
-    H_TILE_BYTES,
     HIDDEN,
-    INTERMEDIATE,
     MAX_ROWS,
     TOP_K,
     LowBatchFront,
+    h_tile_bytes,
 )
 from .gemm_cute import RoutedFc1, RoutedFc2
 from .shared_cute import (
@@ -95,11 +98,17 @@ ROUTED_FC2_CTA_K = 256
 ROUTED_FC1_STAGES = 8
 ROUTED_FC2_STAGES = 4
 ROUTED_CTAS: int | None = None
+# FC2's (routed and shared) K tile and stages by intermediate columns per rank,
+# FC2's K: 384 columns (TP8) take three K tiles of 128, twice the stages at
+# half the stage size.
+FC2_CTA_K = {768: ROUTED_FC2_CTA_K, 384: 128}
+ROUTED_FC2_STAGES_BY_WIDTH = {768: ROUTED_FC2_STAGES, 384: 2 * ROUTED_FC2_STAGES}
 # Above this many rows FC2 starts on each token tile as FC1 completes it;
 # up to it, after the FC1 grid. B300, 12 real layers: per tile 1.6-2.2 us
 # faster at 12-32 rows and 1.1-1.3 us slower at 1-3 rows (even at 8).
 OVERLAP_ROWS = 8
 SHARED_FC1_STAGES = 6
+SHARED_FC2_STAGES = {768: 6, 384: 8}
 # Persistent CTAs of the shared expert's GEMMs (144 and 48 work items per row
 # tile), which leave SMs to the routed GEMMs beside them (the critical path).
 # On B300 at 1, 4 and 8 rows, within 3% of the best of 144/48, 72/48, 48/24
@@ -122,6 +131,9 @@ class LowBatchFfn:
         self.bias = moe.e_score_correction_bias
         self.scale = float(moe.routed_scaling_factor)
         self.routed = routed
+        # Intermediate columns per rank (``unsupported_reason`` checks them).
+        impl = routed.quant_method.moe_kernel.fused_experts
+        self.intermediate = impl.intermediate_size_per_partition
         self.w13, self.w13_scale = routed.w13_weight, quant.w1_scale
         self.w2, self.w2_scale = routed.w2_weight, quant.w2_scale
         self.alpha1, self.alpha2 = quant.g1_alphas, quant.g2_alphas
@@ -156,11 +168,13 @@ class LowBatchFfn:
         # The front's builds run() takes (8, 16 and 32 rows).
         for built in {width(rows) for rows in range(1, MAX_ROWS + 1)}:
             _front(self.device_index, built)
+        columns = self.intermediate
         for overlap in (False, True):
-            _fc1(self.device_index, overlap)
-            _fc2(self.device_index, overlap)
-        for compile_kernel in _KERNELS:
-            compile_kernel(self.device_index)
+            _fc1(self.device_index, columns, overlap)
+            _fc2(self.device_index, columns, overlap)
+        _shared_input(self.device_index)
+        for compile_kernel in _SHARED_KERNELS:
+            compile_kernel(self.device_index, columns)
         self.aux = aux_stream()
         self.input_ready = torch.cuda.Event()
         self.shared_ready = torch.cuda.Event()
@@ -209,11 +223,12 @@ class LowBatchFfn:
         x_quant = torch.empty((rows, HIDDEN // 2), dtype=torch.uint8, device=device)
         x_scale = torch.empty((rows, HIDDEN // 16), dtype=torch.uint8, device=device)
         x_pt = torch.empty(rows, dtype=torch.float32, device=device)
-        h = torch.empty((h_rows, INTERMEDIATE), dtype=torch.bfloat16, device=device)
-        h_quant = torch.empty(
-            (h_rows, INTERMEDIATE // 2), dtype=torch.uint8, device=device
+        columns = self.intermediate
+        h = torch.empty((h_rows, columns), dtype=torch.bfloat16, device=device)
+        h_quant = torch.empty((h_rows, columns // 2), dtype=torch.uint8, device=device)
+        h_scale = torch.empty(
+            tiles * h_tile_bytes(columns), dtype=torch.uint8, device=device
         )
-        h_scale = torch.empty(tiles * H_TILE_BYTES, dtype=torch.uint8, device=device)
         h_pt = torch.empty(h_rows, dtype=torch.float32, device=device)
         output = torch.empty((h_rows, HIDDEN), dtype=torch.bfloat16, device=device)
         stream = current_cu_stream()
@@ -233,7 +248,7 @@ class LowBatchFfn:
             stream,
         )
         overlap = rows > OVERLAP_ROWS
-        _fc1(self.device_index, overlap)(
+        _fc1(self.device_index, columns, overlap)(
             _ptr(cutlass.Float4E2M1FN, self.w13, 32),
             _ptr(cutlass.Float8E4M3FN, self.w13_scale),
             _ptr(cutlass.Float4E2M1FN, x_quant, 32),
@@ -254,7 +269,7 @@ class LowBatchFfn:
             ctas,
             stream,
         )
-        _fc2(self.device_index, overlap)(
+        _fc2(self.device_index, columns, overlap)(
             _ptr(cutlass.Float4E2M1FN, self.w2, 32),
             _ptr(cutlass.Float8E4M3FN, self.w2_scale),
             _ptr(cutlass.Float4E2M1FN, h_quant, 32),
@@ -286,18 +301,17 @@ class LowBatchFfn:
         row_tiles = -(-rows // TILE)
         tiles = SPLITS * row_tiles
         device = x.device
+        columns = self.intermediate
         x8 = torch.empty(row_tiles * TILE * HIDDEN, dtype=torch.uint8, device=device)
         x8_scale = torch.empty(
             tiles * shared_tile_scale_bytes(SPLIT_K), dtype=torch.uint8, device=device
         )
         partial = torch.empty(
-            tiles * TILE * 2 * INTERMEDIATE, dtype=torch.float32, device=device
+            tiles * TILE * 2 * columns, dtype=torch.float32, device=device
         )
-        h8 = torch.empty(
-            row_tiles * TILE * INTERMEDIATE, dtype=torch.uint8, device=device
-        )
+        h8 = torch.empty(row_tiles * TILE * columns, dtype=torch.uint8, device=device)
         h8_scale = torch.empty(
-            row_tiles * shared_tile_scale_bytes(INTERMEDIATE),
+            row_tiles * shared_tile_scale_bytes(columns),
             dtype=torch.uint8,
             device=device,
         )
@@ -313,7 +327,7 @@ class LowBatchFfn:
             Int32(row_tiles),
             stream,
         )
-        _shared_fc1(index)(
+        _shared_fc1(index, columns)(
             _ptr(cutlass.Float8E4M3FN, self.gate_up),
             _ptr(cutlass.Float8E8M0FNU, self.gate_up_scale),
             _ptr(cutlass.Float8E4M3FN, x8),
@@ -325,7 +339,7 @@ class LowBatchFfn:
             Int32(min(sms, SHARED_FC1_CTAS)),
             stream,
         )
-        _shared_act(index)(
+        _shared_act(index, columns)(
             _ptr(cutlass.Float32, partial),
             _ptr(cutlass.Uint32, h8),
             _ptr(cutlass.Uint8, h8_scale),
@@ -333,7 +347,7 @@ class LowBatchFfn:
             Int32(row_tiles),
             stream,
         )
-        _shared_fc2(index)(
+        _shared_fc2(index, columns)(
             _ptr(cutlass.Float8E4M3FN, self.down),
             _ptr(cutlass.Float8E8M0FNU, self.down_scale),
             _ptr(cutlass.Float8E4M3FN, h8),
@@ -390,12 +404,10 @@ def _front(device_index: int, built: int):
 
 
 @cache
-def _fc1(device_index: int, overlap: bool):
+def _fc1(device_index: int, columns: int, overlap: bool):
     with torch.accelerator.device_index(device_index):
         return cute.compile(
-            RoutedFc1(
-                HIDDEN, INTERMEDIATE, overlap, ROUTED_FC1_CTA_K, ROUTED_FC1_STAGES
-            ),
+            RoutedFc1(HIDDEN, columns, overlap, ROUTED_FC1_CTA_K, ROUTED_FC1_STAGES),
             _fake(cutlass.Float4E2M1FN, 32),
             _fake(cutlass.Float8E4M3FN),
             _fake(cutlass.Float4E2M1FN, 32),
@@ -419,16 +431,16 @@ def _fc1(device_index: int, overlap: bool):
 
 
 @cache
-def _fc2(device_index: int, overlap: bool):
+def _fc2(device_index: int, columns: int, overlap: bool):
     with torch.accelerator.device_index(device_index):
         return cute.compile(
             RoutedFc2(
                 HIDDEN,
-                INTERMEDIATE,
+                columns,
                 # FC1's m tiles: a tile's ready count.
-                2 * INTERMEDIATE // 128 if overlap else 0,
-                ROUTED_FC2_CTA_K,
-                ROUTED_FC2_STAGES,
+                2 * columns // 128 if overlap else 0,
+                FC2_CTA_K[columns],
+                ROUTED_FC2_STAGES_BY_WIDTH[columns],
             ),
             _fake(cutlass.Float4E2M1FN, 32),
             _fake(cutlass.Float8E4M3FN),
@@ -461,10 +473,10 @@ def _shared_input(device_index: int):
 
 
 @cache
-def _shared_fc1(device_index: int):
+def _shared_fc1(device_index: int, columns: int):
     with torch.accelerator.device_index(device_index):
         return cute.compile(
-            SharedFc1(num_ab_stage=SHARED_FC1_STAGES),
+            SharedFc1(columns, num_ab_stage=SHARED_FC1_STAGES),
             _fake(cutlass.Float8E4M3FN),
             _fake(cutlass.Float8E8M0FNU),
             _fake(cutlass.Float8E4M3FN),
@@ -479,10 +491,10 @@ def _shared_fc1(device_index: int):
 
 
 @cache
-def _shared_act(device_index: int):
+def _shared_act(device_index: int, columns: int):
     with torch.accelerator.device_index(device_index):
         return cute.compile(
-            SharedAct(),
+            SharedAct(columns),
             _fake(cutlass.Float32),
             _fake(cutlass.Uint32),
             _fake(cutlass.Uint8),
@@ -493,10 +505,10 @@ def _shared_act(device_index: int):
 
 
 @cache
-def _shared_fc2(device_index: int):
+def _shared_fc2(device_index: int, columns: int):
     with torch.accelerator.device_index(device_index):
         return cute.compile(
-            SharedFc2(),
+            SharedFc2(columns, FC2_CTA_K[columns], SHARED_FC2_STAGES[columns]),
             _fake(cutlass.Float8E4M3FN),
             _fake(cutlass.Float8E8M0FNU),
             _fake(cutlass.Float8E4M3FN),
@@ -511,8 +523,7 @@ def _shared_fc2(device_index: int):
         )
 
 
-_KERNELS = (
-    _shared_input,
+_SHARED_KERNELS = (
     _shared_fc1,
     _shared_act,
     _shared_fc2,
@@ -546,11 +557,14 @@ def unsupported_reason(moe: torch.nn.Module) -> str | None:
     if not impl.per_token_activation:
         return "activations are not per-token NVFP4"
     config = impl.moe_config
+    columns = impl.intermediate_size_per_partition
+    if columns not in ffn_widths():
+        hint = f"; {LOW_BATCH_FFN_TP8}=1 takes it" if columns in FC2_CTA_K else ""
+        return f"{columns} intermediate columns per rank{hint}"
     if (
         impl.local_num_experts != EXPERTS
         or config.num_experts != EXPERTS
         or config.hidden_dim != HIDDEN
-        or impl.intermediate_size_per_partition != INTERMEDIATE
     ):
         return "layer shape"
     if (
@@ -561,10 +575,10 @@ def unsupported_reason(moe: torch.nn.Module) -> str | None:
         return "SwiGLU-OAI constants"
     quant = impl.quant_config
     for name, tensor, shape in (
-        ("w13", routed.w13_weight, (EXPERTS, 2 * INTERMEDIATE, HIDDEN // 2)),
-        ("w13 scales", quant.w1_scale, (EXPERTS, 2 * INTERMEDIATE, HIDDEN // 16)),
-        ("w2", routed.w2_weight, (EXPERTS, HIDDEN, INTERMEDIATE // 2)),
-        ("w2 scales", quant.w2_scale, (EXPERTS, HIDDEN, INTERMEDIATE // 16)),
+        ("w13", routed.w13_weight, (EXPERTS, 2 * columns, HIDDEN // 2)),
+        ("w13 scales", quant.w1_scale, (EXPERTS, 2 * columns, HIDDEN // 16)),
+        ("w2", routed.w2_weight, (EXPERTS, HIDDEN, columns // 2)),
+        ("w2 scales", quant.w2_scale, (EXPERTS, HIDDEN, columns // 16)),
     ):
         if (
             tensor is None
@@ -594,8 +608,8 @@ def unsupported_reason(moe: torch.nn.Module) -> str | None:
     ):
         return "shared expert SwiGLU-OAI constants"
     for linear, n, k in (
-        (shared.gate_up_proj, 2 * INTERMEDIATE, HIDDEN),
-        (shared.down_proj, HIDDEN, INTERMEDIATE),
+        (shared.gate_up_proj, 2 * columns, HIDDEN),
+        (shared.down_proj, HIDDEN, columns),
     ):
         # FlashInfer's MXFP8 linears keep K-major E4M3 weights and E8M0
         # scales in the 128x4 layout.

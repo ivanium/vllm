@@ -27,6 +27,12 @@ the row's last CTA to finish (a counter per row, reset by that CTA) merges
 the partials, and four of its threads quantize each 32-value MXFP8 block.
 Rows of padding requests (seq_len 0) attend nothing and write zeros.
 
+A rank of 8 query heads (TP8) is taken as heads 0-7 of the same 16-head
+tile: heads 8-15 get zero queries and their outputs are not stored, so
+o_proj's input is the rank's 8 heads ([rows, 1024]) and each of them is
+computed exactly as in a 16-head row (MMA rows, softmax statistics, merges
+and MXFP8 blocks of 32 values are all per head).
+
 o_proj's launch: up to eight rows, a CTA whose row ranks at most 256 pages
 triggers it once its pages are known, any other CTA once its row's record is
 loaded; past eight rows every CTA triggers it before its grid wait and
@@ -357,11 +363,15 @@ class Ranking:
 
 
 class SparseAttention:
-    """The module docstring's kernel, ``ctas`` CTAs a row."""
+    """The module docstring's kernel, ``ctas`` CTAs a row, for ``heads`` query
+    heads a row (16, or 8 in the first half of the 16-head tile)."""
 
-    def __init__(self, ctas: int) -> None:
+    def __init__(self, ctas: int, heads: int = HEADS) -> None:
         assert ctas in (2, 4, 8)
+        assert heads in (8, HEADS)
         self.ctas = ctas
+        self.heads = heads
+        self.q_size = heads * HEAD_DIM  # a row of the query and of o_proj's input
         self.slots = 16 // ctas
         self.chunks = self.slots * 4 // WARPS  # 32-token steps a warp
 
@@ -387,11 +397,11 @@ class SparseAttention:
         rows: Int32,
         stream: cuda.CUstream,
     ):
-        """Addresses: ``q`` E4M3 [rows, 2048]; ``kv`` NVFP4 pages (K slot,
-        V slot) ``page_stride`` bytes apart; ``records`` the step's row
+        """Addresses: ``q`` E4M3 [rows, heads x 128]; ``kv`` NVFP4 pages (K
+        slot, V slot) ``page_stride`` bytes apart; ``records`` the step's row
         records (``indexer_cute.IndexWork``); ``scores`` the indexer's;
         ``k_scale``, ``v_scale`` FP32 global scales; ``act`` E4M3 [rows,
-        2048] and ``act_scale`` its 128x4 scales; ``weight``, ``weight_scale``
+        heads x 128] and ``act_scale`` its 128x4 scales; ``weight``, ``weight_scale``
         o_proj's (prefetched into L2 past eight rows). ``logit_scale`` is the
         softmax scale times the query scale and log2(e)."""
         self.kernel(
@@ -469,17 +479,22 @@ class SparseAttention:
         first_v, first_p = ld_f32_s32(row_scores + Int64(tid) * 8)
         scale = logit_scale * ld_f32(k_scale)
         v_global = ld_f32(v_scale)
-        # Heads g and g + 8, dims 32t .. 32t + 31.
+        # Heads g and g + 8, dims 32t .. 32t + 31; with 8 heads, head g + 8
+        # has a zero query.
         q_words = cute.make_rmem_tensor((2, 2, 4), Uint32)
         for hh in cutlass.range_constexpr(2):
             for half in cutlass.range_constexpr(2):
-                words = ld_u32x4(
-                    q
-                    + Int64(r) * Q_SIZE
-                    + Int64((g + 8 * hh) * HEAD_DIM + 32 * t + 16 * half)
-                )
-                for i in cutlass.range_constexpr(4):
-                    q_words[hh, half, i] = words[i]
+                if cutlass.const_expr(8 * hh < self.heads):
+                    words = ld_u32x4(
+                        q
+                        + Int64(r) * self.q_size
+                        + Int64((g + 8 * hh) * HEAD_DIM + 32 * t + 16 * half)
+                    )
+                    for i in cutlass.range_constexpr(4):
+                        q_words[hh, half, i] = words[i]
+                else:
+                    for i in cutlass.range_constexpr(4):
+                        q_words[hh, half, i] = Uint32(0)
         # o_proj streams its weights once launched: past eight rows it was
         # launched before the wait; up to eight, a CTA whose row ranks at most
         # 256 pages launches it once its pages are known (its stream does not
@@ -694,14 +709,26 @@ class SparseAttention:
             amax = cute.arch.fmax(amax, cute.arch.shuffle_sync_bfly(amax, 1 << d))
         code = block_scale(amax)
         inverse = inverse_scale(code)
-        row = act + Int64(r) * Q_SIZE + Int64(tid * 8)
+        row = act + Int64(r) * self.q_size + Int64(tid * 8)
+        words = []
         for half in cutlass.range_constexpr(2):
             word = Uint32(0)
             for i in cutlass.range_constexpr(4):
                 word = word | (e4m3_byte(out[4 * half + i] * inverse) << (8 * i))
-            st_u32(row + 4 * half, word)
-        if tid % 4 == 0:
-            st_u8(act_scale + Int64(swizzled_scale_offset(r, tid // 4)), code)
+            words.append(word)
+        if cutlass.const_expr(self.heads == HEADS):
+            for half in cutlass.range_constexpr(2):
+                st_u32(row + 4 * half, words[half])
+            if tid % 4 == 0:
+                st_u8(act_scale + Int64(swizzled_scale_offset(r, tid // 4)), code)
+        else:
+            # Only the rank's heads (the first 128 threads, four whole warps)
+            # are o_proj's input; its blocks are the first of the row's.
+            if head < self.heads:
+                for half in cutlass.range_constexpr(2):
+                    st_u32(row + 4 * half, words[half])
+                if tid % 4 == 0:
+                    st_u8(act_scale + Int64(swizzled_scale_offset(r, tid // 4)), code)
 
     @cute.jit
     def attend(

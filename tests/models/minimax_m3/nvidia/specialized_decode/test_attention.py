@@ -3,7 +3,8 @@
 """The MiniMax-M3 low-batch attention (``specialized_decode/attention``)
 against the stock decode path it replaces (the MSA decode indexer with its
 top-k, the MSA sparse decode and the MXFP8 o_proj), on random NVFP4 KV and
-index caches of one TP rank (16 query heads, one KV head, one index head).
+index caches of one TP rank (16 query heads, one KV head, one index head; or
+a TP8 rank's 8 query heads with VLLM_MINIMAX_M3_LOW_BATCH_ATTN_PAD_HEADS=1).
 
 ``build_low_batch_attention`` reads a fixed set of the layer's attributes
 (its o_proj and the attention constants); a full ``MiniMaxM3SparseAttention``
@@ -29,14 +30,89 @@ pytestmark = pytest.mark.skipif(
 )
 
 HEADS, HEAD_DIM, HIDDEN, PAGE, TOPK, MAX_PAGES = 16, 128, 6144, 128, 16, 8192
-Q_SIZE = HEADS * HEAD_DIM
 DEVICE = "cuda"
+PAD_HEADS = "VLLM_MINIMAX_M3_LOW_BATCH_ATTN_PAD_HEADS"
 
 
-@pytest.fixture(scope="module")
-def layer():
+def _o_proj(quant, heads, raw=None, seed=0):
+    """An MXFP8 ``RowParallelLinear`` from ``heads`` x 128 to the hidden size
+    with random (or ``raw``: E4M3 weight and E8M0 scale bytes) weights,
+    processed for its kernel."""
+    from vllm.model_executor.layers.linear import RowParallelLinear
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizeMethodBase,
+    )
+
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        o_proj = RowParallelLinear(
+            heads * HEAD_DIM,
+            HIDDEN,
+            bias=False,
+            quant_config=quant,
+            reduce_results=False,
+            prefix=f"layers.{seed}.self_attn.o_proj",
+        ).to(DEVICE)
+    finally:
+        torch.set_default_dtype(default_dtype)
+    if raw is None:
+        generator = torch.Generator(device=DEVICE).manual_seed(seed)
+        values = torch.randn(o_proj.weight.shape, generator=generator, device=DEVICE)
+        weight = (values * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
+        scale = torch.randint(
+            114, 118, o_proj.weight_scale.shape, generator=generator, device=DEVICE
+        ).to(torch.uint8)
+    else:
+        weight, scale = raw
+    o_proj.weight.data.copy_(weight)
+    o_proj.weight_scale.data.copy_(scale.view(o_proj.weight_scale.dtype))
+    raw_copy = (weight.clone(), scale.clone())
+    if isinstance(o_proj.quant_method, QuantizeMethodBase):
+        o_proj.quant_method.process_weights_after_loading(o_proj)
+    return o_proj, raw_copy
+
+
+def _attrs(o_proj, heads):
+    return SimpleNamespace(
+        o_proj=o_proj,
+        num_heads=heads,
+        num_kv_heads=1,
+        num_idx_heads=1,
+        head_dim=HEAD_DIM,
+        q_size=heads * HEAD_DIM,
+        kv_cache_dtype="nvfp4",
+        impl=SimpleNamespace(scale=HEAD_DIM**-0.5, topk_blocks=TOPK),
+        _q_scale_float=0.5,
+        _k_scale_float=1.0,
+        _v_scale_float=1.0,
+        _k_scale=torch.ones((), dtype=torch.float32, device=DEVICE),
+        _v_scale=torch.ones((), dtype=torch.float32, device=DEVICE),
+    )
+
+
+def _quant():
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+    return ModelOptMxFp8Config.from_config(
+        {
+            "quant_method": "mxfp8",
+            "weight_block_size": [1, 32],
+            "activation_scheme": "dynamic",
+            "moe_quant_algo": "NVFP4",
+            "moe_quant_format": "nvfp4-pack-quantized",
+            "group_size": 16,
+            "ignored_layers": [],
+        }
+    )
+
+
+@pytest.fixture(scope="module", params=[16, 8], ids=["tp4", "tp8"])
+def layer(request):
     """The layer's attributes around an MXFP8 o_proj with random weights, its
-    config and its low-batch attention."""
+    config and its low-batch attention: a TP4 rank's 16 query heads, or a TP8
+    rank's 8 (VLLM_MINIMAX_M3_LOW_BATCH_ATTN_PAD_HEADS=1)."""
+    heads = request.param
     from vllm.config import (
         KernelConfig,
         ParallelConfig,
@@ -48,31 +124,18 @@ def layer():
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from vllm.model_executor.layers.linear import RowParallelLinear
-    from vllm.model_executor.layers.quantization.base_config import (
-        QuantizeMethodBase,
-    )
-    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
     from vllm.models.minimax_m3.nvidia.specialized_decode.attention import (
         build_low_batch_attention,
     )
     from vllm.v1.worker.workspace import init_workspace_manager
 
-    quant = ModelOptMxFp8Config.from_config(
-        {
-            "quant_method": "mxfp8",
-            "weight_block_size": [1, 32],
-            "activation_scheme": "dynamic",
-            "moe_quant_algo": "NVFP4",
-            "moe_quant_format": "nvfp4-pack-quantized",
-            "group_size": 16,
-            "ignored_layers": [],
-        }
-    )
     config = VllmConfig(parallel_config=ParallelConfig(), kernel_config=KernelConfig())
     fd, path = tempfile.mkstemp()
     os.close(fd)
     default_dtype = torch.get_default_dtype()
+    saved_switch = os.environ.get(PAD_HEADS)
+    if heads == 8:
+        os.environ[PAD_HEADS] = "1"
     try:
         with set_current_vllm_config(config):
             init_distributed_environment(
@@ -84,47 +147,15 @@ def layer():
             )
             initialize_model_parallel(1, 1)
             init_workspace_manager(torch.device(DEVICE))
-            torch.set_default_dtype(torch.bfloat16)
-            o_proj = RowParallelLinear(
-                Q_SIZE,
-                HIDDEN,
-                bias=False,
-                quant_config=quant,
-                reduce_results=False,
-                prefix="layers.0.self_attn.o_proj",
-            ).to(DEVICE)
-            torch.set_default_dtype(default_dtype)
-            generator = torch.Generator(device=DEVICE).manual_seed(0)
-            values = torch.randn(
-                o_proj.weight.shape, generator=generator, device=DEVICE
-            )
-            o_proj.weight.data.copy_(
-                (values * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
-            )
-            o_proj.weight_scale.data.copy_(
-                torch.randint(114, 118, o_proj.weight_scale.shape, device=DEVICE)
-                .to(torch.uint8)
-                .view(o_proj.weight_scale.dtype)
-            )
-            if isinstance(o_proj.quant_method, QuantizeMethodBase):
-                o_proj.quant_method.process_weights_after_loading(o_proj)
-            attrs = SimpleNamespace(
-                o_proj=o_proj,
-                num_heads=HEADS,
-                num_kv_heads=1,
-                num_idx_heads=1,
-                head_dim=HEAD_DIM,
-                q_size=Q_SIZE,
-                kv_cache_dtype="nvfp4",
-                impl=SimpleNamespace(scale=HEAD_DIM**-0.5, topk_blocks=TOPK),
-                _q_scale_float=0.5,
-                _k_scale_float=1.0,
-                _v_scale_float=1.0,
-                _k_scale=torch.ones((), dtype=torch.float32, device=DEVICE),
-                _v_scale=torch.ones((), dtype=torch.float32, device=DEVICE),
-            )
+            o_proj, raw = _o_proj(_quant(), heads)
+            attrs = _attrs(o_proj, heads)
+            attrs.raw_o_proj = raw
             yield attrs, config, build_low_batch_attention(attrs)
     finally:
+        if saved_switch is None:
+            os.environ.pop(PAD_HEADS, None)
+        else:
+            os.environ[PAD_HEADS] = saved_switch
         torch.set_default_dtype(default_dtype)
         cleanup_dist_env_and_memory()
         with suppress(FileNotFoundError):
@@ -158,7 +189,7 @@ def _randint(low, high, shape, generator):
     )
 
 
-def _inputs(context, num_reqs, query_len, seed, warm=0):
+def _inputs(context, num_reqs, query_len, seed, warm=0, heads=HEADS):
     """Queries, caches, block table and seq_lens of one step. Fifteen pages of
     each request score far above its others (their index keys scaled up), so
     the stock top-k's 16-bit key resolution cannot change the selection;
@@ -206,7 +237,7 @@ def _inputs(context, num_reqs, query_len, seed, warm=0):
                 index[warm_pages, codes:] = _randint(
                     0x40, 0x48, (warm, PAGE * 8), generator
                 )
-    q = torch.randn(rows, Q_SIZE, generator=generator, device=DEVICE) * 2
+    q = torch.randn(rows, heads * HEAD_DIM, generator=generator, device=DEVICE) * 2
     iq = torch.randn(rows, HEAD_DIM, generator=generator, device=DEVICE).abs() + 0.1
     return {
         "q": q.to(torch.float8_e4m3fn),
@@ -228,6 +259,7 @@ def _stock(attrs, inputs):
     block_table, seq_lens = inputs["block_table"], inputs["seq_lens"]
     num_reqs, query_len = seq_lens.shape[0], inputs["query_len"]
     rows = num_reqs * query_len
+    heads = attrs.num_heads
     wrapper_cls = _msa_indexers()[0]
     score = torch.empty(
         wrapper_cls.score_buffer_size(num_reqs, MAX_PAGES, num_heads=1),
@@ -247,7 +279,7 @@ def _stock(attrs, inputs):
         seq_lens,
         seq_lens.cpu(),
         query_len,
-        num_q_heads=HEADS,
+        num_q_heads=heads,
         num_kv_heads=1,
         page_size=PAGE,
         topk_blocks=TOPK,
@@ -257,12 +289,12 @@ def _stock(attrs, inputs):
         max(4, (rows + 3) // 4 * 4), 1, TOPK, dtype=torch.int32, device=DEVICE
     )[:rows]
     indexer.run(inputs["iq"].view(-1, 1, HEAD_DIM), inputs["index"], out=topk)
-    attn = torch.empty(rows, Q_SIZE, dtype=torch.bfloat16, device=DEVICE)
+    attn = torch.empty(rows, heads * HEAD_DIM, dtype=torch.bfloat16, device=DEVICE)
     msa.msa_cutlass_sparse_decode(
-        inputs["q"].view(-1, HEADS, HEAD_DIM),
+        inputs["q"].view(-1, heads, HEAD_DIM),
         inputs["kv"],
         topk,
-        attn.view(-1, HEADS, HEAD_DIM),
+        attn.view(-1, heads, HEAD_DIM),
         plan,
         scale=attrs.impl.scale,
         q_scale_float=attrs._q_scale_float,
@@ -307,7 +339,14 @@ def test_low_batch_attention_matches_stock(layer, num_reqs, query_len, context):
 
     attrs, config, low_batch = layer
     assert low_batch is not None and low_batch.accepts(num_reqs, query_len)
-    inputs = _inputs(context, num_reqs, query_len, seed=num_reqs * 10 + query_len)
+    assert low_batch.heads == attrs.num_heads
+    inputs = _inputs(
+        context,
+        num_reqs,
+        query_len,
+        seed=num_reqs * 10 + query_len,
+        heads=attrs.num_heads,
+    )
     with (
         set_current_vllm_config(config),
         set_forward_context(None, config),
@@ -330,7 +369,14 @@ def test_low_batch_attention_crowded_ranking(layer, num_reqs, query_len, warm):
     from vllm.forward_context import set_forward_context
 
     attrs, config, low_batch = layer
-    inputs = _inputs("long", num_reqs, query_len, seed=warm + query_len, warm=warm)
+    inputs = _inputs(
+        "long",
+        num_reqs,
+        query_len,
+        seed=warm + query_len,
+        warm=warm,
+        heads=attrs.num_heads,
+    )
     with (
         set_current_vllm_config(config),
         set_forward_context(None, config),
@@ -360,7 +406,7 @@ def test_low_batch_attention_kv_global_scales(layer):
         }
     )
     low_batch = build_low_batch_attention(scaled)
-    inputs = _inputs("long", 4, 1, seed=5)
+    inputs = _inputs("long", 4, 1, seed=5, heads=attrs.num_heads)
     with (
         set_current_vllm_config(config),
         set_forward_context(None, config),
@@ -381,7 +427,7 @@ def test_low_batch_attention_graph_replay(layer, num_reqs, query_len):
 
     attrs, config, low_batch = layer
     steps = [
-        _inputs(c, num_reqs, query_len, seed)
+        _inputs(c, num_reqs, query_len, seed, heads=attrs.num_heads)
         for seed, c in enumerate(("long", "short", "long"))
     ]
     pool = max(s["kv"].shape[0] for s in steps)
@@ -419,3 +465,105 @@ def test_low_batch_attention_graph_replay(layer, num_reqs, query_len):
             expected = _stock(attrs, dict(static, live=step["live"]))
             torch.accelerator.synchronize()
             _check(out, expected, step["live"])
+
+
+def test_low_batch_attention_tp8_needs_its_switch(layer):
+    """8 query heads per rank (TP8) are refused, and said so, without
+    VLLM_MINIMAX_M3_LOW_BATCH_ATTN_PAD_HEADS=1; 16 are taken either way."""
+    from vllm.models.minimax_m3.nvidia.specialized_decode.attention import (
+        unsupported_reason,
+    )
+
+    attrs, _, _ = layer
+    saved = os.environ.pop(PAD_HEADS, None)
+    try:
+        reason = unsupported_reason(attrs)
+        if attrs.num_heads == 8:
+            assert reason is not None and PAD_HEADS in reason
+        else:
+            assert reason is None
+    finally:
+        if saved is not None:
+            os.environ[PAD_HEADS] = saved
+
+
+@pytest.mark.parametrize("context", ["short", "medium", "long"])
+@pytest.mark.parametrize("num_reqs,query_len", [(1, 8), (4, 8), (32, 1)])
+def test_low_batch_attention_tp8_heads_are_16_head_rows(
+    layer, num_reqs, query_len, context
+):
+    """A TP8 rank's 8 heads are bitwise the first 8 heads of a 16-head row
+    whose other 8 hold any queries: o_proj's MXFP8 input and its scales; and
+    o_proj on the rank's weights is a 16-head o_proj whose weight columns of
+    the other heads are zero (up to the GEMM's summation order)."""
+    from vllm.config import set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+    from vllm.models.minimax_m3.nvidia.specialized_decode.attention import (
+        LowBatchAttention,
+        _scratch,
+    )
+    from vllm.models.minimax_m3.nvidia.specialized_decode.attention.o_proj import (
+        mxfp8_weights,
+    )
+
+    attrs, config, low8 = layer
+    if attrs.num_heads != 8:
+        pytest.skip("the TP8 rank's heads")
+    weight8, scale8 = attrs.raw_o_proj
+    # The 16-head o_proj: the rank's columns, then zero columns (scale 2^0);
+    # the bytes are joined as uint8.
+    bytes8 = weight8.view(torch.uint8)
+    raw16 = (
+        torch.cat([bytes8, torch.zeros_like(bytes8)], dim=1).view(weight8.dtype),
+        torch.cat([scale8, torch.full_like(scale8, 127)], dim=1),
+    )
+    o_proj16, _ = _o_proj(_quant(), HEADS, raw=raw16)
+    attrs16 = _attrs(o_proj16, HEADS)
+    low16 = LowBatchAttention(attrs16, *mxfp8_weights(o_proj16, HIDDEN, 2048))
+    inputs = _inputs(context, num_reqs, query_len, seed=31 + num_reqs, heads=8)
+    rows = num_reqs * query_len
+    generator = torch.Generator(device=DEVICE).manual_seed(rows)
+    other = (
+        torch.randn(rows, 8 * HEAD_DIM, generator=generator, device=DEVICE) * 2
+    ).to(torch.float8_e4m3fn)
+    q16 = torch.cat(
+        [inputs["q"].view(torch.uint8), other.view(torch.uint8)], dim=1
+    ).view(torch.float8_e4m3fn)
+    scratch = _scratch(inputs["q"].device)  # the buffers run() uses
+    with (
+        set_current_vllm_config(config),
+        set_forward_context(None, config),
+        torch.inference_mode(),
+    ):
+        scratch.act.zero_()
+        scratch.act_scale.zero_()
+        out8 = _run(low8, inputs)
+        torch.accelerator.synchronize()
+        act8 = scratch.act.view(-1)[: rows * 1024].view(rows, 1024).clone()
+        scale_bytes8 = scratch.act_scale.clone()
+        scratch.act.zero_()
+        scratch.act_scale.zero_()
+        out16 = _run(low16, dict(inputs, q=q16))
+        torch.accelerator.synchronize()
+        act16 = scratch.act.view(-1)[: rows * 2048].view(rows, 2048).clone()
+        scale_bytes16 = scratch.act_scale.clone()
+        expected = _stock(attrs, inputs)
+        torch.accelerator.synchronize()
+    assert torch.equal(act8, act16[:, :1024])
+    # The first 32 MXFP8 blocks of each row (the rank's heads): 128x4 layout.
+    offsets = torch.tensor(
+        [
+            (b // 4) * 512 + (r % 32) * 16 + (r // 32) * 4 + b % 4
+            for r in range(rows)
+            for b in range(32)
+        ],
+        device=DEVICE,
+    )
+    assert torch.equal(scale_bytes8[offsets], scale_bytes16[offsets])
+    # Nothing past the rank's blocks is written at 8 heads.
+    assert not bool(scale_bytes8[4096:].any())
+    for row in torch.nonzero(inputs["live"]).flatten().tolist():
+        got, want = out8[row].float(), out16[row].float()
+        error = float((got - want).norm() / want.norm().clamp_min(1e-30))
+        assert error < 1e-2, f"row {row}: o_proj 8 vs 16+zero heads {error:.5f}"
+    _check(out8, expected, inputs["live"])

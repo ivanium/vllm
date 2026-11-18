@@ -12,8 +12,8 @@ SwiGLU-OAI, quantization, down GEMM) runs five kernels; its gate_up GEMM puts
    (with ``r`` row tiles of 8 rows, tile ``s r + t``: rows ``8t ..``, columns
    ``512 s ..``) with their scales in the per-tile 128x4 atom layout;
 2. :class:`SharedFc1`: ``gate_up = x @ w_gate_up^T`` split over K into
-   :data:`SPLITS` slices of 512 columns, so the 1536 weight rows give 144
-   work items per row tile: the persistent ``tcgen05`` GEMM the routed FC1
+   :data:`SPLITS` slices of 512 columns, so the 1536 weight rows (768 at TP8)
+   give 144 work items per row tile (72): the persistent ``tcgen05`` GEMM the routed FC1
    and FC2 build on (DeepSeek-V4.1's ``RoutedExpertGemm``), with the split as
    the A operand's batch mode and the B operand's token tiles; each item
    stores its FP32 partial sums;
@@ -22,6 +22,8 @@ SwiGLU-OAI, quantization, down GEMM) runs five kernels; its gate_up GEMM puts
    ``h`` to MXFP8;
 4. :class:`SharedFc2`: ``h @ w_down^T`` (48 items per row tile), stored as
    BF16.
+
+Each is built for the rank's intermediate columns: 768 (TP4) or 384 (TP8).
 
 The weights are the MXFP8 linears' tensors as vLLM prepares them for
 FlashInfer (K-major E4M3 values, E8M0 scales in the 128x4 layout), read in
@@ -50,7 +52,7 @@ from vllm.models.deepseek_v41.nvidia.specialized_decode.moe.routed_expert_gemm_c
     tile_scale_bytes,
 )
 
-from .front_cute import HIDDEN, INTERMEDIATE, local_amax
+from .front_cute import HIDDEN, local_amax
 from .gemm_cute import swiglu_oai_bf16x2
 
 SPLITS = 12
@@ -87,11 +89,28 @@ def store_mxfp8(
     row_tiles: Int32,
 ):
     """Quantize the eight values at column ``first`` of ``row`` and store them
-    and their block's scale. Columns are cut into slices of ``split`` and rows
-    into 8-row tiles: operand tile ``s * row_tiles + t`` (``quant`` as words,
-    ``split`` columns a row) holds rows ``8t ..`` of column slice ``s``, its
-    scales one atom block."""
+    and their block's scale (:func:`store_quantized`)."""
     lo, hi, code = mxfp8_x8(words)
+    store_quantized(quant, scales, lo, hi, code, row, first, split, row_tiles)
+
+
+@cute.jit
+def store_quantized(
+    quant: cute.Tensor,
+    scales: cute.Tensor,
+    lo: Uint32,
+    hi: Uint32,
+    code,
+    row: Int32,
+    first: Int32,
+    split: cutlass.Constexpr[int],
+    row_tiles: Int32,
+):
+    """Store the E4M3 values (two words) at column ``first`` of ``row`` and,
+    at a block's first column, the block's scale. Columns are cut into slices
+    of ``split`` and rows into 8-row tiles: operand tile ``s * row_tiles + t``
+    (``quant`` as words, ``split`` columns a row) holds rows ``8t ..`` of
+    column slice ``s``, its scales one atom block."""
     tile = first // split * row_tiles + row // TILE
     offset = (tile * TILE + row % TILE) * split + first % split
     quant[offset // 4] = lo
@@ -151,11 +170,13 @@ class SharedFc1(RoutedExpertGemm):
     """gate_up, split over K (module docstring). The A operand's batch mode
     and the routing record's tile expert are the split; B's tile ``s r + t``
     (``r`` row tiles) is rows ``8t ..`` of split ``s``. Each item stores
-    its FP32 partial sums [split, 8 r rows, 1536]."""
+    its FP32 partial sums [split, 8 r rows, 2 x intermediate]."""
 
-    def __init__(self, cta_k: int = 256, num_ab_stage: int = 6) -> None:
+    def __init__(
+        self, intermediate: int, cta_k: int = 256, num_ab_stage: int = 6
+    ) -> None:
         super().__init__(
-            2 * INTERMEDIATE, 2 * INTERMEDIATE // 128, SPLIT_K, cta_k, num_ab_stage
+            2 * intermediate, 2 * intermediate // 128, SPLIT_K, cta_k, num_ab_stage
         )
 
     @cute.jit
@@ -172,9 +193,9 @@ class SharedFc1(RoutedExpertGemm):
         ctas: Int32,
         stream: cuda.CUstream,
     ):
-        """A: w_gate_up (1536, 6144) E4M3, K-major, E8M0 scales in the 128x4
-        layout; B: the quantized input (12 x ``row_tiles`` x 8, 512); out
-        FP32."""
+        """A: w_gate_up (2 x intermediate, 6144) E4M3, K-major, E8M0 scales in
+        the 128x4 layout; B: the quantized input (12 x ``row_tiles`` x 8,
+        512); out FP32."""
         tiles = SPLITS * row_tiles
         self.a_dtype = a_ptr.value_type
         self.b_dtype = b_ptr.value_type
@@ -240,8 +261,13 @@ class SharedFc1(RoutedExpertGemm):
 
 class SharedAct:
     """Split sums, BF16 gate_up, SwiGLU-OAI and MXFP8 of ``h`` (module
-    docstring), one CTA of 96 threads per row, eight columns of ``h`` per
-    thread."""
+    docstring), one CTA per row, eight columns of ``h`` per thread: 96 threads
+    at 768 columns; at 384, 48 of 64 (whole warps for the block shuffles)."""
+
+    def __init__(self, intermediate: int) -> None:
+        assert intermediate % SF_VEC == 0
+        self.intermediate = intermediate
+        self.threads = -(-intermediate // 8 // 32) * 32
 
     @cute.jit
     def __call__(
@@ -253,24 +279,25 @@ class SharedAct:
         row_tiles: Int32,
         stream: cuda.CUstream,
     ):
-        """``partial``: FP32 [SPLITS, ``row_tiles`` x 8, 1536]; ``quant``:
-        E4M3 [``row_tiles`` x 8, 768] as words; ``scale``: one atom block per
-        row tile."""
+        """``partial``: FP32 [SPLITS, ``row_tiles`` x 8, 2 x intermediate];
+        ``quant``: E4M3 [``row_tiles`` x 8, intermediate] as words; ``scale``:
+        one atom block per row tile."""
+        inter = self.intermediate
         self.kernel(
             cute.make_tensor(
                 partial_ptr,
-                cute.make_layout(SPLITS * row_tiles * TILE * 2 * INTERMEDIATE),
+                cute.make_layout(SPLITS * row_tiles * TILE * 2 * inter),
             ),
             cute.make_tensor(
-                quant_ptr, cute.make_layout(row_tiles * TILE * INTERMEDIATE // 4)
+                quant_ptr, cute.make_layout(row_tiles * TILE * inter // 4)
             ),
             cute.make_tensor(
-                scale_ptr, cute.make_layout(row_tiles * tile_scale_bytes(INTERMEDIATE))
+                scale_ptr, cute.make_layout(row_tiles * tile_scale_bytes(inter))
             ),
             row_tiles,
         ).launch(
             grid=(rows, 1, 1),
-            block=[INTERMEDIATE // 8, 1, 1],
+            block=[self.threads, 1, 1],
             stream=stream,
             use_pdl=True,
         )
@@ -287,16 +314,18 @@ class SharedAct:
         thread, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         first = thread * 8
+        inter = self.intermediate
         gate = cute.make_rmem_tensor((8,), Float32)
         up = cute.make_rmem_tensor((8,), Float32)
         gate.fill(0.0)
         up.fill(0.0)
         cute.arch.griddepcontrol_wait()
-        for split in cutlass.range_constexpr(SPLITS):
-            base = (split * row_tiles * TILE + row) * 2 * INTERMEDIATE + first
-            for i in cutlass.range_constexpr(8):
-                gate[i] = gate[i] + partial[base + i]
-                up[i] = up[i] + partial[base + INTERMEDIATE + i]
+        if cutlass.const_expr(self.threads * 8 == inter):
+            self.add_splits(partial, row, row_tiles, first, gate, up)
+        else:
+            # Threads past the row's columns keep zeros, never stored.
+            if first < inter:
+                self.add_splits(partial, row, row_tiles, first, gate, up)
         # gate_up as the stock GEMM stores it, then h in BF16.
         words = cute.make_rmem_tensor((4,), Uint32)
         for i in cutlass.range_constexpr(4):
@@ -307,7 +336,34 @@ class SharedAct:
                 _bf16_round(up[2 * i + 1]),
                 _bf16_round(gate[2 * i + 1]),
             )
-        store_mxfp8(quant, scales, words, row, first, INTERMEDIATE, row_tiles)
+        if cutlass.const_expr(self.threads * 8 == inter):
+            store_mxfp8(quant, scales, words, row, first, inter, row_tiles)
+        else:
+            # Every thread takes part in its block's amax shuffles.
+            lo, hi, code = mxfp8_x8(words)
+            if first < inter:
+                store_quantized(
+                    quant, scales, lo, hi, code, row, first, inter, row_tiles
+                )
+
+    @cute.jit
+    def add_splits(
+        self,
+        partial: cute.Tensor,
+        row: Int32,
+        row_tiles: Int32,
+        first: Int32,
+        gate: cute.Tensor,
+        up: cute.Tensor,
+    ):
+        """The FP32 partial sums of gate and up columns ``first ..`` of
+        ``row``, added in split order."""
+        inter = self.intermediate
+        for split in cutlass.range_constexpr(SPLITS):
+            base = (split * row_tiles * TILE + row) * 2 * inter + first
+            for i in cutlass.range_constexpr(8):
+                gate[i] = gate[i] + partial[base + i]
+                up[i] = up[i] + partial[base + inter + i]
 
 
 @cute.jit
@@ -320,8 +376,12 @@ class SharedFc2(RoutedExpertGemm):
     """down: BF16 ``h @ w_down^T`` (module docstring), rows below the
     record's limit stored."""
 
-    def __init__(self, cta_k: int = 256, num_ab_stage: int = 6) -> None:
-        super().__init__(HIDDEN, HIDDEN // 128, INTERMEDIATE, cta_k, num_ab_stage)
+    def __init__(
+        self, intermediate: int, cta_k: int = 256, num_ab_stage: int = 6
+    ) -> None:
+        super().__init__(HIDDEN, HIDDEN // 128, intermediate, cta_k, num_ab_stage)
+        # K tiles cover K (384 columns take 128 or 384).
+        assert intermediate % cta_k == 0, (intermediate, cta_k)
 
     @cute.jit
     def __call__(
@@ -338,8 +398,9 @@ class SharedFc2(RoutedExpertGemm):
         ctas: Int32,
         stream: cuda.CUstream,
     ):
-        """A: w_down (6144, 768) E4M3, K-major, E8M0 scales in the 128x4
-        layout; B: the quantized ``h`` (``row_tiles`` x 8, 768); out: BF16
+        """A: w_down (6144, intermediate) E4M3, K-major, E8M0 scales in the
+        128x4 layout; B: the quantized ``h`` (``row_tiles`` x 8,
+        intermediate); out: BF16
         [rows, 6144]."""
         self.a_dtype = a_ptr.value_type
         self.b_dtype = b_ptr.value_type

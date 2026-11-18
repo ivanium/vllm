@@ -4,8 +4,9 @@
 
 After the stock qkv projection and KV insert, for 1-32 query rows (up to 32
 requests of up to 8 queries) of one TP rank (16 query heads on one KV head,
-one index head, NVFP4 KV and index caches, E4M3 queries), three PDL-chained
-launches a layer replace the stock indexer, top-k, sparse FMHA, o_proj input
+or 8 at TP8 with ``VLLM_MINIMAX_M3_LOW_BATCH_ATTN_PAD_HEADS=1``; one index
+head, NVFP4 KV and index caches, E4M3 queries), three PDL-chained launches a
+layer replace the stock indexer, top-k, sparse FMHA, o_proj input
 quantization and GEMM:
 
 1. ``indexer_cute.IndexScores``: every history page's index score, from the
@@ -29,15 +30,20 @@ from typing import Any, NamedTuple
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.models.common.ops.moe_tail_fusion.primitives import current_cu_stream
 from vllm.platforms import current_platform
 
+from .. import LOW_BATCH_ATTN_PAD_HEADS, attention_pads_heads
 from .o_proj import compile_all, mxfp8_weights, o_proj_gemm
+
+logger = init_logger(__name__)
 
 MAX_ROWS = 32
 MAX_REQS = 32
 MAX_QUERY_LEN = 8
-HEADS = 16
+HEADS = 16  # the kernels' query heads on one KV head
+TP8_HEADS = 8  # a TP8 rank's, the first half of the kernels' 16
 HEAD_DIM = 128
 HIDDEN = 6144
 PAGE = 128
@@ -72,7 +78,7 @@ def prepare_step(
     assert block_table.shape[1] <= MAX_PAGES and seq_lens.is_contiguous()
     assert 0 < num_reqs <= MAX_REQS and 0 < query_len <= MAX_QUERY_LEN
     scratch = _scratch(seq_lens.device)
-    _kernels(seq_lens.device.index).work(
+    _step_kernels(seq_lens.device.index)[1](
         Int64(block_table.data_ptr()),
         Int32(block_table.stride(0)),
         Int64(seq_lens.data_ptr()),
@@ -93,13 +99,37 @@ class _Kernels(NamedTuple):
 
 
 @cache
-def _kernels(device_index: int) -> _Kernels:
+def _kernels(device_index: int, heads: int = HEADS) -> _Kernels:
+    """The step's, the indexer's and (for ``heads`` query heads a row) the
+    attention's compiled kernels."""
     import cutlass.cute as cute
     from cutlass import Float32, Int32, Int64
     from cutlass.cute.runtime import make_fake_stream
 
-    from .indexer_cute import IndexScores, IndexWork
     from .sparse_cute import SparseAttention
+
+    sms, work, indexer = _step_kernels(device_index)
+    with torch.accelerator.device_index(device_index):
+        attention = cute.compile(
+            SparseAttention(ATTENTION_CTAS, heads),
+            *(Int64(0),) * 11,
+            Float32(0.0),
+            *(Int64(0), Int32(0)) * 2,
+            Int32(1),
+            make_fake_stream(),
+        )
+    return _Kernels(sms, work, indexer, attention)
+
+
+@cache
+def _step_kernels(device_index: int) -> tuple[int, Any, Any]:
+    """The kernels every head count shares: the step's work list and the
+    indexer (and o_proj's)."""
+    import cutlass.cute as cute
+    from cutlass import Int32, Int64
+    from cutlass.cute.runtime import make_fake_stream
+
+    from .indexer_cute import IndexScores, IndexWork
 
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
     with torch.accelerator.device_index(device_index):
@@ -118,16 +148,8 @@ def _kernels(device_index: int) -> _Kernels:
             Int32(1),
             make_fake_stream(),
         )
-        attention = cute.compile(
-            SparseAttention(ATTENTION_CTAS),
-            *(Int64(0),) * 11,
-            Float32(0.0),
-            *(Int64(0), Int32(0)) * 2,
-            Int32(1),
-            make_fake_stream(),
-        )
     compile_all(device_index)
-    return _Kernels(sms, work, indexer, attention)
+    return sms, work, indexer
 
 
 class _Scratch(NamedTuple):
@@ -181,7 +203,9 @@ class LowBatchAttention:
         self.v_scale = layer._v_scale
         self.weight = weight
         self.weight_scale = weight_scale
-        self.kernels = _kernels(weight.device.index)
+        # 16, or 8 (TP8): o_proj's input is [rows, heads x 128] (its K).
+        self.heads = layer.num_heads
+        self.kernels = _kernels(weight.device.index, self.heads)
         # Outside any capture: a buffer first made inside one would not be
         # zeroed for the graphs captured later.
         _scratch(weight.device)
@@ -202,13 +226,14 @@ class LowBatchAttention:
         index_cache: torch.Tensor,
     ) -> torch.Tensor:
         """o_proj's BF16 output [rows, 6144] of the E4M3 queries ``q`` [rows,
-        2048] and index queries ``index_q`` [rows, 128] (request-major) on the
+        heads x 128] and index queries ``index_q`` [rows, 128] (request-major) on the
         NVFP4 ``kv_cache`` [pages, 2, 128, 72] and ``index_cache`` [pages,
         128, 72], on the current stream."""
         from cutlass import Float32, Int32, Int64
 
         rows = step.num_reqs * step.query_len
-        assert q.dtype == torch.float8_e4m3fn and q.shape == (rows, HEADS * HEAD_DIM)
+        q_size = self.heads * HEAD_DIM
+        assert q.dtype == torch.float8_e4m3fn and q.shape == (rows, q_size)
         assert index_q.dtype == torch.float8_e4m3fn
         assert index_q.shape == (rows, HEAD_DIM)
         assert q.is_contiguous() and index_q.is_contiguous()
@@ -261,27 +286,53 @@ class LowBatchAttention:
         return out
 
 
+def query_heads() -> tuple[int, ...]:
+    """The query heads per rank the low-batch attention takes."""
+    return (HEADS, TP8_HEADS) if attention_pads_heads() else (HEADS,)
+
+
+def unsupported_reason(layer) -> str | None:
+    """Why ``layer`` (a ``MiniMaxM3SparseAttention``) cannot take the
+    low-batch attention, or None."""
+    if layer.num_heads not in query_heads():
+        unset = f" ({LOW_BATCH_ATTN_PAD_HEADS} unset)"
+        return f"{layer.num_heads} query heads per rank" + (
+            unset if layer.num_heads == TP8_HEADS else ""
+        )
+    if (
+        layer.num_kv_heads != 1
+        or layer.num_idx_heads != 1
+        or layer.head_dim != HEAD_DIM
+        or layer.q_size != layer.num_heads * HEAD_DIM
+    ):
+        return "not one KV head and one index head of 128"
+    if layer.kv_cache_dtype != "nvfp4" or layer.impl.topk_blocks != 16:
+        return "not an NVFP4 KV cache with 16 top-k pages"
+    if layer._k_scale_float != 1.0 or layer._v_scale_float != 1.0:
+        return "KV global scales other than 1"
+    if mxfp8_weights(layer.o_proj, HIDDEN, layer.num_heads * HEAD_DIM) is None:
+        return "o_proj is not a FlashInfer cute-dsl MXFP8 linear without bias"
+    return None
+
+
 def build_low_batch_attention(layer) -> LowBatchAttention | None:
     """``layer``'s (a ``MiniMaxM3SparseAttention``) low-batch attention, or
-    None when it does not have the shapes and caches the kernels serve.
-    Compiles the kernels once per process; call outside CUDA graph capture."""
+    None when it does not have the shapes and caches the kernels serve (said
+    once per process). Compiles the kernels once per process; call outside
+    CUDA graph capture."""
     if not (
         current_platform.is_cuda() and current_platform.is_device_capability_family(100)
     ):
         return None
-    if (
-        layer.num_heads != HEADS
-        or layer.num_kv_heads != 1
-        or layer.num_idx_heads != 1
-        or layer.head_dim != HEAD_DIM
-        or layer.q_size != HEADS * HEAD_DIM
-        or layer.kv_cache_dtype != "nvfp4"
-        or layer.impl.topk_blocks != 16
-        or layer._k_scale_float != 1.0
-        or layer._v_scale_float != 1.0
-    ):
+    reason = unsupported_reason(layer)
+    if reason is not None:
+        logger.warning_once(
+            "MiniMax-M3 low-batch attention not used: %s; the sparse attention "
+            "layers keep the stock attention.",
+            reason,
+            scope="process",
+        )
         return None
-    weights = mxfp8_weights(layer.o_proj, HIDDEN, HEADS * HEAD_DIM)
-    if weights is None:
-        return None
+    weights = mxfp8_weights(layer.o_proj, HIDDEN, layer.num_heads * HEAD_DIM)
+    assert weights is not None
     return LowBatchAttention(layer, *weights)

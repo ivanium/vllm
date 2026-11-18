@@ -9,7 +9,21 @@ the seven-token DSpark draft, whose verify steps are 8 rows a request), with
 the low-batch sparse attention core after the KV insert (``attention/``) and
 the low-batch FFN half of the MoE layers (``moe/``); every other forward
 runs the stock layers.
+
+At TP8 (two NVL72 trays) a rank has 384 intermediate columns and 8 query
+heads; two opt-in switches, read when the model is built, extend the paths
+to those shapes:
+
+- ``VLLM_MINIMAX_M3_LOW_BATCH_FFN_TP8=1``: the low-batch FFN's kernels are
+  also built for 384 intermediate columns per rank;
+- ``VLLM_MINIMAX_M3_LOW_BATCH_ATTN_PAD_HEADS=1``: the low-batch attention
+  takes 8 query heads per rank as the first 8 rows of its 16-head tile, the
+  other 8 with zero queries and their outputs left out of o_proj's input
+  (o_proj keeps the rank's own weights). Without it a TP8 rank keeps the
+  stock attention and says so.
 """
+
+import os
 
 import torch
 
@@ -22,11 +36,27 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 # One TP4 rank of MiniMax-M3.1-Flash: what the low-batch FFN's kernels are
-# compiled for.
+# compiled for; and one TP8 rank's intermediate columns, which they are also
+# built for with LOW_BATCH_FFN_TP8.
 HIDDEN = 6144
 EXPERTS = 128
 TOP_K = 4
 INTERMEDIATE_PER_RANK = 768
+TP8_INTERMEDIATE_PER_RANK = 384
+LOW_BATCH_FFN_TP8 = "VLLM_MINIMAX_M3_LOW_BATCH_FFN_TP8"
+LOW_BATCH_ATTN_PAD_HEADS = "VLLM_MINIMAX_M3_LOW_BATCH_ATTN_PAD_HEADS"
+
+
+def ffn_widths() -> tuple[int, ...]:
+    """The intermediate columns per rank the low-batch FFN takes."""
+    if os.environ.get(LOW_BATCH_FFN_TP8) == "1":
+        return (INTERMEDIATE_PER_RANK, TP8_INTERMEDIATE_PER_RANK)
+    return (INTERMEDIATE_PER_RANK,)
+
+
+def attention_pads_heads() -> bool:
+    """Whether the low-batch attention takes 8 query heads per rank (TP8)."""
+    return os.environ.get(LOW_BATCH_ATTN_PAD_HEADS) == "1"
 
 
 def unsupported(vllm_config: VllmConfig) -> list[str]:
@@ -39,6 +69,12 @@ def unsupported(vllm_config: VllmConfig) -> list[str]:
     cudagraph_mode = compilation.cudagraph_mode
     config = vllm_config.model_config.hf_text_config
     tp = parallel.tensor_parallel_size
+    widths = ffn_widths()
+    width_text = f"{INTERMEDIATE_PER_RANK} intermediate columns per rank (TP4)"
+    if TP8_INTERMEDIATE_PER_RANK in widths:
+        width_text += f" or {TP8_INTERMEDIATE_PER_RANK} (TP8)"
+    else:
+        width_text += f"; {TP8_INTERMEDIATE_PER_RANK} at TP8 with {LOW_BATCH_FFN_TP8}=1"
     # Model Runner V2 is the only runner, and every MoE layer builds one shared
     # expert of intermediate_size (the low-batch FFN checks its shapes).
     requirements = {
@@ -53,12 +89,12 @@ def unsupported(vllm_config: VllmConfig) -> list[str]:
             and not parallel.use_ubatching
         ),
         f"MoE layers of hidden size {HIDDEN}, {EXPERTS} experts, top-{TOP_K} and "
-        f"{INTERMEDIATE_PER_RANK} intermediate columns per rank for the routed "
-        "and the shared expert": (
+        f"{width_text} for the routed and the shared expert": (
             config.hidden_size == HIDDEN
             and config.num_local_experts == EXPERTS
             and config.num_experts_per_tok == TOP_K
-            and config.intermediate_size == INTERMEDIATE_PER_RANK * tp
+            and config.intermediate_size % tp == 0
+            and config.intermediate_size // tp in widths
             and not _use_mega_moe(vllm_config)
         ),
         "FULL CUDA graphs for decode batches only (FULL_AND_PIECEWISE or "
@@ -125,4 +161,23 @@ def specialized_decode_config(vllm_config: VllmConfig) -> bool:
         "attention and o_proj, and MoE layers that leave their finalize to the "
         "next layer run the low-batch FFN."
     )
+    tp = vllm_config.parallel_config.tensor_parallel_size
+    width = vllm_config.model_config.hf_text_config.intermediate_size // tp
+    if width == TP8_INTERMEDIATE_PER_RANK:
+        if attention_pads_heads():
+            attention = "takes 8 query heads per rank as 8 of its 16 ({}=1)"
+        else:
+            attention = (
+                "is not used: 8 query heads per rank ({} unset), so the sparse "
+                "attention layers keep the stock attention"
+            )
+        logger.info_once(
+            "MiniMax-M3 specialized decode at TP%d: the low-batch FFN runs at %d "
+            "intermediate columns per rank (%s=1); the low-batch attention %s.",
+            tp,
+            width,
+            LOW_BATCH_FFN_TP8,
+            attention.format(LOW_BATCH_ATTN_PAD_HEADS),
+            scope="process",
+        )
     return True

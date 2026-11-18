@@ -42,8 +42,8 @@ from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.models.minimax_m3.common.sparse_attention import MiniMaxM3SparseMetadata
 from vllm.sequence import IntermediateTensors
 
-from .. import captures_pure_decode
-from ..attention import MAX_PAGES, AttentionStep, prepare_step
+from .. import INTERMEDIATE_PER_RANK, captures_pure_decode
+from ..attention import HEADS, MAX_PAGES, AttentionStep, prepare_step
 from ..moe import MAX_ROWS
 
 if TYPE_CHECKING:
@@ -145,6 +145,25 @@ class SpecializedDecode:
             len(moe),
             scope="process",
         )
+        # The TP8 shapes (VLLM_MINIMAX_M3_LOW_BATCH_FFN_TP8 and _ATTN_PAD_HEADS).
+        heads = {
+            a.low_batch_attention.heads
+            for a in self.sparse
+            if a.low_batch_attention is not None
+        }
+        columns = {
+            m.low_batch_ffn.intermediate for m in moe if m.low_batch_ffn is not None
+        }
+        if heads - {HEADS} or columns - {INTERMEDIATE_PER_RANK}:
+            logger.info_once(
+                "MiniMax-M3 specialized decode shapes: low-batch FFN at %s "
+                "intermediate columns per rank, low-batch attention at %s query "
+                "heads per rank (of the kernels' %d).",
+                "/".join(map(str, sorted(columns))) or "no",
+                "/".join(map(str, sorted(heads))) or "no",
+                HEADS,
+                scope="process",
+            )
         if attention is None:
             logger.info_once(
                 "MiniMax-M3 specialized decode: FULL-graph decode step of %d rows "
