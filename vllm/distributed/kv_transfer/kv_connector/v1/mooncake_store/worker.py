@@ -83,6 +83,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.protocol import
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.selective_lease import (  # noqa: E501
     SelectiveLookupLease,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.size_class import (  # noqa: E501
+    SIZE_CLASS_SPLIT_ENV,
+    SizeClassSplitStore,
+    is_size_class,
+    size_class_ceil,
+    split_head_bytes,
+)
 from vllm.distributed.mooncake_store import (
     MooncakeStoreConfig,
     _parse_size,
@@ -1528,8 +1535,9 @@ def _reused_transfer_engine() -> SharedMooncakeTransferEngine:
 class MooncakeStoreWorker:
     """Worker-side component for MooncakeStoreConnector."""
 
-    # Bare workers built with __new__ in tests read this default.
+    # Bare workers built with __new__ in tests read these defaults.
     _reuse_pd_transfer_engine: bool = False
+    _size_class_split: SizeClassSplitStore | None = None
 
     @staticmethod
     def _create_mem_pool(
@@ -1661,6 +1669,12 @@ class MooncakeStoreWorker:
         hbm_pool = extra_config.get("hbm_pool")
         if hbm_pool and os.environ.get("VLLM_MOONCAKE_STORE_HBM_POOL") == "1":
             self._mount_hbm_segment(hbm_pool["segment_size"], kv_cache_config)
+        # Objects off an offset-allocator size class are stored as a head and
+        # a tail; register_kv_caches picks the cache groups once sizes are known.
+        self._size_class_split: SizeClassSplitStore | None = None
+        if os.environ.get(SIZE_CLASS_SPLIT_ENV, "0").lower() in ("1", "true"):
+            self._size_class_split = SizeClassSplitStore(self.store)
+            self.store = self._size_class_split
 
         preferred_segment = rdma_utils.get_configured_preferred_segment(extra_config)
         self.preferred_segment = preferred_segment
@@ -2334,6 +2348,8 @@ class MooncakeStoreWorker:
             num_host_segments,
             num_device_segments,
         )
+        if self._size_class_split is not None:
+            self._configure_size_class_split()
 
         # Start transfer threads
         if self.can_put:
@@ -2386,6 +2402,73 @@ class MooncakeStoreWorker:
         logger.info(
             "Started %d Mooncake KV-load receive thread(s)", self.num_recv_threads
         )
+
+    @staticmethod
+    def _store_object_bytes(db: ChunkedTokenDatabase) -> set[int]:
+        """Bytes of each Store object a full chunk of `db`'s group writes."""
+        layout = db.store_layout
+        shard_ids = layout.local_shard_ids
+        starts = range(0, layout.block_size, db.chunk_size)
+        _, sizes, _ = layout.prepare_values(
+            [(start, start + db.chunk_size) for start in starts for _ in shard_ids],
+            [0],
+            [shard_id for _ in starts for shard_id in shard_ids],
+        )
+        return {sum(size) for size in sizes}
+
+    def _configure_size_class_split(self) -> None:
+        """Split the objects of every cache group whose objects are off a
+        Mooncake offset-allocator size class (`size_class.py`)."""
+        assert self._size_class_split is not None
+        if self.pp_size > 1:
+            # Other stages' groups have other sizes, unknown to this rank.
+            logger.warning(
+                "%s is ignored with pipeline parallelism.", SIZE_CLASS_SPLIT_ENV
+            )
+            return
+        prefixes: set[str] = set()
+        for g_idx, db in enumerate(self.token_dbs):
+            if not self._kv_cache_groups[g_idx].prefix_cacheable:
+                continue
+            try:
+                object_bytes = self._store_object_bytes(db)
+            except (AssertionError, IndexError, ValueError) as e:
+                logger.warning(
+                    "Mooncake store size-class split: cache group %d is not "
+                    "split, its object size is unknown: %s",
+                    g_idx,
+                    e,
+                )
+                continue
+            object_bytes.discard(0)
+            if all(is_size_class(n) for n in object_bytes):
+                logger.info(
+                    "Mooncake store size-class split: cache group %d objects "
+                    "(%s bytes) are size classes already.",
+                    g_idx,
+                    sorted(object_bytes),
+                )
+                continue
+            prefixes.update(self._lookup_key_prefixes[g_idx])
+            # This rank's own key prefixes (`PoolKey.build_key_string`).
+            prefixes.update(
+                db.store_layout.key_for(shard_id, BlockHash(b"")).rpartition("@")[0]
+                for shard_id in db.store_layout.local_shard_ids
+            )
+            for n in sorted(object_bytes):
+                head = split_head_bytes(n)
+                logger.info(
+                    "Mooncake store size-class split: cache group %d stores "
+                    "each %d-byte object as %d + %d bytes (offset allocator: "
+                    "%d bytes reserved, %d unsplit).",
+                    g_idx,
+                    n,
+                    head,
+                    n - head,
+                    size_class_ceil(head) + size_class_ceil(n - head),
+                    size_class_ceil(n),
+                )
+        self._size_class_split.set_split_prefixes(prefixes)
 
     def unregister_kv_caches(self) -> None:
         """Unregister device KV buffers after the engine has drained transfers."""
