@@ -26,9 +26,14 @@ from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.prepare_megamoe import (
+    MAX_FUSED_ROUTING_SPLIT_K,
+    MegaMoESigmoidRouting,
+    megamoe_fused_routing_enabled,
+    megamoe_fused_routing_verified,
     megamoe_staging_overlap_enabled,
     prepare_megamoe_inputs,
     prepare_megamoe_nvfp4_inputs,
+    route_and_stage_megamoe_nvfp4,
     stage_megamoe_nvfp4_hidden_states,
     stage_megamoe_topk,
 )
@@ -354,6 +359,9 @@ class DeepGemmMegaMoEExperts(nn.Module):
         self.eplb_state = EplbLayerState()
         # Fork and join events of hidden-state staging on the aux stream.
         self._staging_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        # VLLM_MEGAMOE_FUSED_ROUTING: this layer's correction bias has no NaN
+        # (checked once, outside CUDA graph capture).
+        self._fused_routing_bias_ok: bool | None = None
         # L2 input scale of every logical expert; the NVFP4 kernel takes the max.
         self._w2_input_scales = torch.zeros(self.num_logical_experts, device="cpu")
         self.l2_activation_scale = 1.0
@@ -982,13 +990,76 @@ class DeepGemmMegaMoEExperts(nn.Module):
             "(VLLM_MEGAMOE_STAGING_OVERLAP=1)."
         )
 
+    def sigmoid_router_partials(
+        self,
+        gate: nn.Module,
+        hidden_states: torch.Tensor,
+        e_score_correction_bias: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        routed_scaling_factor: float,
+    ) -> MegaMoESigmoidRouting | None:
+        """Under `VLLM_MEGAMOE_FUSED_ROUTING=1`: run `gate`'s router GEMM
+        without its split-K reduction and return the routing for
+        `forward(routing=...)`, which reduces the partials, selects the top-k
+        as `fused_topk_bias(scoring_func="sigmoid")` does and stages it in one
+        kernel. None, with nothing launched, where that path does not apply:
+        then run the gate and the top-k as before."""
+        if not megamoe_fused_routing_enabled():
+            return None
+        split_k_partials = getattr(gate, "forward_split_k_partials", None)
+        if (
+            split_k_partials is None
+            or not self.weight_format.uses_nvfp4_api
+            or not current_platform.is_cuda()
+        ):
+            logger.warning_once(
+                "VLLM_MEGAMOE_FUSED_ROUTING=1 has no effect: it needs NVFP4 "
+                "MegaMoE experts on CUDA and a GateLinear router."
+            )
+            return None
+        num_experts = e_score_correction_bias.numel()
+        gate_weight = getattr(gate, "weight", None)
+        if (
+            hidden_states.shape[0] > self.max_num_tokens
+            or gate_weight is None
+            or gate_weight.shape[0] != num_experts
+            or e_score_correction_bias.dtype != torch.float32
+            or num_experts & (num_experts - 1)
+            or not 0 < top_k <= num_experts
+        ):
+            return None
+        routing = MegaMoESigmoidRouting(
+            None,  # type: ignore[arg-type]
+            e_score_correction_bias,
+            top_k,
+            renormalize,
+            routed_scaling_factor,
+        )
+        if not megamoe_fused_routing_verified(routing):
+            return None
+        if self._fused_routing_bias_ok is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            # topkGating's choice among NaN scores depends on its lanes.
+            self._fused_routing_bias_ok = not bool(
+                torch.isnan(e_score_correction_bias).any()
+            )
+        if not self._fused_routing_bias_ok:
+            return None
+        partials = split_k_partials(hidden_states, MAX_FUSED_ROUTING_SPLIT_K)
+        if partials is None:
+            return None
+        return routing._replace(router_partials=partials)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor | None,
+        topk_ids: torch.Tensor | None,
         shared_experts: nn.Module | None = None,
         hidden_states_staged: bool = False,
+        routing: MegaMoESigmoidRouting | None = None,
     ) -> torch.Tensor:
         """Run the routed and shared experts on this rank's tokens.
 
@@ -1001,6 +1072,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 shared expert at construction.
             hidden_states_staged: `staging_hidden_states` staged
                 `hidden_states`; only the routing is staged here.
+            routing: `sigmoid_router_partials`' routing, selected and staged
+                here in one kernel; then pass None for the top-k tensors.
 
         Returns:
             BF16 `[num_tokens, hidden_size]` routed plus shared expert output.
@@ -1026,7 +1099,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 is_padding = is_padding[:num_tokens]
 
         # Capture logical ids; staging maps them to EPLB physical replicas.
-        if self.capture_fn is not None:
+        if self.capture_fn is not None and routing is None:
             self.capture_fn(topk_ids)
 
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -1045,7 +1118,48 @@ class DeepGemmMegaMoEExperts(nn.Module):
         if self.shared_spec is not None and self.shared_spec.scale_group_k:
             shared_x_sf = symm_buffer.shared_l1_acts_sf
             shared_block_m = self.get_block_m(block_m_num_tokens)
-        if fmt.uses_nvfp4_api and hidden_states_staged:
+        if routing is not None:
+            # VLLM_MEGAMOE_FUSED_ROUTING: reduce the router's split-K partials,
+            # select the top-k and stage, in one kernel.
+            assert fmt.uses_nvfp4_api
+            if self.capture_fn is not None:
+                topk_ids = torch.empty(
+                    (num_tokens, routing.top_k),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
+            route_and_stage_megamoe_nvfp4(
+                routing,
+                None if hidden_states_staged else hidden_states,
+                symm_buffer.x[:num_tokens],
+                symm_buffer.x_sf[:num_tokens],
+                symm_buffer.x_scales[:num_tokens],
+                symm_buffer.topk_idx[:num_tokens],
+                symm_buffer.topk_weights[:num_tokens],
+                is_padding=is_padding,
+                shared_x=symm_buffer.shared_l1_acts[:num_tokens]
+                if self.has_fused_shared_experts
+                else None,
+                shared_x_sf=shared_x_sf,
+                shared_block_m=shared_block_m,
+                w2_global_scale=self.w2_weight_scale_2,
+                l2_alpha=self._l2_alpha,
+                l2_activation_scale=self.l2_activation_scale,
+                eplb_state=self.eplb_state,
+                topk_ids=topk_ids if self.capture_fn is not None else None,
+            )
+            if self.capture_fn is not None:
+                self.capture_fn(topk_ids)
+            if hidden_states_staged:
+                assert self._staging_events is not None
+                self._staging_events[1].wait(current_stream())
+            kwargs.update(
+                l1_alpha=self.w13_weight_scale_2,
+                l2_alpha=self._l2_alpha,
+                l2_activation_scale=self.l2_activation_scale,
+                use_x_scales=True,
+            )
+        elif fmt.uses_nvfp4_api and hidden_states_staged:
             assert self._staging_events is not None
             stage_megamoe_topk(
                 topk_weights,

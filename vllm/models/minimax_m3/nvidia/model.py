@@ -766,7 +766,27 @@ class MiniMaxM3MoE(nn.Module):
     def _forward_mega_moe_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Staging the hidden states needs no routing: it can run beside the router.
         with self.experts.staging_hidden_states(hidden_states) as staged:
-            router_logits, _ = self.gate(hidden_states)
+            # VLLM_MEGAMOE_FUSED_ROUTING: the router GEMM's split-K partials,
+            # which the experts reduce, route and stage in one kernel.
+            routing = self.experts.sigmoid_router_partials(
+                self.gate,
+                hidden_states,
+                self.e_score_correction_bias.data,
+                self.top_k,
+                renormalize=True,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+            if routing is None:
+                router_logits, _ = self.gate(hidden_states)
+        if routing is not None:
+            return self.experts(
+                hidden_states,
+                None,
+                None,
+                shared_experts=self.shared_experts,
+                hidden_states_staged=staged,
+                routing=routing,
+            )
         topk_weights, topk_ids = fused_topk_bias(
             hidden_states=hidden_states,
             gating_output=router_logits,

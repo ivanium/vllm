@@ -627,6 +627,28 @@ def _bf16x3_router_gemm(X: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def bf16x3_router_gemm_partials(
+    X: torch.Tensor, W: torch.Tensor, max_split_k: int
+) -> torch.Tensor | None:
+    """The split-K partials `_bf16x3_router_gemm` sums, `[split_k, N, M]` fp32,
+    or None when its config splits K more than `max_split_k` ways (nothing runs).
+
+    Same kernel and tiles as `_bf16x3_router_gemm`: `splitk_reduce_triton` of
+    the partials is its output bit for bit (for split_k 1, the partials are).
+    """
+    N, K = X.shape
+    M, _ = W.shape
+    if N == 0:
+        return X.new_empty((1, N, M), dtype=torch.float32)
+    num_sms = torch.cuda.get_device_properties(X.device).multi_processor_count
+    BN, split_k = _pick_tile_config(N, K, M, num_sms)
+    if split_k > max_split_k:
+        return None
+    partials = X.new_empty(split_k, N, M, dtype=torch.float32)
+    Sm100BF16x3RouterGemm.compile(K, BN)(X, W, partials, split_k)
+    return partials
+
+
 def _bf16x3_router_gemm_fake(
     X: torch.Tensor,
     W: torch.Tensor,

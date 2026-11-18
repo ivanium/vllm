@@ -399,6 +399,23 @@ class GateLinear(ReplicatedLinear):
             output = output.to(self.out_dtype)
         return output if not self.return_bias else (output, output_bias)
 
+    def forward_split_k_partials(
+        self, x: torch.Tensor, max_split_k: int
+    ) -> torch.Tensor | None:
+        """`forward(x)`'s fp32 logits before their split-K reduction, as
+        `[split_k, num_tokens, out]` partials, when forward runs the fp32
+        router GEMM tier on SM100 (`fp32_router_gemm_split_k_partials`); None,
+        with nothing launched, for any other tier."""
+        if (
+            type(self).forward is not GateLinear.forward
+            or not (self.allow_fp32_router_gemm and self.allow_bf16x3_router_gemm)
+            or self.allow_ll_bf16_gemm
+            or self.allow_rocm_bf16x3_router_gemm
+            or self.is_hopper
+        ):
+            return None
+        return fp32_router_gemm_split_k_partials(x, self.weight, max_split_k)
+
 
 class _GateLinearMethod(UnquantizedLinearMethod):
     """UnquantizedLinearMethod plus the ROCm bf16x3 weight split.
@@ -563,6 +580,32 @@ def fp32_router_gemm_dispatch_impl(
         return bf16x3_router_gemm_module()._bf16x3_router_gemm(x, weight)
 
     return torch.nn.functional.linear(x.float(), weight)
+
+
+def fp32_router_gemm_split_k_partials(
+    x: torch.Tensor, weight: torch.Tensor, max_split_k: int
+) -> torch.Tensor | None:
+    """`fp32_router_gemm_dispatch_impl(x, weight, True)`'s logits as the
+    `[split_k, num_tokens, out]` fp32 partials its BF16x3 GEMM sums (split_k 1:
+    the logits themselves), on SM100 for bf16 `x` and an fp32 weight of a shape
+    with the default token limit. Summed in `_splitk_reduce_kernel`'s order
+    they are the dispatch's output bit for bit. None, with nothing launched,
+    where the dispatch would run another kernel or split K more than
+    `max_split_k` ways.
+    """
+    if (
+        not current_platform.is_cuda()
+        or _is_hopper()
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.float32
+        or tuple(weight.shape) in ((256, 5120), (352, 4096), (256, 8192))
+    ):
+        return None
+    if x.shape[0] <= _FP32_ROUTER_GEMM_MAX_TOKENS:
+        return ops.fp32_router_gemm(x, weight).unsqueeze(0)
+    return bf16x3_router_gemm_module().bf16x3_router_gemm_partials(
+        x, weight, max_split_k
+    )
 
 
 def fp32_router_gemm_dispatch_fake(
