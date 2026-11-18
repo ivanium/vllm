@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 
 import torch
@@ -17,6 +18,14 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     CudaGraphManager,
 )
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
+
+# VLLM_DP_SHARDED_LM_HEAD=1 (v1/worker/gpu/sample/dp_vocab_shard.py) lays out
+# every rank's sampled rows, so the padding sync also carries each rank's
+# sampled-row count and whether its batch can be sampled vocab-sharded.
+_SYNC_SAMPLED_ROWS = os.environ.get("VLLM_DP_SHARDED_LM_HEAD", "0").lower() in (
+    "1",
+    "true",
+)
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,13 @@ class DPSyncState:
     # Whether every rank's scheduler found that none of its requests can use this
     # step's drafts, so all ranks skip drafting together.
     skip_drafts: bool = False
+    # Every rank's real request count and sampled-row (logits) count, by DP
+    # rank, the same tuple on every rank; None unless VLLM_DP_SHARDED_LM_HEAD.
+    num_reqs_across_dp: tuple[int, ...] | None = None
+    num_logits_across_dp: tuple[int, ...] | None = None
+    # Whether every rank's batch can be sampled vocab-sharded across the DP
+    # ranks (VLLM_DP_SHARDED_LM_HEAD).
+    vocab_shard_ok: bool = False
 
 
 def sync_cudagraph_and_dp_padding(
@@ -60,13 +76,17 @@ def sync_cudagraph_and_dp_padding(
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
     allow_skip_drafts: bool = False,
+    num_logits: int = 0,
+    allow_vocab_shard: bool = False,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Coordinates the batch descriptor and DP padding across all ranks.
 
     Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
     """
     assert dp_size > 1, "DP size must be greater than 1"
-    tensor = torch.zeros(7, dp_size, dtype=torch.int32, device="cpu")
+    tensor = torch.zeros(
+        9 if _SYNC_SAMPLED_ROWS else 7, dp_size, dtype=torch.int32, device="cpu"
+    )
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
@@ -74,6 +94,9 @@ def sync_cudagraph_and_dp_padding(
     tensor[4][dp_rank] = int(allow_ubatching)
     tensor[5][dp_rank] = num_reqs
     tensor[6][dp_rank] = int(allow_skip_drafts)
+    if _SYNC_SAMPLED_ROWS:
+        tensor[7][dp_rank] = num_logits
+        tensor[8][dp_rank] = int(allow_vocab_shard)
     if should_skip_dp_coordination():
         tensor[:] = tensor[:, dp_rank, None].clone()
     else:
@@ -82,6 +105,13 @@ def sync_cudagraph_and_dp_padding(
     # Full width, dead slots included: returned in DPSyncState, whose
     # consumers index it by original dp_rank.
     num_tokens_across_dp_full = tensor[0]
+    sampled_rows: dict = {}
+    if _SYNC_SAMPLED_ROWS and not should_skip_dp_coordination():
+        sampled_rows = dict(
+            num_reqs_across_dp=tuple(int(x) for x in tensor[5].tolist()),
+            num_logits_across_dp=tuple(int(x) for x in tensor[7].tolist()),
+            vocab_shard_ok=bool(torch.all(tensor[8] == 1)),
+        )
 
     if parallel_config is not None and parallel_config.enable_fault_tolerance:
         # Per-step barrier over the TP cpu group: a faulted sibling stops
@@ -176,6 +206,7 @@ def sync_cudagraph_and_dp_padding(
                 eager=ubatch_desc.cg_mode == CUDAGraphMode.NONE,
                 num_reqs=int(num_reqs_across_dp.max()),
                 skip_drafts=skip_drafts,
+                **sampled_rows,
             )
 
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min()))
@@ -196,6 +227,7 @@ def sync_cudagraph_and_dp_padding(
                 eager=True,
                 num_reqs=int(num_reqs_across_dp.max()),
                 skip_drafts=skip_drafts,
+                **sampled_rows,
             ),
         )
 
@@ -226,6 +258,7 @@ def sync_cudagraph_and_dp_padding(
         eager=False,
         num_reqs=int(num_reqs_across_dp.max()),
         skip_drafts=skip_drafts,
+        **sampled_rows,
     )
 
 
@@ -244,6 +277,8 @@ def dispatch_cg_and_sync_dp(
     uniform_decode: bool = False,
     allow_skip_drafts: bool = False,
     dp_sync_state: DPSyncState | None = None,
+    num_logits: int = 0,
+    allow_vocab_shard: bool = False,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Pick a cudagraph descriptor for this batch, agreeing it across DP ranks.
 
@@ -284,6 +319,11 @@ def dispatch_cg_and_sync_dp(
             same `uniform_token_count`; `num_reqs` may differ, as neither
             depends on it. Passing a sync from a different batch is a caller
             error and trips an assert.
+        num_logits: This rank's sampled rows. Gathered into
+            `DPSyncState.num_logits_across_dp` with VLLM_DP_SHARDED_LM_HEAD.
+        allow_vocab_shard: Whether this rank's batch can be sampled
+            vocab-sharded. Agreed across ranks (all must allow it) into
+            `DPSyncState.vocab_shard_ok` with VLLM_DP_SHARDED_LM_HEAD.
 
     Returns:
         (batch_desc, sync), where `sync` is this batch's agreement for a later
@@ -350,4 +390,6 @@ def dispatch_cg_and_sync_dp(
         allow_ubatching=allow_ubatching,
         uniform_decode=uniform_decode,
         allow_skip_drafts=allow_skip_drafts,
+        num_logits=num_logits,
+        allow_vocab_shard=allow_vocab_shard,
     )

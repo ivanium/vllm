@@ -131,6 +131,7 @@ from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
+    get_num_sampled_and_rejected,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
     post_update,
@@ -355,6 +356,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
         self.batch_sharder: BatchSharder | None = None
+        # VLLM_DP_SHARDED_LM_HEAD: the LM heads' vocabulary sharded over the DP
+        # ranks (sample/dp_vocab_shard.py).
+        self.dp_vocab_shard: Any = None
+        # Requests that need the full vocabulary on their own rank (structured
+        # output), besides Sampler.needs_full_vocab.
+        self._needs_full_vocab = np.zeros(self.max_num_reqs, dtype=bool)
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
@@ -563,6 +570,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 device=self.device,
                 mask_stride=self.decode_query_len,
             )
+            self._init_dp_vocab_shard()
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model, self.vllm_config)
@@ -1045,6 +1053,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.step_timing.forward_end()
 
+        if self.dp_vocab_shard is not None and dp_sync_state is not None:
+            # Every rank joins the step's vocab-sharded sampling (no rows here).
+            if dp_sync_state.vocab_shard_ok:
+                self.dp_vocab_shard.verify(None, None, dp_sync_state)
+            elif not is_profile:
+                self.dp_vocab_shard.complete_draft_logits()
+
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
             assert self.sampler is not None
@@ -1381,6 +1396,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
                 self.sampler.add_request(req_index, new_req_data.sampling_params)
+                if self.dp_vocab_shard is not None:
+                    self._needs_full_vocab[req_index] = (
+                        self.sampler.needs_full_vocab[req_index]
+                        or new_req_data.sampling_params.structured_outputs is not None
+                    )
                 assert self.prompt_logprobs_worker is not None
                 self.prompt_logprobs_worker.add_request(
                     req_id, req_index, new_req_data.sampling_params
@@ -1758,12 +1778,310 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _init_dp_vocab_shard(self) -> None:
+        """VLLM_DP_SHARDED_LM_HEAD=1: shard the vocabulary of the target LM head,
+        the DSpark draft head and its Markov head over the DP ranks
+        (sample/dp_vocab_shard.py). Collective over the DP group: every rank
+        reaches the same decision, and logs it."""
+        from vllm.v1.worker.gpu.sample.dp_vocab_shard import (
+            dp_sharded_lm_head_requested,
+        )
+
+        if not dp_sharded_lm_head_requested():
+            return
+
+        from vllm.distributed.parallel_state import get_dp_group
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+            UnquantizedEmbeddingMethod,
+        )
+        from vllm.v1.worker.gpu.sample.dp_vocab_shard import ENV_VAR, DPVocabShard
+        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
+            DSparkSpeculator,
+        )
+
+        reason = DPVocabShard.unsupported_reason(self.vllm_config)
+
+        def head_and_processor(model: nn.Module) -> tuple[Any, Any]:
+            for m in (model, getattr(model, "language_model", None)):
+                if m is not None and hasattr(m, "logits_processor"):
+                    return getattr(m, "lm_head", None), m.logits_processor
+            return None, None
+
+        def head_problem(head: Any, rows: int) -> str | None:
+            """Why `head`'s logits are not `F.linear(x, weight)` on a BF16
+            [rows, hidden] weight, or None. Both unquantized methods (an LM head
+            a quantization config excludes gets UnquantizedLinearMethod) run
+            `cuda_unquantized_gemm`, which is `F.linear` unless a skinny GEMM
+            plan covers the shape."""
+            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+            from vllm.model_executor.layers.utils import (
+                cuda_unquantized_gemm,
+                default_unquantized_gemm,
+            )
+
+            if not isinstance(head, ParallelLMHead):
+                return f"not a ParallelLMHead ({type(head).__name__})"
+            method = head.quant_method
+            if type(method) is UnquantizedLinearMethod:
+                if method._gemm_impl not in (
+                    cuda_unquantized_gemm,
+                    default_unquantized_gemm,
+                ):
+                    return f"its GEMM is {getattr(method._gemm_impl, '__name__', method._gemm_impl)}"
+            elif type(method) is not UnquantizedEmbeddingMethod:
+                return f"quantized ({type(method).__name__})"
+            if head.weight.dtype != torch.bfloat16:
+                return f"weight dtype {head.weight.dtype}"
+            if head.weight.shape[0] != rows:
+                return f"{head.weight.shape[0]} rows, not the vocabulary's {rows}"
+            if head.tp_size != 1:
+                return f"tensor-parallel size {head.tp_size}"
+            if getattr(head, "bias", None) is not None:
+                return "it has a bias"
+            if getattr(head, "use_skinny_gemm", False):
+                return "a skinny GEMM plan covers it"
+            return None
+
+        def processor_problem(proc: Any) -> str | None:
+            """Why the processor's output is not the head's GEMM with an
+            elementwise soft cap and scale (which the shards apply alike)."""
+            if proc is None:
+                return "no logits processor"
+            if proc.logits_as_input:
+                return "logits_as_input"
+            if proc.org_vocab_size != self.vocab_size:
+                return f"org_vocab_size {proc.org_vocab_size}"
+            if proc.head_dtype not in (None, torch.bfloat16):
+                return f"head_dtype {proc.head_dtype}"
+            return None
+
+        def describe(name: str, head: Any, proc: Any, problem: str | None) -> None:
+            weight = getattr(head, "weight", None)
+            logger.info(
+                "%s=1: %s %s: %s %s, %s, logits scale %s, soft cap %s: %s.",
+                ENV_VAR,
+                name,
+                getattr(head, "prefix", ""),
+                None if weight is None else weight.dtype,
+                None if weight is None else list(weight.shape),
+                type(getattr(head, "quant_method", None)).__name__,
+                getattr(proc, "scale", None),
+                getattr(proc, "soft_cap", None),
+                "shardable" if problem is None else f"NOT shardable ({problem})",
+            )
+
+        spec = self.speculator
+        sampler = self.sampler
+        if reason is None:
+            if envs.VLLM_BATCH_INVARIANT:
+                reason = "VLLM_BATCH_INVARIANT is set"
+            elif type(sampler) is not Sampler or not isinstance(
+                self.rejection_sampler, RejectionSampler
+            ):
+                reason = "the sampler or the rejection sampler is a custom one"
+            elif (
+                sampler.compute_nans
+                or sampler.return_sampling_mask
+                or sampler.trace_replay_state is not None
+                or sampler.use_fp64_gumbel
+            ):
+                reason = "NaN counts, sampling masks, trace replay or fp64 Gumbel"
+            elif self.model_state.num_new_sampled_tokens_per_step != 1:
+                reason = "the model samples more than one token per step"
+            elif not isinstance(spec, DSparkSpeculator) or (
+                spec.draft_logits is None
+                or spec.draft_logits.row_mapping is not None
+                or spec._d2t_scatter_index is not None
+                or spec.draft_watermarker is not None
+                or spec.acceptance_estimator is not None
+                or spec.use_confidence_head
+                or spec._draft_topk is not None
+                or not spec._fuse_markov_bias
+                or hasattr(spec.model, "sample_sequential")
+                or hasattr(spec.model, "sample_markov_chain")
+                or getattr(spec.model, "has_recurrent_markov_head", False)
+                or spec._sharded_sequential_comm is not None
+            ):
+                reason = "it needs DSpark with plain probabilistic Markov drafting"
+            elif self.vocab_size % self.dp_size:
+                reason = f"vocabulary {self.vocab_size} is not divisible by DP"
+        target_head = draft_head = markov_w1 = markov_w2 = None
+        target_proc = draft_proc = None
+        if reason is None:
+            target_head, target_proc = head_and_processor(self.model)
+            draft_head, draft_proc = head_and_processor(spec.model)
+            markov = getattr(getattr(spec.model, "model", None), "markov_head", None)
+            markov_w1 = getattr(getattr(markov, "markov_w1", None), "weight", None)
+            markov_w2 = getattr(markov, "markov_w2", None)
+            # The Markov bias goes through the drafter's logits processor.
+            heads = (
+                ("target LM head", target_head, target_proc),
+                ("draft LM head", draft_head, draft_proc),
+                ("Markov bias head", markov_w2, draft_proc),
+            )
+            problems = []
+            for name, head, proc in heads:
+                problem = head_problem(head, self.vocab_size) or processor_problem(
+                    proc
+                )
+                describe(name, head, proc, problem)
+                if problem is not None:
+                    problems.append(f"the {name} ({problem})")
+            if markov_w1 is None:
+                problems.append("the Markov embedding has no weight")
+            if spec.draft_logits.values.shape[-1] != self.vocab_size:
+                problems.append("the draft logits do not span the vocabulary")
+            if problems:
+                reason = "; ".join(problems)
+        if reason is None:
+            from torch._C._autograd import DeviceType
+            from torch._C._distributed_c10d import _SymmetricMemory
+
+            if not _SymmetricMemory.has_multicast_support(
+                DeviceType.CUDA, self.device.index
+            ):
+                reason = "this GPU has no NVLink multicast"
+
+        dp = get_dp_group()
+
+        def agreed(ok: bool) -> bool:
+            flag = torch.tensor([int(ok)], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MIN, group=dp.cpu_group
+            )
+            return bool(flag.item())
+
+        shard = None
+        if reason is None:
+            assert spec is not None and self.rejection_sampler is not None
+            try:
+                shard = DPVocabShard(
+                    dp_group=dp,
+                    device=self.device,
+                    vocab_size=self.vocab_size,
+                    hidden_size=target_head.weight.shape[1],
+                    draft_hidden_size=draft_head.weight.shape[1],
+                    max_num_reqs=self.max_num_reqs,
+                    num_spec=self.num_speculative_steps,
+                    target_head=target_head.weight,
+                    draft_head=draft_head.weight,
+                    markov_w1=markov_w1,
+                    markov_w2=markov_w2.weight,
+                    logits_dtype=target_head.weight.dtype,
+                    draft_logits_dtype=spec.draft_logits.values.dtype,
+                    synthetic_rates=self.rejection_sampler.synthetic_conditional_rates,
+                    use_block_verification=self.rejection_sampler.use_block_verification,
+                    target_processor=target_proc,
+                    draft_processor=draft_proc,
+                )
+            except Exception as e:  # noqa: BLE001 (e.g. no CuTe DSL)
+                reason = f"its exchange kernel failed to build ({e})"
+        if agreed(shard is not None):
+            # Local allocation, agreed, before the collective mapping: a rank
+            # that fails to allocate must not leave its peers in the rendezvous.
+            assert shard is not None
+            allocated = False
+            try:
+                shard.allocate()
+                allocated = True
+            except Exception as e:  # noqa: BLE001
+                logger.warning("DP vocab shard: symmetric memory failed: %s", e)
+            if agreed(allocated):
+                if not agreed(shard.rendezvous()):
+                    reason = "the DP group has no NVLink multicast mapping"
+                    shard = None
+            else:
+                reason = "symmetric memory allocation failed on a DP rank"
+                shard = None
+        else:
+            shard = None
+            if reason is None:
+                reason = "another DP rank cannot run it"
+        if shard is None:
+            logger.warning(
+                "%s=1 is ignored: %s. The LM heads stay replicated.", ENV_VAR, reason
+            )
+            return
+        # A step verified in full completes the stock cache from the slices.
+        shard.full_draft_logits = spec.draft_logits
+        spec._dp_vocab_shard = shard
+        self.dp_vocab_shard = shard
+        logger.info(
+            "%s=1: DP rank %d of %d holds vocabulary rows [%d, %d) of the target "
+            "LM head, the DSpark draft head and its Markov head; verification and "
+            "drafting run vocab-sharded over the %d DP ranks.",
+            ENV_VAR,
+            shard.rank,
+            shard.world,
+            shard.offset,
+            shard.offset + shard.shard,
+            shard.world,
+        )
+
+    def _dp_vocab_shard_vote(self, batch_req_state: "BatchReqState") -> tuple[int, bool]:
+        """This rank's sampled rows and whether its batch can be sampled
+        vocab-sharded, for the DP padding sync."""
+        num_logits = len(batch_req_state.req_ids)
+        if batch_req_state.num_draft_tokens_np is not None:
+            num_logits += int(batch_req_state.num_draft_tokens_np.sum())
+        allow = not bool(np.any(self._needs_full_vocab[batch_req_state.idx_mapping_np]))
+        return num_logits, allow
+
+    def _sample_dp_vocab_sharded(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        dp_sync_state: DPSyncState,
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        assert self.sampler is not None
+        out = self.dp_vocab_shard.verify(
+            hidden_states,
+            input_batch,
+            dp_sync_state,
+            self.sampler.sampling_states,
+            self.req_states.prefill_len.gpu,
+        )
+        assert out is not None
+        sampled, num_sampled = out
+        if input_batch.num_draft_tokens == 0:
+            # One row per request: the sampler's [num_reqs, 1] layout.
+            sampled = sampled[:, :1].contiguous()
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        sampler_output = SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            sampling_mask_tensors=None,
+        )
+        return sampler_output, num_sampled, num_rejected
+
     def sample(
         self,
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
+        dp_sync_state: DPSyncState | None = None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        draft_logits = (
+            self.speculator.draft_logits if self.speculator is not None else None
+        )
+        if self.dp_vocab_shard is not None and dp_sync_state is not None:
+            if dp_sync_state.vocab_shard_ok:
+                return self._sample_dp_vocab_sharded(
+                    hidden_states, input_batch, dp_sync_state
+                )
+            # Some rank has a request that needs the full vocabulary: every rank
+            # verifies in full, from its requests' completed draft logits.
+            draft_logits = self.dp_vocab_shard.complete_draft_logits()
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
@@ -1815,7 +2133,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logits,
                 input_batch,
                 # Draft logits are needed for probabilistic rejection sampling.
-                self.speculator.draft_logits,
+                draft_logits,
             )
 
         if shard_metadata is not None:
@@ -1949,6 +2267,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        num_logits, allow_vocab_shard = 0, True
+        if self.dp_vocab_shard is not None and batch_req_state is not None:
+            num_logits, allow_vocab_shard = self._dp_vocab_shard_vote(batch_req_state)
         batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1965,6 +2286,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
             allow_skip_drafts=scheduler_output.skip_drafts,
+            num_logits=num_logits,
+            allow_vocab_shard=allow_vocab_shard,
         )
 
         if batch_desc.num_tokens == 0:
@@ -2347,7 +2670,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
+            hidden_states, input_batch, grammar_output, dp_sync_state
         )
 
         if self.pp_handler is not None:

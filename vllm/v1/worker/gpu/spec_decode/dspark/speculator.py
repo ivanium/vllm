@@ -100,6 +100,11 @@ class DSparkSpeculator(DFlashSpeculator):
         # Whether the markov bias is fused into the Gumbel sample kernel.
         self._fuse_markov_bias: bool = False
 
+        # Set by the model runner under VLLM_DP_SHARDED_LM_HEAD=1: the draft
+        # head's vocabulary is sharded over the DP ranks, which run the Markov
+        # chain together (v1/worker/gpu/sample/dp_vocab_shard.py).
+        self._dp_vocab_shard: Any = None
+
     def load_model(self, target_model: torch.nn.Module) -> None:
         super().load_model(target_model)
         tp_size = get_tp_group().world_size
@@ -513,7 +518,17 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        if self._sharded_sequential_comm is not None:
+        if self._dp_vocab_shard is not None:
+            # Every DP rank runs the chain for the same request count: the
+            # graph's, or in eager mode the largest of any rank (its padded
+            # sample slots are inert).
+            num_dp_reqs = num_reqs
+            if num_tokens_across_dp is not None:
+                num_dp_reqs = max(
+                    num_reqs, int(num_tokens_across_dp.max()) // self.num_query_per_req
+                )
+            self._dp_vocab_shard.draft(self, num_dp_reqs, head_hidden)
+        elif self._sharded_sequential_comm is not None:
             self._sample_sequential_sharded(num_reqs, head_hidden)
         else:
             self._sample_sequential(num_reqs, head_hidden)
