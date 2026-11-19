@@ -763,11 +763,11 @@ class MooncakeStoreScheduler:
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Record failed loads and drop the block references of store jobs
         every rank has finished."""
-        # A request aborted mid-load is cleaned up before its failure arrives;
-        # skip it so the entry is not leaked.
-        self._load_failed_req_ids |= (
-            connector_output.failed_recving & self._unfinished_request_ids
-        )
+        # Only mark loads assigned to this connector; aborted requests are absent.
+        for req_id in connector_output.failed_recving:
+            entry = self._unfinished_requests.get(req_id)
+            if entry is not None and entry[1]:
+                self._load_failed_req_ids.add(req_id)
         if invalid_block_ids := connector_output.invalid_block_ids:
             for req_id, (req, req_block_ids) in self._unfinished_requests.items():
                 # The block ids are from admission and go stale once a running

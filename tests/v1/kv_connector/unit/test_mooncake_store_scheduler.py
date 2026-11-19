@@ -274,10 +274,13 @@ def _add_unfinished_request(
 
 
 def test_pending_load_for_non_chosen_connector_is_dropped():
-    """A MultiConnector loser must not turn its proposed load into a save."""
+    """An unselected connector must neither save nor mark the load as failed."""
     scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=48)
     request = SimpleNamespace(
         request_id="req-0",
+        num_tokens=48,
         block_hashes=[b"h0", b"h1", b"h2"],
     )
     blocks = SimpleNamespace(get_block_ids=lambda: ([1, 2], [9]))
@@ -298,6 +301,9 @@ def test_pending_load_for_non_chosen_connector_is_dropped():
     assert meta.requests == []
     assert "req-0" not in scheduler.load_specs
     assert "req-0" not in scheduler._request_trackers
+
+    scheduler.update_connector_output(KVConnectorOutput(failed_recving={"req-0"}))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (48, True)
 
 
 def _make_qsa_hybrid_cache_config():
