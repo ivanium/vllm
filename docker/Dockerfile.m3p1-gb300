@@ -1,0 +1,134 @@
+# syntax=docker/dockerfile:1.10
+# check=skip=FromPlatformFlagConstDisallowed
+#
+# MiniMax-M3.1-Flash on GB300 (linux/arm64 only): the vLLM CUDA 13.5 nightly this branch is based
+# on (vllm-project/vllm 153dc046) with this branch's vllm/ files, the DeepGEMM and MSA (fmha_sm100)
+# JIT kernel sources it needs, and Mooncake 0.3.13.post1+hbm. Nothing is compiled: the build copies
+# files, and checks each one against the sha256 lists in docker/m3p1-gb300/ (see its README.md).
+#
+# From the root of a clean checkout of this branch:
+#   docker buildx build --platform linux/arm64 -f docker/Dockerfile.m3p1-gb300 \
+#     --build-arg BRANCH_COMMIT=$(git rev-parse HEAD) \
+#     -t vllm-m3p1-gb300:$(git rev-parse --short=10 HEAD) --load .
+
+# vllm/vllm-openai:cu135-nightly-153dc046... (index sha256:712ef89a...): its linux/arm64 image.
+ARG BASE_IMAGE=docker.io/vllm/vllm-openai:cu135-nightly-153dc046462c4724a9a4eb393cadd60169ed943c@sha256:18dfff3057619a1353d939c0030e9371b71fdf7519951bfe67eb9965c6b513b9
+# The last layer of vllm/vllm-openai:cu134-arm64-1107-mdev
+# (sha256:1b4a9b46c217ae3665b5e793341892d555b9bd5ca81230eed26e1b94a42b5801): Mooncake
+# 0.3.13.post1+hbm, whose store binding has the mount_external_segment that the Mooncake store
+# connector's hbm_pool uses. Its source is not public. The 13 MB layer is fetched by digest rather
+# than pulling the whole image.
+ARG MOONCAKE_LAYER=sha256:65bd369b53169f43dd3e40c9e8bc196e154a353a9a65053ab66c5469b5ea4761
+# DeepGEMM: this branch's pin in cmake/external_projects/deepgemm.cmake (the base vendors 0f7698fe,
+# one commit earlier). MSA: the head of vllm-project/MSA#49 (MXFP8 output for the Q8KV4 kernels),
+# over the base's fmha_sm100 at the pin in cmake/external_projects/fmha_sm100.cmake.
+ARG DEEPGEMM_COMMIT=196f33873c658bde81a669bb645bac4823f8cd61
+ARG MSA_COMMIT=56bf386fb528a79acc4e51954a6ce72b1eaacd95
+
+# The JIT kernel sources the image's DeepGEMM and fmha_sm100 compile at run time, at the paths
+# they are installed to under vllm/ (kernel-sources.sha256 lists the same files and hashes).
+FROM scratch AS kernel-sources
+ARG DEEPGEMM_COMMIT
+ARG MSA_COMMIT
+ADD --checksum=sha256:9ca739659c69d5413790ad18add91104bd20cea30ac2e48ea3f9751ed050a20e https://raw.githubusercontent.com/vllm-project/DeepGEMM/${DEEPGEMM_COMMIT}/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh /vllm/third_party/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh
+ADD --checksum=sha256:d00cf06878b93f5336f3ef70b0389561336ef16980ed8b73d585cf5aaec1c1b5 https://raw.githubusercontent.com/vllm-project/DeepGEMM/${DEEPGEMM_COMMIT}/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh /vllm/third_party/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+ADD --checksum=sha256:066bc3564105a2c77ced0717c006b1f0c9b78c5eef3fa4b646386f485d6f1bea https://raw.githubusercontent.com/vllm-project/DeepGEMM/${DEEPGEMM_COMMIT}/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe_situ.cuh /vllm/third_party/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe_situ.cuh
+ADD --checksum=sha256:76f5d18de39b0749a20cb93c0f8c1dc0c351591f6696d4d0ada4316d5f6325e4 https://raw.githubusercontent.com/vllm-project/DeepGEMM/${DEEPGEMM_COMMIT}/deep_gemm/include/deep_gemm/impls/sm100_nvfp4_mega_moe.cuh /vllm/third_party/deep_gemm/include/deep_gemm/impls/sm100_nvfp4_mega_moe.cuh
+ADD --checksum=sha256:f2e1c9b5f19bb6e08c4f1307768b9c818b51e28b0e9b35f400cf29459bea76e9 https://raw.githubusercontent.com/vllm-project/DeepGEMM/${DEEPGEMM_COMMIT}/deep_gemm/include/deep_gemm/layout/mega_moe.cuh /vllm/third_party/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
+ADD --checksum=sha256:ab22999b6b01122e31f94631717ad7d1730dc20ae37f2446e768e9e2c7385677 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/api.py /vllm/third_party/fmha_sm100/api.py
+ADD --checksum=sha256:18dbae6901aa88768fffd04556ea77d1ac428b6bcaf31a76b166fe293889a5bd https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/cute/src/common/mxfp8_quant.py /vllm/third_party/fmha_sm100/cute/src/common/mxfp8_quant.py
+ADD --checksum=sha256:a5db224896ea53c981580d3c90ee8923d1880c5b901f28db28ccc5614c5a66ff https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/cute/src/sm100/fwd/combine.py /vllm/third_party/fmha_sm100/cute/src/sm100/fwd/combine.py
+ADD --checksum=sha256:45fda25c93b0d68df255be679e04f37de7ffe4d35c61503ce242a728a1ca1113 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/__init__.py /vllm/third_party/fmha_sm100/decode_q8kv4/__init__.py
+ADD --checksum=sha256:9eeb7d36c151a7ec9297ac64c6d74d4285585943c15da9b0b73a68856b264d18 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_api.cpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_api.cpp
+ADD --checksum=sha256:13ca91af97e8cce656ba9a17185f7193e3580f723c51079a1b74e5029608a630 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_api.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_api.hpp
+ADD --checksum=sha256:440c9a3359f7a34702bda6222bd6a1733822b5347248dec9f125f37f859c5e97 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_binding.cpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_binding.cpp
+ADD --checksum=sha256:ff3a242795023758f5eabd1ecac0006522b271082697ccb421b0f9719c996ba6 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/collective/sm100_fmha_correction_tma_warpspecialized.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/collective/sm100_fmha_correction_tma_warpspecialized.hpp
+ADD --checksum=sha256:40e21488ababa477da33f84631c54bb0f90cd2d779bb00d31a8ba7a789161ad6 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+ADD --checksum=sha256:0dbcf66173ee944327129d100e0c78d8fd5a6f18b8e6ddb096e3fd55bc800ccf https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/decode_attention_params.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/decode_attention_params.hpp
+ADD --checksum=sha256:ca93d0d2af2165b36e188f76298862950e48659e7182132ca94f58388546bce9 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/fmha_common.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/fmha_common.hpp
+ADD --checksum=sha256:e1e44a496a6afa9f0c2604a2b9686c4df22d2836ea718e9db51b2b59c69e5ed2 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/mxfp8_output.cuh /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/mxfp8_output.cuh
+ADD --checksum=sha256:1aade06a2b38f531c2617cd008e8c6b0dd534038da3a83c6aa449cf6fcfa216a https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/sm100_fmha_q8kv4_traits.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/sm100_fmha_q8kv4_traits.hpp
+ADD --checksum=sha256:3f4cbc1ab37aafcfc42a52af3b72283a3fff47aae2c7ea3b374194f744cc6820 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/device/sm100_fmha_reduction.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/device/sm100_fmha_reduction.hpp
+ADD --checksum=sha256:08f05cfbd17bc2b2a9cf8c841f60fc41b4a054ae98353f1fe5fd7ed7718bf083 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+ADD --checksum=sha256:5b58850456c33b2080d3c9e104c20c3c7461b40a93d93d0e44b846a0016d4e6d https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/src/decode_attention_reduction.cu /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/src/decode_attention_reduction.cu
+ADD --checksum=sha256:219247912accd2c3f9cce0ea10899535ab6eb200eb90ed12ef9986046b63f084 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/templates/decode_attention_run.cu.jinja /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/templates/decode_attention_run.cu.jinja
+ADD --checksum=sha256:18e5aea82bbcc0412976ad9a106755ace2bf48333579c169e06668994d774691 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/interface.py /vllm/third_party/fmha_sm100/decode_q8kv4/interface.py
+ADD --checksum=sha256:5dd337dce8047681b34074fa1c462613a6994868650cffa4fe4bbae56aa266ce https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/jit.py /vllm/third_party/fmha_sm100/decode_q8kv4/jit.py
+ADD --checksum=sha256:83630b5844292275051e476237e513f393f2119f359c26cbf43411973b352f83 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/msa_warmup.py /vllm/third_party/fmha_sm100/msa_warmup.py
+ADD --checksum=sha256:e80fe7804c84d84c0bf01b0e6093a2c76d1204c20b8370d67e8665d20d3e5b46 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/prefill_q8kv4/interface.py /vllm/third_party/fmha_sm100/prefill_q8kv4/interface.py
+ADD --checksum=sha256:5b12b6ade8873c713d0a3d173e58a2971179fef9563d00af60cc04183f7ed4c2 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/q8kv4_decode_adapter.py /vllm/third_party/fmha_sm100/q8kv4_decode_adapter.py
+
+# Mooncake 0.3.13.post1+hbm out of that layer, checked by digest; whiteouts are skipped.
+FROM --platform=linux/arm64 ${BASE_IMAGE} AS mooncake-hbm
+ARG MOONCAKE_LAYER
+RUN set -eu; \
+    repo=vllm/vllm-openai; \
+    token=$(curl -fsS "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" \
+        | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["token"])'); \
+    curl -fsSL -H "Authorization: Bearer ${token}" -o /tmp/layer.tgz \
+        "https://registry-1.docker.io/v2/${repo}/blobs/${MOONCAKE_LAYER}"; \
+    echo "${MOONCAKE_LAYER#sha256:}  /tmp/layer.tgz" | sha256sum -c -; \
+    mkdir /payload; \
+    tar -xzf /tmp/layer.tgz -C /payload --exclude='.wh.*' \
+        usr/local/lib/python3.12/dist-packages/mooncake \
+        usr/local/lib/python3.12/dist-packages/mooncake_transfer_engine_cuda13-0.3.13.post1+hbm.dist-info \
+        usr/lib/aarch64-linux-gnu; \
+    rm /tmp/layer.tgz
+
+FROM --platform=linux/arm64 ${BASE_IMAGE}
+ARG SP=/usr/local/lib/python3.12/dist-packages
+ARG BRANCH_COMMIT=unknown
+
+# 1. Mooncake 0.3.13.post1+hbm replaces the base's PyPI Mooncake (package, dist-info and bundled
+#    libraries) and brings the five libraries it links, with their soname links (cp -a keeps them
+#    links). The base's mooncake_master console script stays; it runs mooncake.cli.
+RUN --mount=type=bind,from=mooncake-hbm,source=/payload,target=/tmp/m3p1/mooncake \
+    --mount=type=bind,source=docker/m3p1-gb300,target=/tmp/m3p1/lists \
+    set -eu; \
+    mc=/tmp/m3p1/mooncake; \
+    rm -rf "$SP/mooncake" "$SP"/mooncake_transfer_engine_cuda13-*.dist-info "$SP/mooncake_transfer_engine_cuda13.libs"; \
+    cp -a "$mc$SP/mooncake" "$mc$SP/mooncake_transfer_engine_cuda13-0.3.13.post1+hbm.dist-info" "$SP/"; \
+    cp -a "$mc"/usr/lib/aarch64-linux-gnu/* /usr/lib/aarch64-linux-gnu/; \
+    sha256sum -c --quiet /tmp/m3p1/lists/mooncake-hbm.sha256
+
+# 2. The DeepGEMM and MSA JIT kernel sources, readable by every user (ADD leaves a downloaded file
+#    at mode 600), and the bytecode of the Python ones removed.
+RUN --mount=type=bind,from=kernel-sources,source=/vllm,target=/tmp/m3p1/kernels/vllm \
+    --mount=type=bind,source=docker/m3p1-gb300,target=/tmp/m3p1/lists \
+    set -eu; \
+    while read -r _ f; do \
+        install -D -m 0644 "/tmp/m3p1/kernels/$f" "$SP/$f"; \
+        case $f in *.py) rm -f "$SP/${f%/*}/__pycache__/$(basename "$f" .py)".cpython-312*.pyc ;; esac; \
+    done < /tmp/m3p1/lists/kernel-sources.sha256; \
+    cd "$SP" && sha256sum -c --quiet /tmp/m3p1/lists/kernel-sources.sha256
+
+# 3. The vllm/ files this branch changes from 153dc046, from the build context. The checkout must
+#    hold exactly the listed contents, or the build stops. Each file gets its git mode (0755 if
+#    executable, else 0644), and the bytecode of the Python ones is removed.
+RUN --mount=type=bind,source=vllm,target=/tmp/m3p1/src/vllm \
+    --mount=type=bind,source=docker/m3p1-gb300,target=/tmp/m3p1/lists \
+    set -eu; \
+    cd /tmp/m3p1/src && sha256sum -c --quiet /tmp/m3p1/lists/vllm-files.sha256; \
+    while read -r _ f; do \
+        if [ -x "$f" ]; then mode=0755; else mode=0644; fi; \
+        install -D -m "$mode" "$f" "$SP/$f"; \
+        case $f in *.py) rm -f "$SP/${f%/*}/__pycache__/$(basename "$f" .py)".cpython-312*.pyc ;; esac; \
+    done < /tmp/m3p1/lists/vllm-files.sha256; \
+    cd "$SP" && sha256sum -c --quiet /tmp/m3p1/lists/vllm-files.sha256
+
+# 4. Static checks (no GPU): the CUDA 13.5 toolkit, the store binding with mount_external_segment,
+#    and one Mooncake distribution, 0.3.13.post1+hbm. Writes no bytecode.
+RUN set -eu; \
+    nvcc --version | grep -q 'release 13\.5,'; \
+    grep -aq mount_external_segment "$SP/mooncake/_store.cpython-312-aarch64-linux-gnu.so"; \
+    python3 -I -B -c 'import importlib.metadata as m; \
+d = sorted((x.metadata["Name"].lower(), x.version) for x in m.distributions() if "mooncake" in (x.metadata["Name"] or "").lower()); \
+assert d == [("mooncake-transfer-engine-cuda13", "0.3.13.post1+hbm")], d; \
+print("; ".join(n + " " + m.version(n) for n in ("vllm", "torch", "flashinfer-python", "mooncake-transfer-engine-cuda13")))'
+
+# The vLLM version string, VLLM_* environment and ai.vllm.* labels stay the base nightly's.
+LABEL org.opencontainers.image.source="https://github.com/kyleliang-nv/vllm" \
+      org.opencontainers.image.revision="${BRANCH_COMMIT}" \
+      org.opencontainers.image.version="m3p1-gb300-${BRANCH_COMMIT}" \
+      org.opencontainers.image.base.name="docker.io/vllm/vllm-openai:cu135-nightly-153dc046462c4724a9a4eb393cadd60169ed943c" \
+      org.opencontainers.image.base.digest="sha256:18dfff3057619a1353d939c0030e9371b71fdf7519951bfe67eb9965c6b513b9"
