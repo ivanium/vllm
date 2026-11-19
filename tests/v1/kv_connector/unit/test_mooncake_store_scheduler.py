@@ -1225,6 +1225,7 @@ def test_failed_load_skips_store_lookup_until_finished(report):
     scheduler.client = _StubLookupClient(hit_tokens=32)
     request = _make_admission_request()
     assert scheduler.get_num_new_matched_tokens(request, 0) == (32, True)
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
     scheduler._unfinished_requests[request.request_id] = (request, ([3, 4],))
 
     if report == "failed_recving":
@@ -1255,6 +1256,25 @@ def test_failed_load_of_aborted_request_is_not_tracked():
 
     scheduler.update_connector_output(KVConnectorOutput(failed_recving={"req-0"}))
     assert scheduler._load_failed_req_ids == set()
+
+
+def test_async_load_failure_ignores_running_request_with_reused_blocks():
+    # A running request's admission-time block ids go stale once it frees
+    # blocks (e.g. sliding window); another request's failed async load into
+    # a reused block must only mark the loading request.
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    running = _make_admission_request("req-running")
+    running.status = RequestStatus.RUNNING
+    loading = _make_admission_request("req-loading")
+    loading.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler._unfinished_requests = {
+        running.request_id: (running, ([3, 4],)),
+        loading.request_id: (loading, ([4, 5],)),
+    }
+
+    scheduler.update_connector_output(KVConnectorOutput(invalid_block_ids={4}))
+    assert scheduler._load_failed_req_ids == {loading.request_id}
 
 
 def test_disabled_lookup_reports_no_hit_without_querying_client():

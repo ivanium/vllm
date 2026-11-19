@@ -769,7 +769,16 @@ class MooncakeStoreScheduler:
             connector_output.failed_recving & self._unfinished_request_ids
         )
         if invalid_block_ids := connector_output.invalid_block_ids:
-            for req_id, (_, req_block_ids) in self._unfinished_requests.items():
+            for req_id, (req, req_block_ids) in self._unfinished_requests.items():
+                # The block ids are from admission and go stale once a running
+                # request frees blocks (e.g. sliding window) for reuse. An
+                # async load is still waiting when its failure is reported, so
+                # skip running requests to not match another request's blocks.
+                if (
+                    self.load_async
+                    and req.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+                ):
+                    continue
                 if any(invalid_block_ids.intersection(ids) for ids in req_block_ids):
                     self._load_failed_req_ids.add(req_id)
 
