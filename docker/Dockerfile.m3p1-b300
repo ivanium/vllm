@@ -1,0 +1,158 @@
+# syntax=docker/dockerfile:1.10
+ARG BASE_IMAGE=docker.io/vllm/vllm-openai:cu135-nightly-153dc046462c4724a9a4eb393cadd60169ed943c@sha256:f2036e7a2b69217d9fbf048caf4b994fbd996d7821939938e33a4f4a2ce009e3
+ARG DEEPGEMM_COMMIT=196f33873c658bde81a669bb645bac4823f8cd61
+ARG MSA_COMMIT=56bf386fb528a79acc4e51954a6ce72b1eaacd95
+ARG MOONCAKE_COMMIT=ed1b346b0cf3f6b04a1aa33c877b6e0f212a39a4
+ARG NIXL_COMMIT=e72c52c78478d2e1ca9e9c57b872114e113ad767
+
+FROM scratch AS kernel-sources
+ARG DEEPGEMM_COMMIT
+ARG MSA_COMMIT
+ADD --checksum=sha256:9ca739659c69d5413790ad18add91104bd20cea30ac2e48ea3f9751ed050a20e https://raw.githubusercontent.com/vllm-project/DeepGEMM/${DEEPGEMM_COMMIT}/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh /vllm/third_party/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh
+ADD --checksum=sha256:d00cf06878b93f5336f3ef70b0389561336ef16980ed8b73d585cf5aaec1c1b5 https://raw.githubusercontent.com/vllm-project/DeepGEMM/${DEEPGEMM_COMMIT}/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh /vllm/third_party/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+ADD --checksum=sha256:066bc3564105a2c77ced0717c006b1f0c9b78c5eef3fa4b646386f485d6f1bea https://raw.githubusercontent.com/vllm-project/DeepGEMM/${DEEPGEMM_COMMIT}/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe_situ.cuh /vllm/third_party/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe_situ.cuh
+ADD --checksum=sha256:76f5d18de39b0749a20cb93c0f8c1dc0c351591f6696d4d0ada4316d5f6325e4 https://raw.githubusercontent.com/vllm-project/DeepGEMM/${DEEPGEMM_COMMIT}/deep_gemm/include/deep_gemm/impls/sm100_nvfp4_mega_moe.cuh /vllm/third_party/deep_gemm/include/deep_gemm/impls/sm100_nvfp4_mega_moe.cuh
+ADD --checksum=sha256:f2e1c9b5f19bb6e08c4f1307768b9c818b51e28b0e9b35f400cf29459bea76e9 https://raw.githubusercontent.com/vllm-project/DeepGEMM/${DEEPGEMM_COMMIT}/deep_gemm/include/deep_gemm/layout/mega_moe.cuh /vllm/third_party/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
+ADD --checksum=sha256:ab22999b6b01122e31f94631717ad7d1730dc20ae37f2446e768e9e2c7385677 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/api.py /vllm/third_party/fmha_sm100/api.py
+ADD --checksum=sha256:18dbae6901aa88768fffd04556ea77d1ac428b6bcaf31a76b166fe293889a5bd https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/cute/src/common/mxfp8_quant.py /vllm/third_party/fmha_sm100/cute/src/common/mxfp8_quant.py
+ADD --checksum=sha256:a5db224896ea53c981580d3c90ee8923d1880c5b901f28db28ccc5614c5a66ff https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/cute/src/sm100/fwd/combine.py /vllm/third_party/fmha_sm100/cute/src/sm100/fwd/combine.py
+ADD --checksum=sha256:45fda25c93b0d68df255be679e04f37de7ffe4d35c61503ce242a728a1ca1113 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/__init__.py /vllm/third_party/fmha_sm100/decode_q8kv4/__init__.py
+ADD --checksum=sha256:9eeb7d36c151a7ec9297ac64c6d74d4285585943c15da9b0b73a68856b264d18 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_api.cpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_api.cpp
+ADD --checksum=sha256:13ca91af97e8cce656ba9a17185f7193e3580f723c51079a1b74e5029608a630 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_api.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_api.hpp
+ADD --checksum=sha256:440c9a3359f7a34702bda6222bd6a1733822b5347248dec9f125f37f859c5e97 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_binding.cpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/api/decode_attention_binding.cpp
+ADD --checksum=sha256:ff3a242795023758f5eabd1ecac0006522b271082697ccb421b0f9719c996ba6 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/collective/sm100_fmha_correction_tma_warpspecialized.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/collective/sm100_fmha_correction_tma_warpspecialized.hpp
+ADD --checksum=sha256:40e21488ababa477da33f84631c54bb0f90cd2d779bb00d31a8ba7a789161ad6 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+ADD --checksum=sha256:0dbcf66173ee944327129d100e0c78d8fd5a6f18b8e6ddb096e3fd55bc800ccf https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/decode_attention_params.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/decode_attention_params.hpp
+ADD --checksum=sha256:ca93d0d2af2165b36e188f76298862950e48659e7182132ca94f58388546bce9 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/fmha_common.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/fmha_common.hpp
+ADD --checksum=sha256:e1e44a496a6afa9f0c2604a2b9686c4df22d2836ea718e9db51b2b59c69e5ed2 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/mxfp8_output.cuh /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/mxfp8_output.cuh
+ADD --checksum=sha256:1aade06a2b38f531c2617cd008e8c6b0dd534038da3a83c6aa449cf6fcfa216a https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/sm100_fmha_q8kv4_traits.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/common/sm100_fmha_q8kv4_traits.hpp
+ADD --checksum=sha256:3f4cbc1ab37aafcfc42a52af3b72283a3fff47aae2c7ea3b374194f744cc6820 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/device/sm100_fmha_reduction.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/device/sm100_fmha_reduction.hpp
+ADD --checksum=sha256:08f05cfbd17bc2b2a9cf8c841f60fc41b4a054ae98353f1fe5fd7ed7718bf083 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/include/sm100/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/include/sm100/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+ADD --checksum=sha256:5b58850456c33b2080d3c9e104c20c3c7461b40a93d93d0e44b846a0016d4e6d https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/src/decode_attention_reduction.cu /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/src/decode_attention_reduction.cu
+ADD --checksum=sha256:219247912accd2c3f9cce0ea10899535ab6eb200eb90ed12ef9986046b63f084 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/csrc/templates/decode_attention_run.cu.jinja /vllm/third_party/fmha_sm100/decode_q8kv4/csrc/templates/decode_attention_run.cu.jinja
+ADD --checksum=sha256:18e5aea82bbcc0412976ad9a106755ace2bf48333579c169e06668994d774691 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/interface.py /vllm/third_party/fmha_sm100/decode_q8kv4/interface.py
+ADD --checksum=sha256:5dd337dce8047681b34074fa1c462613a6994868650cffa4fe4bbae56aa266ce https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/decode_q8kv4/jit.py /vllm/third_party/fmha_sm100/decode_q8kv4/jit.py
+ADD --checksum=sha256:83630b5844292275051e476237e513f393f2119f359c26cbf43411973b352f83 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/msa_warmup.py /vllm/third_party/fmha_sm100/msa_warmup.py
+ADD --checksum=sha256:e80fe7804c84d84c0bf01b0e6093a2c76d1204c20b8370d67e8665d20d3e5b46 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/prefill_q8kv4/interface.py /vllm/third_party/fmha_sm100/prefill_q8kv4/interface.py
+ADD --checksum=sha256:5b12b6ade8873c713d0a3d173e58a2971179fef9563d00af60cc04183f7ed4c2 https://raw.githubusercontent.com/vllm-project/MSA/${MSA_COMMIT}/python/fmha_sm100/q8kv4_decode_adapter.py /vllm/third_party/fmha_sm100/q8kv4_decode_adapter.py
+
+FROM ${BASE_IMAGE} AS connector-build
+ARG TARGETARCH
+ARG BUILD_JOBS=16
+RUN test "${TARGETARCH}" = amd64 && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git pkg-config ninja-build patchelf \
+        cuda-driver-dev-13-5 cuda-cudart-dev-13-5 \
+        libibverbs-dev libnuma-dev libgoogle-glog-dev libgflags-dev \
+        libjsoncpp-dev libyaml-cpp-dev libssl-dev libcurl4-openssl-dev \
+        libboost-dev liburing-dev libjemalloc-dev libmsgpack-dev \
+        libasio-dev libzstd-dev libxxhash-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    uv venv --system-site-packages /opt/.venv && \
+    uv pip install --python /opt/.venv/bin/python \
+        build meson meson-python pybind11 patchelf pyyaml types-PyYAML \
+        pytest setuptools wheel tomlkit scikit-build-core auditwheel cmake ninja
+ENV PATH=/opt/.venv/bin:${PATH} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
+
+FROM connector-build AS mooncake-build
+ARG MOONCAKE_COMMIT
+WORKDIR /src/mooncake
+RUN git init && git remote add origin https://github.com/kvcache-ai/Mooncake.git && \
+    git fetch --depth=1 origin "${MOONCAKE_COMMIT}" && git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${MOONCAKE_COMMIT}"
+RUN sed -i \
+        -e 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-cuda13"/' \
+        -e 's/version = "0.3.12.post1"/version = "0.3.14+efa.ed1b346b"/' pyproject.toml && \
+    LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} \
+    uv build --python /opt/.venv/bin/python --wheel --no-build-isolation \
+        --out-dir /tmp/mooncake-wheel \
+        -Ccmake.define.USE_CUDA=ON -Ccmake.define.USE_EFA=ON \
+        -Ccmake.define.LIBFABRIC_INCLUDE_DIR=/opt/amazon/efa/include \
+        -Ccmake.define.USE_HTTP=ON -Ccmake.define.USE_INTRA_NVLINK=ON \
+        -Ccmake.define.WITH_TE=ON -Ccmake.define.WITH_STORE=ON \
+        -Ccmake.define.WITH_CONDUCTOR=OFF -Ccmake.define.WITH_EP=OFF \
+        -Ccmake.define.WITH_PG=OFF -Ccmake.define.WITH_STORE_RUST=OFF \
+        -Ccmake.define.WITH_STORE_RS=OFF -Ccmake.define.WITH_STORE_GO=OFF \
+        -Ccmake.define.BUILD_UNIT_TESTS=OFF -Ccmake.define.BUILD_EXAMPLES=OFF && \
+    auditwheel repair --wheel-dir /wheels \
+        --exclude libcuda.so.1 --exclude libcudart.so.13 \
+        --exclude libibverbs.so.1 --exclude libmlx5.so.1 --exclude libnuma.so.1 \
+        /tmp/mooncake-wheel/*.whl
+
+FROM connector-build AS nixl-build
+ARG NIXL_COMMIT
+WORKDIR /src/nixl
+RUN git init && git remote add origin https://github.com/ai-dynamo/nixl.git && \
+    git fetch --depth=1 origin "${NIXL_COMMIT}" && git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${NIXL_COMMIT}"
+COPY docker/m3p1-b300/nixl-1.5.2-reconnect.patch /tmp/nixl-reconnect.patch
+RUN git apply --check /tmp/nixl-reconnect.patch && git apply /tmp/nixl-reconnect.patch && \
+    /opt/.venv/bin/python contrib/tomlutil.py --wheel-name nixl-cu13 pyproject.toml && \
+    sed -i 's/version = "1.5.2"/version = "1.5.2+reconnect"/' pyproject.toml && \
+    sed -i "s/version: '1.5.2'/version: '1.5.2+reconnect'/" meson.build && \
+    uv build --python /opt/.venv/bin/python --wheel --no-build-isolation \
+        --out-dir /wheels \
+        -Csetup-args=-Dlibfabric_path=/opt/amazon/efa \
+        -Csetup-args=-Denable_plugins=LIBFABRIC \
+        -Csetup-args=-Dbuild_tests=false -Csetup-args=-Dbuild_examples=false \
+        -Csetup-args=-Dbuild_nixl_ep=false -Csetup-args=-Dwith_trace=false \
+        -Csetup-args=-Dnixl_cuda_arch_list=103 \
+        -Ccompile-args=-j${BUILD_JOBS}
+
+FROM ${BASE_IMAGE}
+ARG TARGETARCH
+ARG BRANCH_COMMIT
+ARG MOONCAKE_COMMIT
+ARG NIXL_COMMIT
+RUN test "${TARGETARCH}" = amd64 && test -n "${BRANCH_COMMIT}" && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        binutils libibverbs1 ibverbs-providers libnuma1 && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=bind,from=mooncake-build,source=/wheels,target=/tmp/mooncake-wheels \
+    --mount=type=bind,from=nixl-build,source=/wheels,target=/tmp/nixl-wheels \
+    uv pip uninstall --system mooncake-transfer-engine mooncake-transfer-engine-cuda13 \
+        nixl-cu12 nixl-cu13 nvidia-cutlass-dsl-libs-cu12 && \
+    uv pip install --system --no-deps /tmp/mooncake-wheels/*.whl /tmp/nixl-wheels/*.whl
+
+RUN --mount=type=bind,from=kernel-sources,source=/vllm,target=/tmp/kernels/vllm \
+    --mount=type=bind,source=vllm,target=/tmp/src/vllm \
+    --mount=type=bind,source=docker/m3p1-gb300,target=/tmp/lists \
+    set -e; \
+    uv venv --system-site-packages /tmp/check-venv; \
+    sp=$(/tmp/check-venv/bin/python -c 'import importlib.metadata as m; print(m.distribution("vllm").locate_file(""))'); \
+    cd /tmp/src; sha256sum -c --quiet /tmp/lists/vllm-files.sha256; \
+    for source in /tmp/src /tmp/kernels; do \
+        if [ "$source" = /tmp/src ]; then list=vllm-files; else list=kernel-sources; fi; \
+        while read -r hash file; do \
+            if [ -x "$source/$file" ]; then mode=0755; else mode=0644; fi; \
+            install -D -m "$mode" "$source/$file" "$sp/$file"; \
+            case "$file" in *.py) \
+                cache="$(dirname "$sp/$file")/__pycache__"; \
+                if [ -d "$cache" ]; then \
+                    find "$cache" -maxdepth 1 -name "$(basename "$file" .py).*pyc" -delete; \
+                fi ;; esac; \
+        done < "/tmp/lists/$list.sha256"; \
+        (cd "$sp" && sha256sum -c --quiet "/tmp/lists/$list.sha256"); \
+    done; \
+    rm -rf /tmp/check-venv
+
+RUN --mount=type=bind,source=docker/m3p1-b300/check-image.py,target=/tmp/check-image.py \
+    --mount=type=bind,from=connector-build,source=/usr/local/cuda/lib64/stubs/libcuda.so,target=/tmp/libcuda.so.1 \
+    set -e; \
+    nvcc --version | grep -q 'release 13\.5,'; \
+    /opt/amazon/efa/bin/fi_info -l | grep -q '^efa:'; \
+    plugin=$(find /usr/local/lib -name libplugin_LIBFABRIC.so -print -quit); \
+    test -n "$plugin"; \
+    ldd "$plugin" | grep -q 'libfabric\.so\.1 => /opt/amazon/efa/lib/'; \
+    ldconfig -p | grep -q '/opt/amazon/ofi-nccl/lib/libnccl-net-ofi\.so'; \
+    ldconfig -p | grep -q '/opt/amazon/ofi-nccl/lib/libnccl-tuner-ofi\.so'; \
+    uv venv --system-site-packages /tmp/check-venv; \
+    LD_LIBRARY_PATH=/tmp:${LD_LIBRARY_PATH} /tmp/check-venv/bin/python /tmp/check-image.py; \
+    rm -rf /tmp/check-venv
+
+LABEL org.opencontainers.image.source="https://github.com/ivanium/vllm" \
+      org.opencontainers.image.revision="${BRANCH_COMMIT}" \
+      org.opencontainers.image.base.digest="sha256:f2036e7a2b69217d9fbf048caf4b994fbd996d7821939938e33a4f4a2ce009e3" \
+      ai.vllm.mooncake.revision="${MOONCAKE_COMMIT}" \
+      ai.vllm.nixl.revision="${NIXL_COMMIT}" \
+      ai.vllm.nixl.patch="94266532814b823b543fa341c8dffcb486e59b41 (backport)"
